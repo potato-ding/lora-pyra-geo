@@ -1,0 +1,35 @@
+# Python/ML 项目常用忽略
+outputs/
+data/
+.venv/
+__pycache__/
+*.pth
+*.pt
+*.log
+*.ckpt
+*.egg-info/
+.ipynb_checkpoints/
+env/
+venv/
+dist/
+build/
+# 忽略数据目录
+data/
+# 忽略所有模型权重格式
+*.pth
+*.bin
+*.pt
+*.ckpt
+*.onnx
+# 忽略各种日志和临时文件
+__pycache__/
+*.log
+.ipynb_checkpoints/
+outputs/
+checkpoint/
+
+src/models/dinov3/
+src/models/repvit_pth/
+src/checkpoint/
+Miniconda3-latest-Linux-x86_64.sh
+Miniconda3-latest-Linux-x86_64.sh

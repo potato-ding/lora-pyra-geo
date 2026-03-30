@@ -1,0 +1,9 @@
+# Teacher训练超参数配置
+batch_size: 4
+num_workers: 4
+epochs: 100
+learning_rate: 5e-5
+data_root: data/university_1652
+model:
+  backbone: dinov3
+  classifier_head: u1652

@@ -1,0 +1,10 @@
+# requirements.txt
+# 请根据实际依赖补充
+numpy
+pandas
+torch
+torchvision
+yaml
+transformers
+tqdm
+pyyaml
