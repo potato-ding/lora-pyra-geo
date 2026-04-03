@@ -9,6 +9,7 @@ import torch.utils.checkpoint as cp
 from src.models.adapter_model import U1652ResnetBottleBlock, U1652TransBottleBlock, U1652NormalBottleBlock, U1652ClassifierHead
 from src.utils.smart_checkpoint import SmartCheckpointWrapper
 import torch.nn.functional as F
+from src.models.peft_lora import DoRAInject
 
 # 增加设置梯度检查点类
 class CheckpointWrapper(nn.Module):
@@ -24,15 +25,6 @@ class CheckpointWrapper(nn.Module):
         else:
             return self.module(*args, **kwargs)
 
-# pyra配置
-#todo: pyra_cfg 目前放在外面，后续可以改为参数传入
-pyra_cfg = {
-    'in_dim': 4096,           # 【极其重要】DINOv3 不同版本的输出维度不同。ViT-Base 是 768，ViT-Large 是 1024。如果你填了 4096，说明你可能是把 4 层的特征拼接（Concat）在一起了（比如 1024 * 4），这在多尺度特征金字塔中是非常高端且正确的做法！
-    'reduction': 16,          # 常见的通道缩放率（Reduction Ratio）。在计算注意力权重（wr/wd）时，先将 4096 降维到 256 再升维回去，极大节省计算量。
-    'spatial_kernel': 7,      # 如果你的 wd 是空间注意力（Spatial Attention），通常会用 7x7 甚至更大的卷积核来捕获全局视野。
-    'activation': 'relu'      # 权重生成网络内部的激活函数。
-}
-
 
 # dinov3 代码和权重路径 
 repo_dir = 'src/models/dinov3'
@@ -46,8 +38,8 @@ class TeacherModel(nn.Module):
     def __init__(self, args):
         super().__init__()
         self.use_ce = args.use_ce
-        self.use_pyra = args.use_pyra
         self.lora = args.lora
+        self.dora = args.dora
         self.device = args.device
         self.classifier = None  # 分类头初始化为 None，只有在 use_ce 不为 None 时才创建
 
@@ -76,6 +68,22 @@ class TeacherModel(nn.Module):
             self.lora.inject()
         else:
             self.lora = None
+        
+        # 2. DoRA注入: dora>0 就启用，数值表示注入层数（从后往前数）。比如 dora=4 就注入最后4层，dora=0 就完全不启用。
+        if self.dora > 0:
+            start_block = 40 - self.dora
+            self.dora_cfg = {
+                'r': 8,
+                'alpha': 16,
+                'dropout': 0.1,
+                'target_names': ("qkv", "proj"),
+                'block_range': (start_block, 40),
+                'task_type': "feature_extraction"
+            }
+            self.dora = DoRAInject(self.backbone.model, **self.dora_cfg)
+            self.dora.inject()
+        else:
+            self.dora = None
 
         dino_model = self.backbone.model
         if hasattr(dino_model, 'blocks') and isinstance(dino_model.blocks, nn.ModuleList):
@@ -85,15 +93,8 @@ class TeacherModel(nn.Module):
         else:
             print("⚠️ 警告：未在模型中找到 'blocks' 属性，请检查 DINOv3 源码中 Transformer 列表的变量名。")
         
-        # 3. PYRA增强（可选）
-        # if pyra_cfg is not None and use_pyra:
-        #     print(f"PYRA配置: {pyra_cfg}")  # 打印PYRA配置，便于调试和确认参数设置
-        #     in_dim = pyra_cfg.get('in_dim', 4096)
-        #     self.pyra = PYRAModule(dim=in_dim)
-        # else:
-        #     self.pyra = None
         
-        # 4. 分类头可选各种瓶颈层和简单分类头
+        # 分类头可选各种瓶颈层和简单分类头
         if self.use_ce != 'None':
             if self.use_ce == 'resBottle':
                 self.classifier = U1652ResnetBottleBlock(in_dim=4096, num_classes=701)
@@ -109,15 +110,18 @@ class TeacherModel(nn.Module):
         self.logit_scale = nn.Parameter(torch.tensor(init_value, dtype=torch.float32))
 
     def forward(self, x):
-        # x: (B, C, H, W)
-        if self.training:  # 必加：防止反向传播时在冻结层断裂，LoRA 无法更新
+        if self.training:
             x.requires_grad_(True)
-        feats = self.backbone(x)
+        with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.FLASH_ATTENTION):
+            ret = self.backbone.model.forward_features(x)
+            
+        cls_token = ret['x_norm_clstoken']  # 形状: [B, D]
         
-        # todo：PYRA增强
-        # if self.pyra is not None:
-        #     feats = self.pyra(feats, feats)  # 假设两个输入是相同的
-        #     feats = feats.mean(dim=1)
+        # 2. 提取所有空间的 Patch Tokens，并进行全局平均池化 (GAP)
+        patch_tokens = ret['x_norm_patchtokens'] # 形状: [B, N, D]
+        patch_gap = patch_tokens.mean(dim=1)     # 在 N(Patch序列) 维度求均值 -> [B, D]
+        
+        feats = cls_token + patch_gap
         logits = None
         if self.use_ce != 'None':
             logits = self.classifier(feats)

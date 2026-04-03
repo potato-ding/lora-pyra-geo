@@ -32,14 +32,6 @@ from src.data.val_dataloaders import build_val_dataloaders
 if 'OMP_NUM_THREADS' not in os.environ:
     os.environ['OMP_NUM_THREADS'] = '4'
 
-def alb_transform_wrapper(img, transform):
-    # 1. ImageFolder 读出来是 PIL 格式，Albumentations 需要 numpy 数组
-    img_np = np.array(img)
-    # 2. 传入关键字参数 image=
-    augmented = transform(image=img_np)
-    # 3. 返回处理后的图片（已经是 Tensor 了，如果你在 Compose 里加了 ToTensorV2）
-    return augmented['image']
-
 def get_cosine_schedule_with_warmup(warmup_steps, total_steps):
     """
     学习率调度器的工厂函数：
@@ -61,11 +53,12 @@ def get_save_pth(args):
     save_dir = os.path.join(
         'src/checkpoint',
         'dinov3' +
-        (f'_{args.lora}' if (args.lora > 0) else '') +
+        (f'_lora{args.lora}' if (args.lora > 0) else '') +
+        (f'_dora{args.dora}' if (args.dora > 0) else '') +
         (f'_{args.use_ce}' if args.use_ce != 'None' else '') +
         ('_contrastive' if args.use_contrastive else '') +
         ('_triplet' if args.use_triplet else '') +
-        ('_pyra' if args.use_pyra else '') +
+        (f'_{args.triplet_weight}w') + 
         (f'_{args.img_size}')
     )
     return save_dir
@@ -152,7 +145,7 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, logit_scale=N
                 # 自动分别计算 drone->drone 和 sat->sat 的困难样本损失并求均值
                 tri_loss = triplet_criterion(drone_feats, drone_labels, sat_feats, sat_labels)
                 # 建议将权重设为 0.3 到 0.5 之间。你可以通过 args 传入，这里默认给个 0.3
-                tri_weight = getattr(args, 'triplet_weight', 0.3) 
+                tri_weight = args.triplet_weight 
                 
                 loss += tri_weight * tri_loss
                 tri_loss_val = tri_loss.item()
@@ -261,10 +254,11 @@ if __name__ == "__main__":
     parser.add_argument('--batch_size', type=int, default=2, help='每个 GPU 的 batch size')
     parser.add_argument('--img_size', type=int, default=224, help='输入图像的尺寸')
     parser.add_argument('--lora', type=int, help='启用LoRA模块后层数', default=0)
+    parser.add_argument('--dora', type=int, help='启用DoRA模块后层数', default=0)
+    parser.add_argument('--triplet_weight', type=float, help='三元组损失权重', default=2)
     parser.add_argument('--use_ce', type=str, default='None', help=r'分类器类型"layerNormBottle" | "transBottle" | "resBottle" | "normal" | None')
     parser.add_argument('--use_contrastive', action='store_true', help='是否启用对比学习', default=False)
     parser.add_argument('--use_triplet', action='store_true', help='是否启用三元组损失', default=False)
-    parser.add_argument('--use_pyra', action='store_true', help='是否启用PYRA模块', default=False)
     args = parser.parse_args()
     try:
         try_init_dist()
@@ -273,9 +267,7 @@ if __name__ == "__main__":
         # 构建测试集
         val_loaders = build_val_dataloaders(img_size=[args.img_size, args.img_size])
         # 构建模型
-        model = create_teacher_model(
-            args
-        )
+        model = create_teacher_model(args)
         # 获取可训练参数并构建优化器和学习率调度器
         optimizer, logit_scale = build_optimizer_and_scale(model, args)
         scheduler = get_scheduler(

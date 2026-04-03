@@ -16,7 +16,6 @@ class IntraDomainTripletLoss(nn.Module):
         features = F.normalize(features, p=2, dim=1)
 
         # 2. 计算同域内部的距离矩阵 [N, N]
-        # 注意：这里是 features 和自己的转置相乘
         dist_mat = 2.0 - 2.0 * torch.matmul(features, features.t())
         dist_mat = torch.sqrt(dist_mat.clamp(min=1e-12))
 
