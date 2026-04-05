@@ -24,11 +24,12 @@ from src.loss.blocks_infoNCE import blocks_InfoNCE
 from src.utils.initdist import try_init_dist
 from src.utils.gather_features_and_labels_and_views import gather_features_and_labels_and_views 
 from src.utils.train_eval_utils import run_val_and_get_recall
-from src.models.teacher_model import create_teacher_model
+from src.models.teacher_model import TeacherModel
 from src.utils.scheduler import get_scheduler
 from torch.optim.lr_scheduler import LambdaLR
 from src.utils.optimizer_and_scale import build_optimizer_and_scale
 from src.data.val_dataloaders import build_val_dataloaders
+from src.utils.save_path import get_save_pth
 if 'OMP_NUM_THREADS' not in os.environ:
     os.environ['OMP_NUM_THREADS'] = '4'
 
@@ -48,20 +49,6 @@ def get_cosine_schedule_with_warmup(warmup_steps, total_steps):
     
     # 注意这里是返回这个函数本身，而不是调用它
     return lr_lambda
-
-def get_save_pth(args):
-    save_dir = os.path.join(
-        'src/checkpoint',
-        'dinov3' +
-        (f'_lora{args.lora}' if (args.lora > 0) else '') +
-        (f'_dora{args.dora}' if (args.dora > 0) else '') +
-        (f'_{args.use_ce}' if args.use_ce != 'None' else '') +
-        ('_contrastive' if args.use_contrastive else '') +
-        ('_triplet' if args.use_triplet else '') +
-        (f'_{args.triplet_weight}w') + 
-        (f'_{args.img_size}')
-    )
-    return save_dir
 
 def train(model, dataloader, args, optimizer=None, scheduler=None, logit_scale=None, val_loaders=None):
     local_rank = int(os.environ.get('LOCAL_RANK', 0)) if 'LOCAL_RANK' in os.environ else 0
@@ -117,19 +104,10 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, logit_scale=N
             
             # 4. 前向传播
             feats, logits = model_engine(imgs)
-            
-            # 5. 计算各个损失函数
-            loss = 0
-            ce_loss_val = None
-            
-            if (args.use_ce != 'None') and logits is not None:
-                ce_loss = criterion(logits, labels)
-                loss += ce_loss
-                ce_loss_val = ce_loss.item()
                 
             # 跨卡特征聚合
             all_feats, all_labels, all_views = gather_features_and_labels_and_views(feats, labels, views)
-            
+            loss = 0
             tri_loss_val = None
             if args.use_triplet and triplet_criterion is not None:
                 sat_mask = (all_views == 0)
@@ -156,15 +134,6 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, logit_scale=N
                 loss += con_loss
                 con_loss_val = con_loss.item()
                 
-            # 6. 统计准确率 (仅在开启 CE 时)
-            batch_acc = 0.0
-            if (args.use_ce != 'None') and logits is not None:
-                preds = logits.argmax(dim=1)
-                correct = (preds == labels).sum().item()
-                total_correct += correct
-                total_samples += labels.size(0)
-                batch_acc = correct / labels.size(0)
-                
             # 7. 反向传播与优化 (干净利落，一次到位！)
             if torch.is_tensor(loss):
                 model_engine.backward(loss)
@@ -177,11 +146,9 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, logit_scale=N
             if (batch_idx + 1) % 20 == 0:
                 if not dist.is_initialized() or dist.get_rank() == 0:
                     log_str = f"Epoch {epoch} | Batch {batch_idx}: "
-                    if (args.use_ce != 'None') and ce_loss_val is not None: log_str += f"ce={ce_loss_val:.4f} | "
                     if args.use_triplet and tri_loss_val is not None: log_str += f"tri={tri_loss_val:.4f} | "
                     if args.use_contrastive and con_loss_val is not None: log_str += f"con={con_loss_val:.4f} | "
                     log_str += f"total={loss.item():.4f}"
-                    if (args.use_ce != 'None') and ce_loss_val is not None: log_str += f"acc={batch_acc:.4f}"
                     print(log_str)
             # 打印日志后，删除当前批次的变量，释放显存
             try:
@@ -201,9 +168,8 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, logit_scale=N
 
                 gc.collect()               # 强清 Python 层的残存变量
                 torch.cuda.empty_cache()   # 强清 PyTorch 层的显存碎片
-                d2s_r1, d2s_r5, d2s_r10, d2s_map = run_val_and_get_recall(model, q_loader_d2s, g_loader_d2s, 'cuda')
-                s2d_r1, s2d_r5, s2d_r10, s2d_map = run_val_and_get_recall(model, q_loader_s2d, g_loader_s2d, 'cuda')
-                print("评估完成。")
+                d2s_r1, d2s_r5, d2s_r10, d2s_map, d2s_dis_at_1, d2s_sdm_at_3 = run_val_and_get_recall(model, q_loader_d2s, g_loader_d2s, 'cuda')
+                s2d_r1, s2d_r5, s2d_r10, s2d_map, s2d_dis_at_1, s2d_sdm_at_3 = run_val_and_get_recall(model, q_loader_s2d, g_loader_s2d, 'cuda')
                 if dist.get_rank() == 0:
                     trainable_state = {
                         k: v.cpu() 
@@ -256,9 +222,9 @@ if __name__ == "__main__":
     parser.add_argument('--lora', type=int, help='启用LoRA模块后层数', default=0)
     parser.add_argument('--dora', type=int, help='启用DoRA模块后层数', default=0)
     parser.add_argument('--triplet_weight', type=float, help='三元组损失权重', default=2)
-    parser.add_argument('--use_ce', type=str, default='None', help=r'分类器类型"layerNormBottle" | "transBottle" | "resBottle" | "normal" | None')
     parser.add_argument('--use_contrastive', action='store_true', help='是否启用对比学习', default=False)
     parser.add_argument('--use_triplet', action='store_true', help='是否启用三元组损失', default=False)
+    parser.add_argument('--use_pooling', action='store_true', help='是否对dinov3输出做池化', default=True)
     args = parser.parse_args()
     try:
         try_init_dist()
@@ -267,7 +233,7 @@ if __name__ == "__main__":
         # 构建测试集
         val_loaders = build_val_dataloaders(img_size=[args.img_size, args.img_size])
         # 构建模型
-        model = create_teacher_model(args)
+        model = TeacherModel(args)
         # 获取可训练参数并构建优化器和学习率调度器
         optimizer, logit_scale = build_optimizer_and_scale(model, args)
         scheduler = get_scheduler(

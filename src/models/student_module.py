@@ -1,24 +1,9 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from repvit import repvit_m1_5 
-
-class GeMPooling(nn.Module):
-    """
-    Generalized Mean Pooling
-    在跨视角检索任务中，GeM 比 GAP 能更好地保留显著性局部特征
-    """
-    def __init__(self, p=3.0, eps=1e-6):
-        super(GeMPooling, self).__init__()
-        self.p = nn.Parameter(torch.ones(1) * p)
-        self.eps = eps
-
-    def forward(self, x):
-        x = x.clamp(min=self.eps).pow(self.p)
-        x = F.avg_pool2d(x, (x.size(-2), x.size(-1)))
-        return x.pow(1. / self.p)
-
-class MobileGeo_RepViT_Student(nn.Module):
+from repvit import repvit_m1_5
+from utils.gem_pooling import student_GeMPooling as GeMPooling
+class repvit_student_model(nn.Module):
     def __init__(self, num_classes=512, is_training=True, pretrained_path=None):
         super().__init__()
         self.is_training = is_training
