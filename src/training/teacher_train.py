@@ -224,7 +224,7 @@ if __name__ == "__main__":
     parser.add_argument('--triplet_weight', type=float, help='三元组损失权重', default=2)
     parser.add_argument('--use_contrastive', action='store_true', help='是否启用对比学习', default=False)
     parser.add_argument('--use_triplet', action='store_true', help='是否启用三元组损失', default=False)
-    parser.add_argument('--use_pooling', action='store_true', help='是否对dinov3输出做池化', default=True)
+    parser.add_argument('--use_mix', action='store_true', help='是否对dinov3输出做浅层特征混合注意力', default=False)
     args = parser.parse_args()
     try:
         try_init_dist()

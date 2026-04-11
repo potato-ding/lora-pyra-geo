@@ -39,7 +39,7 @@ class TeacherModel(nn.Module):
         self.lora = args.lora
         self.dora = args.dora
         self.device = args.device
-        self.use_pooling = args.use_pooling
+        self.use_mix = args.use_mix
 
         # 1. DINOv3主干
         self.backbone = DINOv3Backbone(
@@ -96,27 +96,53 @@ class TeacherModel(nn.Module):
         # 注册为模型的正式成员
         self.logit_scale = nn.Parameter(torch.tensor(init_value, dtype=torch.float32))
 
-    def forward(self, x):
-        if self.training:
-            x.requires_grad_(True)
+        self.target_layers = [11, 19, 27, 39] 
+        self.num_ap_layers = 3 # 只有前 3 层参与门控
         
-        if self.use_pooling:
+        # 初始化门控参数为负数 (Sigmoid(-2.0) ≈ 0.119)
+        self.ap_gates = nn.Parameter(torch.full((self.num_ap_layers,), -2.0, dtype=torch.bfloat16))
+    def forward(self, x):
+        
+        if self.use_mix:
             with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.FLASH_ATTENTION):
-                features = self.backbone.model.get_intermediate_layers(x, n=4, return_class_token=True)
+                features = self.backbone.model.get_intermediate_layers(x, n=self.target_layers, return_class_token=True)
+            main_cls = features[-1][1] # 形状: [B, 4096]
             
-            cls_layer_1 = features[0][1]  # 倒数第 4 层的 CLS (保留了丰富的局部几何纹理)
-            cls_layer_2 = features[1][1]  # 倒数第 3 层的 CLS
-            cls_layer_3 = features[2][1]  # 倒数第 2 层的 CLS
-            cls_layer_4 = features[3][1]  # 倒数第 1 层的 CLS (全局最高阶语义)
-            feats = torch.cat([cls_layer_1, cls_layer_2, cls_layer_3, cls_layer_4], dim=-1)
+            # 2. 收集浅/中层的 AP 特征 (只遍历前 3 层)
+            ap_list = []
+            for i in range(self.num_ap_layers):
+                patch_tokens = features[i][0] # 形状: [B, N, 4096]
+                
+                # 保留特征抖动：以 50% 的概率注入微小高斯噪声 (防过拟合)
+                # if self.training and torch.rand(1).item() < 0.5:
+                #     noise = torch.randn_like(patch_tokens) * 0.005 # 使用降低后的噪声强度
+                #     patch_tokens = patch_tokens + noise
+                
+                # 计算空间池化 AP
+                ap_token = patch_tokens.mean(dim=1) # [B, 4096]
+                ap_list.append(ap_token)
+
+            # 堆叠成张量准备加权
+            stacked_ap = torch.stack(ap_list, dim=1) # 形状: [B, 3, 4096]
+            
+            # 3. 计算门控值 (使用 Sigmoid 激活，将权重死死限制在 0~1 之间)
+            gates = torch.sigmoid(self.ap_gates).view(1, self.num_ap_layers, 1) # [1, 3, 1]
+            
+            # 4. 门控 Dropout：训练时以 10% 的概率随机彻底关闭某层的辅助特征
+            # gates = F.dropout(gates, p=0.1, training=self.training)
+            
+            # 5. 门控筛选浅层特征 (对应位置相乘然后把 3 层压缩成 1 层)
+            gated_ap = (stacked_ap * gates).sum(dim=1) # 形状: [B, 4096]
+            
+            # 6. 终极残差相加：100% 的绝对主干语义 + 按需获取的浅层空间细节
+            feats = main_cls + gated_ap
         else:
             with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.FLASH_ATTENTION):
                 # 获取 DINOv3 最后一层的输出字典 (放弃 get_intermediate_layers)
                 ret = self.backbone.model.forward_features(x)
                 
             # 只提取最纯粹的、包含最高级全局语义的 [CLS] Token
-            feats = ret['x_norm_clstoken']  # 形状回归到 [B, 1024]
-            
+            feats = ret['x_norm_clstoken']
         
         logits = None
         with torch.amp.autocast(device_type='cuda', enabled=False):
@@ -135,7 +161,7 @@ class EvalTeacherModel(nn.Module):
         self.lora = args.lora
         self.dora = args.dora
         self.device = args.device
-        self.use_pooling = args.use_pooling
+        self.use_mix = args.use_mix
         # 1. DINOv3主干
         self.backbone = DINOv3Backbone(
             repo_dir,
@@ -148,12 +174,16 @@ class EvalTeacherModel(nn.Module):
         self.dora = args.dora
         
         if self.lora > 0:
-            print(f"正在为 DINOv3 的最后 {self.lora} 层注入 LoRA 模块结构...")
             self._inject_lora(args)
             
         elif self.dora > 0:
-            print(f"正在为 DINOv3 注入 DoRA 模块结构...")
             self._inject_dora(args)
+
+        self.target_layers = [11, 19, 27, 39] 
+        self.num_ap_layers = 4 # 只有前 4 层参与门控
+        
+        # 初始化门控参数为负数 (Sigmoid(-2.0) ≈ 0.119)
+        self.ap_gates = nn.Parameter(torch.full((self.num_ap_layers,), -2.0, dtype=torch.bfloat16))
     def _inject_lora(self, args):
         """
         内部方法：复刻训练时的 LoRA 注入逻辑。
@@ -197,26 +227,40 @@ class EvalTeacherModel(nn.Module):
         """
         评估阶段的前向传播：复刻训练时的特征提取与融合逻辑。
         """
-        if self.use_pooling:
+        if self.use_mix:
             with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.FLASH_ATTENTION):
-                # 获取 DINOv3 倒数 4 层的特征元组列表
-                features = self.backbone.model.get_intermediate_layers(x, n=4, return_class_token=True)
-                
-            # 2. 依次提取 4 层的 CLS Token (每个形状: [B, D])
-            cls_layer_1 = features[0][1]  # 倒数第 4 层 (保留丰富局部几何纹理)
-            cls_layer_2 = features[1][1]  # 倒数第 3 层
-            cls_layer_3 = features[2][1]  # 倒数第 2 层
-            cls_layer_4 = features[3][1]  # 倒数第 1 层 (全局最高阶语义)
+                # 一次性提取 4 层特征 (11, 19, 27, 39)
+                features = self.backbone.model.get_intermediate_layers(x, n=self.target_layers, return_class_token=True)
             
-            # 3. 核心特征融合：沿着通道维度拼接
-            feats = torch.cat([cls_layer_1, cls_layer_2, cls_layer_3, cls_layer_4], dim=-1)
+            main_cls = features[-1][1] # 形状: [B, 4096]
+            
+            # 2. 收集浅/中层的 AP 特征 (只遍历前 3 层)
+            ap_list = []
+            for i in range(self.num_ap_layers):
+                patch_tokens = features[i][0] # 形状: [B, N, 4096]
+                
+                # 【注意】评估阶段绝对不能加高斯噪声！直接计算 AP
+                ap_token = patch_tokens.mean(dim=1) # [B, 4096]
+                ap_list.append(ap_token)
+
+            # 堆叠成张量准备加权
+            stacked_ap = torch.stack(ap_list, dim=1)
+            
+            # 3. 计算门控值 (使用 Sigmoid 激活，限制在 0~1 之间)
+            gates = torch.sigmoid(self.ap_gates).view(1, self.num_ap_layers, 1)
+            
+            # 4. 门控筛选浅层特征 (对应位置相乘然后压缩)
+            gated_ap = (stacked_ap * gates).sum(dim=1) # 形状: [B, 4096]
+            
+            # 5. 终极残差相加：100% 的绝对主干语义 + 门控获取的浅层空间细节
+            feats = main_cls + gated_ap
+
         else:
             with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.FLASH_ATTENTION):
-                # 获取 DINOv3 最后一层的输出字典 (放弃 get_intermediate_layers)
                 ret = self.backbone.model.forward_features(x)
-                
-            # 只提取最纯粹的、包含最高级全局语义的 [CLS] Token
-            feats = ret['x_norm_clstoken']  # 形状回归到 [B, 1024]
+            
+            # 只提取最终的全局语义
+            feats = ret['x_norm_clstoken']
             
         
         # 4. 精度对齐与归一化 (度量学习检索的灵魂，必须保证和训练一致)

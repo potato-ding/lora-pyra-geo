@@ -10,6 +10,16 @@ def get_save_pth(args):
         ('_triplet' if args.use_triplet else '') +
         (f'_{args.triplet_weight}w') + 
         (f'_{args.img_size}') + 
-        (f'_pooling' if args.use_pooling else '')
+        (f'_mix' if args.use_mix else '')
+    )
+    return save_dir
+
+def get_student_save_pth(args):
+    save_dir = os.path.join(
+        'src/checkpoint/student',
+        ('_contrastive' if args.use_contrastive else '') +
+        ('_triplet' if args.use_triplet else '') +
+        (f'_{args.triplet_weight}w') + 
+        (f'_{args.img_size}')
     )
     return save_dir

@@ -40,6 +40,7 @@ def test_pipeline(model, args, val_loaders=None):
     print("正在进入测试流程，准备加载模型权重...")
     device = args.device if hasattr(args, 'device') else 'cuda'
     save_dir = get_save_pth(args)
+    model = model.to(torch.bfloat16)
     weight_path = os.path.join(save_dir, "best_model.pth")
     is_main = os.environ.get("LOCAL_RANK", "0") == "0"
     if os.path.exists(weight_path):
@@ -142,6 +143,7 @@ if __name__ == "__main__":
     parser.add_argument('--triplet_weight', type=float, help='三元组损失权重', default=2)
     parser.add_argument('--use_contrastive', action='store_true', help='是否启用对比学习', default=False)
     parser.add_argument('--use_triplet', action='store_true', help='是否启用三元组损失', default=False)
+    parser.add_argument('--use_mix', action='store_true', help='是否对dinov3输出做浅层特征混合注意力', default=False)
     args = parser.parse_args()
     try:
         try_init_dist()

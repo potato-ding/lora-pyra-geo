@@ -109,8 +109,16 @@ def run_val_and_get_recall(model, val_query_loader, val_gallery_loader, device):
             sorted_indices = torch.argsort(score_chunk, dim=-1, descending=True)
             sorted_gallery_labels = g_l[sorted_indices]
             
-            # 计算是否匹配
-            matches = (sorted_gallery_labels == q_l_chunk.unsqueeze(1)).float()
+            if q_l_chunk.dim() == 1:
+                matches = (sorted_gallery_labels == q_l_chunk.unsqueeze(1)).float()
+            # 如果是 2D (如 GTA-UAV)，走多选题的 1对N 匹配
+            else:
+                # 预测标签升维 [1000, 14640, 1] 
+                # 真实标签升维 [1000, 1, 3]
+                match_matrix = (sorted_gallery_labels.unsqueeze(2) == q_l_chunk.unsqueeze(1))
+                
+                # 在第 3 维度上做 Any，只要命中任意一个有效正样本(且绝对不会命中-1)，即算作 1.0
+                matches = match_matrix.any(dim=2).float()
 
             # 统计 R@1, R@5, R@10
             local_correct_1 += matches[:, 0].sum()
@@ -126,11 +134,10 @@ def run_val_and_get_recall(model, val_query_loader, val_gallery_loader, device):
             ap_per_query = (precisions * matches).sum(dim=1) / (total_true_matches + 1e-12)
             local_ap_sum += ap_per_query.sum()
             
-            # ================= 物理定位指标计算 (GTA-UAV 专属) =================
             if q_c is not None and g_c is not None:
                 q_c_chunk = local_q_c[i : i + chunk_size]
                 
-                # --- Dis@1: 距离首位预测的距离误差 ---
+                # --- Dis@1: 首位预测的距离误差 ---
                 top1_indices = sorted_indices[:, 0]
                 pred_coords_top1 = g_c[top1_indices]
                 distances_top1 = torch.sqrt(torch.sum((q_c_chunk - pred_coords_top1) ** 2, dim=1))
@@ -139,19 +146,24 @@ def run_val_and_get_recall(model, val_query_loader, val_gallery_loader, device):
                 local_dis_sum += distances_top1[valid_mask].sum()
                 local_valid_dis_count += valid_mask.float().sum()
                 
-                # --- SDM@3: 前三名中是否有误差小于 50 米的 ---
+                # --- SDM@3: 基于指数衰减的定位评价 (完全对齐论文) ---
                 top3_indices = sorted_indices[:, :3]
-                pred_coords_top3 = g_c[top3_indices]
+                pred_coords_top3 = g_c[top3_indices] # [chunk_size, 3, 2]
                 
-                q_c_unsqueeze = q_c_chunk.unsqueeze(1) # [chunk, 1, 2]
+                q_c_unsqueeze = q_c_chunk.unsqueeze(1) # [chunk_size, 1, 2]
                 distances_top3 = torch.sqrt(torch.sum((q_c_unsqueeze - pred_coords_top3) ** 2, dim=2))
                 
-                min_dist_top3, _ = torch.min(distances_top3, dim=1)
+                # 设置论文官方参数: 衰减系数 s=0.001, 权重=[3, 2, 1]
+                s_decay = 0.001
+                weights = torch.tensor([3.0, 2.0, 1.0], device=device).unsqueeze(0) # [1, 3]
                 
-                sdm_threshold = 50.0  # AAAI 论文常用的定位成功判定阈值
-                sdm3_mask = (min_dist_top3 != float('inf')) & (min_dist_top3 <= sdm_threshold)
-                local_sdm3_count += sdm3_mask.float().sum()
-            # =================================================================
+                # 计算指数衰减得分: weight * exp(-0.001 * d)
+                sdm_scores = weights * torch.exp(-s_decay * distances_top3)
+                
+                # 对 Top-3 求和，除以满分权重(6.0)进行归一化
+                sdm_per_query = sdm_scores.sum(dim=1) / 6.0
+                
+                local_sdm3_count += sdm_per_query.sum()
 
     # 5. 分布式汇总 (All-Reduce)
     if dist.is_initialized():
@@ -174,7 +186,7 @@ def run_val_and_get_recall(model, val_query_loader, val_gallery_loader, device):
     
     if local_valid_dis_count.item() > 0:
         dis_at_1 = local_dis_sum.item() / local_valid_dis_count.item()
+        # 将 SDM 平均得分乘以 100 换算成百分比
         sdm_at_3 = (local_sdm3_count.item() / real_num_queries) * 100
 
-    # 严谨返回 6 个值
     return recall_1, recall_5, recall_10, mAP, dis_at_1, sdm_at_3

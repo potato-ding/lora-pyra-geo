@@ -96,7 +96,13 @@ class RepViTBlock(nn.Module):
             )
 
     def forward(self, x):
-        return self.channel_mixer(self.token_mixer(x) + x)
+        out_token = self.token_mixer(x)
+        
+        if out_token.shape == x.shape:
+            return self.channel_mixer(out_token + x)
+        else:
+            # 遇到下采样或通道扩张层，放弃残差，直接放行
+            return self.channel_mixer(out_token)
 
 class RepViT(nn.Module):
     def __init__(self, cfgs):
@@ -104,7 +110,7 @@ class RepViT(nn.Module):
         self.cfgs = cfgs
 
         # 这里的 embed_dim 会被我们的 MobileGeo 学生模型读取
-        self.embed_dim = [cfg[2] for cfg in cfgs if cfg[4] == 2] 
+        self.embed_dim = [cfg[3] for cfg in cfgs if cfg[6] == 2]
         if len(self.embed_dim) < 4:
             # 补齐最后一层的维度
             self.embed_dim.append(cfgs[-1][2])
@@ -112,9 +118,9 @@ class RepViT(nn.Module):
         # 构建 Patch Embedding (Stem)
         inps = 3
         self.patch_embed = nn.Sequential(
-            Conv2d_BN(inps, cfgs[0][2] // 2, 3, 2, 1),
+            Conv2d_BN(inps, cfgs[0][3] // 2, 3, 2, 1),
             nn.GELU(),
-            Conv2d_BN(cfgs[0][2] // 2, cfgs[0][2], 3, 2, 1)
+            Conv2d_BN(cfgs[0][3] // 2, cfgs[0][3], 3, 2, 1)
         )
 
         # 构建 4 个 Network Stages
@@ -122,7 +128,7 @@ class RepViT(nn.Module):
         stage = []
         for i, k, t, c, use_se, use_hs, s in cfgs:
             oup = c
-            inp = inps if i == 0 else cfgs[i-1][2]
+            inp = cfgs[0][3] if i == 0 else cfgs[i-1][3]
             if s == 2 and i != 0:
                 self.network.append(nn.Sequential(*stage))
                 stage = []
