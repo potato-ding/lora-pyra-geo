@@ -25,6 +25,8 @@ def build_optimizer_and_scale(model, args):
             lora_no_weight_decay.append(param)
         elif "ap_gates" in name:
             mix_params.append(param)
+        elif "ap_gates" in name or "global_ap_scale" in name:
+            mix_params.append(param)
             
         # elif args.use_ce and ("classifier" in name or "fc" in name):
         #     classifier_params.append(param)
@@ -64,8 +66,8 @@ def build_optimizer_and_scale(model, args):
     if mix_params:
         optimizer_grouped_parameters.append({
             "params": mix_params,
-            "lr": args.lr,
-            "weight_decay": 0.01
+            "lr": args.lr,  # 如果后续发现浅层特征融合得太慢，这里甚至可以考虑给 args.lr * 5 或 * 10
+            "weight_decay": 0.0  
         })
 
     # 兜底的其他参数 (由于 DINOv3 冻结，这个列表应该是空的，写上保底防报错)

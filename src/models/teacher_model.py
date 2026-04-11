@@ -96,46 +96,65 @@ class TeacherModel(nn.Module):
         # 注册为模型的正式成员
         self.logit_scale = nn.Parameter(torch.tensor(init_value, dtype=torch.float32))
 
-        self.target_layers = [11, 19, 27, 39] 
+        self.target_layers = [7, 15, 23, 39] 
         self.num_ap_layers = 3 # 只有前 3 层参与门控
-        
+        self.ap_gates = nn.Parameter(torch.zeros(self.num_ap_layers, dtype=torch.float32))
+        self.global_ap_scale = nn.Parameter(torch.tensor(0.5, dtype=torch.float32))
         # 初始化门控参数为负数 (Sigmoid(-2.0) ≈ 0.119)
-        self.ap_gates = nn.Parameter(torch.full((self.num_ap_layers,), -2.0, dtype=torch.bfloat16))
+        self.ap_gates = nn.Parameter(torch.full((self.num_ap_layers,), -2.0, dtype=torch.float32))
     def forward(self, x):
         
         if self.use_mix:
             with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.FLASH_ATTENTION):
                 features = self.backbone.model.get_intermediate_layers(x, n=self.target_layers, return_class_token=True)
-            main_cls = features[-1][1] # 形状: [B, 4096]
             
+            main_cls = features[-1][1] # 取第 39 层的 cls token 作为绝对主干 [B, 4096]
+
             # 2. 收集浅/中层的 AP 特征 (只遍历前 3 层)
             ap_list = []
             for i in range(self.num_ap_layers):
                 patch_tokens = features[i][0] # 形状: [B, N, 4096]
                 
-                # 保留特征抖动：以 50% 的概率注入微小高斯噪声 (防过拟合)
-                # if self.training and torch.rand(1).item() < 0.5:
-                #     noise = torch.randn_like(patch_tokens) * 0.005 # 使用降低后的噪声强度
-                #     patch_tokens = patch_tokens + noise
+                # 特征抖动防过拟合 (保留你原本的逻辑即可，若使用需解除注释)
+                # ... 
                 
                 # 计算空间池化 AP
                 ap_token = patch_tokens.mean(dim=1) # [B, 4096]
+                
+                # 【关键约束 1.1：单层特征归一化】
+                # 消除第7层和第23层之间天然的绝对量级鸿沟
+                ap_token = F.normalize(ap_token, p=2, dim=-1)
                 ap_list.append(ap_token)
 
             # 堆叠成张量准备加权
             stacked_ap = torch.stack(ap_list, dim=1) # 形状: [B, 3, 4096]
-            
-            # 3. 计算门控值 (使用 Sigmoid 激活，将权重死死限制在 0~1 之间)
-            gates = torch.sigmoid(self.ap_gates).view(1, self.num_ap_layers, 1) # [1, 3, 1]
-            
-            # 4. 门控 Dropout：训练时以 10% 的概率随机彻底关闭某层的辅助特征
+
+            # 3. 计算门控值 (使用 Softmax 形成层级竞争)
+            # 【关键约束 1.2：强制 3 层权重之和等于 1】
+            gates = F.softmax(self.ap_gates, dim=0).view(1, self.num_ap_layers, 1) # [1, 3, 1]
+
+            # 4. 门控 Dropout (可选，视你的数据集拟合情况而定)
             # gates = F.dropout(gates, p=0.1, training=self.training)
-            
-            # 5. 门控筛选浅层特征 (对应位置相乘然后把 3 层压缩成 1 层)
+
+            # 5. 门控筛选浅层特征 (融合后的 gated_ap 因为是凸组合，依然接近归一化状态)
             gated_ap = (stacked_ap * gates).sum(dim=1) # 形状: [B, 4096]
+
+            # 【关键约束 2：深浅层量级对齐与安全融合】
+            # 对深层主干特征进行归一化
+            norm_main_cls = F.normalize(main_cls, p=2, dim=-1)
             
-            # 6. 终极残差相加：100% 的绝对主干语义 + 按需获取的浅层空间细节
-            feats = main_cls + gated_ap
+            # 使用 global_ap_scale 控制浅层信息的整体注入量，防止破坏原有语义
+            feats = norm_main_cls + self.global_ap_scale * gated_ap
+            
+            # 7. 最终输出前务必再做一次归一化
+            # 这是为了给 Triplet Loss 和最终的检索计算欧氏距离/余弦相似度提供标准空间
+            feats = F.normalize(feats, p=2, dim=-1)
+            if self.training:
+                # 训练模式：返回两个特征，用于分别计算 对比损失 和 三元组损失
+                return norm_main_cls, feats
+            else:
+                # 测试/推理模式：只返回融合后的最终特征，用于提取 query 和 gallery 进行检索
+                return feats
         else:
             with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.FLASH_ATTENTION):
                 # 获取 DINOv3 最后一层的输出字典 (放弃 get_intermediate_layers)

@@ -76,6 +76,13 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, logit_scale=N
 
     best_r1 = 0.0
     for epoch in range(1, args.epochs + 1):
+        max_con_weight = 0.5   # 初始最高权重
+        min_con_weight = 0.05  # 结束最低权重
+        
+        # 计算进度比例 progress (从 0 到接近 1)
+        progress = (epoch - 1) / args.epochs
+        # 余弦衰减公式：前期平缓下降，中期加速，后期平缓收尾
+        current_con_weight = min_con_weight + 0.5 * (max_con_weight - min_con_weight) * (1.0 + math.cos(math.pi * progress))
         if dist.is_initialized() and hasattr(dataloader, 'sampler') and hasattr(dataloader.sampler, 'set_epoch'):
             dataloader.sampler.set_epoch(epoch)
         model_engine.train()
@@ -103,10 +110,11 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, logit_scale=N
             model_engine.zero_grad()
             
             # 4. 前向传播
-            feats, logits = model_engine(imgs)
+            deep_feats, fused_feats = model_engine(imgs)
                 
             # 跨卡特征聚合
-            all_feats, all_labels, all_views = gather_features_and_labels_and_views(feats, labels, views)
+            all_deep_feats, all_labels, all_views = gather_features_and_labels_and_views(deep_feats, labels, views)
+            all_fused_feats, _, _ = gather_features_and_labels_and_views(fused_feats, labels, views) # labels和views聚合一次就够了
             loss = 0
             tri_loss_val = None
             if args.use_triplet and triplet_criterion is not None:
@@ -114,15 +122,15 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, logit_scale=N
                 drone_mask = (all_views == 1)
 
                 # 2. 干净利落地分离出卫星和无人机的特征与标签 (保持不变)
-                sat_feats = all_feats[sat_mask]
+                sat_fused_feats = all_fused_feats[sat_mask]
                 sat_labels = all_labels[sat_mask]
 
-                drone_feats = all_feats[drone_mask]
+                drone_fused_feats = all_fused_feats[drone_mask]
                 drone_labels = all_labels[drone_mask]
 
-                # 自动分别计算 drone->drone 和 sat->sat 的困难样本损失并求均值
-                tri_loss = triplet_criterion(drone_feats, drone_labels, sat_feats, sat_labels)
-                # 建议将权重设为 0.3 到 0.5 之间。你可以通过 args 传入，这里默认给个 0.3
+                # 自动分别计算 drone->drone 和 sat->sat 的同域样本对并求均值
+                tri_loss = triplet_criterion(drone_fused_feats, drone_labels, sat_fused_feats, sat_labels)
+
                 tri_weight = args.triplet_weight 
                 
                 loss += tri_weight * tri_loss
@@ -130,9 +138,11 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, logit_scale=N
                 
             con_loss_val = None
             if args.use_contrastive and contrastive_criterion is not None:
-                con_loss = contrastive_criterion(all_feats, all_labels, all_views, logit_scale)
-                loss += con_loss
-                con_loss_val = con_loss.item()
+                con_loss = contrastive_criterion(all_deep_feats, all_labels, all_views, logit_scale)
+            
+                # 2. 降权操作：将对比学习损失权重改为 0.1 倍
+                loss += current_con_weight * con_loss
+                con_loss_val = (current_con_weight * con_loss).item() # 日志记录实际施加的 loss 值
                 
             # 7. 反向传播与优化 (干净利落，一次到位！)
             if torch.is_tensor(loss):
@@ -152,7 +162,7 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, logit_scale=N
                     print(log_str)
             # 打印日志后，删除当前批次的变量，释放显存
             try:
-                del feats, logits, loss, all_feats, all_labels, all_views
+                del deep_feats, fused_feats, loss, all_deep_feats, all_fused_feats, all_labels, all_views
                 if args.use_triplet:
                     del drone_feats, drone_labels, sat_feats, sat_labels, tri_loss
                 if args.use_contrastive:
