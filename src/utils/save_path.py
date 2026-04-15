@@ -10,7 +10,8 @@ def get_save_pth(args):
         ('_triplet' if args.use_triplet else '') +
         (f'_{args.triplet_weight}w') + 
         (f'_{args.img_size}') + 
-        (f'_mix' if args.use_mix else '')
+        (f'_mix' if args.use_mix else '') + 
+        ('test')
     )
     return save_dir
 

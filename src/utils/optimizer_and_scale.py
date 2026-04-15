@@ -21,17 +21,14 @@ def build_optimizer_and_scale(model, args):
             
         if "lora_" in name:
             lora_weight_decay.append(param)    # 存放 lora_A.weight, lora_B.weight
-        elif name.endswith(".m"): #把 DoRA 的 m 和 GeM 的 p 都保护起来！
+        elif name.endswith(".m"): #把 DoRA 的 m 都保护起来！
             lora_no_weight_decay.append(param)
-        elif "ap_gates" in name:
+        elif "ap_gates" in name or "global_ap_scale" in name or "gamma" in name in name:
             mix_params.append(param)
-        elif "ap_gates" in name or "global_ap_scale" in name:
-            mix_params.append(param)
-            
-        # elif args.use_ce and ("classifier" in name or "fc" in name):
-        #     classifier_params.append(param)
-        # else:
-        #     other_params.append(param)
+        elif "feature_adapter" in name or "cross_attn" in name:
+            classifier_params.append(param)
+        else:
+            other_params.append(param)
 
     # 打印一下当前的参数分布，你可以借此二次确认 m 参数是不是顺利归队了
     print(f"优化器参数分布： LoRA方向矩阵: {len(lora_weight_decay)}, DoRA幅度向量(m): {len(lora_no_weight_decay)}, 分类头: {len(classifier_params)}, 多层融合权重: {len(mix_params)}, 其他兜底: {len(other_params)}, logit_scale: 1")
@@ -60,13 +57,13 @@ def build_optimizer_and_scale(model, args):
     if head_params:
         optimizer_grouped_parameters.append({
             "params": head_params, 
-            "lr": args.lr * 10, 
+            "lr": args.lr * 2, 
             "weight_decay": 0.01 
         })
     if mix_params:
         optimizer_grouped_parameters.append({
             "params": mix_params,
-            "lr": args.lr,  # 如果后续发现浅层特征融合得太慢，这里甚至可以考虑给 args.lr * 5 或 * 10
+            "lr": args.lr * 10,  # 如果后续发现浅层特征融合得太慢，这里甚至可以考虑给 args.lr * 5 或 * 10
             "weight_decay": 0.0  
         })
 
