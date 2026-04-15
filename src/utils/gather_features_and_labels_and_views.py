@@ -17,7 +17,7 @@ class GatherLayer(torch.autograd.Function):
 
 @torch.no_grad()
 def concat_all_gather(tensor):
-    """专门用来跨卡搬运标签和视角（无梯度，极度安全，防止整数报错）"""
+    """专门用来跨卡搬运标签和视角"""
     tensors_gather = [torch.ones_like(tensor) for _ in range(dist.get_world_size())]
     dist.all_gather(tensors_gather, tensor, async_op=False)
     return torch.cat(tensors_gather, dim=0)

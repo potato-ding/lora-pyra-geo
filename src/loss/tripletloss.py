@@ -50,6 +50,6 @@ class IntraDomainTripletLoss(nn.Module):
         # 将两部分的 Loss 相加求平均
         # 注：如果你的 Batch 中每栋建筑只有 1 张卫星图，loss_g 中的 dist_ap 会自然等于 0，
         # 这时公式会退化为推动卫星图负样本远离自己，这在数学上是完全合理且安全的。
-        loss = (loss_q + loss_g) / 2.0
+        # loss = (loss_q + loss_g) / 2.0
         
-        return loss
+        return loss_q, loss_g

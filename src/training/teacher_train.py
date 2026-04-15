@@ -50,6 +50,38 @@ def get_cosine_schedule_with_warmup(warmup_steps, total_steps):
     # 注意这里是返回这个函数本身，而不是调用它
     return lr_lambda
 
+class LiteEMA:
+    def __init__(self, model, decay=0.999):
+        self.decay = decay
+        self.shadow = {} # 存放平滑后的影子权重
+        self.backup = {} # 考试前用来备份原权重的临时仓库
+        
+        # 初始化：只拷贝【有梯度】的参数（LoRA和门控），彻底放过 7B 主干！
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = param.data.clone().detach()
+
+    def update(self, model):
+        # 每次 Batch 后更新：只算有梯度的参数
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                # EMA 公式: shadow = decay * shadow + (1 - decay) * param
+                self.shadow[name] -= (1.0 - self.decay) * (self.shadow[name] - param.data)
+
+    def apply_shadow(self, model):
+        # 考试前：把原模型对应的参数备份，然后把影子权重覆盖上去
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.backup[name] = param.data.clone().detach()
+                param.data.copy_(self.shadow[name])
+
+    def restore(self, model):
+        # 考试后：把原模型的权重还给它，准备继续训练
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                param.data.copy_(self.backup[name])
+        self.backup = {} # 清空备份
+
 def train(model, dataloader, args, optimizer=None, scheduler=None, logit_scale=None, val_loaders=None):
     local_rank = int(os.environ.get('LOCAL_RANK', 0)) if 'LOCAL_RANK' in os.environ else 0
     
@@ -58,7 +90,7 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, logit_scale=N
 
     # 定义损失函数
     criterion = torch.nn.CrossEntropyLoss().to(args.device)
-    triplet_criterion = IntraDomainTripletLoss(margin=0.3) if args.use_triplet else None
+    triplet_criterion = IntraDomainTripletLoss() if args.use_triplet else None
     contrastive_criterion = blocks_InfoNCE(loss_function=torch.nn.CrossEntropyLoss(), device=args.device) if args.use_contrastive else None
     # 4. deepspeed 初始化
     model_engine, optimizer, _, _ = deepspeed.initialize(
@@ -76,16 +108,10 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, logit_scale=N
 
     best_r1 = 0.0
     for epoch in range(1, args.epochs + 1):
-        max_con_weight = 0.5   # 初始最高权重
-        min_con_weight = 0.05  # 结束最低权重
-        
-        # 计算进度比例 progress (从 0 到接近 1)
-        progress = (epoch - 1) / args.epochs
-        # 余弦衰减公式：前期平缓下降，中期加速，后期平缓收尾
-        current_con_weight = min_con_weight + 0.5 * (max_con_weight - min_con_weight) * (1.0 + math.cos(math.pi * progress))
         if dist.is_initialized() and hasattr(dataloader, 'sampler') and hasattr(dataloader.sampler, 'set_epoch'):
             dataloader.sampler.set_epoch(epoch)
         model_engine.train()
+        ema = LiteEMA(model_engine.module if hasattr(model_engine, 'module') else model_engine)
         total_loss = 0.0
         total_correct = 0
         total_samples = 0
@@ -121,33 +147,37 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, logit_scale=N
                 sat_mask = (all_views == 0)
                 drone_mask = (all_views == 1)
 
-                # 2. 干净利落地分离出卫星和无人机的特征与标签 (保持不变)
-                sat_fused_feats = all_fused_feats[sat_mask]
                 sat_labels = all_labels[sat_mask]
-
-                drone_fused_feats = all_fused_feats[drone_mask]
                 drone_labels = all_labels[drone_mask]
 
-                # 自动分别计算 drone->drone 和 sat->sat 的同域样本对并求均值
-                tri_loss = triplet_criterion(drone_fused_feats, drone_labels, sat_fused_feats, sat_labels)
+                # 只保留纯净主干的同域三元组，让它去死磕宏观特征，稳住 94% 
+                sat_deep = all_deep_feats[sat_mask]
+                drone_deep = all_deep_feats[drone_mask]
+                tri_q_deep, tri_g_deep = triplet_criterion(drone_deep, drone_labels, sat_deep, sat_labels)
 
-                tri_weight = args.triplet_weight 
+                tri_weight = 2.0
+                # 现在的 Triplet Loss 变得极其干净，且没有任何污染
+                total_tri_loss = tri_q_deep + tri_g_deep
+                loss += total_tri_loss
                 
-                loss += tri_weight * tri_loss
-                tri_loss_val = tri_loss.item()
-                
+                tri_loss_val = total_tri_loss.item()
+
             con_loss_val = None
             if args.use_contrastive and contrastive_criterion is not None:
-                con_loss = contrastive_criterion(all_deep_feats, all_labels, all_views, logit_scale)
-            
-                # 2. 降权操作：将对比学习损失权重改为 0.1 倍
-                loss += current_con_weight * con_loss
-                con_loss_val = (current_con_weight * con_loss).item() # 日志记录实际施加的 loss 值
+                con_loss_deep = contrastive_criterion(all_deep_feats, all_labels, all_views, logit_scale)
+                con_loss_fused = contrastive_criterion(all_fused_feats, all_labels, all_views, logit_scale)
+
+                total_con_loss = con_loss_deep + 0.2 * con_loss_fused
+                # total_con_loss = con_loss_deep
+                loss += total_con_loss
+                
+                con_loss_val = total_con_loss.item()
                 
             # 7. 反向传播与优化 (干净利落，一次到位！)
             if torch.is_tensor(loss):
                 model_engine.backward(loss)
                 model_engine.step()
+                ema.update(model_engine.module if hasattr(model_engine, 'module') else model_engine)
                 total_loss += loss.item() * imgs.size(0)
             else:
                 continue
@@ -172,30 +202,45 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, logit_scale=N
 
         if epoch > 5:
             if (epoch % 2 == 0) or (epoch == (args.epochs + 1)):
-                model.eval()
+                ema.apply_shadow(model_engine.module if hasattr(model_engine, 'module') else model_engine)
+                model_engine.eval()
                 q_loader_d2s, g_loader_d2s = val_loaders["D2S"]
                 q_loader_s2d, g_loader_s2d = val_loaders["S2D"]
 
                 gc.collect()               # 强清 Python 层的残存变量
                 torch.cuda.empty_cache()   # 强清 PyTorch 层的显存碎片
-                d2s_r1, d2s_r5, d2s_r10, d2s_map, d2s_dis_at_1, d2s_sdm_at_3 = run_val_and_get_recall(model, q_loader_d2s, g_loader_d2s, 'cuda')
-                s2d_r1, s2d_r5, s2d_r10, s2d_map, s2d_dis_at_1, s2d_sdm_at_3 = run_val_and_get_recall(model, q_loader_s2d, g_loader_s2d, 'cuda')
+                d2s_r1, d2s_r5, d2s_r10, d2s_map, d2s_dis_at_1, d2s_sdm_at_3 = run_val_and_get_recall(model_engine, q_loader_d2s, g_loader_d2s, 'cuda')
+                s2d_r1, s2d_r5, s2d_r10, s2d_map, s2d_dis_at_1, s2d_sdm_at_3 = run_val_and_get_recall(model_engine, q_loader_s2d, g_loader_s2d, 'cuda')
+                ema.restore(model_engine.module if hasattr(model_engine, 'module') else model_engine)
                 if dist.get_rank() == 0:
-                    trainable_state = {
-                        k: v.cpu() 
-                        for k, v in model_engine.module.named_parameters()
-                        if v.requires_grad
-                    }
+                    # trainable_state = {k: v.cpu() for k, v in ema.shadow.items()}
+                    trainable_state = {}
+                    for k, v in model_engine.module.named_parameters():
+                        if v.requires_grad:
+                            trainable_state[k] = v.data.cpu()
                     if d2s_r1 > best_r1:
                         best_r1 = d2s_r1
                         torch.save(trainable_state, os.path.join(save_dir, "best_model.pth"))
                         print(f"🎉 新的最佳模型！Epoch {epoch}")
                         print(f"[D2S 成绩] Recall@1: {d2s_r1:.2f}%, Recall@5: {d2s_r5:.2f}%, Recall@10: {d2s_r10:.2f}%, mAP: {d2s_map:.2f}%")
                         print(f"[S2D 成绩] Recall@1: {s2d_r1:.2f}%, Recall@5: {s2d_r5:.2f}%, Recall@10: {s2d_r10:.2f}%, mAP: {s2d_map:.2f}%")
+                        
                     else:
                         print(f"当前 D2S Recall@1: {d2s_r1:.2f}%，未超过历史最佳 {best_r1:.2f}%，因此不更新 best_model.pth")
                         print(f"[D2S 成绩] Recall@1: {d2s_r1:.2f}%, Recall@5: {d2s_r5:.2f}%, Recall@10: {d2s_r10:.2f}%, mAP: {d2s_map:.2f}%")
                         print(f"[S2D 成绩] Recall@1: {s2d_r1:.2f}%, Recall@5: {s2d_r5:.2f}%, Recall@10: {s2d_r10:.2f}%, mAP: {s2d_map:.2f}%")
+
+                    try:
+                        import torch.nn.functional as F
+                        # 动态查找 key，免疫 DDP 造成的 'module.' 前缀干扰
+                        g_key = next((k for k in trainable_state.keys() if 'gamma' in k), None)
+                        a_key = next((k for k in trainable_state.keys() if 'ap_gates' in k), None)
+                        
+                        if g_key and a_key:
+                            best_gamma = trainable_state[g_key].item()
+                            print(f" Gamma : {best_gamma:.6f}")
+                    except Exception as e:
+                        pass # 防止任何意外报错打断你的最佳模型保存
                         
                     if (epoch == (args.epochs + 1)) and (d2s_r1 <= best_r1):
                         print(f"最后一轮 D2S Recall@1: {d2s_r1:.2f}%，未超过历史最佳 {best_r1:.2f}%，因此不更新 best_model.pth, 但仍保存 final_model.pth")

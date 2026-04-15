@@ -29,7 +29,7 @@ outputs/
 checkpoint/
 
 src/models/dinov3/
-src/models/repvit_pth/
+src/models/repvit/
 src/checkpoint/
 Miniconda3-latest-Linux-x86_64.sh
 Miniconda3-latest-Linux-x86_64.sh
