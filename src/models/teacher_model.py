@@ -102,7 +102,7 @@ class TeacherModel(nn.Module):
         # 初始化门控参数为负数 (Sigmoid(-2.0) ≈ 0.119)
         # self.ap_gates = nn.Parameter(torch.full((self.num_ap_layers,), -2.0, dtype=torch.bfloat16))
         self.ap_gates = nn.Parameter(torch.zeros(self.num_ap_layers, dtype=torch.bfloat16))
-        self.gamma = nn.Parameter(torch.ones(1, dtype=torch.bfloat16)*0.05)
+        self.gamma = nn.Parameter(torch.ones(1, dtype=torch.bfloat16)*0.1)
         reduction_dim = 128  # 将原来的 512 暴砍到 128，剥夺它的记忆容量
 
         self.feature_adapters = nn.ModuleList([
@@ -114,6 +114,7 @@ class TeacherModel(nn.Module):
                 nn.Linear(reduction_dim, 4096, dtype=torch.bfloat16)
             ) for _ in range(3)
         ])
+        self.query_norm = nn.LayerNorm(4096, dtype=torch.bfloat16)
         
         for adapter in self.feature_adapters:
             # 注意：因为加了 LayerNorm 和 Dropout，最后一层变成了索引 [4]
@@ -121,7 +122,7 @@ class TeacherModel(nn.Module):
             nn.init.zeros_(adapter[4].bias)
         self.cross_attn = nn.MultiheadAttention(
             embed_dim=4096, 
-            num_heads=32, 
+            num_heads=4, 
             batch_first=True, 
             dtype=torch.bfloat16
         )
@@ -146,7 +147,7 @@ class TeacherModel(nn.Module):
                 # # ap_token = patch_tokens.mean(dim=1) # [B, 4096]
                 # ap_list.append(ap_token)
                 ap_token = features[i][1]
-                ap_token = F.normalize(ap_token, p=2, dim=-1)
+                # ap_token = F.normalize(ap_token, p=2, dim=-1)
                 ap_list.append(ap_token)
 
             # 堆叠成张量准备加权
@@ -167,7 +168,10 @@ class TeacherModel(nn.Module):
             # 5. 构建提问者 (Query) - 极其核心的防污染机制！
             # 必须使用 main_cls.detach()，绝对禁止 Cross-Attention 的梯度回流破坏 94% 的主干！
             # 使用 unsqueeze(1) 增加序列维度，满足 MultiheadAttention 的输入要求 -> [B, 1, 4096]
-            query = main_cls.detach().unsqueeze(1)
+            # query = main_cls.detach().unsqueeze(1)
+            raw_query = main_cls.detach()
+            normed_query = self.query_norm(raw_query)  # 先标准化，让量级回归到 [-1, 1] 附近
+            query = normed_query.unsqueeze(1)
 
             # 6. 执行交叉注意力检索！
             # 主干拿着问题 (query)，去问这三个专家 (kv_features)
@@ -178,6 +182,15 @@ class TeacherModel(nn.Module):
                 key=kv_features, 
                 value=kv_features
             )
+            import random
+            import torch.distributed as dist
+
+            # 只有大约 1% 的概率打印，且最好只在主进程 (Rank 0) 打印防刷屏
+            if random.random() < 0.01: 
+                if not dist.is_initialized() or dist.get_rank() == 0:
+                    # attn_weights 的形状应该是 [B, 1, 3]
+                    # 我们取 batch 中第一个样本的权重来看看
+                    print(f"\n[Debug] Attention Weights: {attn_weights[0, 0, :].tolist()}")
 
             # 7. 去除多余的序列维度，恢复成主干形状 -> ；[B, 4096]
             attended_features = attn_output.squeeze(1)

@@ -149,15 +149,20 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, logit_scale=N
 
                 sat_labels = all_labels[sat_mask]
                 drone_labels = all_labels[drone_mask]
+                sat_fused_labels = all_labels[sat_mask]
+                drone_fused_labels = all_labels[drone_mask]
 
                 # 只保留纯净主干的同域三元组，让它去死磕宏观特征，稳住 94% 
                 sat_deep = all_deep_feats[sat_mask]
                 drone_deep = all_deep_feats[drone_mask]
+                sat_fused = all_fused_feats[sat_mask]
+                drone_fused = all_fused_feats[drone_mask]
                 tri_q_deep, tri_g_deep = triplet_criterion(drone_deep, drone_labels, sat_deep, sat_labels)
+                tri_q_fused, tri_g_fused = triplet_criterion(drone_fused, drone_fused_labels, sat_fused, sat_fused_labels)
 
                 tri_weight = 2.0
                 # 现在的 Triplet Loss 变得极其干净，且没有任何污染
-                total_tri_loss = tri_q_deep + tri_g_deep
+                total_tri_loss = (tri_q_deep + tri_g_deep) * 1.0 + (tri_q_fused + tri_g_fused) * 1.5
                 loss += total_tri_loss
                 
                 tri_loss_val = total_tri_loss.item()
@@ -167,7 +172,7 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, logit_scale=N
                 con_loss_deep = contrastive_criterion(all_deep_feats, all_labels, all_views, logit_scale)
                 con_loss_fused = contrastive_criterion(all_fused_feats, all_labels, all_views, logit_scale)
 
-                total_con_loss = con_loss_deep + 0.2 * con_loss_fused
+                total_con_loss = con_loss_deep + con_loss_fused
                 # total_con_loss = con_loss_deep
                 loss += total_con_loss
                 
@@ -213,11 +218,11 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, logit_scale=N
                 s2d_r1, s2d_r5, s2d_r10, s2d_map, s2d_dis_at_1, s2d_sdm_at_3 = run_val_and_get_recall(model_engine, q_loader_s2d, g_loader_s2d, 'cuda')
                 ema.restore(model_engine.module if hasattr(model_engine, 'module') else model_engine)
                 if dist.get_rank() == 0:
-                    # trainable_state = {k: v.cpu() for k, v in ema.shadow.items()}
-                    trainable_state = {}
-                    for k, v in model_engine.module.named_parameters():
-                        if v.requires_grad:
-                            trainable_state[k] = v.data.cpu()
+                    trainable_state = {k: v.cpu() for k, v in ema.shadow.items()}
+                    # trainable_state = {}
+                    # for k, v in model_engine.module.named_parameters():
+                    #     if v.requires_grad:
+                    #         trainable_state[k] = v.data.cpu()
                     if d2s_r1 > best_r1:
                         best_r1 = d2s_r1
                         torch.save(trainable_state, os.path.join(save_dir, "best_model.pth"))
