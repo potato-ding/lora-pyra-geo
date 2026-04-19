@@ -23,7 +23,7 @@ def build_optimizer_and_scale(model, args):
             lora_weight_decay.append(param)    # 存放 lora_A.weight, lora_B.weight
         elif name.endswith(".m"): #把 DoRA 的 m 都保护起来！
             lora_no_weight_decay.append(param)
-        elif "ap_gates" in name or "global_ap_scale" in name or "gamma" in name in name:
+        elif "ap_gates" in name or "global_ap_scale" in name or "gamma" in name:
             mix_params.append(param)
         elif "feature_adapter" in name or "cross_attn" in name:
             classifier_params.append(param)

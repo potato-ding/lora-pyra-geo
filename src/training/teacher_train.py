@@ -136,11 +136,11 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, logit_scale=N
             model_engine.zero_grad()
             
             # 4. 前向传播
-            deep_feats, fused_feats = model_engine(imgs)
-                
+            deep_feats, fused_feats, attended_features = model_engine(imgs)
             # 跨卡特征聚合
             all_deep_feats, all_labels, all_views = gather_features_and_labels_and_views(deep_feats, labels, views)
             all_fused_feats, _, _ = gather_features_and_labels_and_views(fused_feats, labels, views) # labels和views聚合一次就够了
+            all_atten_feats, _, _ = gather_features_and_labels_and_views(attended_features, labels, views)
             loss = 0
             tri_loss_val = None
             if args.use_triplet and triplet_criterion is not None:
@@ -157,25 +157,27 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, logit_scale=N
                 drone_deep = all_deep_feats[drone_mask]
                 sat_fused = all_fused_feats[sat_mask]
                 drone_fused = all_fused_feats[drone_mask]
+                sat_atten = all_atten_feats[sat_mask]
+                drone_atten = all_atten_feats[drone_mask]
                 tri_q_deep, tri_g_deep = triplet_criterion(drone_deep, drone_labels, sat_deep, sat_labels)
                 tri_q_fused, tri_g_fused = triplet_criterion(drone_fused, drone_fused_labels, sat_fused, sat_fused_labels)
+                tri_q_atten, tri_g_atten = triplet_criterion(drone_atten, drone_labels, sat_atten, sat_labels)
 
                 tri_weight = 2.0
                 # 现在的 Triplet Loss 变得极其干净，且没有任何污染
-                total_tri_loss = (tri_q_deep + tri_g_deep) * 1.0 + (tri_q_fused + tri_g_fused) * 1.5
-                loss += total_tri_loss
+                total_tri_loss = (tri_q_deep + tri_g_deep) + (tri_q_fused + tri_g_fused) * 1.5 + (tri_q_atten + tri_g_atten) * 1.5
                 
+                loss += total_tri_loss
                 tri_loss_val = total_tri_loss.item()
 
             con_loss_val = None
             if args.use_contrastive and contrastive_criterion is not None:
                 con_loss_deep = contrastive_criterion(all_deep_feats, all_labels, all_views, logit_scale)
                 con_loss_fused = contrastive_criterion(all_fused_feats, all_labels, all_views, logit_scale)
+                con_loss_atten = contrastive_criterion(all_atten_feats, all_labels, all_views, logit_scale)
 
-                total_con_loss = con_loss_deep + con_loss_fused
-                # total_con_loss = con_loss_deep
+                total_con_loss = con_loss_deep + con_loss_fused * 1.5 + con_loss_atten * 1.5
                 loss += total_con_loss
-                
                 con_loss_val = total_con_loss.item()
                 
             # 7. 反向传播与优化 (干净利落，一次到位！)
@@ -206,7 +208,7 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, logit_scale=N
                 pass # 防止有些变量没定义报错
 
         if epoch > 5:
-            if (epoch % 2 == 0) or (epoch == (args.epochs + 1)):
+            if (epoch == 40 ) or (epoch == 50) or (epoch > 50 and epoch % 5 == 0):
                 ema.apply_shadow(model_engine.module if hasattr(model_engine, 'module') else model_engine)
                 model_engine.eval()
                 q_loader_d2s, g_loader_d2s = val_loaders["D2S"]
@@ -234,18 +236,6 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, logit_scale=N
                         print(f"当前 D2S Recall@1: {d2s_r1:.2f}%，未超过历史最佳 {best_r1:.2f}%，因此不更新 best_model.pth")
                         print(f"[D2S 成绩] Recall@1: {d2s_r1:.2f}%, Recall@5: {d2s_r5:.2f}%, Recall@10: {d2s_r10:.2f}%, mAP: {d2s_map:.2f}%")
                         print(f"[S2D 成绩] Recall@1: {s2d_r1:.2f}%, Recall@5: {s2d_r5:.2f}%, Recall@10: {s2d_r10:.2f}%, mAP: {s2d_map:.2f}%")
-
-                    try:
-                        import torch.nn.functional as F
-                        # 动态查找 key，免疫 DDP 造成的 'module.' 前缀干扰
-                        g_key = next((k for k in trainable_state.keys() if 'gamma' in k), None)
-                        a_key = next((k for k in trainable_state.keys() if 'ap_gates' in k), None)
-                        
-                        if g_key and a_key:
-                            best_gamma = trainable_state[g_key].item()
-                            print(f" Gamma : {best_gamma:.6f}")
-                    except Exception as e:
-                        pass # 防止任何意外报错打断你的最佳模型保存
                         
                     if (epoch == (args.epochs + 1)) and (d2s_r1 <= best_r1):
                         print(f"最后一轮 D2S Recall@1: {d2s_r1:.2f}%，未超过历史最佳 {best_r1:.2f}%，因此不更新 best_model.pth, 但仍保存 final_model.pth")
