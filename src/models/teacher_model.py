@@ -238,26 +238,29 @@ class EvalTeacherModel(nn.Module):
             self._inject_dora(args)
 
         if self.use_mix:
-            # 确保 target_layers 与训练时完全一致
-            self.target_layers = [11, 19, 27, 39] 
-            self.num_ap_layers = len(self.target_layers) - 1 # 提取前3层作为 AP 特征
+            self.target_layers = [11, 19, 29, 39]
+            self.num_ap_layers = len(self.target_layers)
+            reduction_dim = 128 # 修复2：对其训练时的降维维度
             
-            # 1. 特征适配器 (必须与训练时参数名一致，否则无法 load_state_dict)
+            # 修复2&4：对齐 Feature Adapters 结构和精度
             self.feature_adapters = nn.ModuleList([
                 nn.Sequential(
-                    nn.LayerNorm(4096),
-                    nn.Linear(4096, 512),
-                    nn.ReLU(),
-                    nn.Linear(512, 4096)
+                    nn.LayerNorm(4096, dtype=torch.bfloat16),
+                    nn.Linear(4096, reduction_dim, dtype=torch.bfloat16),
+                    nn.GELU(),
+                    nn.Dropout(p=0.1), # eval模式下只要调用model.eval()即可，但结构必须有
+                    nn.Linear(reduction_dim, 4096, dtype=torch.bfloat16)
                 ) for _ in range(self.num_ap_layers)
             ])
-
-            # 2. 交叉注意力机制
-            # 注意：这里参数要和训练时的 cross_attn 定义匹配（如 head 数等）
-            self.cross_attn = nn.MultiheadAttention(embed_dim=4096, num_heads=8, batch_first=True)
-            self.reducer_ln = nn.LayerNorm(4096)
-            # 3. 融合系数 (训练代码中使用了 sigmoid(gamma_raw) * 0.3)
-            self.gamma_raw = nn.Parameter(torch.tensor(0.0))
+            
+            # 修复3&4：将 reducer_ln 改回 query_norm，对齐层命名和精度
+            self.query_norm = nn.LayerNorm(4096, dtype=torch.bfloat16)
+            
+            self.cross_attn = nn.MultiheadAttention(
+                embed_dim=4096, num_heads=8, batch_first=True, dtype=torch.bfloat16
+            )
+            
+            self.gamma_raw = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
     def _inject_lora(self, args):
         """
         内部方法：复刻训练时的 LoRA 注入逻辑。
@@ -303,46 +306,40 @@ class EvalTeacherModel(nn.Module):
         """
         if self.use_mix:
             with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.FLASH_ATTENTION):
-                # 1. 提取中间层特征
-                features = self.backbone.model.get_intermediate_layers(x, n=self.target_layers, return_class_token=True)
-                # 主干 CLS Token (最后一层)
-                main_cls = features[-1][1] # [B, 4096]
+                with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.FLASH_ATTENTION):
+                    features = self.backbone.model.get_intermediate_layers(x, n=self.target_layers, return_class_token=True)
+                    main_cls = features[-1][1]
 
-                # 2. 收集并适配浅层 AP 特征
-                adapted_list = []
-                for i in range(self.num_ap_layers):
-                    raw_token = features[i][1] # 获取对应层的 token
-                    # 经过专属 Adapter 提纯
-                    aligned_feat = self.feature_adapters[i](raw_token)
-                    adapted_list.append(aligned_feat)
-                
-                # 堆叠成 [B, 3, 4096] 作为 Key 和 Value
-                kv_features = torch.stack(adapted_list, dim=1)
+                    adapted_list = []
+                    for i in range(self.num_ap_layers):
+                        raw_token = features[i][1]
+                        aligned_feat = self.feature_adapters[i](raw_token)
+                        adapted_list.append(aligned_feat)
 
-                # 3. 执行交叉注意力检索
-                # Query 是主干 CLS，Key/Value 是适配后的浅层特征
-                query = main_cls.unsqueeze(1) # [B, 1, 4096]
-                attn_output, _ = self.cross_attn(
-                    query=query,
-                    key=kv_features,
-                    value=kv_features
-                )
-                attended_features = self.reducer_ln(attended_features)
-                attended_features = attn_output.squeeze(1) # [B, 4096]
+                    kv_features = torch.stack(adapted_list, dim=1)
 
-                # 4. 融合
-                actual_gamma = torch.sigmoid(self.gamma_raw) * 0.3
-                feats = main_cls + actual_gamma * attended_features
+                    # 修复3：对齐训练阶段的 Query Norm 逻辑
+                    normed_query = self.query_norm(main_cls)
+                    query = normed_query.unsqueeze(1) 
+
+                    attn_output, _ = self.cross_attn(
+                        query=query,
+                        key=kv_features,
+                        value=kv_features
+                    )
+                    
+                    # 删除原来这里错误的 self.reducer_ln 步骤
+                    attended_features = attn_output.squeeze(1)
+                    
+                    actual_gamma = torch.sigmoid(self.gamma_raw) * 0.2
+                    feats = main_cls + actual_gamma * attended_features
         else:
-            # 原有的普通分支保持不变
             ret = self.backbone.model.forward_features(x)
             feats = ret['x_norm_clstoken']
 
-        # 5. 梯度对齐与归一化 (保持你代码最后那部分的流程)
         with torch.amp.autocast(device_type='cuda', enabled=False):
             feats = feats.float()
             feats = F.normalize(feats, p=2, dim=-1)
-
         return feats
 
 

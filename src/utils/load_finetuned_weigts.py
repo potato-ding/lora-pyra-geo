@@ -33,6 +33,7 @@ def load_finetuned_weights(model, weight_path, device, is_main=False):
         new_state_dict[new_key] = v
 
     missing_keys, unexpected_keys = model.load_state_dict(new_state_dict, strict=False)
+    model.to(device)
 
     if is_main:
         # 如果有 unexpected_keys，说明权重文件里有模型中不存在的层
