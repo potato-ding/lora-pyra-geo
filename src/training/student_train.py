@@ -12,7 +12,7 @@ import torch.nn.functional as F
 import math
 import torch.distributed as dist
 import argparse
-from src.data.datasets import create_train_dataset_and_sampler
+from src.data.datasets import create_student_train_dataset_and_loader
 from src.loss.tripletloss import IntraDomainTripletLoss
 from src.loss.blocks_infoNCE import blocks_InfoNCE
 from src.utils.initdist import try_init_dist
@@ -21,7 +21,7 @@ from src.utils.train_eval_utils import run_val_and_get_recall
 from src.models.student_model import StudentModel
 from src.utils.scheduler import get_student_scheduler
 from src.utils.optimizer_and_scale import build_student_optimizer_and_scale
-from src.data.val_dataloaders import build_val_dataloaders
+from src.data.val_dataloaders import build_student_val_dataloaders
 from src.utils.save_path import get_student_save_pth
 if 'OMP_NUM_THREADS' not in os.environ:
     os.environ['OMP_NUM_THREADS'] = '4'
@@ -233,35 +233,26 @@ if __name__ == "__main__":
     parser.add_argument('--fisd_weight', type=float, default=1.0, help='FISD 逆向自蒸馏损失权重')
     args = parser.parse_args()
     try:
-        try_init_dist()
-        # 构建训练集
-        train_dataset, train_sampler, train_loader = create_train_dataset_and_sampler(args)
-        # 构建测试集
-        val_loaders = build_val_dataloaders(img_size=[args.img_size, args.img_size])
-        # 构建模型
-        local_rank = int(os.environ.get('LOCAL_RANK', 0))
-        torch.cuda.set_device(local_rank) # 确保操作落在正确的卡上
+        # 构建1652单卡训练dataloader
+        train_loader = create_student_train_dataset_and_loader(args)
+        # 构建1652测试集
+        val_loaders = build_student_val_dataloaders(img_size=[args.img_size, args.img_size])
 
         # ================= 核心修改区域 =================
         # 1. 构建模型并立刻移动到对应的 GPU
         model = StudentModel()
-        model = model.cuda(local_rank)
+        model = model.cuda()
         
-        # 2. 使用 DDP 包装模型 (跨卡梯度同步的灵魂)
-        import torch.distributed as dist
-        if dist.is_initialized():
-            # find_unused_parameters=False 可以提升性能。因为你输出的 z1,z2,z3,z4 和 feat 都会参与算 Loss，所以设为 False 即可
-            model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
-        # 获取可训练参数并构建优化器和学习率调度器
-        optimizer, logit_scale = build_student_optimizer_and_scale(model, args)
-        scheduler = get_student_scheduler(
-            scheduler_type=args.scheduler,
-            train_steps=len(train_loader) * args.epochs,
-            optimizer=optimizer,
-            warmup_steps=int(len(train_loader) * args.epochs * args.warmup_epochs),
-            base_lr=args.lr,
-            lr_end=args.lr_end
-        )
+        
+        # optimizer, logit_scale = build_student_optimizer_and_scale(model, args)
+        # scheduler = get_student_scheduler(
+        #     scheduler_type=args.scheduler,
+        #     train_steps=len(train_loader) * args.epochs,
+        #     optimizer=optimizer,
+        #     warmup_steps=int(len(train_loader) * args.epochs * args.warmup_epochs),
+        #     base_lr=args.lr,
+        #     lr_end=args.lr_end
+        # )
         # train(
         #     model,
         #     train_loader,

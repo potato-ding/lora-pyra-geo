@@ -6,27 +6,13 @@ import os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../../models')))
 os.environ["NO_ALBUMENTATIONS_UPDATE"] = "1"
-from pathlib import Path
 import torch
-import math
 import torch.distributed as dist
-from torchvision.datasets import ImageFolder
-from torch.utils.data import DataLoader
-from torch.utils.data.distributed import DistributedSampler
-from torchvision import transforms
-import deepspeed
 import argparse
-from torch import optim
-import numpy as np
 import gc
-from src.data.datasets import create_train_dataset_and_sampler
-from src.loss.tripletloss import IntraDomainTripletLoss
-from src.loss.blocks_infoNCE import blocks_InfoNCE
 from src.utils.initdist import try_init_dist
-from src.utils.gather_features_and_labels_and_views import gather_features_and_labels_and_views 
 from src.utils.train_eval_utils import run_val_and_get_recall
 from src.models.teacher_model import EvalTeacherModel
-from src.utils.optimizer_and_scale import build_optimizer_and_scale
 from src.data.val_dataloaders import build_val_dataloaders, build_sues200_val_dataloaders, build_gta_val_dataloaders
 if 'OMP_NUM_THREADS' not in os.environ:
     os.environ['OMP_NUM_THREADS'] = '4'
