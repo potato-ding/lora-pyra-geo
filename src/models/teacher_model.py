@@ -39,7 +39,6 @@ class TeacherModel(nn.Module):
         self.lora = args.lora
         self.dora = args.dora
         self.device = args.device
-        self.use_mix = args.use_mix
 
         # 1. DINOv3主干
         self.backbone = DINOv3Backbone(
@@ -93,119 +92,87 @@ class TeacherModel(nn.Module):
         
 
         init_value = np.log(1 / 0.07)
-        # 注册为模型的正式成员
         self.logit_scale = nn.Parameter(torch.tensor(init_value, dtype=torch.float32))
 
-        self.target_layers = [7, 15, 23, 39] 
-        self.num_ap_layers = 3 # 只有前 3 层参与门控
-        
-        # 初始化门控参数为负数 (Sigmoid(-2.0) ≈ 0.119)
-        # self.ap_gates = nn.Parameter(torch.full((self.num_ap_layers,), -2.0, dtype=torch.bfloat16))
-        self.ap_gates = nn.Parameter(torch.zeros(self.num_ap_layers, dtype=torch.bfloat16))
-        self.gamma = nn.Parameter(torch.ones(1, dtype=torch.bfloat16)*0.1)
-        self.gamma_raw = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
-        reduction_dim = 128  # 将原来的 512 暴砍到 128，剥夺它的记忆容量
+        self.target_layers = [7, 15, 23, 39]
+        self.num_ap_layers = 3
+
+        self.gamma_raw = nn.Parameter(torch.tensor(-2.0 , dtype=torch.float32))
+        reduction_dim = 512
 
         self.feature_adapters = nn.ModuleList([
             nn.Sequential(
-                nn.LayerNorm(4096, dtype=torch.bfloat16), # 稳住输入分布
+                nn.LayerNorm(4096, dtype=torch.bfloat16),
                 nn.Linear(4096, reduction_dim, dtype=torch.bfloat16),
                 nn.GELU(),
-                nn.Dropout(p=0.5), # 🌟 杀手锏：50%的失活率，彻底粉碎死记硬背！
+                nn.Dropout(p=0.1),
                 nn.Linear(reduction_dim, 4096, dtype=torch.bfloat16)
             ) for _ in range(3)
         ])
+
         self.query_norm = nn.LayerNorm(4096, dtype=torch.bfloat16)
-        
+
         for adapter in self.feature_adapters:
-            # 注意：因为加了 LayerNorm 和 Dropout，最后一层变成了索引 [4]
             nn.init.zeros_(adapter[4].weight)
             nn.init.zeros_(adapter[4].bias)
+
         self.cross_attn = nn.MultiheadAttention(
-            embed_dim=4096, 
-            num_heads=4, 
-            batch_first=True, 
+            embed_dim=4096,
+            num_heads=4,
+            batch_first=True,
             dtype=torch.bfloat16
         )
     def forward(self, x):
-        
-        if self.use_mix:
-            with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.FLASH_ATTENTION):
-                features = self.backbone.model.get_intermediate_layers(x, n=self.target_layers, return_class_token=True)
-            main_cls = features[-1][1] # 形状: [B, 4096]
-            
-            # 2. 收集浅/中层的 AP 特征 (只遍历前 3 层)
-            ap_list = []
-            for i in range(self.num_ap_layers):
-                ap_token = features[i][1]
-                # ap_token = F.normalize(ap_token, p=2, dim=-1)
-                ap_list.append(ap_token)
-
-            # 堆叠成张量准备加权
-            stacked_ap = torch.stack(ap_list, dim=1) # 形状: [B, 3, 4096]
-            
-            # 3. 计算门控值
-            adapted_list = []
-            for i in range(self.num_ap_layers): # num_ap_layers = 3
-                raw_feat = stacked_ap[:, i, :]  # 形状: [B, 4096]
-                # 送入专属 Adapter 进行特征提纯
-                aligned_feat = self.feature_adapters[i](raw_feat)
-                adapted_list.append(aligned_feat)
-
-            # 4. 构建候选特征库 (Key / Value)
-            kv_features = torch.stack(adapted_list, dim=1) 
-            raw_query = main_cls.detach()
-            normed_query = self.query_norm(raw_query)
-            query = normed_query.unsqueeze(1)
-
-            # 6. 执行交叉注意力检索！
-            # 主干拿着问题 (query)，去问这三个专家 (kv_features)
-            # attn_output 是融合后的最优特征 -> [B, 1, 4096]
-            attn_output, attn_weights = self.cross_attn(
-                query=query, 
-                key=kv_features, 
-                value=kv_features
+        with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.FLASH_ATTENTION):
+            features = self.backbone.model.get_intermediate_layers(
+                x, n=self.target_layers, return_class_token=True
             )
 
-            # 7. 去除多余的序列维度，恢复成主干形状 -> ；[B, 4096]
-            attended_features = attn_output.squeeze(1)
-            main_norm_val = main_cls.norm(dim=-1, keepdim=True).detach()
-            attended_features_aligned = F.normalize(attended_features, p=2, dim=-1) * main_norm_val.mean()
+        main_cls = features[-1][1]                      # [B, 4096]
+        main_cls_detached = main_cls.detach()
 
-            # 直接用 relu，保证它是正数，clamp 限制最高不超过 0.3
-            actual_gamma = torch.clamp(torch.relu(self.gamma_raw), min=0.0, max=0.3)
+        # 1. 前3层浅/中层特征 -> adapter 对齐
+        adapted_list = []
+        for i in range(self.num_ap_layers):
+            raw_feat = features[i][1]                   # [B, 4096]
+            aligned_feat = self.feature_adapters[i](raw_feat)
+            adapted_list.append(aligned_feat)
 
-            # 5. 最终融合
-            feats = main_cls.detach() + actual_gamma * attended_features_aligned
-        else:
-            with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.FLASH_ATTENTION):
-                # 获取 DINOv3 最后一层的输出字典 (放弃 get_intermediate_layers)
-                ret = self.backbone.model.forward_features(x)
-                
-            # 只提取最纯粹的、包含最高级全局语义的 [CLS] Token
-            feats = ret['x_norm_clstoken']
-        
+        # 2. 构造 cross-attn 的 K/V
+        kv_features = torch.stack(adapted_list, dim=1) # [B, 3, 4096]
+
+        # 3. 用深层主特征做 Query
+        query = self.query_norm(main_cls_detached).unsqueeze(1)   # [B, 1, 4096]
+
+        # 4. 交叉注意力融合浅层
+        attn_output, _ = self.cross_attn(
+            query=query,
+            key=kv_features,
+            value=kv_features
+        )
+
+        attended_features = attn_output.squeeze(1)     # [B, 4096]
+
+        # 5. 幅值对齐
+        main_norm_val = main_cls.norm(dim=-1, keepdim=True).detach()
+        attended_features_aligned = F.normalize(attended_features, p=2, dim=-1) * main_norm_val.mean()
+
+        # 6. 控制融合强度
+        actual_gamma = torch.clamp(torch.relu(self.gamma_raw), min=0.0, max=0.3)
+
+        # 7. 最终融合
+        feats = main_cls_detached + actual_gamma * attended_features_aligned
+
         with torch.amp.autocast(device_type='cuda', enabled=False):
-            # 1. 精度提升与归一化：最终融合特征 (准备给 fued_feats 算三元组)
             feats = feats.float()
             feats = F.normalize(feats, p=2, dim=-1)
-            
-            # 2. 精度提升与归一化：纯深层特征 (准备给 deep_feats 算对比学习)
-            if self.use_mix:
-                # 如果开启了融合，main_cls 也就是第 39 层的纯语义特征
-                norm_main_cls = main_cls.float()
-                norm_main_cls = F.normalize(norm_main_cls, p=2, dim=-1)
-            else:
-                # 如果没开融合，兜底处理
-                norm_main_cls = feats
-                
-        # 3. 动态分流返回
+
+            norm_main_cls = main_cls.float()
+            norm_main_cls = F.normalize(norm_main_cls, p=2, dim=-1)
+
         if self.training:
-            # 训练模式：左边吐出纯深层，右边吐出带浅层的融合特征
-            # 完美对接你的 deep_feats, fused_feats = model_engine(imgs)
             return norm_main_cls, feats, attended_features
         else:
-            # 测试/推理模式：只吐出一个最终特征用来算检索准确率
             return feats
 
 class EvalTeacherModel(nn.Module):

@@ -165,7 +165,7 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, logit_scale=N
 
                 tri_weight = 2.0
                 # 现在的 Triplet Loss 变得极其干净，且没有任何污染
-                total_tri_loss = (tri_q_deep + tri_g_deep) + (tri_q_fused + tri_g_fused) * 1.5 + (tri_q_atten + tri_g_atten) * 1.5
+                total_tri_loss = (tri_q_fused + tri_g_fused) * 1.5 + (tri_q_atten + tri_g_atten) * 0.5
                 
                 loss += total_tri_loss
                 tri_loss_val = total_tri_loss.item()
@@ -176,7 +176,7 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, logit_scale=N
                 con_loss_fused = contrastive_criterion(all_fused_feats, all_labels, all_views, logit_scale)
                 con_loss_atten = contrastive_criterion(all_atten_feats, all_labels, all_views, logit_scale)
 
-                total_con_loss = con_loss_deep + con_loss_fused * 1.5 + con_loss_atten * 1.5
+                total_con_loss = con_loss_deep
                 loss += total_con_loss
                 con_loss_val = total_con_loss.item()
                 
@@ -207,41 +207,40 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, logit_scale=N
             except UnboundLocalError:
                 pass # 防止有些变量没定义报错
 
-        if epoch > 5:
-            if (epoch == 40 ) or (epoch == 50) or (epoch > 50 and epoch % 5 == 0):
-                ema.apply_shadow(model_engine.module if hasattr(model_engine, 'module') else model_engine)
-                model_engine.eval()
-                q_loader_d2s, g_loader_d2s = val_loaders["D2S"]
-                q_loader_s2d, g_loader_s2d = val_loaders["S2D"]
+        if (epoch == 40 ) or (epoch == 50) or (epoch > 50 and epoch % 5 == 0):
+            ema.apply_shadow(model_engine.module if hasattr(model_engine, 'module') else model_engine)
+            model_engine.eval()
+            q_loader_d2s, g_loader_d2s = val_loaders["D2S"]
+            q_loader_s2d, g_loader_s2d = val_loaders["S2D"]
 
-                gc.collect()               # 强清 Python 层的残存变量
-                torch.cuda.empty_cache()   # 强清 PyTorch 层的显存碎片
-                d2s_r1, d2s_r5, d2s_r10, d2s_map, d2s_dis_at_1, d2s_sdm_at_3 = run_val_and_get_recall(model_engine, q_loader_d2s, g_loader_d2s, 'cuda')
-                s2d_r1, s2d_r5, s2d_r10, s2d_map, s2d_dis_at_1, s2d_sdm_at_3 = run_val_and_get_recall(model_engine, q_loader_s2d, g_loader_s2d, 'cuda')
-                ema.restore(model_engine.module if hasattr(model_engine, 'module') else model_engine)
-                if dist.get_rank() == 0:
-                    trainable_state = {k: v.cpu() for k, v in ema.shadow.items()}
-                    # trainable_state = {}
-                    # for k, v in model_engine.module.named_parameters():
-                    #     if v.requires_grad:
-                    #         trainable_state[k] = v.data.cpu()
-                    if d2s_r1 > best_r1:
-                        best_r1 = d2s_r1
-                        torch.save(trainable_state, os.path.join(save_dir, "best_model.pth"))
-                        print(f"🎉 新的最佳模型！Epoch {epoch}")
-                        print(f"[D2S 成绩] Recall@1: {d2s_r1:.2f}%, Recall@5: {d2s_r5:.2f}%, Recall@10: {d2s_r10:.2f}%, mAP: {d2s_map:.2f}%")
-                        print(f"[S2D 成绩] Recall@1: {s2d_r1:.2f}%, Recall@5: {s2d_r5:.2f}%, Recall@10: {s2d_r10:.2f}%, mAP: {s2d_map:.2f}%")
-                        
-                    else:
-                        print(f"当前 D2S Recall@1: {d2s_r1:.2f}%，未超过历史最佳 {best_r1:.2f}%，因此不更新 best_model.pth")
-                        print(f"[D2S 成绩] Recall@1: {d2s_r1:.2f}%, Recall@5: {d2s_r5:.2f}%, Recall@10: {d2s_r10:.2f}%, mAP: {d2s_map:.2f}%")
-                        print(f"[S2D 成绩] Recall@1: {s2d_r1:.2f}%, Recall@5: {s2d_r5:.2f}%, Recall@10: {s2d_r10:.2f}%, mAP: {s2d_map:.2f}%")
-                        
-                    if (epoch == (args.epochs + 1)) and (d2s_r1 <= best_r1):
-                        print(f"最后一轮 D2S Recall@1: {d2s_r1:.2f}%，未超过历史最佳 {best_r1:.2f}%，因此不更新 best_model.pth, 但仍保存 final_model.pth")
-                        print(f"[D2S 成绩] Recall@1: {d2s_r1:.2f}%, Recall@5: {d2s_r5:.2f}%, Recall@10: {d2s_r10:.2f}%, mAP: {d2s_map:.2f}%")
-                        print(f"[S2D 成绩] Recall@1: {s2d_r1:.2f}%, Recall@5: {s2d_r5:.2f}%, Recall@10: {s2d_r10:.2f}%, mAP: {s2d_map:.2f}%")
-                        torch.save(trainable_state, os.path.join(save_dir, "final_model.pth"))
+            gc.collect()               # 强清 Python 层的残存变量
+            torch.cuda.empty_cache()   # 强清 PyTorch 层的显存碎片
+            d2s_r1, d2s_r5, d2s_r10, d2s_map, d2s_dis_at_1, d2s_sdm_at_3 = run_val_and_get_recall(model_engine, q_loader_d2s, g_loader_d2s, 'cuda')
+            s2d_r1, s2d_r5, s2d_r10, s2d_map, s2d_dis_at_1, s2d_sdm_at_3 = run_val_and_get_recall(model_engine, q_loader_s2d, g_loader_s2d, 'cuda')
+            ema.restore(model_engine.module if hasattr(model_engine, 'module') else model_engine)
+            if dist.get_rank() == 0:
+                trainable_state = {k: v.cpu() for k, v in ema.shadow.items()}
+                # trainable_state = {}
+                # for k, v in model_engine.module.named_parameters():
+                #     if v.requires_grad:
+                #         trainable_state[k] = v.data.cpu()
+                if d2s_r1 > best_r1:
+                    best_r1 = d2s_r1
+                    torch.save(trainable_state, os.path.join(save_dir, "best_model.pth"))
+                    print(f"🎉 新的最佳模型！Epoch {epoch}")
+                    print(f"[D2S 成绩] Recall@1: {d2s_r1:.2f}%, Recall@5: {d2s_r5:.2f}%, Recall@10: {d2s_r10:.2f}%, mAP: {d2s_map:.2f}%")
+                    print(f"[S2D 成绩] Recall@1: {s2d_r1:.2f}%, Recall@5: {s2d_r5:.2f}%, Recall@10: {s2d_r10:.2f}%, mAP: {s2d_map:.2f}%")
+                    
+                else:
+                    print(f"当前 D2S Recall@1: {d2s_r1:.2f}%，未超过历史最佳 {best_r1:.2f}%，因此不更新 best_model.pth")
+                    print(f"[D2S 成绩] Recall@1: {d2s_r1:.2f}%, Recall@5: {d2s_r5:.2f}%, Recall@10: {d2s_r10:.2f}%, mAP: {d2s_map:.2f}%")
+                    print(f"[S2D 成绩] Recall@1: {s2d_r1:.2f}%, Recall@5: {s2d_r5:.2f}%, Recall@10: {s2d_r10:.2f}%, mAP: {s2d_map:.2f}%")
+                    
+                if (epoch == (args.epochs + 1)) and (d2s_r1 <= best_r1):
+                    print(f"最后一轮 D2S Recall@1: {d2s_r1:.2f}%，未超过历史最佳 {best_r1:.2f}%，因此不更新 best_model.pth, 但仍保存 final_model.pth")
+                    print(f"[D2S 成绩] Recall@1: {d2s_r1:.2f}%, Recall@5: {d2s_r5:.2f}%, Recall@10: {d2s_r10:.2f}%, mAP: {d2s_map:.2f}%")
+                    print(f"[S2D 成绩] Recall@1: {s2d_r1:.2f}%, Recall@5: {s2d_r5:.2f}%, Recall@10: {s2d_r10:.2f}%, mAP: {s2d_map:.2f}%")
+                    torch.save(trainable_state, os.path.join(save_dir, "final_model.pth"))
                     
         # 7. 分布式同步：让所有显卡等 Rank 0 写完再进下一个 Epoch
         dist.barrier()
@@ -274,7 +273,6 @@ if __name__ == "__main__":
     parser.add_argument('--triplet_weight', type=float, help='三元组损失权重', default=2)
     parser.add_argument('--use_contrastive', action='store_true', help='是否启用对比学习', default=False)
     parser.add_argument('--use_triplet', action='store_true', help='是否启用三元组损失', default=False)
-    parser.add_argument('--use_mix', action='store_true', help='是否对dinov3输出做浅层特征混合注意力', default=False)
     args = parser.parse_args()
     try:
         try_init_dist()

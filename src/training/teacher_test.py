@@ -125,11 +125,9 @@ if __name__ == "__main__":
     parser.add_argument('--batch_size', type=int, default=32, help='每个 GPU 的 batch size')
     parser.add_argument('--img_size', type=int, default=224, help='输入图像的尺寸')
     parser.add_argument('--lora', type=int, help='启用LoRA模块后层数', default=0)
-    parser.add_argument('--dora', type=int, help='启用DoRA模块后层数', default=0)
     parser.add_argument('--triplet_weight', type=float, help='三元组损失权重', default=2)
     parser.add_argument('--use_contrastive', action='store_true', help='是否启用对比学习', default=False)
     parser.add_argument('--use_triplet', action='store_true', help='是否启用三元组损失', default=False)
-    parser.add_argument('--use_mix', action='store_true', help='是否对dinov3输出做浅层特征混合注意力', default=False)
     args = parser.parse_args()
     try:
         try_init_dist()
