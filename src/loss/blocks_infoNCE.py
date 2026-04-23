@@ -51,8 +51,8 @@ class blocks_InfoNCE(nn.Module):
         s_labels = labels[sat_mask]
 
         # 计算相似度矩阵
-        clamped_scale = torch.clamp(logit_scale, max=4.6).exp() 
-        logits = d_feats @ s_feats.t() * clamped_scale
+        scale = logit_scale.exp()
+        logits = d_feats @ s_feats.t() * scale
 
         # ✅ 修正后的 Ground Truth 逻辑
         ground_truth = (d_labels.unsqueeze(1) == s_labels.unsqueeze(0)).float()

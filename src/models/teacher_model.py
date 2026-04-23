@@ -90,7 +90,7 @@ class TeacherModel(nn.Module):
         else:
             print("⚠️ 警告：未在模型中找到 'blocks' 属性，请检查 DINOv3 源码中 Transformer 列表的变量名。")
         
-
+        # 初始化温度系数
         init_value = np.log(1 / 0.07)
         self.logit_scale = nn.Parameter(torch.tensor(init_value, dtype=torch.float32))
 

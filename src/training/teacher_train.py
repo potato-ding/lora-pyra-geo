@@ -81,8 +81,15 @@ class LiteEMA:
             if param.requires_grad:
                 param.data.copy_(self.backup[name])
         self.backup = {} # 清空备份
+def get_base_model(model_or_engine):
+    return model_or_engine.module if hasattr(model_or_engine, "module") else model_or_engine
 
-def train(model, dataloader, args, optimizer=None, scheduler=None, logit_scale=None, val_loaders=None):
+def get_logit_scale(model_or_engine):
+    base_model = get_base_model(model_or_engine)
+    logit_scale = getattr(base_model, "logit_scale", None)
+    assert logit_scale is not None, "模型中没有找到 logit_scale"
+    return logit_scale
+def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=None):
     local_rank = int(os.environ.get('LOCAL_RANK', 0)) if 'LOCAL_RANK' in os.environ else 0
     
     model = model.to(args.device)
@@ -99,9 +106,7 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, logit_scale=N
         lr_scheduler=scheduler,
         config="ds_config.json"
     )
-    global_step = 0
     # 开始训练循环
-    best_acc = 0.0
     # 构建保存目录名
     save_dir = get_save_pth(args)
     os.makedirs(save_dir, exist_ok=True)
@@ -159,7 +164,7 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, logit_scale=N
                 drone_fused = all_fused_feats[drone_mask]
                 sat_atten = all_atten_feats[sat_mask]
                 drone_atten = all_atten_feats[drone_mask]
-                tri_q_deep, tri_g_deep = triplet_criterion(drone_deep, drone_labels, sat_deep, sat_labels)
+                # tri_q_deep, tri_g_deep = triplet_criterion(drone_deep, drone_labels, sat_deep, sat_labels)
                 tri_q_fused, tri_g_fused = triplet_criterion(drone_fused, drone_fused_labels, sat_fused, sat_fused_labels)
                 tri_q_atten, tri_g_atten = triplet_criterion(drone_atten, drone_labels, sat_atten, sat_labels)
 
@@ -172,11 +177,11 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, logit_scale=N
 
             con_loss_val = None
             if args.use_contrastive and contrastive_criterion is not None:
+                logit_scale = get_logit_scale(model_engine)
                 con_loss_deep = contrastive_criterion(all_deep_feats, all_labels, all_views, logit_scale)
                 con_loss_fused = contrastive_criterion(all_fused_feats, all_labels, all_views, logit_scale)
-                con_loss_atten = contrastive_criterion(all_atten_feats, all_labels, all_views, logit_scale)
 
-                total_con_loss = con_loss_deep
+                total_con_loss = con_loss_deep + con_loss_fused *1.5
                 loss += total_con_loss
                 con_loss_val = total_con_loss.item()
                 
@@ -184,6 +189,10 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, logit_scale=N
             if torch.is_tensor(loss):
                 model_engine.backward(loss)
                 model_engine.step()
+                with torch.no_grad():
+                    base_model = get_base_model(model_engine)
+                    if hasattr(base_model, "logit_scale") and base_model.logit_scale is not None:
+                        base_model.logit_scale.clamp_(max=4.6)
                 ema.update(model_engine.module if hasattr(model_engine, 'module') else model_engine)
                 total_loss += loss.item() * imgs.size(0)
             else:
@@ -283,7 +292,7 @@ if __name__ == "__main__":
         # 构建模型
         model = TeacherModel(args)
         # 获取可训练参数并构建优化器和学习率调度器
-        optimizer, logit_scale = build_optimizer_and_scale(model, args)
+        optimizer = build_optimizer_and_scale(model, args)
         scheduler = get_scheduler(
             scheduler_type=args.scheduler,
             train_steps=len(train_loader) * args.epochs,
@@ -297,7 +306,6 @@ if __name__ == "__main__":
             args,
             optimizer=optimizer,
             scheduler=scheduler,
-            logit_scale=logit_scale,
             val_loaders=val_loaders,
         )
     except Exception as e:

@@ -25,9 +25,10 @@ def build_optimizer_and_scale(model, args):
             lora_no_weight_decay.append(param)
         elif "ap_gates" in name or "global_ap_scale" in name or "gamma" in name:
             mix_params.append(param)
-        elif "feature_adapter" in name or "cross_attn" in name:
+        elif "feature_adapter" in name or "cross_attn" in name or "query_norm" in name:
             classifier_params.append(param)
         else:
+            print(f"警告：参数 {name} 没有被正确分类，默认放入其他参数组，建议检查命名是否符合预期！")
             other_params.append(param)
 
     # 打印一下当前的参数分布，你可以借此二次确认 m 参数是不是顺利归队了
@@ -87,7 +88,7 @@ def build_optimizer_and_scale(model, args):
     
     print("优化器实例化成功！")
     
-    return optimizer, logit_scale
+    return optimizer
 
 
 def build_student_optimizer_and_scale(model, args):
