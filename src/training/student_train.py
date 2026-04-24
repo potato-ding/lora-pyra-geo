@@ -1,12 +1,10 @@
 # 用于对学生模型进行stage1阶段根据参数配置进行训练的脚本
 import sys
 import os
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../../models')))
-os.environ["NO_ALBUMENTATIONS_UPDATE"] = "1"
 from pathlib import Path
 import torch
 import torch.nn as nn
+import time
 from torch.amp import autocast, GradScaler
 import torch.nn.functional as F
 import math
@@ -14,223 +12,444 @@ import torch.distributed as dist
 import argparse
 from src.data.datasets import create_student_train_dataset_and_loader
 from src.loss.tripletloss import IntraDomainTripletLoss
-from src.loss.blocks_infoNCE import blocks_InfoNCE
 from src.utils.initdist import try_init_dist
 from src.utils.gather_features_and_labels_and_views import gather_features_and_labels_and_views 
 from src.utils.train_eval_utils import run_val_and_get_recall
 from src.models.student_model import StudentModel
-from src.utils.scheduler import get_student_scheduler
-from src.utils.optimizer_and_scale import build_student_optimizer_and_scale
+from src.utils.scheduler import build_student_scheduler
+from src.utils.optimizer_and_scale import build_student_optimizer
 from src.data.val_dataloaders import build_student_val_dataloaders
+from src.loss.blocks_infoNCE import SupConLoss
 from src.utils.save_path import get_student_save_pth
 if 'OMP_NUM_THREADS' not in os.environ:
     os.environ['OMP_NUM_THREADS'] = '4'
 
-def train(model, dataloader, args, optimizer=None, scheduler=None, logit_scale=None, val_loaders=None):
-    local_rank = int(os.environ.get('LOCAL_RANK', 0))
-    amp_device = torch.device(f'cuda:{local_rank}')
-    
-    # 确保模型已经被 DDP 包装 (假设你在外部已经做了 model = DDP(model.cuda(local_rank), device_ids=[local_rank]))
-    # 这里不需要 DeepSpeed 初始化了
-    
-    # 定义损失函数
-    criterion_ce = nn.CrossEntropyLoss().to(amp_device)
-    triplet_criterion = IntraDomainTripletLoss(margin=0.3).to(amp_device) if args.use_triplet else None
-    contrastive_criterion = blocks_InfoNCE(loss_function=nn.CrossEntropyLoss(), device=amp_device).to(amp_device) if getattr(args, 'use_contrastive', False) else None
-    # 启用原生的混合精度加速器 (极大地加速 RepViT 训练)
-    scaler = GradScaler('cuda')
-    
-    global_step = 0
-    best_r1 = 0.0
-    save_dir = get_student_save_pth(args)
-    os.makedirs(save_dir, exist_ok=True)
-    for epoch in range(1, args.epochs + 1):
-        if dist.is_initialized() and hasattr(dataloader, 'sampler') and hasattr(dataloader.sampler, 'set_epoch'):
-            dataloader.sampler.set_epoch(epoch)
-            
-        model.train()
-        
-        for batch_idx, (sat_tensors, drone_tensors, labels, pids) in enumerate(dataloader):
-            # ================= 1. 数据拼接与标签对齐 (保持你的原逻辑) =================
-            sat_imgs = sat_tensors.view(-1, 3, args.img_size, args.img_size)
-            drone_imgs = drone_tensors.view(-1, 3, args.img_size, args.img_size)
-            imgs = torch.cat([sat_imgs, drone_imgs], dim=0).to(amp_device)
-            
-            labels_4 = labels.repeat_interleave(4)
-            labels = torch.cat([labels_4, labels_4], dim=0).to(amp_device)
-            
-            num_sat = sat_imgs.size(0)
-            num_drone = drone_imgs.size(0)
-            views = torch.cat([
-                torch.zeros(num_sat, dtype=torch.long),
-                torch.ones(num_drone, dtype=torch.long)
-            ]).to(amp_device)
 
-            optimizer.zero_grad()
-            
-            # ================= 2. 前向传播与 Loss 计算 =================
-            with autocast(device_type='cuda'):
-                # 适配学生模型：分离 bottleneck 特征(512维) 和 分类 logits
-                feat_bottleneck, logits_list = model(imgs)
-                z1, z2, z3, z4 = logits_list
-                
-                # --- A. ID Loss (多级分类损失) ---
-                loss_id_4 = criterion_ce(z4, labels)
-                loss_id_1 = criterion_ce(z1, labels)
-                loss_id_2 = criterion_ce(z2, labels)
-                loss_id_3 = criterion_ce(z3, labels)
-                # 综合 ID Loss (深层主导，浅层辅助)
-                loss_id = loss_id_4 + 0.5 * (loss_id_1 + loss_id_2 + loss_id_3)
+@torch.no_grad()
+def extract_features_student(model, loader, device, normalize=True):
+    model.eval()
 
-                # --- B. FISD Loss (细粒度自蒸馏) ---
-                T = 4.0 # 蒸馏温度
-                z4_detached = z4.detach() # 切断教师的梯度
-                p_teacher = F.softmax(z4_detached / T, dim=1)
-                
-                loss_fisd = 0.0
-                for z_student in [z1, z2, z3]:
-                    log_p_student = F.log_softmax(z_student / T, dim=1)
-                    loss_fisd += F.kl_div(log_p_student, p_teacher, reduction='batchmean') * (T ** 2)
+    feats = []
+    labels = []
 
-                loss_tri = torch.tensor(0.0, device=amp_device)
-                tri_loss_val = 0.0
-                
-                if args.use_triplet and triplet_criterion is not None:
-                    # 直接使用当前卡的 views 和 labels 进行切分
-                    sat_mask = (views == 0)
-                    drone_mask = (views == 1)
-                    
-                    # 直接使用当前卡的 feat_bottleneck
-                    sat_feats, sat_labels = feat_bottleneck[sat_mask], labels[sat_mask]
-                    drone_feats, drone_labels = feat_bottleneck[drone_mask], labels[drone_mask]
-                    
-                    loss_tri = triplet_criterion(drone_feats, drone_labels, sat_feats, sat_labels)
-                    tri_loss_val = loss_tri.item()
+    for images, target in loader:
+        images = images.to(device, non_blocking=True)
+        target = target.to(device, non_blocking=True).long()
 
-                # --- D. 身份对比损失 (Contrastive Loss 单卡计算) ---
-                loss_con = torch.tensor(0.0, device=amp_device)
-                con_loss_val = 0.0
-                
-                if getattr(args, 'use_contrastive', False) and contrastive_criterion is not None:
-                    # 💡 魔法兜底：提供默认温度系数 2.659 (tau=0.07)
-                    current_scale = logit_scale if logit_scale is not None else torch.tensor(2.659, device=amp_device)
-                    
-                    # 直接将当前卡的 feat_bottleneck 喂给对比损失
-                    loss_con = contrastive_criterion(feat_bottleneck, labels, views, current_scale)
-                    con_loss_val = loss_con.item()
+        feat = model(images)   # eval 模式下 StudentModel 只返回 feat
 
-                # --- E. 总 Loss ---
-                total_loss = loss_id + args.triplet_weight * loss_tri + getattr(args, 'fisd_weight', 1.0) * loss_fisd + getattr(args, 'contrastive_weight', 1.0) * loss_con
+        if normalize:
+            feat = F.normalize(feat, p=2, dim=1)
 
-            # ================= 3. 反向传播与优化 (AMP) =================
+        feats.append(feat.cpu())
+        labels.append(target.cpu())
+
+    feats = torch.cat(feats, dim=0)
+    labels = torch.cat(labels, dim=0)
+    return feats, labels
+
+
+@torch.no_grad()
+def compute_recall_from_features(q_feat, q_label, g_feat, g_label, topk=(1, 5, 10)):
+    """
+    q_feat: [Nq, D]
+    g_feat: [Ng, D]
+    q_label: [Nq]
+    g_label: [Ng]
+    """
+    sim = q_feat @ g_feat.t()   # 如果做了 L2 normalize，这里就是 cosine similarity
+
+    max_k = min(max(topk), g_feat.size(0))
+    indices = sim.topk(k=max_k, dim=1, largest=True, sorted=True).indices   # [Nq, max_k]
+
+    retrieved_labels = g_label[indices]   # [Nq, max_k]
+
+    result = {}
+    for k in topk:
+        k = min(k, retrieved_labels.size(1))
+        hit = (retrieved_labels[:, :k] == q_label.unsqueeze(1)).any(dim=1).float().mean().item()
+        result[f"R@{k}"] = hit
+
+    return result
+
+
+@torch.no_grad()
+def validate_student_u1652(model, val_loaders, args):
+    """
+    val_loaders 结构:
+    {
+        "D2S": (q_drone_loader, g_sat_loader),
+        "S2D": (q_sat_loader, g_drone_loader)
+    }
+    """
+    device = next(model.parameters()).device
+    normalize = getattr(args, "eval_normalize", True)
+
+    results = {}
+
+    for task_name, (q_loader, g_loader) in val_loaders.items():
+        q_feat, q_label = extract_features_student(
+            model, q_loader, device, normalize=normalize
+        )
+        g_feat, g_label = extract_features_student(
+            model, g_loader, device, normalize=normalize
+        )
+
+        recall_dict = compute_recall_from_features(
+            q_feat=q_feat,
+            q_label=q_label,
+            g_feat=g_feat,
+            g_label=g_label,
+            topk=(1, 5, 10),
+        )
+
+        results[f"{task_name}_R1"] = recall_dict["R@1"]
+        results[f"{task_name}_R5"] = recall_dict["R@5"]
+        results[f"{task_name}_R10"] = recall_dict["R@10"]
+
+    # 一个总指标，方便选 best model
+    if "D2S_R1" in results and "S2D_R1" in results:
+        results["avg_R1"] = (results["D2S_R1"] + results["S2D_R1"]) / 2.0
+
+    return results
+
+class AverageMeter:
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.val = 0.0
+        self.sum = 0.0
+        self.count = 0
+        self.avg = 0.0
+
+    def update(self, val, n=1):
+        self.val = float(val)
+        self.sum += float(val) * n
+        self.count += n
+        self.avg = self.sum / max(1, self.count)
+
+
+def unpack_u1652_batch(batch, device):
+    """
+    batch after default collate:
+        sat_tensor   : [B, 4, C, H, W]
+        drone_tensor : [B, 4, C, H, W]
+        labels       : [B]
+        pids         : list/tuple of length B
+
+    返回:
+        all_imgs     : [B*8, C, H, W]
+        all_labels   : [B*8]
+        meta         : 方便后续调试/扩展
+    """
+    sat_tensor, drone_tensor, labels, pids = batch
+
+    sat_tensor = sat_tensor.to(device, non_blocking=True)       # [B, 4, C, H, W]
+    drone_tensor = drone_tensor.to(device, non_blocking=True)   # [B, 4, C, H, W]
+    labels = labels.to(device, non_blocking=True).long()        # [B]
+
+    if sat_tensor.ndim != 5:
+        raise ValueError(f"sat_tensor 应为 [B, 4, C, H, W]，当前 shape={sat_tensor.shape}")
+    if drone_tensor.ndim != 5:
+        raise ValueError(f"drone_tensor 应为 [B, 4, C, H, W]，当前 shape={drone_tensor.shape}")
+
+    B, S, C, H, W = sat_tensor.shape
+    B2, D, C2, H2, W2 = drone_tensor.shape
+    if B != B2 or C != C2 or H != H2 or W != W2:
+        raise ValueError(
+            f"sat/drone batch 维度不一致: sat={sat_tensor.shape}, drone={drone_tensor.shape}"
+        )
+
+    # [B, 4, C, H, W] -> [B*4, C, H, W]
+    sat_imgs = sat_tensor.reshape(B * S, C, H, W)
+    drone_imgs = drone_tensor.reshape(B * D, C, H, W)
+
+    # labels 同步展开
+    sat_labels = labels.repeat_interleave(S)      # [B*4]
+    drone_labels = labels.repeat_interleave(D)    # [B*4]
+
+    # 拼成一个大 batch，统一送进 StudentModel
+    all_imgs = torch.cat([sat_imgs, drone_imgs], dim=0)        # [B*8, C, H, W]
+    all_labels = torch.cat([sat_labels, drone_labels], dim=0)  # [B*8]
+
+    meta = {
+        "batch_size_pid": B,
+        "num_sat_views": S,
+        "num_drone_views": D,
+        "effective_batch": all_imgs.size(0),
+        "pids": pids,
+    }
+    return all_imgs, all_labels, meta
+
+
+def compute_student_loss(
+    feat,
+    logits_list,
+    labels,
+    cls_criterion,
+    metric_criterion=None,
+    cls_weights=(0.3, 0.3, 0.3, 1.0),
+    metric_weight=1.0,
+):
+    """
+    StudentModel(train) -> feat, [z1, z2, z3, z4]
+    """
+    if len(logits_list) != 4:
+        raise ValueError(f"logits_list 长度应为 4，当前为 {len(logits_list)}")
+
+    z1, z2, z3, z4 = logits_list
+
+    loss_z1 = cls_criterion(z1, labels)
+    loss_z2 = cls_criterion(z2, labels)
+    loss_z3 = cls_criterion(z3, labels)
+    loss_z4 = cls_criterion(z4, labels)
+
+    cls_loss = (
+        cls_weights[0] * loss_z1
+        + cls_weights[1] * loss_z2
+        + cls_weights[2] * loss_z3
+        + cls_weights[3] * loss_z4
+    )
+
+    metric_loss = feat.new_tensor(0.0)
+    if metric_criterion is not None:
+        metric_loss = metric_criterion(feat, labels)
+
+    total_loss = cls_loss + metric_weight * metric_loss
+
+    with torch.no_grad():
+        acc = (z4.argmax(dim=1) == labels).float().mean()
+
+    return {
+        "total_loss": total_loss,
+        "cls_loss": cls_loss,
+        "metric_loss": metric_loss,
+        "loss_z1": loss_z1,
+        "loss_z2": loss_z2,
+        "loss_z3": loss_z3,
+        "loss_z4": loss_z4,
+        "acc": acc,
+    }
+
+
+def save_student_checkpoint(model, optimizer, scheduler, epoch, save_path):
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    torch.save(
+        {
+            "epoch": epoch,
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict() if scheduler is not None else None,
+        },
+        save_path,
+    )
+    print(f"[Checkpoint] saved to: {save_path}")
+
+
+def train_one_epoch_student(
+    model,
+    train_loader,
+    optimizer,
+    scheduler,
+    device,
+    epoch,
+    args,
+    cls_criterion,
+    metric_criterion=None,
+    scaler=None,
+):
+    model.train()
+
+    batch_time = AverageMeter()
+    data_time = AverageMeter()
+    total_loss_meter = AverageMeter()
+    cls_loss_meter = AverageMeter()
+    metric_loss_meter = AverageMeter()
+    acc_meter = AverageMeter()
+
+    end = time.time()
+
+    cls_weights = getattr(args, "cls_weights", (0.3, 0.3, 0.3, 1.0))
+    metric_weight = getattr(args, "metric_weight", 1.0)
+    print_freq = getattr(args, "print_freq", 20)
+    grad_clip = getattr(args, "grad_clip", 0.0)
+    use_amp = getattr(args, "amp", True)
+
+    for step, batch in enumerate(train_loader):
+        data_time.update(time.time() - end)
+
+        images, labels, meta = unpack_u1652_batch(batch, device)
+
+        optimizer.zero_grad(set_to_none=True)
+
+        with autocast(device_type="cuda", enabled=use_amp):
+            feat, logits_list = model(images)
+
+            loss_dict = compute_student_loss(
+                feat=feat,
+                logits_list=logits_list,
+                labels=labels,
+                cls_criterion=cls_criterion,
+                metric_criterion=metric_criterion,
+                cls_weights=cls_weights,
+                metric_weight=metric_weight,
+            )
+            total_loss = loss_dict["total_loss"]
+
+        if scaler is not None and scaler.is_enabled():
             scaler.scale(total_loss).backward()
-            
-            # 提前 unscale 方便做梯度裁剪
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
-            
+
+            if grad_clip > 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+
+            scale_before = scaler.get_scale()
             scaler.step(optimizer)
             scaler.update()
+            scale_after = scaler.get_scale()
 
-            # ================= 4. 学习率按 Step 调度 =================
-            if scheduler is not None:
+            # 只有当 optimizer.step 真正执行时，才更新 scheduler
+            if scheduler is not None and scale_after >= scale_before:
                 scheduler.step()
+        else:
+            total_loss.backward()
 
-            # ================= 5. 日志打印 (仅 Rank 0) =================
-            print_str = f"Epoch [{epoch}] Batch ({batch_idx}): LR={optimizer.param_groups[0]['lr']:.6f} | "
-            print(print_str)
-            if (batch_idx + 1) % 20 == 0:
-                if not dist.is_initialized() or dist.get_rank() == 0:
-                    current_lr = optimizer.param_groups[0]['lr']
-                    log_str = f"Epoch [{epoch}] Batch ({batch_idx}): LR={current_lr:.6f} | "
-                    log_str += f"ID_Loss={loss_id.item():.4f} | FISD_Loss={loss_fisd.item():.4f} | "
-                    if args.use_triplet:
-                        log_str += f"Tri_Loss={tri_loss_val:.4f} | "
-                    if getattr(args, 'use_contrastive', False):
-                        log_str += f"Con_Loss={con_loss_val:.4f} | "
-                    log_str += f"Total={total_loss.item():.4f}"
-                    print(log_str)
-                    
-            global_step += 1
-            
-            del imgs, labels, views, feat_bottleneck, logits_list, total_loss
-            if args.use_triplet and triplet_criterion is not None:
-                del sat_feats, drone_feats
+    if grad_clip > 0:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
 
-        # ================= 6. 同步与验证 =================
-        if dist.is_initialized():
-            dist.barrier()
-            
-        if not dist.is_initialized() or local_rank == 0:
-            print(f"--- Epoch {epoch} 训练完成 ---")
-        if epoch > 5:
-            # 你可以根据需要调整验证频率，比如每 2 个 epoch 验一次
-            if (epoch % 2 == 0) or (epoch == args.epochs):
+    optimizer.step()
+
+    if scheduler is not None:
+        scheduler.step()
+
+        # 你前面用的是 iteration 级 scheduler，所以每个 batch 都 step
+        if scheduler is not None:
+            scheduler.step()
+
+        bs = images.size(0)
+        total_loss_meter.update(loss_dict["total_loss"].item(), bs)
+        cls_loss_meter.update(loss_dict["cls_loss"].item(), bs)
+        metric_loss_meter.update(loss_dict["metric_loss"].item(), bs)
+        acc_meter.update(loss_dict["acc"].item(), bs)
+
+        batch_time.update(time.time() - end)
+        end = time.time()
+
+        if step % print_freq == 0 or step == len(train_loader) - 1:
+            lr_backbone = optimizer.param_groups[0]["lr"]
+            lr_head = optimizer.param_groups[2]["lr"] if len(optimizer.param_groups) > 2 else optimizer.param_groups[0]["lr"]
+
+            print(
+                f"Epoch [{epoch+1}/{args.epochs}] "
+                f"Step [{step+1}/{len(train_loader)}] | "
+                f"pid_batch {meta['batch_size_pid']} | "
+                f"effective_batch {meta['effective_batch']} | "
+                f"data {data_time.val:.3f}s ({data_time.avg:.3f}s) | "
+                f"batch {batch_time.val:.3f}s ({batch_time.avg:.3f}s) | "
+                f"total {total_loss_meter.val:.4f} ({total_loss_meter.avg:.4f}) | "
+                f"cls {cls_loss_meter.val:.4f} ({cls_loss_meter.avg:.4f}) | "
+                f"metric {metric_loss_meter.val:.4f} ({metric_loss_meter.avg:.4f}) | "
+                f"acc {acc_meter.val:.4f} ({acc_meter.avg:.4f}) | "
+                f"lr_backbone {lr_backbone:.8f} | "
+                f"lr_head {lr_head:.8f}"
+            )
+
+    return {
+        "total_loss": total_loss_meter.avg,
+        "cls_loss": cls_loss_meter.avg,
+        "metric_loss": metric_loss_meter.avg,
+        "acc": acc_meter.avg,
+    }
+
+
+def train_student(
+    model,
+    train_loader,
+    optimizer,
+    scheduler,
+    device,
+    args,
+    val_fn=None,
+    val_loaders=None,
+    metric_criterion=None,
+):
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    cls_criterion = nn.CrossEntropyLoss(
+        label_smoothing=getattr(args, "label_smoothing", 0.0)
+    ).to(device)
+
+    scaler = GradScaler("cuda", enabled=getattr(args, "amp", True))
+
+    best_metric = -1.0
+    best_metric_name = getattr(args, "best_metric_name", "recall@1")
+
+    for epoch in range(args.epochs):
+        train_stats = train_one_epoch_student(
+            model=model,
+            train_loader=train_loader,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            device=device,
+            epoch=epoch,
+            args=args,
+            cls_criterion=cls_criterion,
+            metric_criterion=metric_criterion,
+            scaler=scaler,
+        )
+
+        print(
+            f"[Train] Epoch {epoch+1}/{args.epochs} | "
+            f"total={train_stats['total_loss']:.4f} | "
+            f"cls={train_stats['cls_loss']:.4f} | "
+            f"metric={train_stats['metric_loss']:.4f} | "
+            f"acc={train_stats['acc']:.4f}"
+        )
+
+        save_freq = getattr(args, "save_freq", 1)
+        if (epoch + 1) % save_freq == 0:
+            save_path = os.path.join(args.output_dir, f"checkpoint_epoch_{epoch+1}.pth")
+            save_student_checkpoint(model, optimizer, scheduler, epoch + 1, save_path)
+
+        if val_fn is not None and val_loaders is not None:
+            val_interval = getattr(args, "val_interval", 1)
+            if ((epoch + 1) % val_interval == 0) or (epoch + 1 == args.epochs):
                 model.eval()
-                
-                # 提取 DataLoader
-                q_loader_d2s, g_loader_d2s = val_loaders["D2S"]
-                q_loader_s2d, g_loader_s2d = val_loaders["S2D"]
-                
-                import gc
-                gc.collect()                 # 强清 Python 层的残存变量
-                torch.cuda.empty_cache()     # 强清 PyTorch 层的显存碎片
-                
-                # 注意：这里传入的 device 最好用你在 train 函数开头定义的 amp_device
-                d2s_r1, d2s_r5, d2s_r10, d2s_map, _, _= run_val_and_get_recall(model, q_loader_d2s, g_loader_d2s, amp_device)
-                s2d_r1, s2d_r5, s2d_r10, s2d_map, _, _= run_val_and_get_recall(model, q_loader_s2d, g_loader_s2d, amp_device)
-                
-                # 仅在主进程 (Rank 0) 执行模型保存
-                if not dist.is_initialized() or dist.get_rank() == 0:
-                    # 1. 获取 DDP 底层模型的 state_dict
-                    # (如果是单卡没有 .module，做个兼容处理)
-                    model_to_save = model.module if hasattr(model, 'module') else model
-                    
-                    # 2. 将权重全部搬到 CPU 上保存，防止显存爆炸
-                    trainable_state = {k: v.cpu() for k, v in model_to_save.state_dict().items()}
-                    # 3. 比较并保存最佳模型 (以 Drone -> Satellite 的 Recall@1 为基准)
-                    if d2s_r1 > best_r1:
-                        best_r1 = d2s_r1
-                        torch.save(trainable_state, os.path.join(save_dir, "best_model.pth"))
-                        print(f"🎉 新的最佳模型! Epoch {epoch}")
-                        print(f"[D2S 成绩] Recall@1: {d2s_r1:.2f}%, Recall@5: {d2s_r5:.2f}%, Recall@10: {d2s_r10:.2f}%, mAP: {d2s_map:.2f}%")
-                        print(f"[S2D 成绩] Recall@1: {s2d_r1:.2f}%, Recall@5: {s2d_r5:.2f}%, Recall@10: {s2d_r10:.2f}%, mAP: {s2d_map:.2f}%")
-                    else:
-                        print(f"当前 D2S Recall@1: {d2s_r1:.2f}%, 未超过历史最佳 {best_r1:.2f}%, 因此不更新 best_model.pth")
-                        print(f"[D2S 成绩] Recall@1: {d2s_r1:.2f}%, Recall@5: {d2s_r5:.2f}%, Recall@10: {d2s_r10:.2f}%, mAP: {d2s_map:.2f}%")
-                        print(f"[S2D 成绩] Recall@1: {s2d_r1:.2f}%, Recall@5: {s2d_r5:.2f}%, Recall@10: {s2d_r10:.2f}%, mAP: {s2d_map:.2f}%")
-                        
-                    # 最后单个 epoch 强制保存一份
-                    if epoch == args.epochs:
-                        torch.save(trainable_state, os.path.join(save_dir, "final_model.pth"))
-                        print(f"最后保存 final_model.pth")
+                val_result = val_fn(model, val_loaders, args)
+                print(f"[Val] Epoch {epoch+1}: {val_result}")
 
-        if dist.is_initialized():
-            dist.barrier()
-
+                if best_metric_name in val_result:
+                    current_metric = val_result[best_metric_name]
+                    if current_metric > best_metric:
+                        best_metric = current_metric
+                        best_path = os.path.join(args.output_dir, "best_model.pth")
+                        save_student_checkpoint(model, optimizer, scheduler, epoch + 1, best_path)
+                        print(f"[Best] {best_metric_name} improved to {best_metric:.6f}")
 
 if __name__ == "__main__":
     import traceback
-    parser = argparse.ArgumentParser(description="Train Teacher Model with LoRA and Classifier on U1652")
-    parser.add_argument('--epochs', type=int, default=22, help='训练轮数')
-    parser.add_argument('--device', type=str, default='cuda', help='训练设备')
+    parser = argparse.ArgumentParser(description="Train Student Model with LoRA and Classifier on U1652")
+    parser.add_argument("--epochs", type=int, default=60)
+    parser.add_argument("--num_classes", type=int, default=701)
+    parser.add_argument("--backbone_lr", type=float, default=1e-4)
+    parser.add_argument("--head_lr", type=float, default=1e-3)
+    parser.add_argument("--weight_decay", type=float, default=1e-4)
 
-    parser.add_argument('--lr', default=4e-4, type=float, help='初始学习率 (4卡建议 4e-4)')
-    parser.add_argument('--scheduler', default="cosine", type=str, help='"polynomial" | "cosine" | "constant" | None')
-    parser.add_argument('--warmup_epochs', default=0.5, type=float, help='预热轮数')
-    parser.add_argument('--lr_end', default=1e-5, type=float, help='最终学习率')
+    parser.add_argument("--amp", action="store_true", default=True)
+    parser.add_argument("--print_freq", type=int, default=20)
+    parser.add_argument("--grad_clip", type=float, default=0.0)
+    parser.add_argument("--label_smoothing", type=float, default=0.0)
 
-    # 3. 分布式训练 (DDP所需)
-    parser.add_argument('--local_rank', type=int, default=0, help='local rank for distributed training')
-
-    # 4. 数据与批次
-    parser.add_argument('--batch_size', type=int, default=8, help='每个 GPU 的 batch size')
+    parser.add_argument("--output_dir", type=str, default="./work_dirs/student")
+    parser.add_argument("--save_freq", type=int, default=1)
+    parser.add_argument("--val_interval", type=int, default=5)
     parser.add_argument('--img_size', type=int, default=224, help='输入图像的尺寸')
-
-    parser.add_argument('--use_triplet', action='store_true', help='是否启用三元组损失')
-    parser.add_argument('--use_contrastive', action='store_true', help='是否启用对比学习', default=False)
-    parser.add_argument('--triplet_weight', type=float, default=2.0, help='三元组损失权重')
-    parser.add_argument('--fisd_weight', type=float, default=1.0, help='FISD 逆向自蒸馏损失权重')
+    parser.add_argument('--batch_size', type=int, default=8, help='每个 GPU 的 batch size')
+    parser.add_argument('--best_metric_name ', type=str, default="avg_R1", help='用于选择最佳模型的指标名称')
+    parser.add_argument("--eval_normalize", action="store_true", default=True)
+    parser.add_argument("--metric_weight", type=float, default=0.2)
+    parser.add_argument("--temperature", type=float, default=0.07)
     args = parser.parse_args()
     try:
         # 构建1652单卡训练dataloader
@@ -238,21 +457,34 @@ if __name__ == "__main__":
         # 构建1652测试集
         val_loaders = build_student_val_dataloaders(img_size=[args.img_size, args.img_size])
 
-        # ================= 核心修改区域 =================
         # 1. 构建模型并立刻移动到对应的 GPU
-        model = StudentModel()
-        model = model.cuda()
-        
-        
-        # optimizer, logit_scale = build_student_optimizer_and_scale(model, args)
-        # scheduler = get_student_scheduler(
-        #     scheduler_type=args.scheduler,
-        #     train_steps=len(train_loader) * args.epochs,
-        #     optimizer=optimizer,
-        #     warmup_steps=int(len(train_loader) * args.epochs * args.warmup_epochs),
-        #     base_lr=args.lr,
-        #     lr_end=args.lr_end
-        # )
+        model = StudentModel().cuda()
+        optimizer = build_student_optimizer(
+            model,
+            backbone_lr=args.backbone_lr,   
+            head_lr=args.head_lr,
+            weight_decay=args.weight_decay,
+        )
+        scheduler = build_student_scheduler(
+            optimizer,
+            args,
+            steps_per_epoch=len(train_loader)
+        )
+        device = torch.device("cuda")
+
+        metric_criterion = SupConLoss(temperature=args.temperature)
+
+        train_student(
+            model=model,
+            train_loader=train_loader,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            device=device,
+            args=args,
+            val_fn=validate_student_u1652,              # 你后面接自己的验证函数
+            val_loaders=val_loaders,
+            metric_criterion=metric_criterion,
+        )
         # train(
         #     model,
         #     train_loader,

@@ -35,52 +35,61 @@ def get_scheduler(scheduler_type, train_steps, optimizer, warmup_steps=0, lr_end
         print("No scheduler used.")
         return None
 
-def get_student_scheduler(scheduler_type, train_steps, optimizer, warmup_steps, base_lr, lr_end):
+import math
+from torch.optim.lr_scheduler import LambdaLR
+
+
+def build_student_scheduler(optimizer, args, steps_per_epoch=None):
     """
-    支持多参数组 (Differential LRs) 和多卡 DDP/DeepSpeed 的学习率调度器。
-    
-    参数:
-        scheduler_type: 调度策略 ('cosine', 'polynomial', 'constant')
-        train_steps: 总训练步数
-        optimizer: 已经分好组的复杂优化器 (如你的 DeepSpeedCPUAdam)
-        warmup_steps: 预热步数
-        base_lr: 直接传入 args.lr，作为计算衰减比例的绝对基准
-        lr_end: 最终的最小学习率
+    为学生模型构建 warmup + cosine scheduler
+
+    支持两种模式：
+    1. 按 epoch 更新：如果 steps_per_epoch is None
+    2. 按 iteration 更新：如果传入 steps_per_epoch
+
+    参数要求：
+    - args.epochs: 总训练轮数
+    - args.warmup_epochs: 可选，不传则自动取 max(1, int(args.epochs * 0.1))
+    - args.min_lr_ratio: 可选，最终 lr = base_lr * min_lr_ratio，默认 0.01
     """
-    
-    # 基于基准学习率计算最终衰减到的比例
-    # 注意：这个比例是全局的乘子
-    min_lr_ratio = lr_end / base_lr if base_lr > 0 else 0
+
+    total_epochs = args.epochs
+    warmup_epochs = getattr(args, "warmup_epochs", None)
+    min_lr_ratio = getattr(args, "min_lr_ratio", 0.01)
+
+    if warmup_epochs is None:
+        warmup_epochs = max(1, int(total_epochs * 0.1))
+
+    # 1. 按 epoch 更新
+    if steps_per_epoch is None:
+        total_steps = total_epochs
+        warmup_steps = warmup_epochs
+
+    # 2. 按 iteration 更新
+    else:
+        total_steps = total_epochs * steps_per_epoch
+        warmup_steps = warmup_epochs * steps_per_epoch
 
     def lr_lambda(current_step):
-        # 1. Warmup 阶段 (线性增长到 1.0 乘子)
+        # warmup
         if current_step < warmup_steps:
-            return float(current_step) / float(max(1, warmup_steps))
-        
-        # 2. 衰减阶段准备
-        decay_steps = train_steps - warmup_steps
-        current_decay_step = current_step - warmup_steps
-        
-        if decay_steps <= 0:
-            return 1.0
-            
-        progress = float(current_decay_step) / float(max(1, decay_steps))
-        
-        # 3. 计算当前的全局乘子
-        if scheduler_type == 'cosine':
-            return min_lr_ratio + 0.5 * (1.0 - min_lr_ratio) * (1.0 + math.cos(math.pi * progress))
-            
-        elif scheduler_type == 'polynomial':
-            # 默认使用 power=1.0 的线性衰减
-            return min_lr_ratio + (1.0 - min_lr_ratio) * (1.0 - progress)
-            
-        elif scheduler_type in ['constant', None]:
-            return 1.0
-            
-        else:
-            raise ValueError(f"不支持的调度器类型: {scheduler_type}")
+            return float(current_step + 1) / float(max(1, warmup_steps))
 
-    # PyTorch 的 LambdaLR 非常智能：
-    # 它会将我们返回的这个乘子，分别乘以每个 param_group 初始化时的 lr！
-    # 这意味着你的 head_params (args.lr * 10) 在整个训练过程中，始终会保持比主干网络高 10 倍的学习率。
-    return LambdaLR(optimizer, lr_lambda)
+        # cosine decay
+        progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+
+        # 从 1.0 衰减到 min_lr_ratio
+        return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
+
+    scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
+
+    print(f"[Scheduler] total_epochs   : {total_epochs}")
+    print(f"[Scheduler] warmup_epochs  : {warmup_epochs}")
+    print(f"[Scheduler] min_lr_ratio   : {min_lr_ratio}")
+    if steps_per_epoch is not None:
+        print(f"[Scheduler] steps/epoch    : {steps_per_epoch}")
+        print(f"[Scheduler] total_steps    : {total_steps}")
+        print(f"[Scheduler] warmup_steps   : {warmup_steps}")
+
+    return scheduler

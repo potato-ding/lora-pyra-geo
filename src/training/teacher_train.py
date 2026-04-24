@@ -168,9 +168,8 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                 tri_q_fused, tri_g_fused = triplet_criterion(drone_fused, drone_fused_labels, sat_fused, sat_fused_labels)
                 tri_q_atten, tri_g_atten = triplet_criterion(drone_atten, drone_labels, sat_atten, sat_labels)
 
-                tri_weight = 2.0
                 # 现在的 Triplet Loss 变得极其干净，且没有任何污染
-                total_tri_loss = (tri_q_fused + tri_g_fused) * 1.5 + (tri_q_atten + tri_g_atten) * 0.5
+                total_tri_loss = (tri_q_fused + tri_g_fused) * 3 + (tri_q_atten + tri_g_atten)
                 
                 loss += total_tri_loss
                 tri_loss_val = total_tri_loss.item()

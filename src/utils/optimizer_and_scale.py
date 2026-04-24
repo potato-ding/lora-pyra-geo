@@ -91,65 +91,83 @@ def build_optimizer_and_scale(model, args):
     return optimizer
 
 
-def build_student_optimizer_and_scale(model, args):
+def build_student_optimizer(
+    model,
+    backbone_lr=1e-4,
+    head_lr=1e-3,
+    weight_decay=1e-4,
+    betas=(0.9, 0.999),
+):
     """
-    专为 RepViT 学生模型构建的优化器。
-    保留了头部 10x 学习率和 Bias/Norm 免衰减机制，去除了多余的 LoRA/DeepSpeed 逻辑。
+    为 StudentModel 构建 AdamW optimizer
+
+    参数分组策略：
+    1. backbone 参数：较小 lr
+    2. 新增头部参数（gem_pool / bottleneck / fc_main / aux_heads）：较大 lr
+    3. bias / BN / norm / 标量参数：不做 weight decay
     """
-    # 兼容解包逻辑，如果学生模型没有 logit_scale，则返回 None
-    logit_scale = getattr(model, 'logit_scale', None)
 
-    # 1. 准备参数组
-    head_params_wd = []
-    head_params_no_wd = []
-    backbone_params_wd = []
-    backbone_params_no_wd = []
-    
-    # 设定默认的 weight_decay，如果在 args 中没有则默认 0.05 (AdamW 常用)
-    weight_decay = getattr(args, 'weight_decay', 0.05)
+    backbone_decay = []
+    backbone_no_decay = []
+    head_decay = []
+    head_no_decay = []
 
-    # 2. 遍历参数并精细分组
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-            
-        # 判定是否属于头部结构 (新初始化的层)
-        is_head = any(keyword in name for keyword in ["aux_head", "fc_main", "uapa_bottleneck"])
-        
-        # 判定是否需要免除 Weight Decay
-        # 规则: 1D 张量 (Bias, Norm层权重) 或 显式包含特定关键词 (如 GeM 的 p)
-        no_decay = (len(param.shape) == 1) or name.endswith(".bias") or ("p" in name.split('.')[-1])
 
-        if is_head:
-            if no_decay:
-                head_params_no_wd.append(param)
+        # 是否属于 backbone
+        is_backbone = name.startswith("backbone.")
+
+        # 是否不做 weight decay
+        name_lower = name.lower()
+        is_no_decay = (
+            param.ndim <= 1              # bias / BN weight / 标量参数
+            or name.endswith(".bias")
+            or "bn" in name_lower
+            or "norm" in name_lower
+        )
+
+        if is_backbone:
+            if is_no_decay:
+                backbone_no_decay.append(param)
             else:
-                head_params_wd.append(param)
+                backbone_decay.append(param)
         else:
-            if no_decay:
-                backbone_params_no_wd.append(param)
+            if is_no_decay:
+                head_no_decay.append(param)
             else:
-                backbone_params_wd.append(param)
+                head_decay.append(param)
 
-    # 3. 组装优化器参数字典
-    optimizer_grouped_parameters = [
-        # 主干网络 (1x LR)
-        {"params": backbone_params_wd, "lr": args.lr, "weight_decay": weight_decay},
-        {"params": backbone_params_no_wd, "lr": args.lr, "weight_decay": 0.0},
-        
-        # 任务头/辅助头 (10x LR，加速收敛)
-        {"params": head_params_wd, "lr": args.lr * 10, "weight_decay": weight_decay},
-        {"params": head_params_no_wd, "lr": args.lr * 10, "weight_decay": 0.0},
-    ]
+    optimizer = torch.optim.AdamW(
+        [
+            {
+                "params": backbone_decay,
+                "lr": backbone_lr,
+                "weight_decay": weight_decay,
+            },
+            {
+                "params": backbone_no_decay,
+                "lr": backbone_lr,
+                "weight_decay": 0.0,
+            },
+            {
+                "params": head_decay,
+                "lr": head_lr,
+                "weight_decay": weight_decay,
+            },
+            {
+                "params": head_no_decay,
+                "lr": head_lr,
+                "weight_decay": 0.0,
+            },
+        ],
+        betas=betas,
+    )
 
-    # 4. 实例化原生 AdamW (速度远快于 CPUAdam)
-    optimizer = torch.optim.AdamW(optimizer_grouped_parameters)
+    print("[Optimizer] backbone_decay params   :", len(backbone_decay))
+    print("[Optimizer] backbone_no_decay params:", len(backbone_no_decay))
+    print("[Optimizer] head_decay params       :", len(head_decay))
+    print("[Optimizer] head_no_decay params    :", len(head_no_decay))
 
-    # 打印分布情况，方便你核对
-    print(f"🚀 学生模型优化器构建成功!")
-    print(f" - Backbone (带衰减, 1x LR): {len(backbone_params_wd)} 个参数组")
-    print(f" - Backbone (无衰减, 1x LR): {len(backbone_params_no_wd)} 个参数组 (含 Bias/Norm)")
-    print(f" - Heads    (带衰减, 10x LR): {len(head_params_wd)} 个参数组")
-    print(f" - Heads    (无衰减, 10x LR): {len(head_params_no_wd)} 个参数组")
-
-    return optimizer, logit_scale
+    return optimizer
