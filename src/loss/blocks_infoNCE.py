@@ -54,7 +54,7 @@ class blocks_InfoNCE(nn.Module):
         clamped_scale = torch.clamp(logit_scale, max=4.6).exp() 
         logits = d_feats @ s_feats.t() * clamped_scale
 
-        # ✅ 修正后的 Ground Truth 逻辑
+        #  Ground Truth 逻辑
         ground_truth = (d_labels.unsqueeze(1) == s_labels.unsqueeze(0)).float()
         ground_truth = ground_truth / (ground_truth.sum(dim=1, keepdim=True) + 1e-12)
 

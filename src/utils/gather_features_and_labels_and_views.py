@@ -23,9 +23,6 @@ def concat_all_gather(tensor):
     return torch.cat(tensors_gather, dim=0)
 
 def gather_features_and_labels_and_views(feats, labels, views):
-    """
-    将所有显卡上的特征、标签汇总，并保留跨卡满血梯度！
-    """
     if not dist.is_initialized():
         return feats, labels, views
     
