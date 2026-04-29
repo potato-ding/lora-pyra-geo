@@ -56,6 +56,115 @@ def extract_features_dist(model, dataloader, device):
 
     return res_feats, res_labels, res_coords
 
+@torch.no_grad()
+def getdist_1652_val_and_get_recall(model, val_query_loader, val_gallery_loader, device):
+    """
+    University-1652 专用多卡验证函数。
+
+    多卡逻辑：
+        1. 每张卡用 DistributedSampler 提取一部分 query/gallery 特征
+        2. extract_features_dist 内部 all_gather 汇总所有卡的特征和标签
+        3. 截断 DistributedSampler padding 出来的重复样本
+        4. 所有 rank 分片计算 query 指标
+        5. all_reduce 汇总 Recall@1 / Recall@5 / Recall@10 / mAP
+
+    返回：
+        recall_1, recall_5, recall_10, mAP
+    """
+
+    model.eval()
+
+    # 1. 提取并 all_gather query / gallery 特征
+    q_f, q_l, _ = extract_features_dist(model, val_query_loader, device)
+    g_f, g_l, _ = extract_features_dist(model, val_gallery_loader, device)
+
+    # 2. 删除 DistributedSampler 为整除 world_size 补出来的重复样本
+    real_num_queries = len(val_query_loader.dataset)
+    real_num_gallery = len(val_gallery_loader.dataset)
+
+    q_f = q_f[:real_num_queries]
+    q_l = q_l[:real_num_queries]
+
+    g_f = g_f[:real_num_gallery]
+    g_l = g_l[:real_num_gallery]
+
+    # 3. 保证 label 是一维
+    q_l = q_l.view(-1)
+    g_l = g_l.view(-1)
+
+    # 4. 多卡下每张卡负责一部分 query 指标计算
+    if dist.is_available() and dist.is_initialized():
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+    else:
+        world_size = 1
+        rank = 0
+
+    queries_per_rank = (real_num_queries + world_size - 1) // world_size
+    start_idx = rank * queries_per_rank
+    end_idx = min(start_idx + queries_per_rank, real_num_queries)
+
+    local_q_f = q_f[start_idx:end_idx]
+    local_q_l = q_l[start_idx:end_idx]
+    local_num_queries = local_q_f.size(0)
+
+    # 5. 初始化本卡统计量
+    local_correct_1 = torch.tensor(0.0, device=device)
+    local_correct_5 = torch.tensor(0.0, device=device)
+    local_correct_10 = torch.tensor(0.0, device=device)
+    local_ap_sum = torch.tensor(0.0, device=device)
+
+    # 6. 分块计算，避免一次性相似度矩阵过大
+    if local_num_queries > 0:
+        chunk_size = 1000
+
+        for i in range(0, local_num_queries, chunk_size):
+            q_f_chunk = local_q_f[i:i + chunk_size]
+            q_l_chunk = local_q_l[i:i + chunk_size]
+
+            # [chunk_size, real_num_gallery]
+            score_chunk = torch.matmul(q_f_chunk, g_f.t())
+
+            # 降序排序
+            sorted_indices = torch.argsort(score_chunk, dim=1, descending=True)
+            sorted_gallery_labels = g_l[sorted_indices]
+
+            # [chunk_size, real_num_gallery]
+            matches = (sorted_gallery_labels == q_l_chunk.unsqueeze(1)).float()
+
+            # Recall@K
+            local_correct_1 += matches[:, :1].any(dim=1).float().sum()
+            local_correct_5 += matches[:, :5].any(dim=1).float().sum()
+            local_correct_10 += matches[:, :10].any(dim=1).float().sum()
+
+            # mAP
+            cum_matches = torch.cumsum(matches, dim=1)
+            ranks = torch.arange(
+                1,
+                real_num_gallery + 1,
+                device=device
+            ).float().unsqueeze(0)
+
+            precisions = cum_matches / ranks
+            total_true_matches = matches.sum(dim=1)
+
+            ap_per_query = (precisions * matches).sum(dim=1) / (total_true_matches + 1e-12)
+            local_ap_sum += ap_per_query.sum()
+
+    # 7. 多卡汇总统计量
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(local_correct_1, op=dist.ReduceOp.SUM)
+        dist.all_reduce(local_correct_5, op=dist.ReduceOp.SUM)
+        dist.all_reduce(local_correct_10, op=dist.ReduceOp.SUM)
+        dist.all_reduce(local_ap_sum, op=dist.ReduceOp.SUM)
+
+    # 8. 计算最终指标
+    recall_1 = local_correct_1.item() / real_num_queries * 100
+    recall_5 = local_correct_5.item() / real_num_queries * 100
+    recall_10 = local_correct_10.item() / real_num_queries * 100
+    mAP = local_ap_sum.item() / real_num_queries * 100
+
+    return recall_1, recall_5, recall_10, mAP
 
 def run_val_and_get_recall(model, val_query_loader, val_gallery_loader, device):
     # 1. 提取全局特征 (提取函数内部已做完 all_gather)
