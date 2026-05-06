@@ -11,7 +11,6 @@ import math
 import torch.distributed as dist
 import argparse
 from src.data.datasets import create_student_train_dataset_and_loader
-from src.loss.tripletloss import IntraDomainTripletLoss
 from src.utils.initdist import try_init_dist
 from src.utils.gather_features_and_labels_and_views import gather_features_and_labels_and_views 
 from src.utils.train_eval_utils import run_val_and_get_recall
@@ -19,7 +18,8 @@ from src.models.student_model import StudentModel
 from src.utils.scheduler import build_student_scheduler
 from src.utils.optimizer_and_scale import build_student_optimizer
 from src.data.val_dataloaders import build_student_val_dataloaders
-from src.loss.blocks_infoNCE import SupConLoss
+from src.loss.blocks_infoNCE import blocks_InfoNCE
+from src.loss.tripletloss import IntraDomainTripletLoss
 from src.utils.save_path import get_student_save_pth
 if 'OMP_NUM_THREADS' not in os.environ:
     os.environ['OMP_NUM_THREADS'] = '4'
@@ -141,18 +141,22 @@ def unpack_u1652_batch(batch, device):
     返回:
         all_imgs     : [B*8, C, H, W]
         all_labels   : [B*8]
+        all_views    : [B*8]
+                      satellite = 0
+                      drone     = 1
         meta         : 方便后续调试/扩展
     """
+
     sat_tensor, drone_tensor, labels, pids = batch
 
-    sat_tensor = sat_tensor.to(device, non_blocking=True)       # [B, 4, C, H, W]
-    drone_tensor = drone_tensor.to(device, non_blocking=True)   # [B, 4, C, H, W]
+    sat_tensor = sat_tensor.to(device, non_blocking=True)       # [B, S, C, H, W]
+    drone_tensor = drone_tensor.to(device, non_blocking=True)   # [B, D, C, H, W]
     labels = labels.to(device, non_blocking=True).long()        # [B]
 
     if sat_tensor.ndim != 5:
-        raise ValueError(f"sat_tensor 应为 [B, 4, C, H, W]，当前 shape={sat_tensor.shape}")
+        raise ValueError(f"sat_tensor 应为 [B, S, C, H, W], 当前 shape={sat_tensor.shape}")
     if drone_tensor.ndim != 5:
-        raise ValueError(f"drone_tensor 应为 [B, 4, C, H, W]，当前 shape={drone_tensor.shape}")
+        raise ValueError(f"drone_tensor 应为 [B, D, C, H, W], 当前 shape={drone_tensor.shape}")
 
     B, S, C, H, W = sat_tensor.shape
     B2, D, C2, H2, W2 = drone_tensor.shape
@@ -161,17 +165,23 @@ def unpack_u1652_batch(batch, device):
             f"sat/drone batch 维度不一致: sat={sat_tensor.shape}, drone={drone_tensor.shape}"
         )
 
-    # [B, 4, C, H, W] -> [B*4, C, H, W]
+    # [B, S, C, H, W] -> [B*S, C, H, W]
     sat_imgs = sat_tensor.reshape(B * S, C, H, W)
     drone_imgs = drone_tensor.reshape(B * D, C, H, W)
 
     # labels 同步展开
-    sat_labels = labels.repeat_interleave(S)      # [B*4]
-    drone_labels = labels.repeat_interleave(D)    # [B*4]
+    sat_labels = labels.repeat_interleave(S)       # [B*S]
+    drone_labels = labels.repeat_interleave(D)     # [B*D]
+
+    # views 同步展开
+    # satellite = 0, drone = 1
+    sat_views = torch.zeros(B * S, dtype=torch.long, device=device)
+    drone_views = torch.ones(B * D, dtype=torch.long, device=device)
 
     # 拼成一个大 batch，统一送进 StudentModel
-    all_imgs = torch.cat([sat_imgs, drone_imgs], dim=0)        # [B*8, C, H, W]
-    all_labels = torch.cat([sat_labels, drone_labels], dim=0)  # [B*8]
+    all_imgs = torch.cat([sat_imgs, drone_imgs], dim=0)             # [B*S + B*D, C, H, W]
+    all_labels = torch.cat([sat_labels, drone_labels], dim=0)       # [B*S + B*D]
+    all_views = torch.cat([sat_views, drone_views], dim=0)          # [B*S + B*D]
 
     meta = {
         "batch_size_pid": B,
@@ -179,27 +189,34 @@ def unpack_u1652_batch(batch, device):
         "num_drone_views": D,
         "effective_batch": all_imgs.size(0),
         "pids": pids,
+        "views": all_views,
     }
-    return all_imgs, all_labels, meta
+
+    return all_imgs, all_labels, all_views, meta
 
 
 def compute_student_loss(
     feat,
     logits_list,
     labels,
+    views,
     cls_criterion,
+    logit_scale=None,
     metric_criterion=None,
+    triplet_criterion=None,
     cls_weights=(0.3, 0.3, 0.3, 1.0),
     metric_weight=1.0,
+    triplet_weight=0.5,
 ):
     """
     StudentModel(train) -> feat, [z1, z2, z3, z4]
     """
     if len(logits_list) != 4:
-        raise ValueError(f"logits_list 长度应为 4，当前为 {len(logits_list)}")
+        raise ValueError(f"logits_list 长度应为 4, 当前为 {len(logits_list)}")
 
     z1, z2, z3, z4 = logits_list
 
+    # 1. CE 分类损失
     loss_z1 = cls_criterion(z1, labels)
     loss_z2 = cls_criterion(z2, labels)
     loss_z3 = cls_criterion(z3, labels)
@@ -212,11 +229,37 @@ def compute_student_loss(
         + cls_weights[3] * loss_z4
     )
 
+    # 2. 跨域身份级对比学习 InfoNCE
     metric_loss = feat.new_tensor(0.0)
     if metric_criterion is not None:
-        metric_loss = metric_criterion(feat, labels)
+        metric_loss = metric_criterion(feat, labels, views, logit_scale)
 
-    total_loss = cls_loss + metric_weight * metric_loss
+    # 3. 同域三元组损失
+    tri_loss = feat.new_tensor(0.0)
+    loss_tri_q = feat.new_tensor(0.0)
+    loss_tri_g = feat.new_tensor(0.0)
+
+    if triplet_criterion is not None:
+        sat_mask = views == 0
+        drone_mask = views != 0
+
+        drone_feats = feat[drone_mask]
+        drone_labels = labels[drone_mask]
+
+        sat_feats = feat[sat_mask]
+        sat_labels = labels[sat_mask]
+
+        loss_tri_q, loss_tri_g = triplet_criterion(
+            drone_feats,
+            drone_labels,
+            sat_feats,
+            sat_labels,
+        )
+
+        tri_loss = loss_tri_q + loss_tri_g
+
+    # 4. 总损失
+    total_loss = cls_loss + metric_weight * metric_loss + triplet_weight * tri_loss
 
     with torch.no_grad():
         acc = (z4.argmax(dim=1) == labels).float().mean()
@@ -225,6 +268,9 @@ def compute_student_loss(
         "total_loss": total_loss,
         "cls_loss": cls_loss,
         "metric_loss": metric_loss,
+        "tri_loss": tri_loss,
+        "loss_tri_q": loss_tri_q,
+        "loss_tri_g": loss_tri_g,
         "loss_z1": loss_z1,
         "loss_z2": loss_z2,
         "loss_z3": loss_z3,
@@ -257,6 +303,7 @@ def train_one_epoch_student(
     args,
     cls_criterion,
     metric_criterion=None,
+    triplet_criterion=None,
     scaler=None,
 ):
     model.train()
@@ -266,12 +313,14 @@ def train_one_epoch_student(
     total_loss_meter = AverageMeter()
     cls_loss_meter = AverageMeter()
     metric_loss_meter = AverageMeter()
+    tri_loss_meter = AverageMeter()
     acc_meter = AverageMeter()
 
     end = time.time()
 
     cls_weights = getattr(args, "cls_weights", (0.3, 0.3, 0.3, 1.0))
     metric_weight = getattr(args, "metric_weight", 1.0)
+    triplet_weight = getattr(args, "triplet_weight", 0.5)
     print_freq = getattr(args, "print_freq", 20)
     grad_clip = getattr(args, "grad_clip", 0.0)
     use_amp = getattr(args, "amp", True)
@@ -279,7 +328,7 @@ def train_one_epoch_student(
     for step, batch in enumerate(train_loader):
         data_time.update(time.time() - end)
 
-        images, labels, meta = unpack_u1652_batch(batch, device)
+        images, labels, views, meta = unpack_u1652_batch(batch, device)
 
         optimizer.zero_grad(set_to_none=True)
 
@@ -290,10 +339,14 @@ def train_one_epoch_student(
                 feat=feat,
                 logits_list=logits_list,
                 labels=labels,
+                views=views,
                 cls_criterion=cls_criterion,
                 metric_criterion=metric_criterion,
+                triplet_criterion=triplet_criterion,
                 cls_weights=cls_weights,
                 metric_weight=metric_weight,
+                triplet_weight=triplet_weight,
+                logit_scale=model.logit_scale if hasattr(model, 'logit_scale') else None,
             )
             total_loss = loss_dict["total_loss"]
 
@@ -331,6 +384,7 @@ def train_one_epoch_student(
         total_loss_meter.update(loss_dict["total_loss"].item(), bs)
         cls_loss_meter.update(loss_dict["cls_loss"].item(), bs)
         metric_loss_meter.update(loss_dict["metric_loss"].item(), bs)
+        tri_loss_meter.update(loss_dict["tri_loss"].item(), bs)
         acc_meter.update(loss_dict["acc"].item(), bs)
 
         batch_time.update(time.time() - end)
@@ -350,6 +404,7 @@ def train_one_epoch_student(
                 f"total {total_loss_meter.val:.4f} ({total_loss_meter.avg:.4f}) | "
                 f"cls {cls_loss_meter.val:.4f} ({cls_loss_meter.avg:.4f}) | "
                 f"metric {metric_loss_meter.val:.4f} ({metric_loss_meter.avg:.4f}) | "
+                f"tri {tri_loss_meter.val:.4f} ({tri_loss_meter.avg:.4f}) | "
                 f"acc {acc_meter.val:.4f} ({acc_meter.avg:.4f}) | "
                 f"lr_backbone {lr_backbone:.8f} | "
                 f"lr_head {lr_head:.8f}"
@@ -359,6 +414,7 @@ def train_one_epoch_student(
         "total_loss": total_loss_meter.avg,
         "cls_loss": cls_loss_meter.avg,
         "metric_loss": metric_loss_meter.avg,
+        "tri_loss": tri_loss_meter.avg,
         "acc": acc_meter.avg,
     }
 
@@ -373,6 +429,7 @@ def train_student(
     val_fn=None,
     val_loaders=None,
     metric_criterion=None,
+    triplet_criterion=None,
 ):
     os.makedirs(args.output_dir, exist_ok=True)
 
@@ -396,6 +453,7 @@ def train_student(
             args=args,
             cls_criterion=cls_criterion,
             metric_criterion=metric_criterion,
+            triplet_criterion=triplet_criterion,
             scaler=scaler,
         )
 
@@ -472,8 +530,8 @@ if __name__ == "__main__":
         )
         device = torch.device("cuda")
 
-        metric_criterion = SupConLoss(temperature=args.temperature)
-
+        metric_criterion = blocks_InfoNCE(device=device)
+        domainTripletLoss = IntraDomainTripletLoss(margin=0.3).to(device)
         train_student(
             model=model,
             train_loader=train_loader,
@@ -481,19 +539,11 @@ if __name__ == "__main__":
             scheduler=scheduler,
             device=device,
             args=args,
-            val_fn=validate_student_u1652,              # 你后面接自己的验证函数
+            val_fn=validate_student_u1652,
             val_loaders=val_loaders,
             metric_criterion=metric_criterion,
+            triplet_criterion=domainTripletLoss,
         )
-        # train(
-        #     model,
-        #     train_loader,
-        #     args,
-        #     optimizer=optimizer,
-        #     scheduler=scheduler,
-        #     logit_scale=logit_scale,
-        #     val_loaders=val_loaders,
-        # )
     except Exception as e:
         print("\n[Error] Exception occurred during training:")
         traceback.print_exc()

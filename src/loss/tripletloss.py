@@ -12,30 +12,43 @@ class IntraDomainTripletLoss(nn.Module):
         """
         计算单域内部的 Batch Hard Triplet Loss
         """
-        # 1. L2 归一化
         features = F.normalize(features, p=2, dim=1)
 
-        # 2. 计算同域内部的距离矩阵 [N, N]
         dist_mat = 2.0 - 2.0 * torch.matmul(features, features.t())
         dist_mat = torch.sqrt(dist_mat.clamp(min=1e-12))
 
-        # 3. 构造同域掩码 (Mask) [N, N]
-        # mask[i, j] == True 表示 i 和 j 是同一个建筑
-        mask = labels.unsqueeze(1).expand(-1, labels.size(0)) == \
-               labels.unsqueeze(0).expand(labels.size(0), -1)
+        labels = labels.view(-1)
 
-        # 4. 同域困难样本挖掘
-        # 找每个 Anchor 对应的最远正样本 (同一建筑)
-        dist_ap = (dist_mat * mask.float()).max(dim=1)[0]
+        # 同 ID mask
+        is_pos = labels.unsqueeze(1).eq(labels.unsqueeze(0))
 
-        # 找每个 Anchor 对应的最近负样本 (不同建筑)
-        # 将正样本位置的距离加上一个大数后取 min
-        dist_an = (dist_mat + 1e5 * mask.float()).min(dim=1)[0]
+        # 排除自己
+        eye = torch.eye(labels.size(0), device=labels.device, dtype=torch.bool)
+        is_pos = is_pos & ~eye
 
-        # 5. 计算 Margin Ranking Loss
+        # 不同 ID mask
+        is_neg = ~labels.unsqueeze(1).eq(labels.unsqueeze(0))
+
+        # 防止某些 anchor 没有正样本
+        valid_pos = is_pos.any(dim=1)
+        valid_neg = is_neg.any(dim=1)
+        valid = valid_pos & valid_neg
+
+        if valid.sum() == 0:
+            return features.sum() * 0.0
+
+        # hardest positive: 同 ID 中距离最远的
+        dist_ap = dist_mat.masked_fill(~is_pos, -1.0).max(dim=1)[0]
+
+        # hardest negative: 不同 ID 中距离最近的
+        dist_an = dist_mat.masked_fill(~is_neg, 1e5).min(dim=1)[0]
+
+        dist_ap = dist_ap[valid]
+        dist_an = dist_an[valid]
+
         y = torch.ones_like(dist_an)
         loss = self.ranking_loss(dist_an, dist_ap, y)
-        
+
         return loss
 
     def forward(self, q_feats, q_labels, g_feats, g_labels):
