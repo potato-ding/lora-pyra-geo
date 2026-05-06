@@ -36,68 +36,56 @@ class TeacherModel(nn.Module):
     """
     def __init__(self, args):
         super().__init__()
-        self.lora = args.lora
-        self.dora = args.dora
+        self.lora_layers = args.lora
         self.device = args.device
+        self.lora_injector = None
 
-        # 1. DINOv3主干
         self.backbone = DINOv3Backbone(
             repo_dir,
             ckpt_path,
             device=self.device,
-            dtype='bfloat16' # 固定必须使用
+            dtype="bfloat16"
         )
-        # 冻结主干参数
+
         for param in self.backbone.parameters():
             param.requires_grad = False
-        # 2. LoRA注入: lora>0 就启用，数值表示注入层数（从后往前数）。比如 lora=4 就注入最后4层，lora=0 就完全不启用。
-        if self.lora > 0:
-            start_block = 40 - self.lora
-            self.lora_cfg = {
-                'r': 8,
-                'alpha': 16,
-                'dropout': 0.1,
-                'target_names': ("qkv", "proj"),
-                'block_range': (start_block, 40),
-                'task_type': "feature_extraction"
-            }
-            self.lora = LoRAInject(self.backbone.model, **self.lora_cfg)
-            self.lora.inject()
-        else:
-            self.lora = None
-        
-        # 2. DoRA注入: dora>0 就启用，数值表示注入层数（从后往前数）。比如 dora=4 就注入最后4层，dora=0 就完全不启用。
-        if self.dora > 0:
-            start_block = 40 - self.dora
-            self.dora_cfg = {
-                'r': 8,
-                'alpha': 16,
-                'dropout': 0.1,
-                'target_names': ("qkv", "proj"),
-                'block_range': (start_block, 40),
-                'task_type': "feature_extraction"
-            }
-            self.dora = DoRAInject(self.backbone.model, **self.dora_cfg)
-            self.dora.inject()
-        else:
-            self.dora = None
 
         dino_model = self.backbone.model
-        if hasattr(dino_model, 'blocks') and isinstance(dino_model.blocks, nn.ModuleList):
-            # 遍历所有的 Transformer Block，将其替换为【智能】检查点版本
-            for i in range(len(dino_model.blocks)):
-                dino_model.blocks[i] = SmartCheckpointWrapper(dino_model.blocks[i])
-        else:
-            print("⚠️ 警告：未在模型中找到 'blocks' 属性，请检查 DINOv3 源码中 Transformer 列表的变量名。")
-        
-        # 初始化温度系数
+
+        if not hasattr(dino_model, "blocks") or not isinstance(dino_model.blocks, nn.ModuleList):
+            raise AttributeError("未找到 dino_model.blocks，请检查 DINOv3 模型结构。")
+
+        num_blocks = len(dino_model.blocks)
+
+        if self.lora_layers < 0 or self.lora_layers > num_blocks:
+            raise ValueError(f"lora_layers={self.lora_layers} 不合法，模型共有 {num_blocks} 个 block")
+
+        if self.lora_layers > 0:
+            start_block = num_blocks - self.lora_layers
+
+            self.lora_cfg = {
+                "r": 8,
+                "alpha": 16,
+                "dropout": 0.1,
+                "target_names": ("qkv", "proj"),
+                "block_range": (start_block, num_blocks),
+                "task_type": "feature_extraction"
+            }
+
+            self.lora_injector = LoRAInject(dino_model, **self.lora_cfg)
+            self.lora_injector.inject()
+
+        for i in range(num_blocks):
+            dino_model.blocks[i] = SmartCheckpointWrapper(dino_model.blocks[i])
+
         init_value = np.log(1 / 0.07)
         self.logit_scale = nn.Parameter(torch.tensor(init_value, dtype=torch.float32))
 
-        self.target_layers = [7, 15, 23, 39]
+        self.target_layers = [7, 15, 23, num_blocks - 1]
         self.num_ap_layers = 3
 
-        self.gamma_raw = nn.Parameter(torch.tensor(-2.0 , dtype=torch.float32))
+        self.gamma_raw = nn.Parameter(torch.tensor(-2.0, dtype=torch.float32))
+
         reduction_dim = 512
 
         self.feature_adapters = nn.ModuleList([
@@ -106,15 +94,16 @@ class TeacherModel(nn.Module):
                 nn.Linear(4096, reduction_dim, dtype=torch.bfloat16),
                 nn.GELU(),
                 nn.Dropout(p=0.1),
-                nn.Linear(reduction_dim, 4096, dtype=torch.bfloat16)
-            ) for _ in range(3)
+                nn.Linear(reduction_dim, 4096, dtype=torch.bfloat16),
+            )
+            for _ in range(self.num_ap_layers)
         ])
-
-        self.query_norm = nn.LayerNorm(4096, dtype=torch.bfloat16)
 
         for adapter in self.feature_adapters:
             nn.init.zeros_(adapter[4].weight)
             nn.init.zeros_(adapter[4].bias)
+
+        self.query_norm = nn.LayerNorm(4096, dtype=torch.bfloat16)
 
         self.cross_attn = nn.MultiheadAttention(
             embed_dim=4096,
@@ -125,53 +114,58 @@ class TeacherModel(nn.Module):
     def forward(self, x):
         with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.FLASH_ATTENTION):
             features = self.backbone.model.get_intermediate_layers(
-                x, n=self.target_layers, return_class_token=True
+                x,
+                n=self.target_layers,
+                return_class_token=True
             )
 
+        # 最后一层 class token 作为主特征
         main_cls = features[-1][1]                      # [B, 4096]
         main_cls_detached = main_cls.detach()
 
-        # 1. 前3层浅/中层特征 -> adapter 对齐
+        # 前 3 层 class token 作为辅助特征
         adapted_list = []
         for i in range(self.num_ap_layers):
             raw_feat = features[i][1]                   # [B, 4096]
             aligned_feat = self.feature_adapters[i](raw_feat)
             adapted_list.append(aligned_feat)
 
-        # 2. 构造 cross-attn 的 K/V
-        kv_features = torch.stack(adapted_list, dim=1) # [B, 3, 4096]
+        # 构造 cross-attention 的 K/V
+        kv_features = torch.stack(adapted_list, dim=1)  # [B, 3, 4096]
 
-        # 3. 用深层主特征做 Query
-        query = self.query_norm(main_cls_detached).unsqueeze(1)   # [B, 1, 4096]
+        # 深层主特征作为 Query
+        query = self.query_norm(main_cls_detached).unsqueeze(1)  # [B, 1, 4096]
 
-        # 4. 交叉注意力融合浅层
+        # cross attention
         attn_output, _ = self.cross_attn(
             query=query,
             key=kv_features,
             value=kv_features
         )
 
-        attended_features = attn_output.squeeze(1)     # [B, 4096]
+        attended_features = attn_output.squeeze(1)      # [B, 4096]
 
-        # 5. 幅值对齐
-        main_norm_val = main_cls.norm(dim=-1, keepdim=True).detach()
-        attended_features_aligned = F.normalize(attended_features, p=2, dim=-1) * main_norm_val.mean()
+        # 逐样本幅值对齐
+        main_norm_val = main_cls.norm(dim=-1, keepdim=True).detach().float()
+        attended_features_aligned = F.normalize(
+            attended_features.float(), p=2, dim=-1
+        ) * main_norm_val
 
-        # 6. 控制融合强度
-        actual_gamma = torch.clamp(torch.relu(self.gamma_raw), min=0.0, max=0.3)
+        # 融合强度，不能用 relu + clamp
+        actual_gamma = 0.3 * torch.sigmoid(self.gamma_raw)
 
-        # 7. 最终融合
-        feats = main_cls_detached + actual_gamma * attended_features_aligned
+        # 最终融合
+        feats = main_cls_detached.float() + actual_gamma * attended_features_aligned
+        feats = F.normalize(feats, p=2, dim=-1)
 
-        with torch.amp.autocast(device_type='cuda', enabled=False):
-            feats = feats.float()
-            feats = F.normalize(feats, p=2, dim=-1)
+        # 主特征输出
+        norm_main_cls = F.normalize(main_cls.float(), p=2, dim=-1)
 
-            norm_main_cls = main_cls.float()
-            norm_main_cls = F.normalize(norm_main_cls, p=2, dim=-1)
+        # attended 分支输出也归一化
+        norm_attended_features = F.normalize(attended_features.float(), p=2, dim=-1)
 
         if self.training:
-            return norm_main_cls, feats, attended_features
+            return norm_main_cls, feats, norm_attended_features
         else:
             return feats
 
