@@ -140,7 +140,8 @@ class TeacherModel(nn.Module):
         attn_output, _ = self.cross_attn(
             query=query,
             key=kv_features,
-            value=kv_features
+            value=kv_features,
+            need_weights=False
         )
 
         attended_features = attn_output.squeeze(1)      # [B, 4096]
@@ -155,7 +156,8 @@ class TeacherModel(nn.Module):
         actual_gamma = 0.3 * torch.sigmoid(self.gamma_raw)
 
         # 最终融合
-        feats = main_cls_detached.float() + actual_gamma * attended_features_aligned
+        # feats = main_cls_detached.float() + actual_gamma * attended_features_aligned
+        feats = main_cls.float() + actual_gamma * attended_features_aligned
         feats = F.normalize(feats, p=2, dim=-1)
 
         # 主特征输出
