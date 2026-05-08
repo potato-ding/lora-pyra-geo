@@ -13,7 +13,7 @@ import gc
 from src.utils.initdist import try_init_dist
 from src.utils.train_eval_utils import run_val_and_get_recall
 from src.models.teacher_model import EvalTeacherModel
-from src.data.val_dataloaders import build_val_dataloaders, build_sues200_val_dataloaders, build_gta_val_dataloaders
+from src.dataset.val_dataloaders import build_val_dataloaders, build_sues200_val_dataloaders, build_gta_val_dataloaders
 if 'OMP_NUM_THREADS' not in os.environ:
     os.environ['OMP_NUM_THREADS'] = '4'
 from src.utils.load_finetuned_weigts import load_finetuned_weights

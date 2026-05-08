@@ -10,7 +10,7 @@ import torch.nn.functional as F
 import math
 import torch.distributed as dist
 import argparse
-from src.data.datasets import create_student_train_dataset_and_loader
+from src.dataset.datasets import create_student_train_dataset_and_loader
 from src.loss.tripletloss import IntraDomainTripletLoss
 from src.utils.initdist import try_init_dist
 from src.utils.gather_features_and_labels_and_views import gather_features_and_labels_and_views 
@@ -18,7 +18,7 @@ from src.utils.train_eval_utils import run_val_and_get_recall
 from src.models.student_model import StudentModel
 from src.utils.scheduler import build_student_scheduler
 from src.utils.optimizer_and_scale import build_student_optimizer
-from src.data.val_dataloaders import build_student_val_dataloaders
+from src.dataset.val_dataloaders import build_student_val_dataloaders
 from src.loss.blocks_infoNCE import SupConLoss
 from src.utils.save_path import get_student_save_pth
 if 'OMP_NUM_THREADS' not in os.environ:

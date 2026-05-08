@@ -19,7 +19,7 @@ from torch import optim
 import numpy as np
 import gc
 import json
-from src.data.datasets import create_1652_train_dataset
+from src.dataset.datasets import create_1652_train_dataset
 from src.loss.tripletloss import IntraDomainTripletLoss
 from src.loss.blocks_infoNCE import blocks_InfoNCE
 from src.utils.initdist import try_init_dist
@@ -29,7 +29,7 @@ from src.models.teacher_model import TeacherModel
 from src.utils.scheduler import get_scheduler
 from torch.optim.lr_scheduler import LambdaLR
 from src.utils.optimizer_and_scale import build_optimizer_and_scale
-from src.data.val_dataloaders import build_1652_val_dataloaders
+from src.dataset.val_dataloaders import build_1652_val_dataloaders
 from src.utils.save_path import get_save_pth
 if 'OMP_NUM_THREADS' not in os.environ:
     os.environ['OMP_NUM_THREADS'] = '4'

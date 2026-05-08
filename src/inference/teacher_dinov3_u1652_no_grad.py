@@ -11,7 +11,7 @@ from torch.utils.data.distributed import DistributedSampler
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from src.data.university652 import U1652DatasetEval, get_transforms
+from src.dataset.university652 import U1652DatasetEval, get_transforms
 
 def build_eval_dataloaders(
     data_root: Path,
