@@ -28,7 +28,7 @@ __pycache__/
 outputs/
 checkpoint/
 
-src/models/dinov3/
+src/models/dinov3_main/
 src/models/repvit/
 src/checkpoint/
 Miniconda3-latest-Linux-x86_64.sh
