@@ -11,7 +11,7 @@ import torch
 import torch.distributed as dist
 from torch.utils.data import Dataset, DataLoader
 
-def build_1652_val_dataloaders(data_dir="data/university_1652", img_size=[224, 224], batch_size=32, num_workers=8):
+def build_1652_val_dataloaders(data_dir="data/U1652", img_size=[224, 224], batch_size=32, num_workers=8):
     val_transform = get_test_transforms(img_size=img_size)
 
     # ==================== 任务 1: D2S (无人机找卫星) ====================

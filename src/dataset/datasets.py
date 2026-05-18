@@ -106,11 +106,11 @@ def create_1652_train_dataset(args):
     )
     # 1. 创建训练数据dataset
     train_dataset = U1652Dataset(
-        data_dir='data/university_1652/train',
+        data_dir=os.path.join(args.data_dir, "train"),
         val_transforms=val_tf,
         sat_transforms=train_sat_tf,
         drone_transforms=train_drone_tf,
-        num_drones=4
+        num_drones=args.num_drones
     )
     # 判断是否为分布式
     is_distributed = dist.is_available() and dist.is_initialized()
@@ -132,7 +132,7 @@ def create_1652_train_dataset(args):
         batch_size=args.batch_size,
         sampler=train_sampler,
         shuffle=shuffle,
-        num_workers=8,
+        num_workers=args.num_workers,
         pin_memory=True,
         drop_last=True
     )
@@ -167,7 +167,7 @@ def create_student_train_dataset_and_loader(args):
 
     # 2. 创建训练数据集 (保持不变)
     train_dataset = U1652Dataset(
-        data_dir='data/university_1652/train',
+        data_dir='data/U1652/train',
         val_transforms=val_tf,
         sat_transforms=train_sat_tf,
         drone_transforms=train_drone_tf,
