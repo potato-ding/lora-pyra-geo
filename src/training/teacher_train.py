@@ -275,6 +275,9 @@ if __name__ == "__main__":
 
     parser.add_argument('--batch_size', type=int, default=2, help='每个 GPU 的 batch size')
     parser.add_argument('--img_size', type=int, default=224, help='输入图像的尺寸')
+    parser.add_argument('--data_dir', type=str, default='data/U1652', help='数据集路径')
+    parser.add_argument('--num_drones', type=int, default=4, help='抽取的无人机图像数量')
+    parser.add_argument('--num_workers', type=int, default=4, help='数据加载器的工作进程数')
     parser.add_argument('--lora', type=int, help='启用LoRA模块后层数', default=0)
     parser.add_argument('--triplet_weight', type=float, help='三元组损失权重', default=2)
     parser.add_argument('--use_contrastive', action='store_true', help='是否启用对比学习', default=False)
@@ -285,7 +288,11 @@ if __name__ == "__main__":
         # 构建训练集
         train_dataset, train_sampler, train_loader = create_1652_train_dataset(args)
         # 构建测试集
-        val_loaders = build_1652_val_dataloaders(img_size=[args.img_size, args.img_size])
+        val_loaders = build_1652_val_dataloaders(
+            data_dir=args.data_dir,
+            img_size=[args.img_size, args.img_size],
+            num_workers=args.num_workers
+        )
         # 构建模型
         model = TeacherModel(args)
         model = model.to(device)

@@ -28,7 +28,9 @@ class DINOv3Backbone(nn.Module):
 			
 		# 把定义模型的函数导进来
 		from dinov3_main.dinov3.hub.backbones import dinov3_vit7b16
-		model = dinov3_vit7b16(pretrained=True)
+		# 使用 pretrained=False，从本地权重加载
+		model = dinov3_vit7b16(pretrained=False)
+		print(f"Loading checkpoint from: {self.ckpt_path}")
 		checkpoint = torch.load(self.ckpt_path, map_location='cpu')
 		# 扒出真正的权重字典
 		if 'model' in checkpoint:

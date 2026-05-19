@@ -1,5 +1,11 @@
-from deepspeed.ops.adam import DeepSpeedCPUAdam
 import torch
+from torch.optim import AdamW
+try:
+    from deepspeed.ops.adam import DeepSpeedCPUAdam
+    HAS_DEEPSPEED_ADAM = True
+except ImportError:
+    HAS_DEEPSPEED_ADAM = False
+
 def build_optimizer_and_scale(model, args):
     """
     构建带有差分学习率的优化器，并初始化可学习的对比损失温度系数 (logit_scale)。
@@ -25,7 +31,14 @@ def build_optimizer_and_scale(model, args):
             lora_no_weight_decay.append(param)
         elif "ap_gates" in name or "global_ap_scale" in name or "gamma" in name:
             mix_params.append(param)
-        elif "feature_adapter" in name or "cross_attn" in name or "query_norm" in name:
+        elif (
+            "feature_adapter" in name
+            or "patch_projector" in name
+            or "cross_attn" in name
+            or "query_norm" in name
+            or "query_projector" in name
+            or "local_out_projector" in name
+        ):
             classifier_params.append(param)
         else:
             print(f"警告：参数 {name} 没有被正确分类，默认放入其他参数组，建议检查命名是否符合预期！")
@@ -76,16 +89,33 @@ def build_optimizer_and_scale(model, args):
             "weight_decay": 0.01
         })
 
+    logit_scale_lr_mult = getattr(args, "logit_scale_lr_mult", 1.0)
+    logit_scale_lr = args.lr * logit_scale_lr_mult
+
     optimizer_grouped_parameters.append({
         "params": [logit_scale],
-        "lr": args.lr,
+        "lr": logit_scale_lr,
         "weight_decay": 0.0 
     })
     
     
-    # 去掉外层的全局 weight_decay 参数
-    optimizer = DeepSpeedCPUAdam(optimizer_grouped_parameters)
+    # 去掉外层的全局 weight_decay 参数，改用 DeepSpeedCPUAdam（如果可用）或标准 AdamW
+    if HAS_DEEPSPEED_ADAM:
+        optimizer = DeepSpeedCPUAdam(
+            optimizer_grouped_parameters,
+            betas=(0.9, 0.999),
+            eps=1e-8
+        )
+        print("使用 DeepSpeedCPUAdam 优化器（用于 ZeRO-Offload）")
+    else:
+        optimizer = AdamW(
+            optimizer_grouped_parameters,
+            betas=(0.9, 0.999),
+            eps=1e-8
+        )
+        print("使用标准 AdamW 优化器")
     
+    print(f"logit_scale lr: {logit_scale_lr:.6g} (mult={logit_scale_lr_mult:g})")
     print("优化器实例化成功！")
     
     return optimizer
@@ -139,7 +169,8 @@ def build_student_optimizer(
             else:
                 head_decay.append(param)
 
-    optimizer = torch.optim.AdamW(
+    optimizer_class = DeepSpeedCPUAdam if HAS_DEEPSPEED_ADAM else torch.optim.AdamW
+    optimizer = optimizer_class(
         [
             {
                 "params": backbone_decay,
@@ -169,5 +200,6 @@ def build_student_optimizer(
     print("[Optimizer] backbone_no_decay params:", len(backbone_no_decay))
     print("[Optimizer] head_decay params       :", len(head_decay))
     print("[Optimizer] head_no_decay params    :", len(head_no_decay))
+    print(f"[Optimizer] 使用优化器: {optimizer_class.__name__}")
 
     return optimizer
