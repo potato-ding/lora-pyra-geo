@@ -7,7 +7,8 @@ def get_save_pth(args):
         (f'_lora{args.lora}' if (args.lora > 0) else '') +
         ('_contrastive' if args.use_contrastive else '') +
         ('_triplet' if args.use_triplet else '') +
-        (f'_{args.triplet_weight}w')
+        (f'_{args.triplet_weight}w') +
+        (f'_cross{args.cross_triplet_weight}w' if args.use_triplet and getattr(args, 'cross_triplet_weight', 0) > 0 else '')
     )
     return save_dir
 

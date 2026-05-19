@@ -21,6 +21,7 @@ import gc
 import json
 from src.dataset.datasets import create_1652_train_dataset
 from src.loss.tripletloss import IntraDomainTripletLoss
+from src.loss.tripletloss import CrossDomainTripletLoss
 from src.loss.blocks_infoNCE import blocks_InfoNCE
 from src.utils.initdist import try_init_dist
 from src.utils.gather_features_and_labels_and_views import gather_features_and_labels_and_views 
@@ -80,6 +81,7 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
 
     # 定义损失函数
     triplet_criterion = IntraDomainTripletLoss() if args.use_triplet else None
+    cross_triplet_criterion = CrossDomainTripletLoss() if args.use_triplet else None
     contrastive_criterion = blocks_InfoNCE(loss_function=torch.nn.CrossEntropyLoss(), device=args.device) if args.use_contrastive else None
     # 4. deepspeed 初始化
     model_engine, optimizer, _, scheduler = deepspeed.initialize(
@@ -126,6 +128,7 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
             all_atten_feats, _, _ = gather_features_and_labels_and_views(attended_features, labels, views)
             loss = 0
             tri_loss_val = None
+            cross_tri_loss_val = None
             if args.use_triplet and triplet_criterion is not None:
                 sat_mask = (all_views == 0)
                 drone_mask = (all_views == 1)
@@ -146,7 +149,20 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                 tri_q_fused, tri_g_fused = triplet_criterion(drone_fused, drone_fused_labels, sat_fused, sat_fused_labels)  # 融合浅层的深层特征
                 tri_q_atten, tri_g_atten = triplet_criterion(drone_atten, drone_labels, sat_atten, sat_labels) # 纯浅层特征
 
-                total_tri_loss = (tri_q_fused + tri_g_fused) * 2 + (tri_q_atten + tri_g_atten) * 0.5
+                intra_tri_loss = (tri_q_fused + tri_g_fused) * 2 + (tri_q_atten + tri_g_atten) * 0.5
+                total_tri_loss = intra_tri_loss
+
+                cross_triplet_weight = getattr(args, "cross_triplet_weight", 0.5)
+                if cross_triplet_criterion is not None and cross_triplet_weight > 0:
+                    cross_q_fused, cross_g_fused = cross_triplet_criterion(
+                        drone_fused,
+                        drone_fused_labels,
+                        sat_fused,
+                        sat_fused_labels
+                    )
+                    cross_tri_loss = (cross_q_fused + cross_g_fused) * cross_triplet_weight
+                    total_tri_loss = total_tri_loss + cross_tri_loss
+                    cross_tri_loss_val = cross_tri_loss.item()
                 
                 loss += total_tri_loss
                 tri_loss_val = total_tri_loss.item()
@@ -181,6 +197,9 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
 
                     if args.use_triplet and tri_loss_val is not None:
                         log_str += f"tri={tri_loss_val:.4f} | "
+
+                    if args.use_triplet and cross_tri_loss_val is not None:
+                        log_str += f"cross_tri={cross_tri_loss_val:.4f} | "
 
                     if args.use_contrastive and con_loss_val is not None:
                         log_str += f"con={con_loss_val:.4f} | "
@@ -280,6 +299,7 @@ if __name__ == "__main__":
     parser.add_argument('--num_workers', type=int, default=4, help='数据加载器的工作进程数')
     parser.add_argument('--lora', type=int, help='启用LoRA模块后层数', default=0)
     parser.add_argument('--triplet_weight', type=float, help='三元组损失权重', default=2)
+    parser.add_argument('--cross_triplet_weight', type=float, help='跨域三元组损失权重，设为0可关闭', default=0.5)
     parser.add_argument('--use_contrastive', action='store_true', help='是否启用对比学习', default=False)
     parser.add_argument('--use_triplet', action='store_true', help='是否启用三元组损失', default=False)
     args = parser.parse_args()
