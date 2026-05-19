@@ -292,7 +292,7 @@ if __name__ == "__main__":
 
     parser.add_argument('--local_rank', type=int, default=0, help='local rank for distributed training')
 
-    parser.add_argument('--batch_size', type=int, default=2, help='每个 GPU 的 batch size')
+    parser.add_argument('--batch_size', type=int, default=4, help='每个 GPU 的 batch size')
     parser.add_argument('--img_size', type=int, default=224, help='输入图像的尺寸')
     parser.add_argument('--data_dir', type=str, default='data/U1652', help='数据集路径')
     parser.add_argument('--num_drones', type=int, default=4, help='抽取的无人机图像数量')
