@@ -97,13 +97,15 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
 
     best_r1 = 0.0
     for epoch in range(1, args.epochs + 1):
+        if hasattr(dataloader, 'dataset') and hasattr(dataloader.dataset, 'set_epoch'):
+            dataloader.dataset.set_epoch(epoch)
         if dist.is_initialized() and hasattr(dataloader, 'sampler') and hasattr(dataloader.sampler, 'set_epoch'):
             dataloader.sampler.set_epoch(epoch)
         model_engine.train()
         ema = LiteEMA(model_engine.module if hasattr(model_engine, 'module') else model_engine)
         total_loss = 0.0
         for batch_idx, (sat_tensors, drone_tensors, labels, pids) in enumerate(dataloader):
-            # 1. 展平并拼接，制造真正的 imgs [16, 3, ]
+            # 1. 展平并拼接：[B, 4, C, H, W] -> [B * 8, C, H, W]
             sat_imgs = sat_tensors.view(-1, 3, args.img_size, args.img_size)
             drone_imgs = drone_tensors.view(-1, 3, args.img_size, args.img_size)
             imgs = torch.cat([sat_imgs, drone_imgs], dim=0).to(amp_device).to(torch.bfloat16)
@@ -292,10 +294,12 @@ if __name__ == "__main__":
 
     parser.add_argument('--local_rank', type=int, default=0, help='local rank for distributed training')
 
-    parser.add_argument('--batch_size', type=int, default=2, help='每个 GPU 的 batch size')
+    parser.add_argument('--batch_size', type=int, default=4, help='每个 GPU 的 batch size')
     parser.add_argument('--img_size', type=int, default=224, help='输入图像的尺寸')
     parser.add_argument('--data_dir', type=str, default='data/U1652', help='数据集路径')
     parser.add_argument('--num_drones', type=int, default=4, help='抽取的无人机图像数量')
+    parser.add_argument('--sampling_mode', type=str, default='coverage', choices=['random', 'coverage'], help='训练采样模式')
+    parser.add_argument('--coverage_seed', type=int, default=0, help='coverage sampling 的基础随机种子')
     parser.add_argument('--num_workers', type=int, default=4, help='数据加载器的工作进程数')
     parser.add_argument('--lora', type=int, help='启用LoRA模块后层数', default=0)
     parser.add_argument('--triplet_weight', type=float, help='三元组损失权重', default=2)

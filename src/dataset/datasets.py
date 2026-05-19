@@ -1,5 +1,7 @@
 import os
 import random
+import math
+import hashlib
 import cv2
 import torch
 from torch.utils.data import Dataset
@@ -11,21 +13,42 @@ from torch.utils.data import DataLoader
 class U1652Dataset(Dataset):
     """
     基于建筑 ID (PID) 主导的 Dataset。
-    每次 __getitem__ 直接返回该 PID 对应的 4 张卫星图 (1原+3增) 和 4 张无人机图。
+    random 模式：每次 __getitem__ 直接返回该 PID 对应的 4 张卫星图 (1原+3增) 和随机 4 张无人机图。
+    coverage 模式：一个 epoch 内把每个 PID 的无人机图按 num_drones 分组走完一遍。
     """
-    def __init__(self, data_dir, val_transforms=None, sat_transforms=None, drone_transforms=None, num_drones=4):
+    def __init__(
+        self,
+        data_dir,
+        val_transforms=None,
+        sat_transforms=None,
+        drone_transforms=None,
+        num_drones=4,
+        sampling_mode="random",
+        seed=0,
+    ):
         self.data_dir = data_dir
         self.val_transforms = val_transforms
         self.sat_transforms = sat_transforms
         self.drone_transforms = drone_transforms
         self.num_drones = num_drones  # 默认抽 4 张无人机
+        self.sampling_mode = sampling_mode
+        self.seed = seed
+        self.epoch = 0
+
+        if self.num_drones <= 0:
+            raise ValueError("num_drones 必须大于 0")
+        if self.sampling_mode not in {"random", "coverage"}:
+            raise ValueError(f"不支持的 sampling_mode: {self.sampling_mode}")
         
         # 核心数据结构：以建筑 PID 为键，存储它所有的图片路径
         # { '0001': {'sat': ['path...'], 'drone': ['path1', 'path2...'], 'label': 0}, ... }
         self.data_dict = {}
         self.pids = []
+        self.coverage_samples = []
         
         self._parse_dataset()
+        if self.sampling_mode == "coverage":
+            self._build_coverage_samples()
 
     def _parse_dataset(self):
         views = ['satellite', 'drone']
@@ -49,17 +72,61 @@ class U1652Dataset(Dataset):
                     current_idx += 1
                 
                 # 记录图片路径
-                for img_name in os.listdir(b_dir):
+                for img_name in sorted(os.listdir(b_dir)):
                     if img_name.lower().endswith(('.jpg', '.jpeg', '.png')):
                         img_path = os.path.join(b_dir, img_name)
                         self.data_dict[b_id][view].append(img_path)
-                        
+
+    def _build_coverage_samples(self):
+        """
+        将每个 PID 展开成若干个 chunk。
+        例如每个 PID 有 54 张 drone，num_drones=4，则该 PID 会生成 14 个样本：
+        前 13 个 chunk 各 4 张，最后 1 个 chunk 为剩余 2 张 + 2 张补齐图。
+        """
+        self.coverage_samples = []
+        for pid in self.pids:
+            drone_paths = self.data_dict[pid]['drone']
+            if len(drone_paths) == 0:
+                raise RuntimeError(f"PID {pid} 没有无人机图片，无法进行训练")
+
+            num_chunks = math.ceil(len(drone_paths) / self.num_drones)
+            for chunk_idx in range(num_chunks):
+                self.coverage_samples.append((pid, chunk_idx))
+
+    def _stable_pid_offset(self, pid):
+        digest = hashlib.md5(str(pid).encode("utf-8")).hexdigest()
+        return int(digest[:8], 16)
+
+    def _get_coverage_drones(self, pid, drone_paths, chunk_idx):
+        rng = random.Random(self.seed + self.epoch * 1000003 + self._stable_pid_offset(pid))
+        shuffled_paths = list(drone_paths)
+        rng.shuffle(shuffled_paths)
+
+        start = chunk_idx * self.num_drones
+        selected_drones = shuffled_paths[start:start + self.num_drones]
+
+        if len(selected_drones) < self.num_drones:
+            selected_drones.extend(
+                rng.choices(shuffled_paths, k=self.num_drones - len(selected_drones))
+            )
+
+        return selected_drones
+
+    def set_epoch(self, epoch):
+        self.epoch = epoch
 
     def __len__(self):
+        if self.sampling_mode == "coverage":
+            return len(self.coverage_samples)
         return len(self.pids)
 
     def __getitem__(self, idx):
-        pid = self.pids[idx]
+        if self.sampling_mode == "coverage":
+            pid, chunk_idx = self.coverage_samples[idx]
+        else:
+            pid = self.pids[idx]
+            chunk_idx = None
+
         data = self.data_dict[pid]
         label = data['label']
         
@@ -67,11 +134,14 @@ class U1652Dataset(Dataset):
         sat_path = data['satellite'][0] # University-1652 每个建筑只有1张卫星图
         drone_paths = data['drone']
         
-        # 随机抽取 4 张无人机图 (如果不够4张就允许重复抽)
-        if len(drone_paths) >= self.num_drones:
-            selected_drones = random.sample(drone_paths, self.num_drones)
+        if self.sampling_mode == "coverage":
+            selected_drones = self._get_coverage_drones(pid, drone_paths, chunk_idx)
         else:
-            selected_drones = random.choices(drone_paths, k=self.num_drones)
+            # 随机抽取 4 张无人机图 (如果不够4张就允许重复抽)
+            if len(drone_paths) >= self.num_drones:
+                selected_drones = random.sample(drone_paths, self.num_drones)
+            else:
+                selected_drones = random.choices(drone_paths, k=self.num_drones)
 
         # 处理卫星图 (1原 + 3增)
         img_sat = cv2.cvtColor(cv2.imread(sat_path), cv2.COLOR_BGR2RGB)
@@ -110,7 +180,9 @@ def create_1652_train_dataset(args):
         val_transforms=val_tf,
         sat_transforms=train_sat_tf,
         drone_transforms=train_drone_tf,
-        num_drones=args.num_drones
+        num_drones=args.num_drones,
+        sampling_mode=getattr(args, "sampling_mode", "random"),
+        seed=getattr(args, "coverage_seed", 0),
     )
     # 判断是否为分布式
     is_distributed = dist.is_available() and dist.is_initialized()
@@ -134,7 +206,7 @@ def create_1652_train_dataset(args):
         shuffle=shuffle,
         num_workers=args.num_workers,
         pin_memory=True,
-        drop_last=True
+        drop_last=train_dataset.sampling_mode != "coverage"
     )
     # 2. 实例化采样器 (针对 4张卡，单卡 batch=1)
     # if dist.is_initialized():
