@@ -6,16 +6,19 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../.
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../../models')))
 os.environ["NO_ALBUMENTATIONS_UPDATE"] = "1"
 from pathlib import Path
+import cv2
+import time
 import torch
 import math
 import torch.distributed as dist
 from torchvision.datasets import ImageFolder
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 from torchvision import transforms
 import deepspeed
 import argparse
 from torch import optim
+import torch.nn.functional as F
 import numpy as np
 import gc
 import json
@@ -44,22 +47,25 @@ class LiteEMA:
         # 初始化：只拷贝【有梯度】的参数（LoRA和门控），彻底放过 7B 主干！
         for name, param in model.named_parameters():
             if param.requires_grad:
-                self.shadow[name] = param.data.clone().detach()
+                self.shadow[name] = param.detach().float().clone()
 
+    @torch.no_grad()
     def update(self, model):
         # 每次 Batch 后更新：只算有梯度的参数
         for name, param in model.named_parameters():
             if param.requires_grad:
                 # EMA 公式: shadow = decay * shadow + (1 - decay) * param
-                self.shadow[name] -= (1.0 - self.decay) * (self.shadow[name] - param.data)
+                self.shadow[name].mul_(self.decay).add_(param.detach().float(), alpha=1.0 - self.decay)
 
+    @torch.no_grad()
     def apply_shadow(self, model):
-        # 考试前：把原模型对应的参数备份，然后把影子权重覆盖上去
+        # 把原模型对应的参数备份，然后把影子权重覆盖上去
         for name, param in model.named_parameters():
             if param.requires_grad:
                 self.backup[name] = param.data.clone().detach()
-                param.data.copy_(self.shadow[name])
+                param.data.copy_(self.shadow[name].to(dtype=param.dtype))
 
+    @torch.no_grad()
     def restore(self, model):
         # 考试后：把原模型的权重还给它，准备继续训练
         for name, param in model.named_parameters():
@@ -74,15 +80,320 @@ def get_logit_scale(model_or_engine):
     logit_scale = getattr(base_model, "logit_scale", None)
     assert logit_scale is not None, "模型中没有找到 logit_scale"
     return logit_scale
+
+
+def is_main_process():
+    return not dist.is_available() or not dist.is_initialized() or dist.get_rank() == 0
+
+
+def get_current_lr(optimizer, scheduler=None):
+    if scheduler is not None and hasattr(scheduler, "get_last_lr"):
+        try:
+            lrs = scheduler.get_last_lr()
+            if lrs:
+                return lrs[0]
+        except Exception:
+            pass
+    if optimizer is not None and hasattr(optimizer, "param_groups") and optimizer.param_groups:
+        return optimizer.param_groups[0].get("lr", 0.0)
+    return 0.0
+
+
+def get_training_mode_desc(dataset, args):
+    mode = getattr(dataset, "sampling_mode", "unknown")
+    if mode == "coverage":
+        num_pids = len(getattr(dataset, "pids", []))
+        num_chunks = 0
+        if num_pids > 0:
+            num_chunks = len(getattr(dataset, "coverage_samples", [])) // num_pids
+        return mode, f"{num_chunks} chunks/id, {args.num_drones} drone/chunk"
+    if mode == "hard_mix":
+        random_samples = args.num_drones - args.hard_samples
+        return mode, f"{args.hard_samples} hard + {random_samples} random, topK={args.hard_pool_topk}"
+    if mode == "random":
+        return mode, f"{args.num_drones} random drone/id"
+    return mode, "custom sampling"
+
+
+def get_model_debug_values(model_or_engine):
+    base_model = get_base_model(model_or_engine)
+    values = {}
+    with torch.no_grad():
+        if hasattr(base_model, "logit_scale"):
+            values["scale"] = base_model.logit_scale.exp().item()
+        if hasattr(base_model, "gamma_raw"):
+            gamma_scale = getattr(base_model, "local_gamma_scale", 1.0)
+            values["gamma"] = (gamma_scale * torch.sigmoid(base_model.gamma_raw)).item()
+    return values
+
+
+def format_optional_metric(name, value):
+    return f"{name}={value:.4f}" if value is not None else None
+
+
+def get_loss_weight_desc(args):
+    return (
+        f"tri={args.triplet_weight:g}"
+        f"(fused={args.triplet_fused_weight:g},local={args.triplet_local_weight:g},deep={args.triplet_deep_weight:g}) | "
+        f"cross_tri={args.cross_triplet_weight:g} | "
+        f"con={args.contrastive_weight:g}"
+        f"(fused={args.contrastive_fused_weight:g},deep={args.contrastive_deep_weight:g})"
+    )
+
+
+def validate_loss_weights(args):
+    weight_names = [
+        "triplet_weight",
+        "triplet_fused_weight",
+        "triplet_local_weight",
+        "triplet_deep_weight",
+        "cross_triplet_weight",
+        "contrastive_weight",
+        "contrastive_fused_weight",
+        "contrastive_deep_weight",
+    ]
+    for name in weight_names:
+        if getattr(args, name) < 0:
+            raise ValueError(f"{name} 不能为负数")
+
+    intra_triplet_enabled = (
+        args.triplet_weight > 0
+        and (
+            args.triplet_fused_weight > 0
+            or args.triplet_local_weight > 0
+            or args.triplet_deep_weight > 0
+        )
+    )
+    contrastive_enabled = (
+        args.contrastive_weight > 0
+        and (
+            args.contrastive_fused_weight > 0
+            or args.contrastive_deep_weight > 0
+        )
+    )
+
+    if not intra_triplet_enabled and args.cross_triplet_weight == 0 and not contrastive_enabled:
+        raise ValueError("所有 loss 大类权重都为 0，训练不会产生有效梯度")
+
+
+def validate_scheduler_args(args):
+    if args.warmup_ratio < 0 or args.warmup_ratio >= 1:
+        raise ValueError("warmup_ratio 必须在 [0, 1) 范围内")
+    if args.hard_eval_interval < 0:
+        raise ValueError("hard_eval_interval 不能为负数")
+
+
+def should_run_validation(cur_epoch, args):
+    if cur_epoch <= args.coverage_epochs:
+        return True
+    if cur_epoch == args.epochs:
+        return True
+
+    hard_mix_epoch = cur_epoch - args.coverage_epochs
+    if hard_mix_epoch == 1:
+        return True
+
+    return (
+        args.hard_eval_interval > 0
+        and (hard_mix_epoch - 1) % args.hard_eval_interval == 0
+    )
+
+
+def build_scheduler_plan(train_loader, train_sampler, args, grad_accum_steps):
+    if hasattr(train_sampler, "num_batches_for_mode") and args.sampling_mode == "coverage":
+        coverage_epochs = min(args.coverage_epochs, args.epochs)
+        hard_mix_epochs = max(args.epochs - coverage_epochs, 0)
+        coverage_batches_per_epoch = train_sampler.num_batches_for_mode("coverage")
+        hard_mix_batches_per_epoch = train_sampler.num_batches_for_mode("hard_mix")
+        total_train_batches = (
+            coverage_epochs * coverage_batches_per_epoch
+            + hard_mix_epochs * hard_mix_batches_per_epoch
+        )
+        mode_desc = (
+            f"coverage_epochs={coverage_epochs}, hard_mix_epochs={hard_mix_epochs}, "
+            f"coverage_batches/epoch={coverage_batches_per_epoch}, "
+            f"hard_mix_batches/epoch={hard_mix_batches_per_epoch}"
+        )
+    else:
+        coverage_epochs = 0
+        hard_mix_epochs = 0
+        total_train_batches = len(train_loader) * args.epochs
+        mode_desc = f"standard_epochs={args.epochs}, batches/epoch={len(train_loader)}"
+
+    total_train_steps = math.ceil(total_train_batches / grad_accum_steps)
+    warmup_steps = int(total_train_steps * args.warmup_ratio)
+
+    return {
+        "coverage_epochs": coverage_epochs,
+        "hard_mix_epochs": hard_mix_epochs,
+        "total_train_batches": total_train_batches,
+        "total_train_steps": total_train_steps,
+        "warmup_steps": warmup_steps,
+        "mode_desc": mode_desc,
+    }
+
+
+def print_scheduler_plan(plan, args, grad_accum_steps):
+    if is_main_process():
+        print(
+            f"[SchedulerPlan] scheduler={args.scheduler} | {plan['mode_desc']} | "
+            f"grad_accum_steps={grad_accum_steps} | "
+            f"total_batches={plan['total_train_batches']} | "
+            f"total_optimizer_steps={plan['total_train_steps']} | "
+            f"warmup_ratio={args.warmup_ratio:g} | warmup_steps={plan['warmup_steps']}"
+        )
+
+
+def clear_memory_cache():
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+class HardMiningImageDataset(Dataset):
+    def __init__(self, image_paths, labels, pids, transform):
+        self.image_paths = image_paths
+        self.labels = labels
+        self.pids = pids
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def __getitem__(self, idx):
+        img = cv2.cvtColor(cv2.imread(self.image_paths[idx]), cv2.COLOR_BGR2RGB)
+        tensor = self.transform(image=img)["image"]
+        return tensor, self.labels[idx], self.pids[idx], self.image_paths[idx]
+
+
+@torch.no_grad()
+def extract_hard_mining_features(model_engine, image_paths, labels, pids, transform, args, device):
+    dataset = HardMiningImageDataset(image_paths, labels, pids, transform)
+    loader = DataLoader(
+        dataset,
+        batch_size=args.hard_pool_batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        drop_last=False,
+    )
+
+    features, all_labels, all_pids, all_paths = [], [], [], []
+    model_engine.eval()
+    for imgs, batch_labels, batch_pids, batch_paths in loader:
+        imgs = imgs.to(device).to(torch.bfloat16)
+        feats = model_engine(imgs)
+        if isinstance(feats, tuple):
+            feats = feats[1] if len(feats) > 1 else feats[0]
+        feats = F.normalize(feats.float(), p=2, dim=1, eps=1e-6)
+
+        features.append(feats.cpu())
+        all_labels.extend(batch_labels.tolist())
+        all_pids.extend(list(batch_pids))
+        all_paths.extend(list(batch_paths))
+
+    return torch.cat(features, dim=0), all_labels, all_pids, all_paths
+
+
+@torch.no_grad()
+def build_hard_pool(model_engine, train_dataset, args, device):
+    rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+    hard_pool = None
+
+    if rank == 0:
+        label_pid_pairs = sorted(
+            (data["label"], pid)
+            for pid, data in train_dataset.data_dict.items()
+        )
+
+        sat_paths, sat_labels, sat_pids = [], [], []
+        for label, pid in label_pid_pairs:
+            sat_paths.append(train_dataset.data_dict[pid]["satellite"][0])
+            sat_labels.append(label)
+            sat_pids.append(pid)
+
+        sat_feats, _, _, _ = extract_hard_mining_features(
+            model_engine,
+            sat_paths,
+            sat_labels,
+            sat_pids,
+            train_dataset.val_transforms,
+            args,
+            device,
+        )
+
+        drone_paths, drone_labels, drone_pids = [], [], []
+        for label, pid in label_pid_pairs:
+            for path in train_dataset.data_dict[pid]["drone"]:
+                drone_paths.append(path)
+                drone_labels.append(label)
+                drone_pids.append(pid)
+
+        drone_dataset = HardMiningImageDataset(
+            drone_paths,
+            drone_labels,
+            drone_pids,
+            train_dataset.val_transforms,
+        )
+        drone_loader = DataLoader(
+            drone_dataset,
+            batch_size=args.hard_pool_batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            drop_last=False,
+        )
+
+        sat_feats = sat_feats.to(device)
+        scored_paths = {pid: [] for _, pid in label_pid_pairs}
+        model_engine.eval()
+        for imgs, labels, pids, paths in drone_loader:
+            imgs = imgs.to(device).to(torch.bfloat16)
+            labels = labels.to(device, dtype=torch.long)
+            feats = model_engine(imgs)
+            if isinstance(feats, tuple):
+                feats = feats[1] if len(feats) > 1 else feats[0]
+            feats = F.normalize(feats.float(), p=2, dim=1, eps=1e-6)
+
+            sims = feats @ sat_feats.t()
+            row_idx = torch.arange(labels.size(0), device=device)
+            pos_sim = sims[row_idx, labels]
+            sims[row_idx, labels] = -float("inf")
+            neg_sim = sims.max(dim=1)[0]
+            hard_scores = (neg_sim - pos_sim).detach().cpu().tolist()
+
+            for pid, path, score in zip(pids, paths, hard_scores):
+                scored_paths[pid].append((score, path))
+
+        hard_pool = {}
+        topk = args.hard_pool_topk
+        for pid, items in scored_paths.items():
+            items.sort(key=lambda item: item[0], reverse=True)
+            hard_pool[pid] = [path for _, path in items[:topk]]
+
+        print(f"[HardPool] 已构建 hard_pool: {len(hard_pool)} 个 ID，每个 ID 最多 {topk} 张困难图")
+
+    if dist.is_available() and dist.is_initialized():
+        obj = [hard_pool]
+        dist.broadcast_object_list(obj, src=0)
+        hard_pool = obj[0]
+
+    train_dataset.set_hard_pool(hard_pool)
+    train_dataset.set_sampling_mode("hard_mix")
+    if not dist.is_initialized() or rank == 0:
+        random_samples = args.num_drones - args.hard_samples
+        print(f"[HardPool] 已切换训练采样模式: hard_mix = {args.hard_samples} hard + {random_samples} random")
+
+
 def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=None):
     local_rank = int(os.environ.get('LOCAL_RANK', 0)) if 'LOCAL_RANK' in os.environ else 0
     
     amp_device = args.device
 
-    # 定义损失函数
-    triplet_criterion = IntraDomainTripletLoss() if args.use_triplet else None
-    cross_triplet_criterion = CrossDomainTripletLoss() if args.use_triplet else None
-    contrastive_criterion = blocks_InfoNCE(loss_function=torch.nn.CrossEntropyLoss(), device=args.device) if args.use_contrastive else None
+    # 当前训练固定使用三元组损失和对比损失，具体比例由命令行权重控制。
+    triplet_criterion = IntraDomainTripletLoss()
+    cross_triplet_criterion = CrossDomainTripletLoss()
+    contrastive_criterion = blocks_InfoNCE(loss_function=torch.nn.CrossEntropyLoss(), device=args.device)
     # 4. deepspeed 初始化
     model_engine, optimizer, _, scheduler = deepspeed.initialize(
         model=model,
@@ -95,24 +406,45 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
     save_dir = get_save_pth(args)
     os.makedirs(save_dir, exist_ok=True)
 
-    best_r1 = 0.0
+    ema = LiteEMA(get_base_model(model_engine), decay=args.ema_decay)
+    best_r1 = -1.0
+    best_epoch = 0
     for epoch in range(1, args.epochs + 1):
         if hasattr(dataloader, 'dataset') and hasattr(dataloader.dataset, 'set_epoch'):
             dataloader.dataset.set_epoch(epoch)
+        if hasattr(dataloader, 'batch_sampler') and hasattr(dataloader.batch_sampler, 'set_epoch'):
+            dataloader.batch_sampler.set_epoch(epoch)
         if dist.is_initialized() and hasattr(dataloader, 'sampler') and hasattr(dataloader.sampler, 'set_epoch'):
             dataloader.sampler.set_epoch(epoch)
         model_engine.train()
-        ema = LiteEMA(model_engine.module if hasattr(model_engine, 'module') else model_engine)
-        total_loss = 0.0
+        mode_name, mode_desc = get_training_mode_desc(dataloader.dataset, args)
+        num_batches = len(dataloader)
+        world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
+        epoch_start_time = time.time()
+        loss_sums = {"total": 0.0, "tri": 0.0, "cross_tri": 0.0, "con": 0.0}
+        loss_counts = {"total": 0, "tri": 0, "cross_tri": 0, "con": 0}
+
+        if is_main_process():
+            print(
+                f"[Train] Epoch {epoch}/{args.epochs} start | "
+                f"mode={mode_name} ({mode_desc}) | "
+                f"batches={num_batches} | local_pid_batch={args.batch_size} | "
+                f"global_pid_batch={args.batch_size * world_size} | ema_decay={args.ema_decay} | "
+                f"loss_weights={get_loss_weight_desc(args)}"
+            )
+
         for batch_idx, (sat_tensors, drone_tensors, labels, pids) in enumerate(dataloader):
-            # 1. 展平并拼接：[B, 4, C, H, W] -> [B * 8, C, H, W]
-            sat_imgs = sat_tensors.view(-1, 3, args.img_size, args.img_size)
-            drone_imgs = drone_tensors.view(-1, 3, args.img_size, args.img_size)
+            # 1. 展平并拼接：[B, V, C, H, W] -> [(B * V_sat + B * V_drone), C, H, W]
+            sat_views_per_id = sat_tensors.size(1)
+            drone_views_per_id = drone_tensors.size(1)
+            sat_imgs = sat_tensors.reshape(-1, 3, args.img_size, args.img_size)
+            drone_imgs = drone_tensors.reshape(-1, 3, args.img_size, args.img_size)
             imgs = torch.cat([sat_imgs, drone_imgs], dim=0).to(amp_device).to(torch.bfloat16)
             
-            # 2. 标签精确对齐 (卫星4个，无人机4个，各自复制后拼接)
-            labels_4 = labels.repeat_interleave(4)
-            labels = torch.cat([labels_4, labels_4], dim=0).to(amp_device)
+            # 2. 标签精确对齐：每个 ID 的卫星增强数和无人机图数分别复制。
+            sat_labels = labels.repeat_interleave(sat_views_per_id)
+            drone_labels = labels.repeat_interleave(drone_views_per_id)
+            labels = torch.cat([sat_labels, drone_labels], dim=0).to(amp_device)
             
             # 3. 动态生成 views (前半截=0，后半截=1)
             num_sat = sat_imgs.size(0)
@@ -128,58 +460,68 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
             all_deep_feats, all_labels, all_views = gather_features_and_labels_and_views(deep_feats, labels, views)
             all_fused_feats, _, _ = gather_features_and_labels_and_views(fused_feats, labels, views) # labels和views聚合一次就够了
             all_atten_feats, _, _ = gather_features_and_labels_and_views(attended_features, labels, views)
-            loss = 0
+            loss_terms = []
             tri_loss_val = None
             cross_tri_loss_val = None
-            if args.use_triplet and triplet_criterion is not None:
-                sat_mask = (all_views == 0)
-                drone_mask = (all_views == 1)
+            sat_mask = (all_views == 0)
+            drone_mask = (all_views == 1)
 
-                sat_labels = all_labels[sat_mask]
-                drone_labels = all_labels[drone_mask]
-                sat_fused_labels = all_labels[sat_mask]
-                drone_fused_labels = all_labels[drone_mask]
+            sat_labels = all_labels[sat_mask]
+            drone_labels = all_labels[drone_mask]
 
-                # 只保留纯净主干的同域三元组，让它去死磕宏观特征，稳住 94% 
-                sat_deep = all_deep_feats[sat_mask]
-                drone_deep = all_deep_feats[drone_mask]
-                sat_fused = all_fused_feats[sat_mask]
-                drone_fused = all_fused_feats[drone_mask]
-                sat_atten = all_atten_feats[sat_mask]
-                drone_atten = all_atten_feats[drone_mask]
-                tri_q_deep, tri_g_deep = triplet_criterion(drone_deep, drone_labels, sat_deep, sat_labels)
-                tri_q_fused, tri_g_fused = triplet_criterion(drone_fused, drone_fused_labels, sat_fused, sat_fused_labels)  # 融合浅层的深层特征
-                tri_q_atten, tri_g_atten = triplet_criterion(drone_atten, drone_labels, sat_atten, sat_labels) # 纯浅层特征
+            sat_deep = all_deep_feats[sat_mask]
+            drone_deep = all_deep_feats[drone_mask]
+            sat_fused = all_fused_feats[sat_mask]
+            drone_fused = all_fused_feats[drone_mask]
+            sat_atten = all_atten_feats[sat_mask]
+            drone_atten = all_atten_feats[drone_mask]
 
-                intra_tri_loss = (tri_q_fused + tri_g_fused) * 2 + (tri_q_atten + tri_g_atten) * 0.5
-                total_tri_loss = intra_tri_loss
+            if args.triplet_weight > 0:
+                intra_tri_terms = []
+                if args.triplet_fused_weight > 0:
+                    tri_q_fused, tri_g_fused = triplet_criterion(drone_fused, drone_labels, sat_fused, sat_labels)
+                    intra_tri_terms.append(args.triplet_fused_weight * (tri_q_fused + tri_g_fused))
+                if args.triplet_local_weight > 0:
+                    tri_q_atten, tri_g_atten = triplet_criterion(drone_atten, drone_labels, sat_atten, sat_labels)
+                    intra_tri_terms.append(args.triplet_local_weight * (tri_q_atten + tri_g_atten))
+                if args.triplet_deep_weight > 0:
+                    tri_q_deep, tri_g_deep = triplet_criterion(drone_deep, drone_labels, sat_deep, sat_labels)
+                    intra_tri_terms.append(args.triplet_deep_weight * (tri_q_deep + tri_g_deep))
 
-                cross_triplet_weight = getattr(args, "cross_triplet_weight", 0.5)
-                if cross_triplet_criterion is not None and cross_triplet_weight > 0:
-                    cross_q_fused, cross_g_fused = cross_triplet_criterion(
-                        drone_fused,
-                        drone_fused_labels,
-                        sat_fused,
-                        sat_fused_labels
-                    )
-                    cross_tri_loss = (cross_q_fused + cross_g_fused) * cross_triplet_weight
-                    total_tri_loss = total_tri_loss + cross_tri_loss
-                    cross_tri_loss_val = cross_tri_loss.item()
-                
-                loss += total_tri_loss
-                tri_loss_val = total_tri_loss.item()
+                if intra_tri_terms:
+                    weighted_tri_loss = args.triplet_weight * sum(intra_tri_terms)
+                    loss_terms.append(weighted_tri_loss)
+                    tri_loss_val = weighted_tri_loss.item()
+
+            if args.cross_triplet_weight > 0:
+                cross_q_fused, cross_g_fused = cross_triplet_criterion(
+                    drone_fused,
+                    drone_labels,
+                    sat_fused,
+                    sat_labels
+                )
+                cross_tri_loss = args.cross_triplet_weight * (cross_q_fused + cross_g_fused)
+                loss_terms.append(cross_tri_loss)
+                cross_tri_loss_val = cross_tri_loss.item()
 
             con_loss_val = None
-            if args.use_contrastive and contrastive_criterion is not None:
+            if args.contrastive_weight > 0:
                 logit_scale = get_logit_scale(model_engine)
-                con_loss_deep = contrastive_criterion(all_deep_feats, all_labels, all_views, logit_scale)  # 纯深层特征
-                con_loss_fused = contrastive_criterion(all_fused_feats, all_labels, all_views, logit_scale) # 融合浅层的深层特征
+                con_terms = []
+                if args.contrastive_fused_weight > 0:
+                    con_loss_fused = contrastive_criterion(all_fused_feats, all_labels, all_views, logit_scale)
+                    con_terms.append(args.contrastive_fused_weight * con_loss_fused)
+                if args.contrastive_deep_weight > 0:
+                    con_loss_deep = contrastive_criterion(all_deep_feats, all_labels, all_views, logit_scale)
+                    con_terms.append(args.contrastive_deep_weight * con_loss_deep)
 
-                total_con_loss = con_loss_fused + 0.2 * con_loss_deep
-                loss += total_con_loss
-                con_loss_val = total_con_loss.item()
+                if con_terms:
+                    total_con_loss = args.contrastive_weight * sum(con_terms)
+                    loss_terms.append(total_con_loss)
+                    con_loss_val = total_con_loss.item()
                 
             # 7. 反向传播与优化 (干净利落，一次到位！)
+            loss = sum(loss_terms) if loss_terms else None
             if torch.is_tensor(loss):
                 model_engine.backward(loss)
                 model_engine.step()
@@ -188,77 +530,133 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                     if hasattr(base_model, "logit_scale") and base_model.logit_scale is not None:
                         base_model.logit_scale.clamp_(max=4.6)
                 ema.update(model_engine.module if hasattr(model_engine, "module") else model_engine)
-                total_loss += loss.item() * imgs.size(0)
+                loss_sums["total"] += loss.item()
+                loss_counts["total"] += 1
+                if tri_loss_val is not None:
+                    loss_sums["tri"] += tri_loss_val
+                    loss_counts["tri"] += 1
+                if cross_tri_loss_val is not None:
+                    loss_sums["cross_tri"] += cross_tri_loss_val
+                    loss_counts["cross_tri"] += 1
+                if con_loss_val is not None:
+                    loss_sums["con"] += con_loss_val
+                    loss_counts["con"] += 1
             else:
                 continue
                 
             # 8. 打印日志，仅 rank 0
-            if (batch_idx + 1) % 20 == 0:
-                if not dist.is_initialized() or dist.get_rank() == 0:
-                    log_str = f"Epoch {epoch} | Batch {batch_idx} "
+            step = batch_idx + 1
+            should_log = (
+                is_main_process()
+                and (
+                    step == 1
+                    or step == num_batches
+                    or (args.log_interval > 0 and step % args.log_interval == 0)
+                )
+            )
+            if should_log:
+                avg_total = loss_sums["total"] / max(loss_counts["total"], 1)
+                progress = 100.0 * step / max(num_batches, 1)
+                elapsed_min = (time.time() - epoch_start_time) / 60.0
+                lr = get_current_lr(optimizer, scheduler)
+                debug_values = get_model_debug_values(model_engine)
 
-                    if args.use_triplet and tri_loss_val is not None:
-                        log_str += f"tri={tri_loss_val:.4f} | "
+                metric_parts = [
+                    format_optional_metric("tri", tri_loss_val),
+                    format_optional_metric("cross", cross_tri_loss_val),
+                    format_optional_metric("con", con_loss_val),
+                ]
+                metric_parts = [part for part in metric_parts if part is not None]
+                metric_text = " | ".join(metric_parts) if metric_parts else "loss_parts=none"
 
-                    if args.use_triplet and cross_tri_loss_val is not None:
-                        log_str += f"cross_tri={cross_tri_loss_val:.4f} | "
+                print(
+                    f"[Train] Epoch {epoch}/{args.epochs} | mode={mode_name} | "
+                    f"batch {step}/{num_batches} ({progress:.1f}%) | "
+                    f"loss={loss.item():.4f} avg={avg_total:.4f} | {metric_text} | "
+                    f"lr={lr:.2e} | scale={debug_values.get('scale', 0.0):.3f} | "
+                    f"gamma={debug_values.get('gamma', 0.0):.4f} | elapsed={elapsed_min:.1f}m"
+                )
 
-                    if args.use_contrastive and con_loss_val is not None:
-                        log_str += f"con={con_loss_val:.4f} | "
+        if is_main_process():
+            elapsed_min = (time.time() - epoch_start_time) / 60.0
+            avg_parts = []
+            for key in ("total", "tri", "cross_tri", "con"):
+                if loss_counts[key] > 0:
+                    avg_parts.append(f"{key}_avg={loss_sums[key] / loss_counts[key]:.4f}")
+            avg_text = " | ".join(avg_parts) if avg_parts else "no_update"
+            print(
+                f"[Train] Epoch {epoch}/{args.epochs} done | mode={mode_name} | "
+                f"updates={loss_counts['total']} | {avg_text} | time={elapsed_min:.1f}m"
+            )
+        cur_epoch = epoch
+        if val_loaders is not None and should_run_validation(cur_epoch, args):
+            if is_main_process():
+                print(f"[Eval] Epoch {cur_epoch}/{args.epochs} start | weights=EMA")
+            eval_model = get_base_model(model_engine)
+            ema_applied = False
+            try:
+                ema.apply_shadow(eval_model)
+                ema_applied = True
+                model_engine.eval()
+                q_loader_d2s, g_loader_d2s = val_loaders["D2S"]
+                q_loader_s2d, g_loader_s2d = val_loaders["S2D"]
 
-                    log_str += f"total={loss.item():.4f}"
+                clear_memory_cache()
+                d2s_r1, d2s_r5, d2s_r10, d2s_map = getdist_1652_val_and_get_recall(model_engine, q_loader_d2s, g_loader_d2s, amp_device)
+                clear_memory_cache()
+                s2d_r1, s2d_r5, s2d_r10, s2d_map = getdist_1652_val_and_get_recall(model_engine, q_loader_s2d, g_loader_s2d, amp_device)
+            finally:
+                if ema_applied:
+                    ema.restore(eval_model)
+                model_engine.train()
+                clear_memory_cache()
 
-                    # 可选：打印 logit_scale 和 gamma
-                    with torch.no_grad():
-                        base_model = get_base_model(model_engine)
-                        if hasattr(base_model, "logit_scale"):
-                            logit_scale_val = base_model.logit_scale.exp().item()
-                            log_str += f" | scale={logit_scale_val:.3f}"
-
-                        if hasattr(base_model, "gamma_raw"):
-                            gamma_val = (0.3 * torch.sigmoid(base_model.gamma_raw)).item()
-                            log_str += f" | gamma={gamma_val:.4f}"
-
-                    print(log_str)
-        cur_epoch = epoch + 1
-        if (cur_epoch == 15 ) or (cur_epoch >20 and cur_epoch % 2 == 0):
-            ema.apply_shadow(model_engine.module if hasattr(model_engine, 'module') else model_engine)
-            model_engine.eval()
-            q_loader_d2s, g_loader_d2s = val_loaders["D2S"]
-            q_loader_s2d, g_loader_s2d = val_loaders["S2D"]
-
-            gc.collect()               # 强清 Python 层的残存变量
-            torch.cuda.empty_cache()   # 强清 PyTorch 层的显存碎片
-            d2s_r1, d2s_r5, d2s_r10, d2s_map = getdist_1652_val_and_get_recall(model_engine, q_loader_d2s, g_loader_d2s, 'cuda')
-            s2d_r1, s2d_r5, s2d_r10, s2d_map = getdist_1652_val_and_get_recall(model_engine, q_loader_s2d, g_loader_s2d, 'cuda')
-            ema.restore(model_engine.module if hasattr(model_engine, 'module') else model_engine)
-            model_engine.train()
-            if dist.get_rank() == 0:
+            if is_main_process():
                 trainable_state = {k: v.cpu() for k, v in ema.shadow.items()}
-                # trainable_state = {}
-                # for k, v in model_engine.module.named_parameters():
-                #     if v.requires_grad:
-                #         trainable_state[k] = v.data.cpu()
-                if d2s_r1 > best_r1:
+                is_best = d2s_r1 > best_r1
+
+                if is_best:
                     best_r1 = d2s_r1
+                    best_epoch = cur_epoch
                     torch.save(trainable_state, os.path.join(save_dir, "best_model.pth"))
-                    print(f"🎉 新的最佳模型！Epoch {cur_epoch}")
-                    print(f"[D2S 成绩] Recall@1: {d2s_r1:.2f}%, Recall@5: {d2s_r5:.2f}%, Recall@10: {d2s_r10:.2f}%, mAP: {d2s_map:.2f}%")
-                    print(f"[S2D 成绩] Recall@1: {s2d_r1:.2f}%, Recall@5: {s2d_r5:.2f}%, Recall@10: {s2d_r10:.2f}%, mAP: {s2d_map:.2f}%")
-                    
-                else:
-                    print(f"当前 D2S Recall@1: {d2s_r1:.2f}%，未超过历史最佳 {best_r1:.2f}%，因此不更新 best_model.pth")
-                    print(f"[D2S 成绩] Recall@1: {d2s_r1:.2f}%, Recall@5: {d2s_r5:.2f}%, Recall@10: {d2s_r10:.2f}%, mAP: {d2s_map:.2f}%")
-                    print(f"[S2D 成绩] Recall@1: {s2d_r1:.2f}%, Recall@5: {s2d_r5:.2f}%, Recall@10: {s2d_r10:.2f}%, mAP: {s2d_map:.2f}%")
-                    
-                if (cur_epoch == args.epochs) and (d2s_r1 <= best_r1):
-                    print(f"最后一轮 D2S Recall@1: {d2s_r1:.2f}%，未超过历史最佳 {best_r1:.2f}%，因此不更新 best_model.pth, 但仍保存 final_model.pth")
-                    print(f"[D2S 成绩] Recall@1: {d2s_r1:.2f}%, Recall@5: {d2s_r5:.2f}%, Recall@10: {d2s_r10:.2f}%, mAP: {d2s_map:.2f}%")
-                    print(f"[S2D 成绩] Recall@1: {s2d_r1:.2f}%, Recall@5: {s2d_r5:.2f}%, Recall@10: {s2d_r10:.2f}%, mAP: {s2d_map:.2f}%")
+
+                if cur_epoch == args.epochs:
                     torch.save(trainable_state, os.path.join(save_dir, "final_model.pth"))
-                    
+
+                print(
+                    f"[Eval] Epoch {cur_epoch}/{args.epochs} done | "
+                    f"D2S R@1={d2s_r1:.2f} R@5={d2s_r5:.2f} R@10={d2s_r10:.2f} mAP={d2s_map:.2f} | "
+                    f"S2D R@1={s2d_r1:.2f} R@5={s2d_r5:.2f} R@10={s2d_r10:.2f} mAP={s2d_map:.2f} | "
+                    f"best_D2S_R@1={best_r1:.2f}@epoch{best_epoch}"
+                )
+                if is_best:
+                    print(f"[Checkpoint] Saved best_model.pth | epoch={cur_epoch} | D2S_R@1={d2s_r1:.2f}")
+                if cur_epoch == args.epochs:
+                    print(f"[Checkpoint] Saved final_model.pth | epoch={cur_epoch} | D2S_R@1={d2s_r1:.2f}")
+
+        if (
+            cur_epoch == args.coverage_epochs
+            and cur_epoch < args.epochs
+            and hasattr(dataloader, "dataset")
+            and getattr(dataloader.dataset, "sampling_mode", None) == "coverage"
+        ):
+            ema_model = get_base_model(model_engine)
+            ema_applied = False
+            try:
+                ema.apply_shadow(ema_model)
+                ema_applied = True
+                if is_main_process():
+                    print(f"[HardPool] Epoch {cur_epoch} start | weights=EMA | topK={args.hard_pool_topk}")
+                build_hard_pool(model_engine, dataloader.dataset, args, amp_device)
+            finally:
+                if ema_applied:
+                    ema.restore(ema_model)
+                model_engine.train()
+                clear_memory_cache()
+
         # 7. 分布式同步：让所有显卡等 Rank 0 写完再进下一个 Epoch
-        dist.barrier()
+        if dist.is_initialized():
+            dist.barrier()
     if not dist.is_initialized() or local_rank == 0:
         print("训练完成！")
 
@@ -289,8 +687,9 @@ if __name__ == "__main__":
     # Learning Rate Config
     parser.add_argument('--lr', default=1e-4, type=float, help='1 * 10^-4 for ViT | 1 * 10^-1 for CNN')
     parser.add_argument('--scheduler', default="cosine", type=str, help=r'"polynomial" | "cosine" | "constant" | None')
-    parser.add_argument('--warmup_epochs', default=0.05, type=float)
+    parser.add_argument('--warmup_ratio', default=0.05, type=float, help='warmup 占总 optimizer step 的比例')
     parser.add_argument('--lr_end', default=0.00001, type=float)
+    parser.add_argument('--ema_decay', type=float, default=0.999, help='EMA 衰减系数')
 
     parser.add_argument('--local_rank', type=int, default=0, help='local rank for distributed training')
 
@@ -300,14 +699,29 @@ if __name__ == "__main__":
     parser.add_argument('--num_drones', type=int, default=4, help='抽取的无人机图像数量')
     parser.add_argument('--sampling_mode', type=str, default='coverage', choices=['random', 'coverage'], help='训练采样模式')
     parser.add_argument('--coverage_seed', type=int, default=0, help='coverage sampling 的基础随机种子')
+    parser.add_argument('--coverage_epochs', type=int, default=4, help='前多少个 coverage epoch 后切换到 hard_mix')
+    parser.add_argument('--hard_eval_interval', type=int, default=5, help='hard_mix 阶段每隔多少个 epoch 验证一次；0 表示只验证第一个 hard_mix epoch 和最后一轮')
+    parser.add_argument('--hard_samples', type=int, default=2, help='hard_mix 中每个 ID 抽取的困难无人机图数量')
+    parser.add_argument('--hard_pool_topk', type=int, default=12, help='每个 ID 保留多少张困难无人机图')
+    parser.add_argument('--hard_pool_batch_size', type=int, default=32, help='构建 hard_pool 时的推理 batch size')
+    parser.add_argument('--log_interval', type=int, default=20, help='训练日志打印间隔，按 batch 计')
     parser.add_argument('--num_workers', type=int, default=4, help='数据加载器的工作进程数')
     parser.add_argument('--lora', type=int, help='启用LoRA模块后层数', default=0)
-    parser.add_argument('--triplet_weight', type=float, help='三元组损失权重', default=2)
-    parser.add_argument('--cross_triplet_weight', type=float, help='跨域三元组损失权重，设为0可关闭', default=0.5)
-    parser.add_argument('--use_contrastive', action='store_true', help='是否启用对比学习', default=False)
-    parser.add_argument('--use_triplet', action='store_true', help='是否启用三元组损失', default=False)
+
+    # Loss weights. 三元组和对比学习默认固定启用，设对应大类权重为 0 可关闭该项。
+    parser.add_argument('--triplet_weight', type=float, default=1.0, help='同域三元组损失整体权重')
+    parser.add_argument('--triplet_fused_weight', type=float, default=2.0, help='同域三元组 fused 特征分支权重')
+    parser.add_argument('--triplet_local_weight', type=float, default=0.5, help='同域三元组 local/attended 特征分支权重')
+    parser.add_argument('--triplet_deep_weight', type=float, default=0.0, help='同域三元组 deep/global 特征分支权重')
+    parser.add_argument('--cross_triplet_weight', type=float, default=0.5, help='跨域三元组损失权重，设为 0 可关闭')
+    parser.add_argument('--contrastive_weight', type=float, default=1.0, help='跨域对比学习损失整体权重')
+    parser.add_argument('--contrastive_fused_weight', type=float, default=1.0, help='对比学习 fused 特征分支权重')
+    parser.add_argument('--contrastive_deep_weight', type=float, default=0.2, help='对比学习 deep/global 特征分支权重')
+
     args = parser.parse_args()
     try:
+        validate_loss_weights(args)
+        validate_scheduler_args(args)
         device, rank, local_rank, world_size = try_init_dist()
         # 构建训练集
         train_dataset, train_sampler, train_loader = create_1652_train_dataset(args)
@@ -327,15 +741,19 @@ if __name__ == "__main__":
             world_size
         )
 
-        num_update_steps_per_epoch = math.ceil(len(train_loader) / grad_accum_steps)
-        total_train_steps = num_update_steps_per_epoch * args.epochs
-        warmup_steps = int(total_train_steps * args.warmup_epochs)
+        scheduler_plan = build_scheduler_plan(
+            train_loader,
+            train_sampler,
+            args,
+            grad_accum_steps,
+        )
+        print_scheduler_plan(scheduler_plan, args, grad_accum_steps)
 
         scheduler = get_scheduler(
             scheduler_type=args.scheduler,
-            train_steps=total_train_steps,
+            train_steps=scheduler_plan["total_train_steps"],
             optimizer=optimizer,
-            warmup_steps=warmup_steps,
+            warmup_steps=scheduler_plan["warmup_steps"],
             lr_end=args.lr_end
         )
         train(

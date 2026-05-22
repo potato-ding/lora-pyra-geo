@@ -6,6 +6,7 @@ def extract_features_dist(model, dataloader, device):
     model.eval()
     local_feats, local_labels, local_coords = [], [], []
     has_coords = False
+    has_indices = False
 
     for batch_data in dataloader:
         # 1. 动态对齐精度，防止 FP32 和 FP16/BF16 冲突报错
@@ -24,12 +25,16 @@ def extract_features_dist(model, dataloader, device):
         
         # 3. 动态探测：是否有物理坐标 (兼容 U1652 等老数据集)
         if len(batch_data) > 2:
-            has_coords = True
-            local_coords.append(batch_data[2].to(device))
+            extra = batch_data[2].to(device)
+            if extra.ndim == 1 and extra.dtype in (torch.int8, torch.int16, torch.int32, torch.int64, torch.long):
+                has_indices = True
+            else:
+                has_coords = True
+            local_coords.append(extra)
 
     local_feats = torch.cat(local_feats, dim=0)
     local_labels = torch.cat(local_labels, dim=0)
-    local_coords = torch.cat(local_coords, dim=0) if has_coords else None
+    local_coords = torch.cat(local_coords, dim=0) if (has_coords or has_indices) else None
 
     # ================= 核心：分布式特征跨卡汇聚 (All-Gather) =================
     if dist.is_initialized():
@@ -45,7 +50,7 @@ def extract_features_dist(model, dataloader, device):
         res_feats = torch.cat(all_feats, dim=0)
         res_labels = torch.cat(all_labels, dim=0)
         
-        if has_coords:
+        if has_coords or has_indices:
             all_coords = [torch.zeros_like(local_coords) for _ in range(world_size)]
             dist.all_gather(all_coords, local_coords)
             res_coords = torch.cat(all_coords, dim=0)
@@ -53,6 +58,24 @@ def extract_features_dist(model, dataloader, device):
             res_coords = None
     else:
         res_feats, res_labels, res_coords = local_feats, local_labels, local_coords
+
+    if has_indices and res_coords is not None:
+        order = torch.argsort(res_coords)
+        sorted_indices = res_coords[order]
+        valid_mask = (sorted_indices >= 0) & (sorted_indices < len(dataloader.dataset))
+        unique_mask = torch.ones_like(valid_mask, dtype=torch.bool)
+        unique_mask[1:] = sorted_indices[1:] != sorted_indices[:-1]
+        keep = valid_mask & unique_mask
+        keep_order = order[keep]
+
+        res_feats = res_feats[keep_order]
+        res_labels = res_labels[keep_order]
+        expected_count = len(dataloader.dataset)
+        if res_feats.size(0) != expected_count:
+            raise RuntimeError(
+                f"验证集 index 去重后数量异常: got {res_feats.size(0)}, expected {expected_count}"
+            )
+        res_coords = None
 
     return res_feats, res_labels, res_coords
 
@@ -64,7 +87,7 @@ def getdist_1652_val_and_get_recall(model, val_query_loader, val_gallery_loader,
     多卡逻辑：
         1. 每张卡用 DistributedSampler 提取一部分 query/gallery 特征
         2. extract_features_dist 内部 all_gather 汇总所有卡的特征和标签
-        3. 截断 DistributedSampler padding 出来的重复样本
+        3. 如果 dataloader 返回了样本 index，则先按 index 恢复顺序并去掉 DistributedSampler padding
         4. 所有 rank 分片计算 query 指标
         5. all_reduce 汇总 Recall@1 / Recall@5 / Recall@10 / mAP
 

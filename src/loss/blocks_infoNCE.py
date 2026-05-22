@@ -55,12 +55,13 @@ class blocks_InfoNCE(nn.Module):
         logits = d_feats @ s_feats.t() * scale
 
         #  Ground Truth 逻辑
-        ground_truth = (d_labels.unsqueeze(1) == s_labels.unsqueeze(0)).float()
-        ground_truth = ground_truth / (ground_truth.sum(dim=1, keepdim=True) + 1e-12)
+        positive_mask = (d_labels.unsqueeze(1) == s_labels.unsqueeze(0)).float()
+        d2s_target = positive_mask / (positive_mask.sum(dim=1, keepdim=True) + 1e-12)
+        s2d_target = positive_mask.t() / (positive_mask.t().sum(dim=1, keepdim=True) + 1e-12)
 
         # 对称 InfoNCE 损失
-        loss_d = -torch.sum(ground_truth * F.log_softmax(logits, dim=1)) / len(d_labels)
-        loss_s = -torch.sum(ground_truth.t() * F.log_softmax(logits.t(), dim=1)) / len(s_labels)
+        loss_d = -torch.sum(d2s_target * F.log_softmax(logits, dim=1)) / len(d_labels)
+        loss_s = -torch.sum(s2d_target * F.log_softmax(logits.t(), dim=1)) / len(s_labels)
         
         return (loss_d + loss_s) / 2
 

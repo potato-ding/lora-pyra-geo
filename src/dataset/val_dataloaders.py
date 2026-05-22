@@ -11,6 +11,24 @@ import torch
 import torch.distributed as dist
 from torch.utils.data import Dataset, DataLoader
 
+
+class IndexedDataset(Dataset):
+    def __init__(self, dataset):
+        self.dataset = dataset
+
+    def __getattr__(self, name):
+        dataset = self.__dict__.get("dataset")
+        if dataset is None:
+            raise AttributeError(name)
+        return getattr(dataset, name)
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        img, label = self.dataset[idx]
+        return img, label, idx
+
 def build_1652_val_dataloaders(data_dir="data/U1652", img_size=[224, 224], batch_size=32, num_workers=8):
     val_transform = get_test_transforms(img_size=img_size)
 
@@ -29,6 +47,11 @@ def build_1652_val_dataloaders(data_dir="data/U1652", img_size=[224, 224], batch
     q_sat_classes = val_q_sat_ds.classes 
     g_drone_class_to_idx = val_g_drone_ds.class_to_idx 
     val_q_sat_ds.target_transform = lambda old_label: g_drone_class_to_idx[q_sat_classes[old_label]]
+
+    val_q_drone_ds = IndexedDataset(val_q_drone_ds)
+    val_g_sat_ds = IndexedDataset(val_g_sat_ds)
+    val_q_sat_ds = IndexedDataset(val_q_sat_ds)
+    val_g_drone_ds = IndexedDataset(val_g_drone_ds)
 
     is_distributed = dist.is_available() and dist.is_initialized()
 
