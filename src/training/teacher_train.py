@@ -109,7 +109,10 @@ def get_training_mode_desc(dataset, args):
         return mode, f"{num_chunks} chunks/id, {args.num_drones} drone/chunk"
     if mode == "hard_mix":
         random_samples = args.num_drones - args.hard_samples
-        return mode, f"{args.hard_samples} hard + {random_samples} random, topK={args.hard_pool_topk}"
+        return mode, (
+            f"{args.hard_samples} hard + {random_samples} random, "
+            f"pool_size={get_hard_pool_size(args)}, skip_top={args.hard_pool_skip_top}"
+        )
     if mode == "random":
         return mode, f"{args.num_drones} random drone/id"
     return mode, "custom sampling"
@@ -181,6 +184,30 @@ def validate_scheduler_args(args):
         raise ValueError("warmup_ratio 必须在 [0, 1) 范围内")
     if args.hard_eval_interval < 0:
         raise ValueError("hard_eval_interval 不能为负数")
+
+
+def get_hard_pool_size(args):
+    legacy_topk = getattr(args, "hard_pool_topk", None)
+    if legacy_topk is not None:
+        return legacy_topk
+    return args.hard_pool_size
+
+
+def validate_hard_pool_args(args):
+    if args.hard_score_type != "boundary_risk":
+        raise ValueError(f"当前仅支持 hard_score_type=boundary_risk，收到: {args.hard_score_type}")
+    if args.hard_neg_topk <= 0:
+        raise ValueError("hard_neg_topk 必须大于 0")
+    if args.hard_pool_skip_top < 0:
+        raise ValueError("hard_pool_skip_top 不能为负数")
+    if args.hard_pool_size <= 0:
+        raise ValueError("hard_pool_size 必须大于 0")
+    if getattr(args, "hard_pool_topk", None) is not None:
+        if args.hard_pool_topk <= 0:
+            raise ValueError("hard_pool_topk 必须大于 0")
+        args.hard_pool_size = args.hard_pool_topk
+    if args.hard_score_chunk_size <= 0:
+        raise ValueError("hard_score_chunk_size 必须大于 0")
 
 
 def should_run_validation(cur_epoch, args):
@@ -296,43 +323,132 @@ def extract_hard_mining_features(model_engine, image_paths, labels, pids, transf
 
 
 @torch.no_grad()
+def build_satellite_prototypes(satellite_feats, satellite_labels, device):
+    satellite_feats = F.normalize(satellite_feats.to(device).float(), p=2, dim=1, eps=1e-6)
+    satellite_labels = torch.as_tensor(satellite_labels, dtype=torch.long, device=device)
+    prototype_labels = torch.unique(satellite_labels, sorted=True)
+
+    prototypes = []
+    for label in prototype_labels:
+        label_feats = satellite_feats[satellite_labels == label]
+        prototype = label_feats.mean(dim=0, keepdim=True)
+        prototype = F.normalize(prototype, p=2, dim=1, eps=1e-6).squeeze(0)
+        prototypes.append(prototype)
+
+    return torch.stack(prototypes, dim=0), prototype_labels
+
+
+@torch.no_grad()
+def compute_cross_view_boundary_risk(
+    drone_feats,
+    drone_labels,
+    satellite_prototypes,
+    prototype_labels,
+    hard_neg_topk=5,
+    chunk_size=4096,
+):
+    device = drone_feats.device
+    drone_feats = F.normalize(drone_feats.float(), p=2, dim=1, eps=1e-6)
+    satellite_prototypes = F.normalize(satellite_prototypes.to(device).float(), p=2, dim=1, eps=1e-6)
+    prototype_labels = prototype_labels.to(device=device, dtype=torch.long)
+    drone_labels = torch.as_tensor(drone_labels, dtype=torch.long, device=device)
+
+    if satellite_prototypes.size(0) == 0:
+        raise RuntimeError("无法计算 boundary_risk：satellite prototype 为空")
+
+    chunk_size = max(int(chunk_size), 1)
+    boundary_risks, positive_sims, topk_negative_sims = [], [], []
+    neg_k = min(int(hard_neg_topk), max(satellite_prototypes.size(0) - 1, 1))
+
+    for start in range(0, drone_feats.size(0), chunk_size):
+        end = min(start + chunk_size, drone_feats.size(0))
+        chunk_feats = drone_feats[start:end]
+        chunk_labels = drone_labels[start:end]
+
+        positive_indices = torch.searchsorted(prototype_labels, chunk_labels)
+        valid = (
+            positive_indices < prototype_labels.numel()
+        ) & (prototype_labels[positive_indices.clamp(max=prototype_labels.numel() - 1)] == chunk_labels)
+        if not torch.all(valid):
+            missing = chunk_labels[~valid].detach().cpu().unique().tolist()
+            raise RuntimeError(f"satellite prototype 缺少这些 label: {missing[:10]}")
+
+        sim_matrix = chunk_feats @ satellite_prototypes.t()
+        row_idx = torch.arange(chunk_labels.size(0), device=device)
+        positive_sim = sim_matrix[row_idx, positive_indices]
+
+        if satellite_prototypes.size(0) > 1:
+            negative_sims = sim_matrix.clone()
+            negative_sims[row_idx, positive_indices] = -float("inf")
+            topk_negative_sim = negative_sims.topk(neg_k, dim=1).values.mean(dim=1)
+        else:
+            topk_negative_sim = torch.zeros_like(positive_sim)
+
+        boundary_risk = topk_negative_sim - positive_sim
+        boundary_risks.append(boundary_risk.detach().cpu())
+        positive_sims.append(positive_sim.detach().cpu())
+        topk_negative_sims.append(topk_negative_sim.detach().cpu())
+
+    return (
+        torch.cat(boundary_risks, dim=0),
+        torch.cat(positive_sims, dim=0),
+        torch.cat(topk_negative_sims, dim=0),
+    )
+
+
+@torch.no_grad()
 def build_hard_pool(model_engine, train_dataset, args, device):
-    rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+    is_distributed = dist.is_available() and dist.is_initialized()
+    rank = dist.get_rank() if is_distributed else 0
+    world_size = dist.get_world_size() if is_distributed else 1
     hard_pool = None
 
-    if rank == 0:
-        label_pid_pairs = sorted(
-            (data["label"], pid)
-            for pid, data in train_dataset.data_dict.items()
-        )
+    label_pid_pairs = sorted(
+        (data["label"], pid)
+        for pid, data in train_dataset.data_dict.items()
+    )
 
-        sat_paths, sat_labels, sat_pids = [], [], []
-        for label, pid in label_pid_pairs:
-            sat_paths.append(train_dataset.data_dict[pid]["satellite"][0])
+    sat_paths, sat_labels, sat_pids = [], [], []
+    for label, pid in label_pid_pairs:
+        for sat_path in train_dataset.data_dict[pid]["satellite"]:
+            sat_paths.append(sat_path)
             sat_labels.append(label)
             sat_pids.append(pid)
 
-        sat_feats, _, _, _ = extract_hard_mining_features(
-            model_engine,
-            sat_paths,
-            sat_labels,
-            sat_pids,
-            train_dataset.val_transforms,
-            args,
-            device,
-        )
+    sat_feats, _, _, _ = extract_hard_mining_features(
+        model_engine,
+        sat_paths,
+        sat_labels,
+        sat_pids,
+        train_dataset.val_transforms,
+        args,
+        device,
+    )
+    sat_prototypes, prototype_labels = build_satellite_prototypes(sat_feats, sat_labels, device)
 
-        drone_paths, drone_labels, drone_pids = [], [], []
-        for label, pid in label_pid_pairs:
-            for path in train_dataset.data_dict[pid]["drone"]:
-                drone_paths.append(path)
-                drone_labels.append(label)
-                drone_pids.append(pid)
+    drone_items = []
+    for label, pid in label_pid_pairs:
+        for path in train_dataset.data_dict[pid]["drone"]:
+            drone_items.append((path, label, pid))
 
+    local_drone_items = drone_items[rank::world_size]
+    local_drone_paths = [path for path, _, _ in local_drone_items]
+    local_drone_labels = [label for _, label, _ in local_drone_items]
+    local_drone_pids = [pid for _, _, pid in local_drone_items]
+
+    print(
+        f"[HardPool] Rank {rank}/{world_size} scoring "
+        f"{len(local_drone_items)}/{len(drone_items)} drone images | "
+        f"score={args.hard_score_type} | hard_neg_topk={args.hard_neg_topk}",
+        flush=True,
+    )
+
+    local_scored_items = []
+    if local_drone_items:
         drone_dataset = HardMiningImageDataset(
-            drone_paths,
-            drone_labels,
-            drone_pids,
+            local_drone_paths,
+            local_drone_labels,
+            local_drone_pids,
             train_dataset.val_transforms,
         )
         drone_loader = DataLoader(
@@ -344,8 +460,6 @@ def build_hard_pool(model_engine, train_dataset, args, device):
             drop_last=False,
         )
 
-        sat_feats = sat_feats.to(device)
-        scored_paths = {pid: [] for _, pid in label_pid_pairs}
         model_engine.eval()
         for imgs, labels, pids, paths in drone_loader:
             imgs = imgs.to(device).to(torch.bfloat16)
@@ -353,36 +467,122 @@ def build_hard_pool(model_engine, train_dataset, args, device):
             feats = model_engine(imgs)
             if isinstance(feats, tuple):
                 feats = feats[1] if len(feats) > 1 else feats[0]
-            feats = F.normalize(feats.float(), p=2, dim=1, eps=1e-6)
+            boundary_risks, positive_sims, topk_negative_sims = compute_cross_view_boundary_risk(
+                drone_feats=feats,
+                drone_labels=labels,
+                satellite_prototypes=sat_prototypes,
+                prototype_labels=prototype_labels,
+                hard_neg_topk=args.hard_neg_topk,
+                chunk_size=args.hard_score_chunk_size,
+            )
 
-            sims = feats @ sat_feats.t()
-            row_idx = torch.arange(labels.size(0), device=device)
-            pos_sim = sims[row_idx, labels]
-            sims[row_idx, labels] = -float("inf")
-            neg_sim = sims.max(dim=1)[0]
-            hard_scores = (neg_sim - pos_sim).detach().cpu().tolist()
+            for pid, path, boundary_risk, positive_sim, topk_negative_sim in zip(
+                pids,
+                paths,
+                boundary_risks.tolist(),
+                positive_sims.tolist(),
+                topk_negative_sims.tolist(),
+            ):
+                local_scored_items.append(
+                    (
+                        pid,
+                        path,
+                        float(boundary_risk),
+                        float(positive_sim),
+                        float(topk_negative_sim),
+                    )
+                )
 
-            for pid, path, score in zip(pids, paths, hard_scores):
-                scored_paths[pid].append((score, path))
+    if is_distributed:
+        gathered_scored_items = [None for _ in range(world_size)]
+        dist.all_gather_object(gathered_scored_items, local_scored_items)
+    else:
+        gathered_scored_items = [local_scored_items]
+
+    if rank == 0:
+        scored_paths = {pid: [] for _, pid in label_pid_pairs}
+        all_boundary_risks, all_positive_sims, all_topk_negative_sims = [], [], []
+        for scored_items in gathered_scored_items:
+            for pid, path, boundary_risk, positive_sim, topk_negative_sim in scored_items:
+                scored_paths[pid].append((boundary_risk, path, positive_sim, topk_negative_sim))
+                all_boundary_risks.append(boundary_risk)
+                all_positive_sims.append(positive_sim)
+                all_topk_negative_sims.append(topk_negative_sim)
 
         hard_pool = {}
-        topk = args.hard_pool_topk
+        hard_pool_scores = {}
+        pool_size = get_hard_pool_size(args)
+        skip_top = args.hard_pool_skip_top
         for pid, items in scored_paths.items():
             items.sort(key=lambda item: item[0], reverse=True)
-            hard_pool[pid] = [path for _, path in items[:topk]]
+            candidates = items[skip_top:skip_top + pool_size]
+            if not candidates:
+                candidates = items[:min(pool_size, len(items))]
+            hard_pool[pid] = [path for _, path, _, _ in candidates]
+            hard_pool_scores[pid] = [boundary_risk for boundary_risk, _, _, _ in candidates]
 
-        print(f"[HardPool] 已构建 hard_pool: {len(hard_pool)} 个 ID，每个 ID 最多 {topk} 张困难图")
+        boundary_tensor = torch.tensor(all_boundary_risks, dtype=torch.float32)
+        positive_tensor = torch.tensor(all_positive_sims, dtype=torch.float32)
+        topk_negative_tensor = torch.tensor(all_topk_negative_sims, dtype=torch.float32)
+        pool_sizes = [len(paths) for paths in hard_pool.values()]
+        avg_pool_size = sum(pool_sizes) / max(len(pool_sizes), 1)
 
-    if dist.is_available() and dist.is_initialized():
+        print(
+            f"[HardPool] 已构建 hard_pool: {len(hard_pool)} 个 ID，"
+            f"pool_size={pool_size} | skip_top={skip_top} | "
+            f"world_size={world_size} | drone_images={len(drone_items)}",
+            flush=True,
+        )
+        print(
+            f"[HardPool] boundary_risk stats | "
+            f"mean={boundary_tensor.mean().item():.4f} | "
+            f"std={boundary_tensor.std(unbiased=False).item():.4f} | "
+            f"min={boundary_tensor.min().item():.4f} | "
+            f"max={boundary_tensor.max().item():.4f} | "
+            f"pos_sim_mean={positive_tensor.mean().item():.4f} | "
+            f"top{args.hard_neg_topk}_neg_sim_mean={topk_negative_tensor.mean().item():.4f} | "
+            f"avg_hard_pool_size={avg_pool_size:.2f}",
+            flush=True,
+        )
+        for pid in list(hard_pool_scores.keys())[:3]:
+            scores = hard_pool_scores[pid]
+            if scores:
+                print(
+                    f"[HardPool] sample pid={pid} | selected_score_range="
+                    f"[{min(scores):.4f}, {max(scores):.4f}] | selected={len(scores)}",
+                    flush=True,
+                )
+
+        if any(size == 0 for size in pool_sizes):
+            empty_count = sum(size == 0 for size in pool_sizes)
+            print(
+                f"[HardPool] warning: {empty_count} 个 ID 的 hard_pool 为空，"
+                "hard_mix 会自动退回随机采样",
+                flush=True,
+            )
+
+        print(
+            f"[HardPool] config | hard_score_type={args.hard_score_type} | "
+            f"hard_neg_topk={args.hard_neg_topk} | "
+            f"hard_pool_skip_top={skip_top} | hard_pool_size={pool_size} | "
+            f"hard_score_chunk_size={args.hard_score_chunk_size}",
+            flush=True,
+        )
+
+    if is_distributed:
         obj = [hard_pool]
         dist.broadcast_object_list(obj, src=0)
         hard_pool = obj[0]
 
     train_dataset.set_hard_pool(hard_pool)
     train_dataset.set_sampling_mode("hard_mix")
-    if not dist.is_initialized() or rank == 0:
+    if not is_distributed or rank == 0:
         random_samples = args.num_drones - args.hard_samples
-        print(f"[HardPool] 已切换训练采样模式: hard_mix = {args.hard_samples} hard + {random_samples} random")
+        print(
+            f"[HardPool] 已切换训练采样模式: hard_mix = "
+            f"{args.hard_samples} hard + {random_samples} random",
+            flush=True,
+        )
 
 
 def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=None):
@@ -646,7 +846,11 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                 ema.apply_shadow(ema_model)
                 ema_applied = True
                 if is_main_process():
-                    print(f"[HardPool] Epoch {cur_epoch} start | weights=EMA | topK={args.hard_pool_topk}")
+                    print(
+                        f"[HardPool] Epoch {cur_epoch} start | weights=EMA | "
+                        f"score={args.hard_score_type} | neg_topk={args.hard_neg_topk} | "
+                        f"skip_top={args.hard_pool_skip_top} | pool_size={get_hard_pool_size(args)}"
+                    )
                 build_hard_pool(model_engine, dataloader.dataset, args, amp_device)
             finally:
                 if ema_applied:
@@ -702,7 +906,12 @@ if __name__ == "__main__":
     parser.add_argument('--coverage_epochs', type=int, default=4, help='前多少个 coverage epoch 后切换到 hard_mix')
     parser.add_argument('--hard_eval_interval', type=int, default=5, help='hard_mix 阶段每隔多少个 epoch 验证一次；0 表示只验证第一个 hard_mix epoch 和最后一轮')
     parser.add_argument('--hard_samples', type=int, default=2, help='hard_mix 中每个 ID 抽取的困难无人机图数量')
-    parser.add_argument('--hard_pool_topk', type=int, default=12, help='每个 ID 保留多少张困难无人机图')
+    parser.add_argument('--hard_score_type', type=str, default='boundary_risk', choices=['boundary_risk'], help='hard_pool 样本价值分数类型')
+    parser.add_argument('--hard_neg_topk', type=int, default=5, help='boundary_risk 中参与均值的 topK negative satellite 数量')
+    parser.add_argument('--hard_pool_skip_top', type=int, default=2, help='每个 ID 内跳过最极端的前几个 boundary_risk 样本')
+    parser.add_argument('--hard_pool_size', type=int, default=16, help='每个 ID 跳过极端样本后保留的 hard_pool 样本数')
+    parser.add_argument('--hard_pool_topk', type=int, default=None, help='兼容旧命令：等价于 hard_pool_size')
+    parser.add_argument('--hard_score_chunk_size', type=int, default=4096, help='计算 drone-to-satellite similarity 时的分块大小')
     parser.add_argument('--hard_pool_batch_size', type=int, default=32, help='构建 hard_pool 时的推理 batch size')
     parser.add_argument('--log_interval', type=int, default=20, help='训练日志打印间隔，按 batch 计')
     parser.add_argument('--num_workers', type=int, default=4, help='数据加载器的工作进程数')
@@ -722,6 +931,7 @@ if __name__ == "__main__":
     try:
         validate_loss_weights(args)
         validate_scheduler_args(args)
+        validate_hard_pool_args(args)
         device, rank, local_rank, world_size = try_init_dist()
         # 构建训练集
         train_dataset, train_sampler, train_loader = create_1652_train_dataset(args)
