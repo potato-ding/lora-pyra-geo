@@ -24,6 +24,13 @@ def _loss_weight_tag(args):
 
 
 def get_save_pth(args):
+    run_timestamp = getattr(args, 'run_timestamp', None)
+    if run_timestamp:
+        return os.path.join(
+            getattr(args, 'output_root', 'src/checkpoint/teacher'),
+            run_timestamp
+        )
+
     save_dir = os.path.join(
         getattr(args, 'output_root', 'src/checkpoint/teacher'),
         'dinov3' +

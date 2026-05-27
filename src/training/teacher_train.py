@@ -17,6 +17,7 @@ from torch.utils.data.distributed import DistributedSampler
 from torchvision import transforms
 import deepspeed
 import argparse
+from datetime import datetime
 from torch import optim
 import torch.nn.functional as F
 import numpy as np
@@ -84,6 +85,47 @@ def get_logit_scale(model_or_engine):
 
 def is_main_process():
     return not dist.is_available() or not dist.is_initialized() or dist.get_rank() == 0
+
+
+def init_run_timestamp(args):
+    timestamp = getattr(args, "run_timestamp", None)
+    if timestamp is None:
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M") if is_main_process() else None
+
+    if dist.is_available() and dist.is_initialized():
+        obj = [timestamp]
+        dist.broadcast_object_list(obj, src=0)
+        timestamp = obj[0]
+
+    args.run_timestamp = timestamp
+    return timestamp
+
+
+def _json_safe_value(value):
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_value(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _json_safe_value(val) for key, val in value.items()}
+    return str(value)
+
+
+def save_hyperparameters(save_dir, args):
+    hyperparameters = {
+        key: _json_safe_value(value)
+        for key, value in sorted(vars(args).items())
+    }
+    payload = {
+        "run_timestamp": getattr(args, "run_timestamp", None),
+        "save_dir": save_dir,
+        "command": " ".join(sys.argv),
+        "hyperparameters": hyperparameters,
+    }
+
+    json_path = os.path.join(save_dir, "hyperparameters.json")
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
 
 
 def get_current_lr(optimizer, scheduler=None):
@@ -603,8 +645,14 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
     )
     # 开始训练循环
     # 构建保存目录名
+    init_run_timestamp(args)
     save_dir = get_save_pth(args)
-    os.makedirs(save_dir, exist_ok=True)
+    if is_main_process():
+        os.makedirs(save_dir, exist_ok=True)
+        save_hyperparameters(save_dir, args)
+        print(f"[Checkpoint] Save directory: {save_dir}")
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
 
     ema = LiteEMA(get_base_model(model_engine), decay=args.ema_decay)
     best_r1 = -1.0
