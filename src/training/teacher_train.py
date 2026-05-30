@@ -850,9 +850,21 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                 q_loader_s2d, g_loader_s2d = val_loaders["S2D"]
 
                 clear_memory_cache()
-                d2s_r1, d2s_r5, d2s_r10, d2s_map = getdist_1652_val_and_get_recall(model_engine, q_loader_d2s, g_loader_d2s, amp_device)
+                d2s_r1, d2s_r5, d2s_r10, d2s_map = getdist_1652_val_and_get_recall(
+                    model_engine,
+                    q_loader_d2s,
+                    g_loader_d2s,
+                    amp_device,
+                    task_name="D2S",
+                )
                 clear_memory_cache()
-                s2d_r1, s2d_r5, s2d_r10, s2d_map = getdist_1652_val_and_get_recall(model_engine, q_loader_s2d, g_loader_s2d, amp_device)
+                s2d_r1, s2d_r5, s2d_r10, s2d_map = getdist_1652_val_and_get_recall(
+                    model_engine,
+                    q_loader_s2d,
+                    g_loader_s2d,
+                    amp_device,
+                    task_name="S2D",
+                )
             finally:
                 if ema_applied:
                     ema.restore(eval_model)

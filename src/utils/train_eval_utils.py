@@ -1,63 +1,94 @@
 import torch
 import torch.distributed as dist
 
+
+def _dist_info():
+    if dist.is_available() and dist.is_initialized():
+        return dist.get_world_size(), dist.get_rank()
+    return 1, 0
+
+
+def _gather_tensor_same_shape(tensor):
+    world_size, _ = _dist_info()
+    if world_size == 1:
+        return tensor
+
+    gathered = [torch.empty_like(tensor) for _ in range(world_size)]
+    dist.all_gather(gathered, tensor)
+    return torch.cat(gathered, dim=0)
+
+
 @torch.no_grad()
-def extract_features_dist(model, dataloader, device):
+def extract_features_dist(model, dataloader, device, stage_name=None):
     model.eval()
     local_feats, local_labels, local_coords = [], [], []
     has_coords = False
     has_indices = False
+    world_size, rank = _dist_info()
+    log_prefix = f"[Eval:{stage_name}]" if stage_name else "[Eval]"
 
-    for batch_data in dataloader:
+    if rank == 0 and stage_name:
+        print(
+            f"{log_prefix} extract start | samples={len(dataloader.dataset)} | "
+            f"local_batches={len(dataloader)} | world_size={world_size}",
+            flush=True,
+        )
+
+    for batch_idx, batch_data in enumerate(dataloader, start=1):
         # 1. 动态对齐精度，防止 FP32 和 FP16/BF16 冲突报错
         imgs = batch_data[0].to(device).to(next(model.parameters()).dtype)
         labels = batch_data[1].to(device)
-        
+
         feats = model(imgs)
         if isinstance(feats, tuple):
             feats = feats[0]
 
         # 2. L2 归一化，方便后面直接点乘作为余弦相似度
         feats = torch.nn.functional.normalize(feats, p=2, dim=1)
-        
-        local_feats.append(feats)
-        local_labels.append(labels)
-        
+
         # 3. 动态探测：是否有物理坐标 (兼容 U1652 等老数据集)
+        extra = None
         if len(batch_data) > 2:
             extra = batch_data[2].to(device)
             if extra.ndim == 1 and extra.dtype in (torch.int8, torch.int16, torch.int32, torch.int64, torch.long):
                 has_indices = True
             else:
                 has_coords = True
-            local_coords.append(extra)
 
-    local_feats = torch.cat(local_feats, dim=0)
-    local_labels = torch.cat(local_labels, dim=0)
-    local_coords = torch.cat(local_coords, dim=0) if (has_coords or has_indices) else None
+        # 每个 batch 后立即汇聚，避免不同 rank 的验证耗时差累计到一个巨大的 all_gather。
+        gathered_feats = _gather_tensor_same_shape(feats)
+        gathered_labels = _gather_tensor_same_shape(labels)
+        local_feats.append(gathered_feats.detach().cpu())
+        local_labels.append(gathered_labels.detach().cpu())
 
-    # ================= 核心：分布式特征跨卡汇聚 (All-Gather) =================
-    if dist.is_initialized():
-        world_size = dist.get_world_size()
-        
-        # 准备空容器接收所有 GPU 的数据
-        all_feats = [torch.zeros_like(local_feats) for _ in range(world_size)]
-        all_labels = [torch.zeros_like(local_labels) for _ in range(world_size)]
-        
-        dist.all_gather(all_feats, local_feats)
-        dist.all_gather(all_labels, local_labels)
-        
-        res_feats = torch.cat(all_feats, dim=0)
-        res_labels = torch.cat(all_labels, dim=0)
-        
-        if has_coords or has_indices:
-            all_coords = [torch.zeros_like(local_coords) for _ in range(world_size)]
-            dist.all_gather(all_coords, local_coords)
-            res_coords = torch.cat(all_coords, dim=0)
-        else:
-            res_coords = None
-    else:
-        res_feats, res_labels, res_coords = local_feats, local_labels, local_coords
+        if extra is not None:
+            gathered_extra = _gather_tensor_same_shape(extra)
+            local_coords.append(gathered_extra.detach().cpu())
+
+        if (
+            rank == 0
+            and stage_name
+            and (
+                batch_idx == 1
+                or batch_idx == len(dataloader)
+                or (batch_idx % 200 == 0)
+            )
+        ):
+            print(
+                f"{log_prefix} batch {batch_idx}/{len(dataloader)} gathered | "
+                f"batch_feats={tuple(feats.shape)}",
+                flush=True,
+            )
+
+    res_feats = torch.cat(local_feats, dim=0)
+    res_labels = torch.cat(local_labels, dim=0)
+    res_coords = torch.cat(local_coords, dim=0) if (has_coords or has_indices) else None
+
+    if rank == 0 and stage_name:
+        print(
+            f"{log_prefix} extract done | gathered_feats={tuple(res_feats.shape)}",
+            flush=True,
+        )
 
     if has_indices and res_coords is not None:
         order = torch.argsort(res_coords)
@@ -80,7 +111,7 @@ def extract_features_dist(model, dataloader, device):
     return res_feats, res_labels, res_coords
 
 @torch.no_grad()
-def getdist_1652_val_and_get_recall(model, val_query_loader, val_gallery_loader, device):
+def getdist_1652_val_and_get_recall(model, val_query_loader, val_gallery_loader, device, task_name=None):
     """
     University-1652 专用多卡验证函数。
 
@@ -98,8 +129,10 @@ def getdist_1652_val_and_get_recall(model, val_query_loader, val_gallery_loader,
     model.eval()
 
     # 1. 提取并 all_gather query / gallery 特征
-    q_f, q_l, _ = extract_features_dist(model, val_query_loader, device)
-    g_f, g_l, _ = extract_features_dist(model, val_gallery_loader, device)
+    query_stage = f"{task_name}:query" if task_name else None
+    gallery_stage = f"{task_name}:gallery" if task_name else None
+    q_f, q_l, _ = extract_features_dist(model, val_query_loader, device, stage_name=query_stage)
+    g_f, g_l, _ = extract_features_dist(model, val_gallery_loader, device, stage_name=gallery_stage)
 
     # 2. 删除 DistributedSampler 为整除 world_size 补出来的重复样本
     real_num_queries = len(val_query_loader.dataset)
@@ -114,6 +147,8 @@ def getdist_1652_val_and_get_recall(model, val_query_loader, val_gallery_loader,
     # 3. 保证 label 是一维
     q_l = q_l.view(-1)
     g_l = g_l.view(-1)
+    g_f_device = g_f.to(device)
+    g_l_device = g_l.to(device)
 
     # 4. 多卡下每张卡负责一部分 query 指标计算
     if dist.is_available() and dist.is_initialized():
@@ -142,15 +177,15 @@ def getdist_1652_val_and_get_recall(model, val_query_loader, val_gallery_loader,
         chunk_size = 1000
 
         for i in range(0, local_num_queries, chunk_size):
-            q_f_chunk = local_q_f[i:i + chunk_size]
-            q_l_chunk = local_q_l[i:i + chunk_size]
+            q_f_chunk = local_q_f[i:i + chunk_size].to(device)
+            q_l_chunk = local_q_l[i:i + chunk_size].to(device)
 
             # [chunk_size, real_num_gallery]
-            score_chunk = torch.matmul(q_f_chunk, g_f.t())
+            score_chunk = torch.matmul(q_f_chunk, g_f_device.t())
 
             # 降序排序
             sorted_indices = torch.argsort(score_chunk, dim=1, descending=True)
-            sorted_gallery_labels = g_l[sorted_indices]
+            sorted_gallery_labels = g_l_device[sorted_indices]
 
             # [chunk_size, real_num_gallery]
             matches = (sorted_gallery_labels == q_l_chunk.unsqueeze(1)).float()
@@ -215,6 +250,9 @@ def run_val_and_get_recall(model, val_query_loader, val_gallery_loader, device):
     local_q_l = q_l[start_idx:end_idx]
     local_q_c = q_c[start_idx:end_idx] if q_c is not None else None
     local_num_queries = local_q_f.size(0)
+    g_f_device = g_f.to(device)
+    g_l_device = g_l.to(device)
+    g_c_device = g_c.to(device) if g_c is not None else None
 
     # 3. 初始化本地卡的统计变量
     local_correct_1 = torch.tensor(0.0, device=device)
@@ -231,15 +269,15 @@ def run_val_and_get_recall(model, val_query_loader, val_gallery_loader, device):
     if local_num_queries > 0:
         chunk_size = 1000
         for i in range(0, local_num_queries, chunk_size):
-            q_f_chunk = local_q_f[i : i + chunk_size]
-            q_l_chunk = local_q_l[i : i + chunk_size]
+            q_f_chunk = local_q_f[i : i + chunk_size].to(device)
+            q_l_chunk = local_q_l[i : i + chunk_size].to(device)
 
             # 计算相似度得分矩阵: [chunk_size, real_num_gallery]
-            score_chunk = torch.matmul(q_f_chunk, g_f.t())
+            score_chunk = torch.matmul(q_f_chunk, g_f_device.t())
 
             # 获取降序索引
             sorted_indices = torch.argsort(score_chunk, dim=-1, descending=True)
-            sorted_gallery_labels = g_l[sorted_indices]
+            sorted_gallery_labels = g_l_device[sorted_indices]
             
             if q_l_chunk.dim() == 1:
                 matches = (sorted_gallery_labels == q_l_chunk.unsqueeze(1)).float()
@@ -266,12 +304,12 @@ def run_val_and_get_recall(model, val_query_loader, val_gallery_loader, device):
             ap_per_query = (precisions * matches).sum(dim=1) / (total_true_matches + 1e-12)
             local_ap_sum += ap_per_query.sum()
             
-            if q_c is not None and g_c is not None:
-                q_c_chunk = local_q_c[i : i + chunk_size]
+            if q_c is not None and g_c_device is not None:
+                q_c_chunk = local_q_c[i : i + chunk_size].to(device)
                 
                 # --- Dis@1: 首位预测的距离误差 ---
                 top1_indices = sorted_indices[:, 0]
-                pred_coords_top1 = g_c[top1_indices]
+                pred_coords_top1 = g_c_device[top1_indices]
                 distances_top1 = torch.sqrt(torch.sum((q_c_chunk - pred_coords_top1) ** 2, dim=1))
                 
                 valid_mask = (distances_top1 != float('inf'))
@@ -280,7 +318,7 @@ def run_val_and_get_recall(model, val_query_loader, val_gallery_loader, device):
                 
                 # --- SDM@3: 基于指数衰减的定位评价 (完全对齐论文) ---
                 top3_indices = sorted_indices[:, :3]
-                pred_coords_top3 = g_c[top3_indices] # [chunk_size, 3, 2]
+                pred_coords_top3 = g_c_device[top3_indices] # [chunk_size, 3, 2]
                 
                 q_c_unsqueeze = q_c_chunk.unsqueeze(1) # [chunk_size, 1, 2]
                 distances_top3 = torch.sqrt(torch.sum((q_c_unsqueeze - pred_coords_top3) ** 2, dim=2))
