@@ -250,7 +250,7 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
         dist.barrier()
 
     ema = LiteEMA(get_base_model(model_engine), decay=args.ema_decay)
-    best_r1 = -1.0
+    best_r1_sum = -1.0
     best_epoch = 0
     for epoch in range(1, args.epochs + 1):
         if hasattr(dataloader, 'dataset') and hasattr(dataloader.dataset, 'set_epoch'):
@@ -442,10 +442,11 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
 
             if is_main_process():
                 trainable_state = {k: v.cpu() for k, v in ema.shadow.items()}
-                is_best = d2s_r1 > best_r1
+                r1_sum = d2s_r1 + s2d_r1
+                is_best = r1_sum > best_r1_sum
 
                 if is_best:
-                    best_r1 = d2s_r1
+                    best_r1_sum = r1_sum
                     best_epoch = cur_epoch
                     torch.save(trainable_state, os.path.join(save_dir, "best_model.pth"))
                     save_metrics_json(
@@ -453,8 +454,8 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                         "best_metrics.json",
                         {
                             "epoch": cur_epoch,
-                            "selection_metric": "D2S_R@1",
-                            "best_D2S_R@1": best_r1,
+                            "selection_metric": "D2S_R@1+S2D_R@1",
+                            "best_R@1_sum": best_r1_sum,
                             "D2S": {
                                 "R@1": d2s_r1,
                                 "R@5": d2s_r5,
@@ -477,12 +478,18 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                     f"[Eval] Epoch {cur_epoch}/{args.epochs} done | "
                     f"D2S R@1={d2s_r1:.2f} R@5={d2s_r5:.2f} R@10={d2s_r10:.2f} mAP={d2s_map:.2f} | "
                     f"S2D R@1={s2d_r1:.2f} R@5={s2d_r5:.2f} R@10={s2d_r10:.2f} mAP={s2d_map:.2f} | "
-                    f"best_D2S_R@1={best_r1:.2f}@epoch{best_epoch}"
+                    f"R@1_sum={r1_sum:.2f} | best_R@1_sum={best_r1_sum:.2f}@epoch{best_epoch}"
                 )
                 if is_best:
-                    print(f"[Checkpoint] Saved best_model.pth | epoch={cur_epoch} | D2S_R@1={d2s_r1:.2f}")
+                    print(
+                        f"[Checkpoint] Saved best_model.pth | epoch={cur_epoch} | "
+                        f"D2S_R@1={d2s_r1:.2f} | S2D_R@1={s2d_r1:.2f} | R@1_sum={r1_sum:.2f}"
+                    )
                 if cur_epoch == args.epochs:
-                    print(f"[Checkpoint] Saved final_model.pth | epoch={cur_epoch} | D2S_R@1={d2s_r1:.2f}")
+                    print(
+                        f"[Checkpoint] Saved final_model.pth | epoch={cur_epoch} | "
+                        f"D2S_R@1={d2s_r1:.2f} | S2D_R@1={s2d_r1:.2f} | R@1_sum={r1_sum:.2f}"
+                    )
 
         # 7. 分布式同步：让所有显卡等 Rank 0 写完再进下一个 Epoch
         if dist.is_initialized():
