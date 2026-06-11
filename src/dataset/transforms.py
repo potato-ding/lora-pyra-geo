@@ -3,37 +3,43 @@ import torchvision.transforms as transforms
 import numpy as np
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
+import inspect
+
+
+def _transform_supports(transform_cls, arg_name):
+    try:
+        return arg_name in inspect.signature(transform_cls).parameters
+    except (TypeError, ValueError):
+        return False
 
 
 def _image_compression_90_100(p=0.5):
-    try:
-        return A.ImageCompression(quality_lower=90, quality_upper=100, p=p)
-    except TypeError:
+    if _transform_supports(A.ImageCompression, "quality_range"):
         return A.ImageCompression(quality_range=(90, 100), p=p)
+    return A.ImageCompression(quality_lower=90, quality_upper=100, p=p)
 
 
 def _sample4geo_coarse_dropout(img_size, p=1.0):
     min_h = int(0.1 * img_size[0])
     max_h = int(0.2 * img_size[0])
-    min_w = int(0.1 * img_size[0])
-    max_w = int(0.2 * img_size[0])
-    try:
-        return A.CoarseDropout(
-            max_holes=25,
-            max_height=max_h,
-            max_width=max_w,
-            min_holes=10,
-            min_height=min_h,
-            min_width=min_w,
-            p=p,
-        )
-    except TypeError:
+    min_w = int(0.1 * img_size[1])
+    max_w = int(0.2 * img_size[1])
+    if _transform_supports(A.CoarseDropout, "num_holes_range"):
         return A.CoarseDropout(
             num_holes_range=(10, 25),
             hole_height_range=(min_h, max_h),
             hole_width_range=(min_w, max_w),
             p=p,
         )
+    return A.CoarseDropout(
+        max_holes=25,
+        max_height=max_h,
+        max_width=max_w,
+        min_holes=10,
+        min_height=min_h,
+        min_width=min_w,
+        p=p,
+    )
 
 
 def get_sample4geo_train_transforms(
