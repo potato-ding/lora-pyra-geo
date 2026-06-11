@@ -1,7 +1,7 @@
 import os
 from torchvision.datasets import ImageFolder
 from torch.utils.data.distributed import DistributedSampler
-from src.dataset.transforms import get_test_transforms, alb_transform_wrapper
+from src.dataset.transforms import get_sample4geo_val_transforms, get_test_transforms, alb_transform_wrapper
 import glob
 import json
 import re
@@ -30,7 +30,7 @@ class IndexedDataset(Dataset):
         return img, label, idx
 
 def build_1652_val_dataloaders(data_dir="data/U1652", img_size=[224, 224], batch_size=32, num_workers=8):
-    val_transform = get_test_transforms(img_size=img_size)
+    val_transform = get_sample4geo_val_transforms(img_size=img_size)
 
     # ==================== 任务 1: D2S (无人机找卫星) ====================
     val_q_drone_ds = ImageFolder(os.path.join(data_dir, "test/query_drone"), transform=lambda x: alb_transform_wrapper(x, val_transform))

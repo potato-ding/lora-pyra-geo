@@ -1,13 +1,13 @@
-import os
+﻿import os
 import random
 import math
 import hashlib
+from collections import deque
 import cv2
 import torch
 from torch.utils.data import Dataset
 import torch.distributed as dist
-from src.dataset.transforms import get_train_transforms
-from torch.utils.data.distributed import DistributedSampler
+from src.dataset.transforms import get_sample4geo_train_transforms, get_train_transforms
 from torch.utils.data import DataLoader
 from torch.utils.data.sampler import Sampler
 
@@ -16,7 +16,6 @@ class U1652Dataset(Dataset):
     基于建筑 ID (PID) 主导的 Dataset。
     random 模式：每次 __getitem__ 直接返回该 PID 对应的 4 张卫星图 (1原+3增) 和随机 4 张无人机图。
     coverage 模式：一个 epoch 内把每个 PID 的无人机图按 num_drones 分组走完一遍。
-    hard_mix 模式：每个 PID 抽 hard_samples 张困难图 + 其余随机图。
     """
     def __init__(
         self,
@@ -27,7 +26,6 @@ class U1652Dataset(Dataset):
         num_drones=4,
         sampling_mode="random",
         seed=0,
-        hard_samples=2,
     ):
         self.data_dir = data_dir
         self.val_transforms = val_transforms
@@ -37,15 +35,10 @@ class U1652Dataset(Dataset):
         self.sampling_mode = sampling_mode
         self.seed = seed
         self.epoch = 0
-        self.hard_samples = hard_samples
-        self.hard_pool = {}
-
         if self.num_drones <= 0:
             raise ValueError("num_drones 必须大于 0")
-        if self.sampling_mode not in {"random", "coverage", "hard_mix"}:
+        if self.sampling_mode not in {"random", "coverage"}:
             raise ValueError(f"不支持的 sampling_mode: {self.sampling_mode}")
-        if self.hard_samples < 0 or self.hard_samples > self.num_drones:
-            raise ValueError("hard_samples 必须在 [0, num_drones] 范围内")
         
         # 核心数据结构：以建筑 PID 为键，存储它所有的图片路径
         # { '0001': {'sat': ['path...'], 'drone': ['path1', 'path2...'], 'label': 0}, ... }
@@ -143,14 +136,9 @@ class U1652Dataset(Dataset):
         self.epoch = epoch
 
     def set_sampling_mode(self, sampling_mode):
-        if sampling_mode not in {"random", "coverage", "hard_mix"}:
+        if sampling_mode not in {"random", "coverage"}:
             raise ValueError(f"不支持的 sampling_mode: {sampling_mode}")
-        if sampling_mode == "hard_mix" and not self.hard_pool:
-            raise RuntimeError("切换到 hard_mix 前必须先设置 hard_pool")
         self.sampling_mode = sampling_mode
-
-    def set_hard_pool(self, hard_pool):
-        self.hard_pool = hard_pool
 
     def _get_random_drones(self, drone_paths, rng=None, exclude_paths=None, k=None):
         k = self.num_drones if k is None else k
@@ -166,33 +154,6 @@ class U1652Dataset(Dataset):
         if len(candidates) >= k:
             return sampler.sample(candidates, k)
         return sampler.choices(candidates, k=k)
-
-    def _get_hard_mix_drones(self, pid, drone_paths):
-        rng = random.Random(self.seed + self.epoch * 1000003 + self._stable_pid_offset(pid))
-        drone_path_set = set(drone_paths)
-        hard_candidates = [
-            path for path in self.hard_pool.get(pid, [])
-            if path in drone_path_set
-        ]
-
-        hard_k = min(self.hard_samples, self.num_drones)
-        if len(hard_candidates) >= hard_k:
-            selected_hard = rng.sample(hard_candidates, hard_k)
-        elif hard_candidates:
-            selected_hard = rng.choices(hard_candidates, k=hard_k)
-        else:
-            selected_hard = self._get_random_drones(drone_paths, rng=rng, k=hard_k)
-
-        random_k = self.num_drones - len(selected_hard)
-        selected_random = self._get_random_drones(
-            drone_paths,
-            rng=rng,
-            exclude_paths=selected_hard,
-            k=random_k,
-        )
-        selected_drones = selected_hard + selected_random
-        rng.shuffle(selected_drones)
-        return selected_drones
 
     def __len__(self):
         if self.sampling_mode == "coverage":
@@ -215,8 +176,6 @@ class U1652Dataset(Dataset):
         
         if self.sampling_mode == "coverage":
             selected_drones = self._get_coverage_drones(pid, drone_paths, chunk_idx)
-        elif self.sampling_mode == "hard_mix":
-            selected_drones = self._get_hard_mix_drones(pid, drone_paths)
         else:
             selected_drones = self._get_random_drones(drone_paths)
 
@@ -242,6 +201,228 @@ class U1652Dataset(Dataset):
         drone_tensor = torch.stack(drone_tensors, dim=0)
 
         return sat_tensor, drone_tensor, label, pid
+
+
+class Sample4GeoU1652Dataset(Dataset):
+    """
+    Sample4Geo-style University-1652 training dataset.
+
+    Each item is one positive satellite/drone pair. A companion batch sampler
+    keeps class ids unique inside every batch, which is required when all other
+    batch entries are treated as negatives by symmetric InfoNCE.
+    """
+    def __init__(
+        self,
+        data_dir,
+        sat_transforms=None,
+        drone_transforms=None,
+        prob_flip=0.5,
+    ):
+        self.data_dir = data_dir
+        self.sat_transforms = sat_transforms
+        self.drone_transforms = drone_transforms
+        self.prob_flip = prob_flip
+
+        self.satellite_dir = os.path.join(self.data_dir, "satellite")
+        self.drone_dir = os.path.join(self.data_dir, "drone")
+
+        self.satellite_dict = self._collect_view_paths(self.satellite_dir)
+        self.drone_dict = self._collect_view_paths(self.drone_dir)
+        self.pids = sorted(set(self.satellite_dict.keys()) & set(self.drone_dict.keys()))
+
+        if not self.pids:
+            raise RuntimeError(
+                f"Sample4GeoU1652Dataset found no shared satellite/drone ids in {self.data_dir}"
+            )
+
+        self.pid_to_label = {pid: idx for idx, pid in enumerate(self.pids)}
+        self.data_dict = {}
+        self.pairs = []
+        self.pair_pids = []
+
+        for pid in self.pids:
+            sat_paths = self.satellite_dict[pid]
+            drone_paths = self.drone_dict[pid]
+            label = self.pid_to_label[pid]
+            self.data_dict[pid] = {
+                "satellite": sat_paths,
+                "drone": drone_paths,
+                "label": label,
+            }
+
+            sat_path = sat_paths[0]
+            for drone_path in drone_paths:
+                self.pairs.append((pid, sat_path, drone_path, label))
+                self.pair_pids.append(pid)
+
+        if not self.pairs:
+            raise RuntimeError(f"Sample4GeoU1652Dataset found no training pairs in {self.data_dir}")
+
+        self.sampling_mode = "sample4geo"
+        self.epoch = 0
+
+    @staticmethod
+    def _collect_view_paths(view_dir):
+        if not os.path.isdir(view_dir):
+            raise RuntimeError(f"Missing view directory: {view_dir}")
+
+        data = {}
+        for pid in sorted(os.listdir(view_dir)):
+            pid_dir = os.path.join(view_dir, pid)
+            if not os.path.isdir(pid_dir):
+                continue
+
+            image_paths = []
+            for name in sorted(os.listdir(pid_dir)):
+                if name.lower().endswith((".jpg", ".jpeg", ".png")):
+                    image_paths.append(os.path.join(pid_dir, name))
+
+            if image_paths:
+                data[pid] = image_paths
+
+        return data
+
+    @staticmethod
+    def _read_rgb(path):
+        img = cv2.imread(path)
+        if img is None:
+            raise RuntimeError(f"Failed to read image: {path}")
+        return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+    def set_epoch(self, epoch):
+        self.epoch = epoch
+
+    def __len__(self):
+        return len(self.pairs)
+
+    def __getitem__(self, idx):
+        pid, sat_path, drone_path, label = self.pairs[idx]
+
+        sat_img = self._read_rgb(sat_path)
+        drone_img = self._read_rgb(drone_path)
+
+        if self.prob_flip > 0 and random.random() < self.prob_flip:
+            sat_img = cv2.flip(sat_img, 1)
+            drone_img = cv2.flip(drone_img, 1)
+
+        if self.sat_transforms is not None:
+            sat_img = self.sat_transforms(image=sat_img)["image"]
+        if self.drone_transforms is not None:
+            drone_img = self.drone_transforms(image=drone_img)["image"]
+
+        return sat_img, drone_img, label, pid
+
+
+class Sample4GeoBatchSampler(Sampler):
+    """
+    Batch sampler for Sample4Geo/InfoNCE training.
+
+    The sampler builds global batches first and then slices them per rank. This
+    keeps every PID unique across the whole distributed batch, not just inside a
+    single GPU micro-batch.
+    """
+    def __init__(
+        self,
+        dataset,
+        batch_size,
+        shuffle=True,
+        seed=0,
+        break_counter_limit=512,
+    ):
+        if batch_size <= 0:
+            raise ValueError("batch_size must be greater than 0")
+        if not hasattr(dataset, "pair_pids"):
+            raise ValueError("Sample4GeoBatchSampler requires dataset.pair_pids")
+
+        self.dataset = dataset
+        self.batch_size = int(batch_size)
+        self.shuffle = shuffle
+        self.seed = seed
+        self.break_counter_limit = break_counter_limit
+        self.epoch = 0
+        self._cache_epoch = None
+        self._cache_batches = None
+
+        if dist.is_available() and dist.is_initialized():
+            self.rank = dist.get_rank()
+            self.num_replicas = dist.get_world_size()
+        else:
+            self.rank = 0
+            self.num_replicas = 1
+
+        self.global_batch_size = self.batch_size * self.num_replicas
+        self.num_pids = len(set(self.dataset.pair_pids))
+        if self.global_batch_size > self.num_pids:
+            raise ValueError(
+                f"global_batch_size={self.global_batch_size} is larger than PID count={self.num_pids}; "
+                "cannot keep class ids unique inside a Sample4Geo batch"
+            )
+
+    def set_epoch(self, epoch):
+        self.epoch = epoch
+        self._cache_epoch = None
+        self._cache_batches = None
+
+    def _build_local_batches(self):
+        indices = list(range(len(self.dataset.pair_pids)))
+        rng = random.Random(self.seed + self.epoch)
+        if self.shuffle:
+            rng.shuffle(indices)
+
+        pair_pool = deque(indices)
+        used_pairs = set()
+        current_batch = []
+        current_pids = set()
+        global_batches = []
+        break_counter = 0
+
+        while pair_pool:
+            pair_idx = pair_pool.popleft()
+            pid = self.dataset.pair_pids[pair_idx]
+
+            if pid not in current_pids and pair_idx not in used_pairs:
+                current_pids.add(pid)
+                current_batch.append(pair_idx)
+                used_pairs.add(pair_idx)
+                break_counter = 0
+            else:
+                if pair_idx not in used_pairs:
+                    pair_pool.append(pair_idx)
+                break_counter += 1
+                if break_counter >= self.break_counter_limit:
+                    break
+
+            if len(current_batch) == self.global_batch_size:
+                global_batches.append(current_batch)
+                current_batch = []
+                current_pids = set()
+
+        local_batches = []
+        local_start = self.rank * self.batch_size
+        local_end = local_start + self.batch_size
+        for global_batch in global_batches:
+            local_batches.append(global_batch[local_start:local_end])
+
+        return local_batches
+
+    def _get_batches(self):
+        if self._cache_epoch != self.epoch or self._cache_batches is None:
+            self._cache_batches = self._build_local_batches()
+            self._cache_epoch = self.epoch
+        return self._cache_batches
+
+    def __iter__(self):
+        for batch in self._get_batches():
+            yield batch
+
+    def __len__(self):
+        return len(self._get_batches())
+
+    def __repr__(self):
+        return (
+            f"{self.__class__.__name__}(batch_size={self.batch_size}, "
+            f"replicas={self.num_replicas}, global_batch_size={self.global_batch_size})"
+        )
 
 
 class DistributedCoverageBatchSampler(Sampler):
@@ -318,31 +499,18 @@ class DistributedCoverageBatchSampler(Sampler):
         generator = torch.Generator()
         generator.manual_seed(self.seed + self.epoch)
 
-        if self.dataset.sampling_mode == "hard_mix":
-            round_pids = self._make_round_pids(generator)
-            for local_pids in self._iter_pid_batches(round_pids):
-                yield [self.pid_to_pid_index[pid] for pid in local_pids]
-            return
-
         for chunk_idx in range(self.num_chunks):
             round_pids = self._make_round_pids(generator)
             for local_pids in self._iter_pid_batches(round_pids):
                 yield [self.pid_to_indices[pid][chunk_idx] for pid in local_pids]
 
     def __len__(self):
-        if self.dataset.sampling_mode == "hard_mix":
-            return self.num_batches_for_mode("hard_mix")
         return self.num_batches_for_mode("coverage")
 
     def num_batches_for_mode(self, sampling_mode):
         if sampling_mode == "coverage":
             return self.num_chunks * self.num_global_batches_per_round
-        if sampling_mode == "hard_mix":
-            return self.num_global_batches_per_round
         raise ValueError(f"不支持的 sampling_mode: {sampling_mode}")
-
-    def switch_dataset_to_hard_mix(self):
-        self.dataset.set_sampling_mode("hard_mix")
 
     def switch_dataset_to_coverage(self):
         self.dataset.set_sampling_mode("coverage")
@@ -358,82 +526,31 @@ class DistributedCoverageBatchSampler(Sampler):
 
 # 适配多卡和单卡的环境的1652数据集创建函数
 def create_1652_train_dataset(args):
-    # 获取训练增强和验证增强
-    val_tf, train_sat_tf, train_drone_tf = get_train_transforms(
+    train_sat_tf, train_drone_tf = get_sample4geo_train_transforms(
         img_size=[args.img_size, args.img_size],
         mean=[0.485, 0.456, 0.406],
-        std=[0.229, 0.224, 0.225]
+        std=[0.229, 0.224, 0.225],
     )
-    # 1. 创建训练数据dataset
-    train_dataset = U1652Dataset(
+    train_dataset = Sample4GeoU1652Dataset(
         data_dir=os.path.join(args.data_dir, "train"),
-        val_transforms=val_tf,
         sat_transforms=train_sat_tf,
         drone_transforms=train_drone_tf,
-        num_drones=args.num_drones,
-        sampling_mode=getattr(args, "sampling_mode", "random"),
-        seed=getattr(args, "coverage_seed", 0),
-        hard_samples=getattr(args, "hard_samples", 2),
+        prob_flip=getattr(args, "prob_flip", 0.5),
     )
-    if train_dataset.sampling_mode == "coverage":
-        train_sampler = DistributedCoverageBatchSampler(
-            train_dataset,
-            batch_size=args.batch_size,
-            shuffle=True,
-            seed=getattr(args, "coverage_seed", 0),
-        )
-        train_loader = DataLoader(
-            dataset=train_dataset,
-            batch_sampler=train_sampler,
-            num_workers=args.num_workers,
-            pin_memory=True,
-        )
-        return train_dataset, train_sampler, train_loader
-
-    # 判断是否为分布式
-    is_distributed = dist.is_available() and dist.is_initialized()
-
-    if is_distributed:
-        train_sampler = DistributedSampler(
-            train_dataset,
-            shuffle=True,
-            drop_last=False
-        )
-        shuffle = False   # 有 sampler 时，DataLoader 不要再 shuffle
-    else:
-        train_sampler = None
-        shuffle = True    # 单卡时交给 DataLoader shuffle
-
-    # 无论分布式还是单卡，都创建 train_loader
+    train_sampler = Sample4GeoBatchSampler(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        seed=getattr(args, "seed", 0),
+    )
     train_loader = DataLoader(
         dataset=train_dataset,
-        batch_size=args.batch_size,
-        sampler=train_sampler,
-        shuffle=shuffle,
+        batch_sampler=train_sampler,
         num_workers=args.num_workers,
         pin_memory=True,
-        drop_last=train_dataset.sampling_mode != "coverage"
     )
-    # 2. 实例化采样器 (针对 4张卡，单卡 batch=1)
-    # if dist.is_initialized():
-    #     train_sampler = DistributedSampler(
-    #         train_dataset, 
-    #         shuffle=True, 
-    #         drop_last=True # 推荐加上，保证每张卡拿到的 batch 永远是对齐的
-    #     )
-
-    #     # 4. 实例化多卡 DataLoader
-    #     train_loader = DataLoader(
-    #         dataset=train_dataset,
-    #         batch_size=args.batch_size,          # 注意：这是单卡 batch_size。意味着每张卡每次处理 2 个建筑
-    #         sampler=train_sampler, # 把分布式采样器喂给它
-    #         num_workers=8,         # 4张卡建议拉高点，保证喂数据速度
-    #         pin_memory=True,       # 加速 CPU Tensor 到 GPU 的传输
-    #         drop_last=True
-    #     )
-    # else:
-    #     train_sampler = None # 或者定义非分布式的版本
     return train_dataset, train_sampler, train_loader
+
 
 def create_student_train_dataset_and_loader(args):
     # 1. 获取训练增强和验证增强 (保持不变)

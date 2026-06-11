@@ -29,6 +29,44 @@ def get_heartmap_pool(part_features, blocks=3, add_global=False, otherbranch=Fal
     return part_featuers_
 
 
+class infonce(nn.Module):
+    """
+    Symmetric one-to-one InfoNCE for paired satellite/drone batches.
+
+    sat_feats[i] and drone_feats[i] are treated as the only positive pair.
+    All other entries in the batch are negatives, so the dataloader/sampler
+    should keep identities unique inside the global batch.
+    """
+    def __init__(self, loss_function=None):
+        super().__init__()
+        self.loss_function = loss_function if loss_function is not None else nn.CrossEntropyLoss()
+
+    @staticmethod
+    def _zero_loss(sat_feats, drone_feats):
+        return sat_feats.sum() * 0.0 + drone_feats.sum() * 0.0
+
+    def forward(self, sat_feats, drone_feats, logit_scale):
+        if sat_feats.numel() == 0 or drone_feats.numel() == 0:
+            return self._zero_loss(sat_feats, drone_feats)
+
+        if sat_feats.size(0) != drone_feats.size(0):
+            raise ValueError(
+                f"infonce requires paired sat/drone features with the same batch size, "
+                f"got sat={sat_feats.size(0)} and drone={drone_feats.size(0)}"
+            )
+
+        sat_feats = F.normalize(sat_feats, p=2, dim=-1, eps=1e-6)
+        drone_feats = F.normalize(drone_feats, p=2, dim=-1, eps=1e-6)
+
+        scale = logit_scale.float().exp()
+        logits = drone_feats @ sat_feats.t() * scale
+        targets = torch.arange(logits.size(0), dtype=torch.long, device=logits.device)
+
+        loss_d2s = self.loss_function(logits, targets)
+        loss_s2d = self.loss_function(logits.t(), targets)
+        return (loss_d2s + loss_s2d) / 2.0
+
+
 class blocks_InfoNCE(nn.Module):
     def __init__(self, loss_function=torch.nn.CrossEntropyLoss(), device='cuda'):
         super().__init__()

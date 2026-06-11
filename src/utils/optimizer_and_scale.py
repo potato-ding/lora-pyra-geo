@@ -1,4 +1,4 @@
-import torch
+﻿import torch
 from torch.optim import AdamW
 try:
     from deepspeed.ops.adam import DeepSpeedCPUAdam
@@ -8,15 +8,16 @@ except ImportError:
 
 def build_optimizer_and_scale(model, args):
     """
-    构建带有差分学习率的优化器，并初始化可学习的对比损失温度系数 (logit_scale)。
+    Build the teacher optimizer for the current final-only DINOv3 setup.
+
+    Trainable groups are LoRA params, fully fine-tuned backbone params,
+    the InfoNCE logit_scale, and a small fallback group for unexpected params.
     """
     logit_scale = model.logit_scale
-    
-    # 2. 精细化抽取参数组
     lora_weight_decay = []
-    lora_no_weight_decay = [] # 专门存放不能做 weight decay 的一维参数（如 DoRA 的 m）
-    classifier_params = []
-    mix_params = []
+    lora_no_weight_decay = []
+    backbone_full_decay = []
+    backbone_full_no_decay = []
     other_params = []
 
     for name, param in model.named_parameters():
@@ -24,102 +25,95 @@ def build_optimizer_and_scale(model, args):
             continue
         if name == "logit_scale" or name.endswith(".logit_scale"):
             continue
-            
+
+        name_lower = name.lower()
+        no_decay = (
+            param.ndim <= 1
+            or name.endswith(".bias")
+            or "norm" in name_lower
+            or "bn" in name_lower
+        )
+
         if "lora_" in name:
-            lora_weight_decay.append(param)    # 存放 lora_A.weight, lora_B.weight
-        elif name.endswith(".m"): #把 DoRA 的 m 都保护起来！
+            if no_decay:
+                lora_no_weight_decay.append(param)
+            else:
+                lora_weight_decay.append(param)
+        elif name.endswith(".m"):
             lora_no_weight_decay.append(param)
-        elif "ap_gates" in name or "global_ap_scale" in name or "gamma" in name:
-            mix_params.append(param)
-        elif (
-            "feature_adapter" in name
-            or "patch_projector" in name
-            or "cross_attn" in name
-            or "query_norm" in name
-            or "query_projector" in name
-            or "local_out_projector" in name
-        ):
-            classifier_params.append(param)
+        elif name.startswith("backbone."):
+            if no_decay:
+                backbone_full_no_decay.append(param)
+            else:
+                backbone_full_decay.append(param)
         else:
-            print(f"警告：参数 {name} 没有被正确分类，默认放入其他参数组，建议检查命名是否符合预期！")
+            print(f"[TeacherOptimizer] warning: unexpected trainable param: {name}")
             other_params.append(param)
 
-    # 打印一下当前的参数分布，你可以借此二次确认 m 参数是不是顺利归队了
-    print(f"优化器参数分布： LoRA方向矩阵: {len(lora_weight_decay)}, DoRA幅度向量(m): {len(lora_no_weight_decay)}, 分类头: {len(classifier_params)}, 多层融合权重: {len(mix_params)}, 其他兜底: {len(other_params)}, logit_scale: 1")
-    
-    # 3. 组装高级优化器参数字典
+    print(
+        f"[TeacherOptimizer] lora_decay={len(lora_weight_decay)} | "
+        f"lora_no_decay={len(lora_no_weight_decay)} | "
+        f"full_backbone_decay/no_decay={len(backbone_full_decay)}/{len(backbone_full_no_decay)} | "
+        f"other={len(other_params)} | logit_scale=1"
+    )
+
     optimizer_grouped_parameters = []
 
-    # 方向矩阵 A 和 B (保留正常的 weight decay)
     if lora_weight_decay:
         optimizer_grouped_parameters.append({
-            "params": lora_weight_decay, 
-            "lr": args.lr, 
-            "weight_decay": 0.01
+            "params": lora_weight_decay,
+            "lr": args.lr,
+            "weight_decay": 0.01,
         })
-        
-    #幅度参数 m (坚决设为 0.0 weight decay！)
     if lora_no_weight_decay:
         optimizer_grouped_parameters.append({
-            "params": lora_no_weight_decay, 
-            "lr": args.lr, 
-            "weight_decay": 0.0 
+            "params": lora_no_weight_decay,
+            "lr": args.lr,
+            "weight_decay": 0.0,
         })
 
-    # 头部参数合并 (保留原来的 10 倍学习率逻辑)
-    head_params = classifier_params
-    if head_params:
+    full_lr_mult = getattr(args, "full_finetune_lr_mult", 0.1)
+    full_lr = args.lr * full_lr_mult
+    if backbone_full_decay:
         optimizer_grouped_parameters.append({
-            "params": head_params, 
-            "lr": args.lr * 2, 
-            "weight_decay": 0.01 
+            "params": backbone_full_decay,
+            "lr": full_lr,
+            "weight_decay": 0.01,
         })
-    if mix_params:
+    if backbone_full_no_decay:
         optimizer_grouped_parameters.append({
-            "params": mix_params,
-            "lr": args.lr * 10,  # 如果后续发现浅层特征融合得太慢，这里甚至可以考虑给 args.lr * 5 或 * 10
-            "weight_decay": 0.0  
+            "params": backbone_full_no_decay,
+            "lr": full_lr,
+            "weight_decay": 0.0,
         })
 
-    # 兜底的其他参数 (由于 DINOv3 冻结，这个列表应该是空的，写上保底防报错)
     if other_params:
         optimizer_grouped_parameters.append({
-            "params": other_params, 
-            "lr": args.lr, 
-            "weight_decay": 0.01
+            "params": other_params,
+            "lr": args.lr,
+            "weight_decay": 0.01,
         })
 
     logit_scale_lr_mult = getattr(args, "logit_scale_lr_mult", 1.0)
     logit_scale_lr = args.lr * logit_scale_lr_mult
-
     optimizer_grouped_parameters.append({
         "params": [logit_scale],
         "lr": logit_scale_lr,
-        "weight_decay": 0.0 
+        "weight_decay": 0.0,
     })
-    
-    
-    # 去掉外层的全局 weight_decay 参数，改用 DeepSpeedCPUAdam（如果可用）或标准 AdamW
-    if HAS_DEEPSPEED_ADAM:
-        optimizer = DeepSpeedCPUAdam(
-            optimizer_grouped_parameters,
-            betas=(0.9, 0.999),
-            eps=1e-8
-        )
-        print("使用 DeepSpeedCPUAdam 优化器（用于 ZeRO-Offload）")
-    else:
-        optimizer = AdamW(
-            optimizer_grouped_parameters,
-            betas=(0.9, 0.999),
-            eps=1e-8
-        )
-        print("使用标准 AdamW 优化器")
-    
-    print(f"logit_scale lr: {logit_scale_lr:.6g} (mult={logit_scale_lr_mult:g})")
-    print("优化器实例化成功！")
-    
-    return optimizer
 
+    optimizer_class = DeepSpeedCPUAdam if HAS_DEEPSPEED_ADAM else AdamW
+    optimizer = optimizer_class(
+        optimizer_grouped_parameters,
+        betas=(0.9, 0.999),
+        eps=1e-8,
+    )
+
+    print(f"[TeacherOptimizer] using {optimizer_class.__name__}")
+    print(f"[TeacherOptimizer] lora lr: {args.lr:.6g}")
+    print(f"[TeacherOptimizer] full_finetune lr: {full_lr:.6g} (mult={full_lr_mult:g})")
+    print(f"[TeacherOptimizer] logit_scale lr: {logit_scale_lr:.6g} (mult={logit_scale_lr_mult:g})")
+    return optimizer
 
 def build_student_optimizer(
     model,

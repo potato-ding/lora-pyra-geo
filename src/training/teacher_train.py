@@ -1,38 +1,27 @@
-# train.py
+﻿# train.py
 # 专门用于根据参数配置进行训练的脚本
 import sys
 import os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../../models')))
 os.environ["NO_ALBUMENTATIONS_UPDATE"] = "1"
-from pathlib import Path
-import cv2
 import time
 import torch
 import math
 import torch.distributed as dist
-from torchvision.datasets import ImageFolder
-from torch.utils.data import DataLoader, Dataset
-from torch.utils.data.distributed import DistributedSampler
-from torchvision import transforms
 import deepspeed
 import argparse
 from datetime import datetime
-from torch import optim
-import torch.nn.functional as F
-import numpy as np
 import gc
 import json
 from src.dataset.datasets import create_1652_train_dataset
 from src.loss.tripletloss import IntraDomainTripletLoss
-from src.loss.tripletloss import CrossDomainTripletLoss
-from src.loss.blocks_infoNCE import blocks_InfoNCE
+from src.loss.blocks_infoNCE import infonce
 from src.utils.initdist import try_init_dist
 from src.utils.gather_features_and_labels_and_views import gather_features_and_labels_and_views 
 from src.utils.train_eval_utils import getdist_1652_val_and_get_recall
 from src.models.teacher_model import TeacherModel
 from src.utils.scheduler import get_scheduler
-from torch.optim.lr_scheduler import LambdaLR
 from src.utils.optimizer_and_scale import build_optimizer_and_scale
 from src.dataset.val_dataloaders import build_1652_val_dataloaders
 from src.utils.save_path import get_save_pth
@@ -149,21 +138,12 @@ def get_current_lr(optimizer, scheduler=None):
 
 def get_training_mode_desc(dataset, args):
     mode = getattr(dataset, "sampling_mode", "unknown")
-    if mode == "coverage":
-        num_pids = len(getattr(dataset, "pids", []))
-        num_chunks = 0
-        if num_pids > 0:
-            num_chunks = len(getattr(dataset, "coverage_samples", [])) // num_pids
-        return mode, f"{num_chunks} chunks/id, {args.num_drones} drone/chunk"
-    if mode == "hard_mix":
-        random_samples = args.num_drones - args.hard_samples
+    if mode == "sample4geo":
         return mode, (
-            f"{args.hard_samples} hard + {random_samples} random, "
-            f"pool_size={get_hard_pool_size(args)}, skip_top={args.hard_pool_skip_top}"
+            f"{len(getattr(dataset, 'pairs', []))} sat-drone pairs, "
+            "unique PID per global batch"
         )
-    if mode == "random":
-        return mode, f"{args.num_drones} random drone/id"
-    return mode, "custom sampling"
+    return mode, "Sample4Geo dataloader expected"
 
 
 def get_model_debug_values(model_or_engine):
@@ -172,9 +152,6 @@ def get_model_debug_values(model_or_engine):
     with torch.no_grad():
         if hasattr(base_model, "logit_scale"):
             values["scale"] = base_model.logit_scale.exp().item()
-        if hasattr(base_model, "gamma_raw"):
-            gamma_scale = getattr(base_model, "local_gamma_scale", 1.0)
-            values["gamma"] = (gamma_scale * torch.sigmoid(base_model.gamma_raw)).item()
     return values
 
 
@@ -184,123 +161,44 @@ def format_optional_metric(name, value):
 
 def get_loss_weight_desc(args):
     return (
-        f"tri={args.triplet_weight:g}"
-        f"(fused={args.triplet_fused_weight:g},local={args.triplet_local_weight:g},deep={args.triplet_deep_weight:g}) | "
-        f"cross_tri={args.cross_triplet_weight:g} | "
-        f"con={args.contrastive_weight:g}"
-        f"(fused={args.contrastive_fused_weight:g},deep={args.contrastive_deep_weight:g})"
+        f"tri={args.triplet_weight:g}(drone+sat) | "
+        f"infonce={args.infonce_weight:g}"
     )
 
 
 def validate_loss_weights(args):
     weight_names = [
         "triplet_weight",
-        "triplet_fused_weight",
-        "triplet_local_weight",
-        "triplet_deep_weight",
-        "cross_triplet_weight",
-        "contrastive_weight",
-        "contrastive_fused_weight",
-        "contrastive_deep_weight",
+        "infonce_weight",
     ]
     for name in weight_names:
         if getattr(args, name) < 0:
             raise ValueError(f"{name} 不能为负数")
 
-    intra_triplet_enabled = (
-        args.triplet_weight > 0
-        and (
-            args.triplet_fused_weight > 0
-            or args.triplet_local_weight > 0
-            or args.triplet_deep_weight > 0
-        )
-    )
-    contrastive_enabled = (
-        args.contrastive_weight > 0
-        and (
-            args.contrastive_fused_weight > 0
-            or args.contrastive_deep_weight > 0
-        )
-    )
+    intra_triplet_enabled = args.triplet_weight > 0
+    contrastive_enabled = args.infonce_weight > 0
 
-    if not intra_triplet_enabled and args.cross_triplet_weight == 0 and not contrastive_enabled:
+    if not intra_triplet_enabled and not contrastive_enabled:
         raise ValueError("所有 loss 大类权重都为 0，训练不会产生有效梯度")
 
 
 def validate_scheduler_args(args):
     if args.warmup_ratio < 0 or args.warmup_ratio >= 1:
         raise ValueError("warmup_ratio 必须在 [0, 1) 范围内")
-    if args.hard_eval_interval < 0:
-        raise ValueError("hard_eval_interval 不能为负数")
-
-
-def get_hard_pool_size(args):
-    legacy_topk = getattr(args, "hard_pool_topk", None)
-    if legacy_topk is not None:
-        return legacy_topk
-    return args.hard_pool_size
-
-
-def validate_hard_pool_args(args):
-    if args.hard_score_type != "boundary_risk":
-        raise ValueError(f"当前仅支持 hard_score_type=boundary_risk，收到: {args.hard_score_type}")
-    if args.hard_neg_topk <= 0:
-        raise ValueError("hard_neg_topk 必须大于 0")
-    if args.hard_pool_skip_top < 0:
-        raise ValueError("hard_pool_skip_top 不能为负数")
-    if args.hard_pool_size <= 0:
-        raise ValueError("hard_pool_size 必须大于 0")
-    if getattr(args, "hard_pool_topk", None) is not None:
-        if args.hard_pool_topk <= 0:
-            raise ValueError("hard_pool_topk 必须大于 0")
-        args.hard_pool_size = args.hard_pool_topk
-    if args.hard_score_chunk_size <= 0:
-        raise ValueError("hard_score_chunk_size 必须大于 0")
 
 
 def should_run_validation(cur_epoch, args):
-    if cur_epoch <= args.coverage_epochs:
-        return True
-    if cur_epoch == args.epochs:
-        return True
-
-    hard_mix_epoch = cur_epoch - args.coverage_epochs
-    if hard_mix_epoch == 1:
-        return True
-
-    return (
-        args.hard_eval_interval > 0
-        and (hard_mix_epoch - 1) % args.hard_eval_interval == 0
-    )
+    return True
 
 
 def build_scheduler_plan(train_loader, train_sampler, args, grad_accum_steps):
-    if hasattr(train_sampler, "num_batches_for_mode") and args.sampling_mode == "coverage":
-        coverage_epochs = min(args.coverage_epochs, args.epochs)
-        hard_mix_epochs = max(args.epochs - coverage_epochs, 0)
-        coverage_batches_per_epoch = train_sampler.num_batches_for_mode("coverage")
-        hard_mix_batches_per_epoch = train_sampler.num_batches_for_mode("hard_mix")
-        total_train_batches = (
-            coverage_epochs * coverage_batches_per_epoch
-            + hard_mix_epochs * hard_mix_batches_per_epoch
-        )
-        mode_desc = (
-            f"coverage_epochs={coverage_epochs}, hard_mix_epochs={hard_mix_epochs}, "
-            f"coverage_batches/epoch={coverage_batches_per_epoch}, "
-            f"hard_mix_batches/epoch={hard_mix_batches_per_epoch}"
-        )
-    else:
-        coverage_epochs = 0
-        hard_mix_epochs = 0
-        total_train_batches = len(train_loader) * args.epochs
-        mode_desc = f"standard_epochs={args.epochs}, batches/epoch={len(train_loader)}"
+    total_train_batches = len(train_loader) * args.epochs
+    mode_desc = f"sample4geo_epochs={args.epochs}, batches/epoch={len(train_loader)}"
 
     total_train_steps = math.ceil(total_train_batches / grad_accum_steps)
     warmup_steps = int(total_train_steps * args.warmup_ratio)
 
     return {
-        "coverage_epochs": coverage_epochs,
-        "hard_mix_epochs": hard_mix_epochs,
         "total_train_batches": total_train_batches,
         "total_train_steps": total_train_steps,
         "warmup_steps": warmup_steps,
@@ -325,314 +223,6 @@ def clear_memory_cache():
         torch.cuda.empty_cache()
 
 
-class HardMiningImageDataset(Dataset):
-    def __init__(self, image_paths, labels, pids, transform):
-        self.image_paths = image_paths
-        self.labels = labels
-        self.pids = pids
-        self.transform = transform
-
-    def __len__(self):
-        return len(self.image_paths)
-
-    def __getitem__(self, idx):
-        img = cv2.cvtColor(cv2.imread(self.image_paths[idx]), cv2.COLOR_BGR2RGB)
-        tensor = self.transform(image=img)["image"]
-        return tensor, self.labels[idx], self.pids[idx], self.image_paths[idx]
-
-
-@torch.no_grad()
-def extract_hard_mining_features(model_engine, image_paths, labels, pids, transform, args, device):
-    dataset = HardMiningImageDataset(image_paths, labels, pids, transform)
-    loader = DataLoader(
-        dataset,
-        batch_size=args.hard_pool_batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        drop_last=False,
-    )
-
-    features, all_labels, all_pids, all_paths = [], [], [], []
-    model_engine.eval()
-    for imgs, batch_labels, batch_pids, batch_paths in loader:
-        imgs = imgs.to(device).to(torch.bfloat16)
-        feats = model_engine(imgs)
-        if isinstance(feats, tuple):
-            feats = feats[1] if len(feats) > 1 else feats[0]
-        feats = F.normalize(feats.float(), p=2, dim=1, eps=1e-6)
-
-        features.append(feats.cpu())
-        all_labels.extend(batch_labels.tolist())
-        all_pids.extend(list(batch_pids))
-        all_paths.extend(list(batch_paths))
-
-    return torch.cat(features, dim=0), all_labels, all_pids, all_paths
-
-
-@torch.no_grad()
-def build_satellite_prototypes(satellite_feats, satellite_labels, device):
-    satellite_feats = F.normalize(satellite_feats.to(device).float(), p=2, dim=1, eps=1e-6)
-    satellite_labels = torch.as_tensor(satellite_labels, dtype=torch.long, device=device)
-    prototype_labels = torch.unique(satellite_labels, sorted=True)
-
-    prototypes = []
-    for label in prototype_labels:
-        label_feats = satellite_feats[satellite_labels == label]
-        prototype = label_feats.mean(dim=0, keepdim=True)
-        prototype = F.normalize(prototype, p=2, dim=1, eps=1e-6).squeeze(0)
-        prototypes.append(prototype)
-
-    return torch.stack(prototypes, dim=0), prototype_labels
-
-
-@torch.no_grad()
-def compute_cross_view_boundary_risk(
-    drone_feats,
-    drone_labels,
-    satellite_prototypes,
-    prototype_labels,
-    hard_neg_topk=5,
-    chunk_size=4096,
-):
-    device = drone_feats.device
-    drone_feats = F.normalize(drone_feats.float(), p=2, dim=1, eps=1e-6)
-    satellite_prototypes = F.normalize(satellite_prototypes.to(device).float(), p=2, dim=1, eps=1e-6)
-    prototype_labels = prototype_labels.to(device=device, dtype=torch.long)
-    drone_labels = torch.as_tensor(drone_labels, dtype=torch.long, device=device)
-
-    if satellite_prototypes.size(0) == 0:
-        raise RuntimeError("无法计算 boundary_risk：satellite prototype 为空")
-
-    chunk_size = max(int(chunk_size), 1)
-    boundary_risks, positive_sims, topk_negative_sims = [], [], []
-    neg_k = min(int(hard_neg_topk), max(satellite_prototypes.size(0) - 1, 1))
-
-    for start in range(0, drone_feats.size(0), chunk_size):
-        end = min(start + chunk_size, drone_feats.size(0))
-        chunk_feats = drone_feats[start:end]
-        chunk_labels = drone_labels[start:end]
-
-        positive_indices = torch.searchsorted(prototype_labels, chunk_labels)
-        valid = (
-            positive_indices < prototype_labels.numel()
-        ) & (prototype_labels[positive_indices.clamp(max=prototype_labels.numel() - 1)] == chunk_labels)
-        if not torch.all(valid):
-            missing = chunk_labels[~valid].detach().cpu().unique().tolist()
-            raise RuntimeError(f"satellite prototype 缺少这些 label: {missing[:10]}")
-
-        sim_matrix = chunk_feats @ satellite_prototypes.t()
-        row_idx = torch.arange(chunk_labels.size(0), device=device)
-        positive_sim = sim_matrix[row_idx, positive_indices]
-
-        if satellite_prototypes.size(0) > 1:
-            negative_sims = sim_matrix.clone()
-            negative_sims[row_idx, positive_indices] = -float("inf")
-            topk_negative_sim = negative_sims.topk(neg_k, dim=1).values.mean(dim=1)
-        else:
-            topk_negative_sim = torch.zeros_like(positive_sim)
-
-        boundary_risk = topk_negative_sim - positive_sim
-        boundary_risks.append(boundary_risk.detach().cpu())
-        positive_sims.append(positive_sim.detach().cpu())
-        topk_negative_sims.append(topk_negative_sim.detach().cpu())
-
-    return (
-        torch.cat(boundary_risks, dim=0),
-        torch.cat(positive_sims, dim=0),
-        torch.cat(topk_negative_sims, dim=0),
-    )
-
-
-@torch.no_grad()
-def build_hard_pool(model_engine, train_dataset, args, device):
-    is_distributed = dist.is_available() and dist.is_initialized()
-    rank = dist.get_rank() if is_distributed else 0
-    world_size = dist.get_world_size() if is_distributed else 1
-    hard_pool = None
-
-    label_pid_pairs = sorted(
-        (data["label"], pid)
-        for pid, data in train_dataset.data_dict.items()
-    )
-
-    sat_paths, sat_labels, sat_pids = [], [], []
-    for label, pid in label_pid_pairs:
-        for sat_path in train_dataset.data_dict[pid]["satellite"]:
-            sat_paths.append(sat_path)
-            sat_labels.append(label)
-            sat_pids.append(pid)
-
-    sat_feats, _, _, _ = extract_hard_mining_features(
-        model_engine,
-        sat_paths,
-        sat_labels,
-        sat_pids,
-        train_dataset.val_transforms,
-        args,
-        device,
-    )
-    sat_prototypes, prototype_labels = build_satellite_prototypes(sat_feats, sat_labels, device)
-
-    drone_items = []
-    for label, pid in label_pid_pairs:
-        for path in train_dataset.data_dict[pid]["drone"]:
-            drone_items.append((path, label, pid))
-
-    local_drone_items = drone_items[rank::world_size]
-    local_drone_paths = [path for path, _, _ in local_drone_items]
-    local_drone_labels = [label for _, label, _ in local_drone_items]
-    local_drone_pids = [pid for _, _, pid in local_drone_items]
-
-    print(
-        f"[HardPool] Rank {rank}/{world_size} scoring "
-        f"{len(local_drone_items)}/{len(drone_items)} drone images | "
-        f"score={args.hard_score_type} | hard_neg_topk={args.hard_neg_topk}",
-        flush=True,
-    )
-
-    local_scored_items = []
-    if local_drone_items:
-        drone_dataset = HardMiningImageDataset(
-            local_drone_paths,
-            local_drone_labels,
-            local_drone_pids,
-            train_dataset.val_transforms,
-        )
-        drone_loader = DataLoader(
-            drone_dataset,
-            batch_size=args.hard_pool_batch_size,
-            shuffle=False,
-            num_workers=args.num_workers,
-            pin_memory=True,
-            drop_last=False,
-        )
-
-        model_engine.eval()
-        for imgs, labels, pids, paths in drone_loader:
-            imgs = imgs.to(device).to(torch.bfloat16)
-            labels = labels.to(device, dtype=torch.long)
-            feats = model_engine(imgs)
-            if isinstance(feats, tuple):
-                feats = feats[1] if len(feats) > 1 else feats[0]
-            boundary_risks, positive_sims, topk_negative_sims = compute_cross_view_boundary_risk(
-                drone_feats=feats,
-                drone_labels=labels,
-                satellite_prototypes=sat_prototypes,
-                prototype_labels=prototype_labels,
-                hard_neg_topk=args.hard_neg_topk,
-                chunk_size=args.hard_score_chunk_size,
-            )
-
-            for pid, path, boundary_risk, positive_sim, topk_negative_sim in zip(
-                pids,
-                paths,
-                boundary_risks.tolist(),
-                positive_sims.tolist(),
-                topk_negative_sims.tolist(),
-            ):
-                local_scored_items.append(
-                    (
-                        pid,
-                        path,
-                        float(boundary_risk),
-                        float(positive_sim),
-                        float(topk_negative_sim),
-                    )
-                )
-
-    if is_distributed:
-        gathered_scored_items = [None for _ in range(world_size)]
-        dist.all_gather_object(gathered_scored_items, local_scored_items)
-    else:
-        gathered_scored_items = [local_scored_items]
-
-    if rank == 0:
-        scored_paths = {pid: [] for _, pid in label_pid_pairs}
-        all_boundary_risks, all_positive_sims, all_topk_negative_sims = [], [], []
-        for scored_items in gathered_scored_items:
-            for pid, path, boundary_risk, positive_sim, topk_negative_sim in scored_items:
-                scored_paths[pid].append((boundary_risk, path, positive_sim, topk_negative_sim))
-                all_boundary_risks.append(boundary_risk)
-                all_positive_sims.append(positive_sim)
-                all_topk_negative_sims.append(topk_negative_sim)
-
-        hard_pool = {}
-        hard_pool_scores = {}
-        pool_size = get_hard_pool_size(args)
-        skip_top = args.hard_pool_skip_top
-        for pid, items in scored_paths.items():
-            items.sort(key=lambda item: item[0], reverse=True)
-            candidates = items[skip_top:skip_top + pool_size]
-            if not candidates:
-                candidates = items[:min(pool_size, len(items))]
-            hard_pool[pid] = [path for _, path, _, _ in candidates]
-            hard_pool_scores[pid] = [boundary_risk for boundary_risk, _, _, _ in candidates]
-
-        boundary_tensor = torch.tensor(all_boundary_risks, dtype=torch.float32)
-        positive_tensor = torch.tensor(all_positive_sims, dtype=torch.float32)
-        topk_negative_tensor = torch.tensor(all_topk_negative_sims, dtype=torch.float32)
-        pool_sizes = [len(paths) for paths in hard_pool.values()]
-        avg_pool_size = sum(pool_sizes) / max(len(pool_sizes), 1)
-
-        print(
-            f"[HardPool] 已构建 hard_pool: {len(hard_pool)} 个 ID，"
-            f"pool_size={pool_size} | skip_top={skip_top} | "
-            f"world_size={world_size} | drone_images={len(drone_items)}",
-            flush=True,
-        )
-        print(
-            f"[HardPool] boundary_risk stats | "
-            f"mean={boundary_tensor.mean().item():.4f} | "
-            f"std={boundary_tensor.std(unbiased=False).item():.4f} | "
-            f"min={boundary_tensor.min().item():.4f} | "
-            f"max={boundary_tensor.max().item():.4f} | "
-            f"pos_sim_mean={positive_tensor.mean().item():.4f} | "
-            f"top{args.hard_neg_topk}_neg_sim_mean={topk_negative_tensor.mean().item():.4f} | "
-            f"avg_hard_pool_size={avg_pool_size:.2f}",
-            flush=True,
-        )
-        for pid in list(hard_pool_scores.keys())[:3]:
-            scores = hard_pool_scores[pid]
-            if scores:
-                print(
-                    f"[HardPool] sample pid={pid} | selected_score_range="
-                    f"[{min(scores):.4f}, {max(scores):.4f}] | selected={len(scores)}",
-                    flush=True,
-                )
-
-        if any(size == 0 for size in pool_sizes):
-            empty_count = sum(size == 0 for size in pool_sizes)
-            print(
-                f"[HardPool] warning: {empty_count} 个 ID 的 hard_pool 为空，"
-                "hard_mix 会自动退回随机采样",
-                flush=True,
-            )
-
-        print(
-            f"[HardPool] config | hard_score_type={args.hard_score_type} | "
-            f"hard_neg_topk={args.hard_neg_topk} | "
-            f"hard_pool_skip_top={skip_top} | hard_pool_size={pool_size} | "
-            f"hard_score_chunk_size={args.hard_score_chunk_size}",
-            flush=True,
-        )
-
-    if is_distributed:
-        obj = [hard_pool]
-        dist.broadcast_object_list(obj, src=0)
-        hard_pool = obj[0]
-
-    train_dataset.set_hard_pool(hard_pool)
-    train_dataset.set_sampling_mode("hard_mix")
-    if not is_distributed or rank == 0:
-        random_samples = args.num_drones - args.hard_samples
-        print(
-            f"[HardPool] 已切换训练采样模式: hard_mix = "
-            f"{args.hard_samples} hard + {random_samples} random",
-            flush=True,
-        )
-
-
 def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=None, ds_config=None):
     local_rank = int(os.environ.get('LOCAL_RANK', 0)) if 'LOCAL_RANK' in os.environ else 0
     
@@ -640,8 +230,7 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
 
     # 当前训练固定使用三元组损失和对比损失，具体比例由命令行权重控制。
     triplet_criterion = IntraDomainTripletLoss()
-    cross_triplet_criterion = CrossDomainTripletLoss()
-    contrastive_criterion = blocks_InfoNCE(loss_function=torch.nn.CrossEntropyLoss(), device=args.device)
+    infonce_criterion = infonce(loss_function=torch.nn.CrossEntropyLoss())
     # 4. deepspeed 初始化
     model_engine, optimizer, _, scheduler = deepspeed.initialize(
         model=model,
@@ -675,8 +264,8 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
         num_batches = len(dataloader)
         world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
         epoch_start_time = time.time()
-        loss_sums = {"total": 0.0, "tri": 0.0, "cross_tri": 0.0, "con": 0.0}
-        loss_counts = {"total": 0, "tri": 0, "cross_tri": 0, "con": 0}
+        loss_sums = {"total": 0.0, "tri_drone": 0.0, "tri_sat": 0.0, "infonce": 0.0}
+        loss_counts = {"total": 0, "tri_drone": 0, "tri_sat": 0, "infonce": 0}
 
         if is_main_process():
             print(
@@ -688,11 +277,16 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
             )
 
         for batch_idx, (sat_tensors, drone_tensors, labels, pids) in enumerate(dataloader):
+            if sat_tensors.ndim == 4:
+                sat_tensors = sat_tensors.unsqueeze(1)
+            if drone_tensors.ndim == 4:
+                drone_tensors = drone_tensors.unsqueeze(1)
+
             # 1. 展平并拼接：[B, V, C, H, W] -> [(B * V_sat + B * V_drone), C, H, W]
             sat_views_per_id = sat_tensors.size(1)
             drone_views_per_id = drone_tensors.size(1)
-            sat_imgs = sat_tensors.reshape(-1, 3, args.img_size, args.img_size)
-            drone_imgs = drone_tensors.reshape(-1, 3, args.img_size, args.img_size)
+            sat_imgs = sat_tensors.reshape(-1, *sat_tensors.shape[2:])
+            drone_imgs = drone_tensors.reshape(-1, *drone_tensors.shape[2:])
             imgs = torch.cat([sat_imgs, drone_imgs], dim=0).to(amp_device).to(torch.bfloat16)
             
             # 2. 标签精确对齐：每个 ID 的卫星增强数和无人机图数分别复制。
@@ -708,71 +302,40 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                 torch.ones(num_drone, dtype=torch.long)
             ]).to(amp_device)
             
-            # 4. 前向传播
-            deep_feats, fused_feats, attended_features = model_engine(imgs)
+            # 4. 前向传播：当前 teacher 只使用最后层输出特征。
+            final_feats = model_engine(imgs)
+            if isinstance(final_feats, tuple):
+                final_feats = final_feats[1] if len(final_feats) > 1 else final_feats[0]
+
             # 跨卡特征聚合
-            all_deep_feats, all_labels, all_views = gather_features_and_labels_and_views(deep_feats, labels, views)
-            all_fused_feats, _, _ = gather_features_and_labels_and_views(fused_feats, labels, views) # labels和views聚合一次就够了
-            all_atten_feats, _, _ = gather_features_and_labels_and_views(attended_features, labels, views)
+            all_feats, all_labels, all_views = gather_features_and_labels_and_views(final_feats, labels, views)
             loss_terms = []
-            tri_loss_val = None
-            cross_tri_loss_val = None
+            tri_drone_loss_val = None
+            tri_sat_loss_val = None
             sat_mask = (all_views == 0)
             drone_mask = (all_views == 1)
 
             sat_labels = all_labels[sat_mask]
             drone_labels = all_labels[drone_mask]
 
-            sat_deep = all_deep_feats[sat_mask]
-            drone_deep = all_deep_feats[drone_mask]
-            sat_fused = all_fused_feats[sat_mask]
-            drone_fused = all_fused_feats[drone_mask]
-            sat_atten = all_atten_feats[sat_mask]
-            drone_atten = all_atten_feats[drone_mask]
+            sat_feats = all_feats[sat_mask]
+            drone_feats = all_feats[drone_mask]
 
             if args.triplet_weight > 0:
-                intra_tri_terms = []
-                if args.triplet_fused_weight > 0:
-                    tri_q_fused, tri_g_fused = triplet_criterion(drone_fused, drone_labels, sat_fused, sat_labels)
-                    intra_tri_terms.append(args.triplet_fused_weight * (tri_q_fused + tri_g_fused))
-                if args.triplet_local_weight > 0:
-                    tri_q_atten, tri_g_atten = triplet_criterion(drone_atten, drone_labels, sat_atten, sat_labels)
-                    intra_tri_terms.append(args.triplet_local_weight * (tri_q_atten + tri_g_atten))
-                if args.triplet_deep_weight > 0:
-                    tri_q_deep, tri_g_deep = triplet_criterion(drone_deep, drone_labels, sat_deep, sat_labels)
-                    intra_tri_terms.append(args.triplet_deep_weight * (tri_q_deep + tri_g_deep))
+                tri_drone, tri_sat = triplet_criterion(drone_feats, drone_labels, sat_feats, sat_labels)
+                weighted_tri_drone = args.triplet_weight * tri_drone
+                weighted_tri_sat = args.triplet_weight * tri_sat
+                loss_terms.extend([weighted_tri_drone, weighted_tri_sat])
+                tri_drone_loss_val = weighted_tri_drone.item()
+                tri_sat_loss_val = weighted_tri_sat.item()
 
-                if intra_tri_terms:
-                    weighted_tri_loss = args.triplet_weight * sum(intra_tri_terms)
-                    loss_terms.append(weighted_tri_loss)
-                    tri_loss_val = weighted_tri_loss.item()
-
-            if args.cross_triplet_weight > 0:
-                cross_q_fused, cross_g_fused = cross_triplet_criterion(
-                    drone_fused,
-                    drone_labels,
-                    sat_fused,
-                    sat_labels
-                )
-                cross_tri_loss = args.cross_triplet_weight * (cross_q_fused + cross_g_fused)
-                loss_terms.append(cross_tri_loss)
-                cross_tri_loss_val = cross_tri_loss.item()
-
-            con_loss_val = None
-            if args.contrastive_weight > 0:
+            infonce_loss_val = None
+            if args.infonce_weight > 0:
                 logit_scale = get_logit_scale(model_engine)
-                con_terms = []
-                if args.contrastive_fused_weight > 0:
-                    con_loss_fused = contrastive_criterion(all_fused_feats, all_labels, all_views, logit_scale)
-                    con_terms.append(args.contrastive_fused_weight * con_loss_fused)
-                if args.contrastive_deep_weight > 0:
-                    con_loss_deep = contrastive_criterion(all_deep_feats, all_labels, all_views, logit_scale)
-                    con_terms.append(args.contrastive_deep_weight * con_loss_deep)
-
-                if con_terms:
-                    total_con_loss = args.contrastive_weight * sum(con_terms)
-                    loss_terms.append(total_con_loss)
-                    con_loss_val = total_con_loss.item()
+                infonce_loss = infonce_criterion(sat_feats, drone_feats, logit_scale)
+                total_infonce_loss = args.infonce_weight * infonce_loss
+                loss_terms.append(total_infonce_loss)
+                infonce_loss_val = total_infonce_loss.item()
                 
             # 7. 反向传播与优化 (干净利落，一次到位！)
             loss = sum(loss_terms) if loss_terms else None
@@ -786,15 +349,15 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                 ema.update(model_engine.module if hasattr(model_engine, "module") else model_engine)
                 loss_sums["total"] += loss.item()
                 loss_counts["total"] += 1
-                if tri_loss_val is not None:
-                    loss_sums["tri"] += tri_loss_val
-                    loss_counts["tri"] += 1
-                if cross_tri_loss_val is not None:
-                    loss_sums["cross_tri"] += cross_tri_loss_val
-                    loss_counts["cross_tri"] += 1
-                if con_loss_val is not None:
-                    loss_sums["con"] += con_loss_val
-                    loss_counts["con"] += 1
+                if tri_drone_loss_val is not None:
+                    loss_sums["tri_drone"] += tri_drone_loss_val
+                    loss_counts["tri_drone"] += 1
+                if tri_sat_loss_val is not None:
+                    loss_sums["tri_sat"] += tri_sat_loss_val
+                    loss_counts["tri_sat"] += 1
+                if infonce_loss_val is not None:
+                    loss_sums["infonce"] += infonce_loss_val
+                    loss_counts["infonce"] += 1
             else:
                 continue
                 
@@ -816,9 +379,9 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                 debug_values = get_model_debug_values(model_engine)
 
                 metric_parts = [
-                    format_optional_metric("tri", tri_loss_val),
-                    format_optional_metric("cross", cross_tri_loss_val),
-                    format_optional_metric("con", con_loss_val),
+                    format_optional_metric("tri_drone", tri_drone_loss_val),
+                    format_optional_metric("tri_sat", tri_sat_loss_val),
+                    format_optional_metric("infonce", infonce_loss_val),
                 ]
                 metric_parts = [part for part in metric_parts if part is not None]
                 metric_text = " | ".join(metric_parts) if metric_parts else "loss_parts=none"
@@ -828,13 +391,13 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                     f"batch {step}/{num_batches} ({progress:.1f}%) | "
                     f"loss={loss.item():.4f} avg={avg_total:.4f} | {metric_text} | "
                     f"lr={lr:.2e} | scale={debug_values.get('scale', 0.0):.3f} | "
-                    f"gamma={debug_values.get('gamma', 0.0):.4f} | elapsed={elapsed_min:.1f}m"
+                    f"elapsed={elapsed_min:.1f}m"
                 )
 
         if is_main_process():
             elapsed_min = (time.time() - epoch_start_time) / 60.0
             avg_parts = []
-            for key in ("total", "tri", "cross_tri", "con"):
+            for key in ("total", "tri_drone", "tri_sat", "infonce"):
                 if loss_counts[key] > 0:
                     avg_parts.append(f"{key}_avg={loss_sums[key] / loss_counts[key]:.4f}")
             avg_text = " | ".join(avg_parts) if avg_parts else "no_update"
@@ -921,30 +484,6 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                 if cur_epoch == args.epochs:
                     print(f"[Checkpoint] Saved final_model.pth | epoch={cur_epoch} | D2S_R@1={d2s_r1:.2f}")
 
-        if (
-            cur_epoch == args.coverage_epochs
-            and cur_epoch < args.epochs
-            and hasattr(dataloader, "dataset")
-            and getattr(dataloader.dataset, "sampling_mode", None) == "coverage"
-        ):
-            ema_model = get_base_model(model_engine)
-            ema_applied = False
-            try:
-                ema.apply_shadow(ema_model)
-                ema_applied = True
-                if is_main_process():
-                    print(
-                        f"[HardPool] Epoch {cur_epoch} start | weights=EMA | "
-                        f"score={args.hard_score_type} | neg_topk={args.hard_neg_topk} | "
-                        f"skip_top={args.hard_pool_skip_top} | pool_size={get_hard_pool_size(args)}"
-                    )
-                build_hard_pool(model_engine, dataloader.dataset, args, amp_device)
-            finally:
-                if ema_applied:
-                    ema.restore(ema_model)
-                model_engine.train()
-                clear_memory_cache()
-
         # 7. 分布式同步：让所有显卡等 Rank 0 写完再进下一个 Epoch
         if dist.is_initialized():
             dist.barrier()
@@ -980,7 +519,7 @@ def print_deepspeed_batch_config(ds_config, args, world_size):
     micro_pid_batch = ds_config["train_micro_batch_size_per_gpu"]
     grad_accum_steps = ds_config["gradient_accumulation_steps"]
     global_pid_batch = ds_config["train_batch_size"]
-    views_per_pid = 4 + args.num_drones
+    views_per_pid = 2
     micro_image_batch = micro_pid_batch * views_per_pid
     global_image_batch = global_pid_batch * views_per_pid
 
@@ -988,7 +527,7 @@ def print_deepspeed_batch_config(ds_config, args, world_size):
         f"[DeepSpeedBatch] local_pid_batch={micro_pid_batch} | "
         f"world_size={world_size} | grad_accum_steps={grad_accum_steps} | "
         f"global_pid_batch={global_pid_batch} | views_per_pid={views_per_pid} | "
-        f"local_image_batch≈{micro_image_batch} | global_image_batch≈{global_image_batch}"
+        f"local_image_batch={micro_image_batch} | global_image_batch={global_image_batch}"
     )
 
 if __name__ == "__main__":
@@ -998,7 +537,6 @@ if __name__ == "__main__":
     parser.add_argument('--device', type=str, default='cuda', help='训练设备')
 
     # muti-runk
-    parser.add_argument('--deepspeed', action='store_true', help='enable deepspeed')
     parser.add_argument('--deepspeed_config', type=str, default='ds_config.json', help='deepspeed config file')
     parser.add_argument(
         '--grad_accum_steps',
@@ -1021,38 +559,29 @@ if __name__ == "__main__":
     parser.add_argument('--batch_size', type=int, default=4, help='每个 GPU 的 batch size')
     parser.add_argument('--img_size', type=int, default=224, help='输入图像的尺寸')
     parser.add_argument('--data_dir', type=str, default='data/U1652', help='数据集路径')
-    parser.add_argument('--num_drones', type=int, default=4, help='抽取的无人机图像数量')
-    parser.add_argument('--sampling_mode', type=str, default='coverage', choices=['random', 'coverage'], help='训练采样模式')
-    parser.add_argument('--coverage_seed', type=int, default=0, help='coverage sampling 的基础随机种子')
-    parser.add_argument('--coverage_epochs', type=int, default=4, help='前多少个 coverage epoch 后切换到 hard_mix')
-    parser.add_argument('--hard_eval_interval', type=int, default=5, help='hard_mix 阶段每隔多少个 epoch 验证一次；0 表示只验证第一个 hard_mix epoch 和最后一轮')
-    parser.add_argument('--hard_samples', type=int, default=2, help='hard_mix 中每个 ID 抽取的困难无人机图数量')
-    parser.add_argument('--hard_score_type', type=str, default='boundary_risk', choices=['boundary_risk'], help='hard_pool 样本价值分数类型')
-    parser.add_argument('--hard_neg_topk', type=int, default=5, help='boundary_risk 中参与均值的 topK negative satellite 数量')
-    parser.add_argument('--hard_pool_skip_top', type=int, default=2, help='每个 ID 内跳过最极端的前几个 boundary_risk 样本')
-    parser.add_argument('--hard_pool_size', type=int, default=16, help='每个 ID 跳过极端样本后保留的 hard_pool 样本数')
-    parser.add_argument('--hard_pool_topk', type=int, default=None, help='兼容旧命令：等价于 hard_pool_size')
-    parser.add_argument('--hard_score_chunk_size', type=int, default=4096, help='计算 drone-to-satellite similarity 时的分块大小')
-    parser.add_argument('--hard_pool_batch_size', type=int, default=32, help='构建 hard_pool 时的推理 batch size')
+    parser.add_argument('--seed', type=int, default=0, help='Sample4Geo batch sampler 随机种子')
+    parser.add_argument('--prob_flip', type=float, default=0.5, help='Sample4Geo pair-level horizontal flip probability')
     parser.add_argument('--log_interval', type=int, default=20, help='训练日志打印间隔，按 batch 计')
     parser.add_argument('--num_workers', type=int, default=4, help='数据加载器的工作进程数')
-    parser.add_argument('--lora', type=int, help='启用LoRA模块后层数', default=0)
+    parser.add_argument('--lora_start_block', type=int, default=None, help='LoRA 起始 transformer block，默认 20')
+    parser.add_argument('--lora_end_block', type=int, default=None, help='LoRA 结束 transformer block（左闭右开），默认等于 full_finetune_start_block')
+    parser.add_argument('--full_finetune_start_block', type=int, default=None, help='全量微调起始 transformer block，默认 -4，即最后四层')
+    parser.add_argument('--full_finetune_end_block', type=int, default=None, help='全量微调结束 transformer block（左闭右开），默认模型总层数')
+    parser.add_argument('--full_finetune_lr_mult', type=float, default=0.1, help='全量微调 backbone 参数相对 lr 的倍率')
+    parser.add_argument('--logit_scale_lr_mult', type=float, default=1.0, help='InfoNCE logit_scale 参数相对 lr 的倍率')
+    parser.add_argument('--lora_rank', type=int, default=8, help='LoRA rank')
+    parser.add_argument('--lora_alpha', type=int, default=16, help='LoRA alpha')
+    parser.add_argument('--lora_dropout', type=float, default=0.1, help='LoRA dropout')
+    parser.add_argument('--lora_target_names', type=str, default='qkv,proj', help='逗号分隔的 LoRA 目标 Linear 名称')
 
     # Loss weights. 三元组和对比学习默认固定启用，设对应大类权重为 0 可关闭该项。
-    parser.add_argument('--triplet_weight', type=float, default=1.0, help='同域三元组损失整体权重')
-    parser.add_argument('--triplet_fused_weight', type=float, default=2.0, help='同域三元组 fused 特征分支权重')
-    parser.add_argument('--triplet_local_weight', type=float, default=0.5, help='同域三元组 local/attended 特征分支权重')
-    parser.add_argument('--triplet_deep_weight', type=float, default=0.0, help='同域三元组 deep/global 特征分支权重')
-    parser.add_argument('--cross_triplet_weight', type=float, default=0.5, help='跨域三元组损失权重，设为 0 可关闭')
-    parser.add_argument('--contrastive_weight', type=float, default=1.0, help='跨域对比学习损失整体权重')
-    parser.add_argument('--contrastive_fused_weight', type=float, default=1.0, help='对比学习 fused 特征分支权重')
-    parser.add_argument('--contrastive_deep_weight', type=float, default=0.2, help='对比学习 deep/global 特征分支权重')
+    parser.add_argument('--triplet_weight', type=float, default=2.0, help='两个同域三元组损失的权重')
+    parser.add_argument('--infonce_weight', type=float, default=1.0, help='InfoNCE 损失整体权重')
 
     args = parser.parse_args()
     try:
         validate_loss_weights(args)
         validate_scheduler_args(args)
-        validate_hard_pool_args(args)
         device, rank, local_rank, world_size = try_init_dist()
         # 构建训练集
         train_dataset, train_sampler, train_loader = create_1652_train_dataset(args)

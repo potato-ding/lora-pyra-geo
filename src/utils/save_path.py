@@ -12,15 +12,18 @@ def _arg(args, name, default):
 def _loss_weight_tag(args):
     return (
         "loss"
-        f"_tri-main{_fmt_weight(_arg(args, 'triplet_weight', 1.0))}"
-        f"_tri-fused{_fmt_weight(_arg(args, 'triplet_fused_weight', 2.0))}"
-        f"_tri-local{_fmt_weight(_arg(args, 'triplet_local_weight', 0.5))}"
-        f"_tri-deep{_fmt_weight(_arg(args, 'triplet_deep_weight', 0.0))}"
-        f"_cross-triplet{_fmt_weight(_arg(args, 'cross_triplet_weight', 0.5))}"
-        f"_con-main{_fmt_weight(_arg(args, 'contrastive_weight', 1.0))}"
-        f"_con-fused{_fmt_weight(_arg(args, 'contrastive_fused_weight', 1.0))}"
-        f"_con-deep{_fmt_weight(_arg(args, 'contrastive_deep_weight', 0.2))}"
+        f"_tri{_fmt_weight(_arg(args, 'triplet_weight', 2.0))}"
+        f"_infonce{_fmt_weight(_arg(args, 'infonce_weight', 1.0))}"
     )
+
+
+def _teacher_tuning_tag(args):
+    if hasattr(args, "resolved_lora_start_block") and hasattr(args, "resolved_full_finetune_start_block"):
+        return (
+            f"_lora{args.resolved_lora_start_block}-{args.resolved_lora_end_block}"
+            f"_full{args.resolved_full_finetune_start_block}-{args.resolved_full_finetune_end_block}"
+        )
+    return ""
 
 
 def get_save_pth(args):
@@ -34,7 +37,7 @@ def get_save_pth(args):
     save_dir = os.path.join(
         getattr(args, 'output_root', 'src/checkpoint/teacher'),
         'dinov3' +
-        (f'_lora{args.lora}' if (args.lora > 0) else '') +
+        _teacher_tuning_tag(args) +
         f"_{_loss_weight_tag(args)}"
     )
     return save_dir

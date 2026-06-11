@@ -1,44 +1,107 @@
 # 专门用于根据args构建教师模型实例，保持train.py的简洁。
 import torch
 import torch.nn as nn
-import numpy as np
 from pathlib import Path
 from .dinov3_backbone import DINOv3Backbone
 from .peft_lora import LoRAInject
-from .pyra_module import PYRAModule
-import torch.utils.checkpoint as cp
 from src.utils.smart_checkpoint import SmartCheckpointWrapper
 import torch.nn.functional as F
-from src.models.peft_lora import DoRAInject
-
-# 增加设置梯度检查点类
-class CheckpointWrapper(nn.Module):
-    def __init__(self, module):
-        super().__init__()
-        self.module = module
-
-    def forward(self, *args, **kwargs):
-        # 只有在训练模式且输入需要梯度时，才触发 checkpoint 以节省显存
-        if self.training:
-            # use_reentrant=False 是新版 PyTorch 的推荐规范，能更稳定地处理底层冻结的梯度流
-            return cp.checkpoint(self.module, *args, use_reentrant=False, **kwargs)
-        else:
-            return self.module(*args, **kwargs)
-
 
 # dinov3 代码和权重路径。使用绝对路径，避免从非项目根目录启动时找不到权重。
 _MODEL_DIR = Path(__file__).resolve().parent
 repo_dir = str(_MODEL_DIR)
 ckpt_path = str(_MODEL_DIR / 'dinov3-pth' / 'dinov3_vit7b16_pretrain_lvd1689m-a955f4ea.pth')
 
+
+def _resolve_block_index(value, num_blocks, name, default=None):
+    if value is None:
+        value = default
+    if value is None:
+        return num_blocks
+
+    idx = int(value)
+    if idx < 0:
+        idx = num_blocks + idx
+
+    if idx < 0 or idx > num_blocks:
+        raise ValueError(f"{name}={value} 解析为 {idx}，但 block 范围应在 [0, {num_blocks}]")
+    return idx
+
+
+def _range_overlaps(range_a, range_b):
+    return max(range_a[0], range_b[0]) < min(range_a[1], range_b[1])
+
+
+def resolve_teacher_tuning_ranges(args, num_blocks):
+    lora_start_arg = getattr(args, "lora_start_block", None)
+    lora_end_arg = getattr(args, "lora_end_block", None)
+    full_start_arg = getattr(args, "full_finetune_start_block", None)
+    full_end_arg = getattr(args, "full_finetune_end_block", None)
+
+    full_start = _resolve_block_index(
+        full_start_arg,
+        num_blocks,
+        "full_finetune_start_block",
+        default=-4,
+    )
+    full_end = _resolve_block_index(
+        full_end_arg,
+        num_blocks,
+        "full_finetune_end_block",
+        default=None,
+    )
+    if full_start > full_end:
+        raise ValueError(
+            f"full_finetune range 非法: start={full_start}, end={full_end}"
+        )
+
+    default_lora_start = min(20, full_start)
+    lora_start = _resolve_block_index(
+        lora_start_arg,
+        num_blocks,
+        "lora_start_block",
+        default=default_lora_start,
+    )
+    lora_end = _resolve_block_index(
+        lora_end_arg,
+        num_blocks,
+        "lora_end_block",
+        default=full_start,
+    )
+    if lora_start > lora_end:
+        raise ValueError(f"lora range 非法: start={lora_start}, end={lora_end}")
+
+    lora_range = (lora_start, lora_end)
+    full_range = (full_start, full_end)
+
+    if _range_overlaps(lora_range, full_range):
+        raise ValueError(
+            f"LoRA 区间 {lora_range} 与全量微调区间 {full_range} 重叠，请调整超参"
+        )
+
+    return {
+        "lora_range": lora_range,
+        "full_range": full_range,
+    }
+
+
+def _parse_lora_target_names(value):
+    if isinstance(value, str):
+        names = tuple(item.strip() for item in value.split(",") if item.strip())
+    else:
+        names = tuple(value)
+    if not names:
+        raise ValueError("lora_target_names 不能为空")
+    return names
+
+
 class TeacherModel(nn.Module):
     """
-    组装车间：将 DINOv3-7B 主干、LoRA 注入、PYRA增强缝合为一体。
-    支持灵活配置 LoRA、PYRA，便于微调与特征增强。
+    组装 DINOv3-7B 主干，并按 block 区间控制 LoRA 与全量微调。
+    forward 只返回最后一层 class token 的归一化特征。
     """
     def __init__(self, args):
         super().__init__()
-        self.lora_layers = args.lora
         self.device = args.device
         self.lora_injector = None
 
@@ -59,62 +122,47 @@ class TeacherModel(nn.Module):
 
         num_blocks = len(dino_model.blocks)
 
-        if self.lora_layers < 0 or self.lora_layers > num_blocks:
-            raise ValueError(f"lora_layers={self.lora_layers} 不合法，模型共有 {num_blocks} 个 block")
+        tuning_ranges = resolve_teacher_tuning_ranges(args, num_blocks)
+        self.lora_range = tuning_ranges["lora_range"]
+        self.full_finetune_range = tuning_ranges["full_range"]
+        args.resolved_lora_start_block = self.lora_range[0]
+        args.resolved_lora_end_block = self.lora_range[1]
+        args.resolved_full_finetune_start_block = self.full_finetune_range[0]
+        args.resolved_full_finetune_end_block = self.full_finetune_range[1]
 
-        if self.lora_layers > 0:
-            start_block = num_blocks - self.lora_layers
+        print(
+            f"[TeacherTune] blocks={num_blocks} | "
+            f"lora={self.lora_range} | full_finetune={self.full_finetune_range}"
+        )
+
+        if self.lora_range[0] < self.lora_range[1]:
+            lora_target_names = _parse_lora_target_names(
+                getattr(args, "lora_target_names", "qkv,proj")
+            )
 
             self.lora_cfg = {
-                "r": 8,
-                "alpha": 16,
-                "dropout": 0.1,
-                "target_names": ("qkv", "proj"),
-                "block_range": (start_block, num_blocks),
+                "r": int(getattr(args, "lora_rank", 8)),
+                "alpha": int(getattr(args, "lora_alpha", 16)),
+                "dropout": float(getattr(args, "lora_dropout", 0.1)),
+                "target_names": lora_target_names,
+                "block_range": self.lora_range,
                 "task_type": "feature_extraction"
             }
 
             self.lora_injector = LoRAInject(dino_model, **self.lora_cfg)
             self.lora_injector.inject()
 
+        full_start, full_end = self.full_finetune_range
+        for block_idx in range(full_start, full_end):
+            for param in dino_model.blocks[block_idx].parameters():
+                param.requires_grad = True
+
         for i in range(num_blocks):
             dino_model.blocks[i] = SmartCheckpointWrapper(dino_model.blocks[i])
 
-        init_value = np.log(1 / 0.07)
-        self.logit_scale = nn.Parameter(torch.tensor(init_value, dtype=torch.float32))
-
-        self.target_layers = [15, 23, 31, num_blocks - 1]
-        self.num_local_layers = len(self.target_layers) - 1
-
-        self.gamma_raw = nn.Parameter(torch.tensor(-2.0, dtype=torch.float32))
-        self.local_gamma_scale = 0.05
-
-        local_dim = 512
-
-        self.patch_projectors = nn.ModuleList([
-            nn.Sequential(
-                nn.LayerNorm(4096, dtype=torch.bfloat16),
-                nn.Linear(4096, local_dim, dtype=torch.bfloat16),
-            )
-            for _ in range(self.num_local_layers)
-        ])
-
-        self.query_norm = nn.LayerNorm(4096, dtype=torch.bfloat16)
-        self.query_projector = nn.Linear(4096, local_dim, dtype=torch.bfloat16)
-
-        self.local_cross_attn = nn.MultiheadAttention(
-            embed_dim=local_dim,
-            num_heads=8,
-            batch_first=True,
-            dtype=torch.bfloat16
-        )
-
-        self.local_out_projector = nn.Sequential(
-            nn.LayerNorm(local_dim, dtype=torch.bfloat16),
-            nn.Linear(local_dim, 4096, dtype=torch.bfloat16),
-        )
-        nn.init.zeros_(self.local_out_projector[1].weight)
-        nn.init.zeros_(self.local_out_projector[1].bias)
+        init_value = torch.log(torch.tensor(1 / 0.07, dtype=torch.float32))
+        self.logit_scale = nn.Parameter(init_value)
+        self.target_layers = [num_blocks - 1]
 
     def forward(self, x):
         with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.FLASH_ATTENTION):
@@ -124,48 +172,7 @@ class TeacherModel(nn.Module):
                 return_class_token=True
             )
 
-        # 最后一层 class token 作为主特征
         main_cls = features[-1][1]                      # [B, 4096]
-        global_feat = F.normalize(main_cls.float(), p=2, dim=-1, eps=1e-6)
+        feats = F.normalize(main_cls.float(), p=2, dim=-1, eps=1e-6)
 
-        # 中后层 patch tokens 作为细粒度局部信息
-        local_tokens = []
-        for i in range(self.num_local_layers):
-            patch_tokens = features[i][0]               # [B, N, 4096]
-            local_tokens.append(self.patch_projectors[i](patch_tokens))
-
-        # 构造 cross-attention 的 K/V: [B, 3N, 512]
-        kv_features = torch.cat(local_tokens, dim=1)
-
-        # 深层全局语义作为 Query，查询中后层局部 patch 细节
-        query = self.query_projector(
-            self.query_norm(main_cls.detach())
-        ).unsqueeze(1)                                  # [B, 1, 512]
-
-        attn_output, _ = self.local_cross_attn(
-            query=query,
-            key=kv_features,
-            value=kv_features,
-            need_weights=False
-        )
-
-        local_feat = self.local_out_projector(
-            attn_output.squeeze(1)
-        ).float()                                       # [B, 4096]
-
-        # 只保留与全局特征互补的局部方向，减少对强 baseline 的主方向扰动
-        local_feat = local_feat - (
-            local_feat * global_feat
-        ).sum(dim=-1, keepdim=True) * global_feat
-        local_feat = F.normalize(local_feat, p=2, dim=-1, eps=1e-6)
-
-        # 融合强度保持很小：细节分支只做补充，不改写主全局特征
-        actual_gamma = self.local_gamma_scale * torch.sigmoid(self.gamma_raw)
-
-        # 最终融合
-        feats = F.normalize(global_feat + actual_gamma * local_feat, p=2, dim=-1, eps=1e-6)
-
-        if self.training:
-            return global_feat, feats, local_feat
-        else:
-            return feats
+        return feats
