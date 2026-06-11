@@ -128,6 +128,12 @@ def save_hyperparameters(save_dir, args):
         json.dump(payload, f, indent=2, ensure_ascii=False)
 
 
+def save_metrics_json(save_dir, filename, payload):
+    json_path = os.path.join(save_dir, filename)
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(_json_safe_value(payload), f, indent=2, ensure_ascii=False)
+
+
 def get_current_lr(optimizer, scheduler=None):
     if scheduler is not None and hasattr(scheduler, "get_last_lr"):
         try:
@@ -879,6 +885,27 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                     best_r1 = d2s_r1
                     best_epoch = cur_epoch
                     torch.save(trainable_state, os.path.join(save_dir, "best_model.pth"))
+                    save_metrics_json(
+                        save_dir,
+                        "best_metrics.json",
+                        {
+                            "epoch": cur_epoch,
+                            "selection_metric": "D2S_R@1",
+                            "best_D2S_R@1": best_r1,
+                            "D2S": {
+                                "R@1": d2s_r1,
+                                "R@5": d2s_r5,
+                                "R@10": d2s_r10,
+                                "mAP": d2s_map,
+                            },
+                            "S2D": {
+                                "R@1": s2d_r1,
+                                "R@5": s2d_r5,
+                                "R@10": s2d_r10,
+                                "mAP": s2d_map,
+                            },
+                        },
+                    )
 
                 if cur_epoch == args.epochs:
                     torch.save(trainable_state, os.path.join(save_dir, "final_model.pth"))
