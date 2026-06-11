@@ -12,7 +12,7 @@ def _arg(args, name, default):
 def _loss_weight_tag(args):
     return (
         "loss"
-        f"_tri{_fmt_weight(_arg(args, 'triplet_weight', 2.0))}"
+        f"_tri{_fmt_weight(_arg(args, 'triplet_weight', 0.0))}"
         f"_infonce{_fmt_weight(_arg(args, 'infonce_weight', 1.0))}"
     )
 

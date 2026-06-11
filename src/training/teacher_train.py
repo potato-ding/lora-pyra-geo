@@ -581,8 +581,8 @@ if __name__ == "__main__":
     parser.add_argument('--lora_dropout', type=float, default=0.1, help='LoRA dropout')
     parser.add_argument('--lora_target_names', type=str, default='qkv,proj', help='逗号分隔的 LoRA 目标 Linear 名称')
 
-    # Loss weights. 三元组和对比学习默认固定启用，设对应大类权重为 0 可关闭该项。
-    parser.add_argument('--triplet_weight', type=float, default=2.0, help='两个同域三元组损失的权重')
+    # Loss weights. Sample4Geo-style training defaults to cross-view InfoNCE only.
+    parser.add_argument('--triplet_weight', type=float, default=0.0, help='两个同域三元组损失的权重；设为 0 可关闭')
     parser.add_argument('--infonce_weight', type=float, default=1.0, help='InfoNCE 损失整体权重')
 
     args = parser.parse_args()
