@@ -72,7 +72,9 @@ class LoRALayer(nn.Module):
 		if x.dtype != dtype:
 			x = x.to(dtype)
 			
-		lora_out = self.dropout(self.lora_B(self.lora_A(x))) * self.scaling
+		lora_dtype = self.lora_A.weight.dtype
+		x_lora = x.to(lora_dtype)
+		lora_out = self.lora_B(self.lora_A(self.dropout(x_lora))) * self.scaling
 		
 		return self.base(x) + lora_out.to(dtype)
 

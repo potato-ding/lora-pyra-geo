@@ -627,7 +627,7 @@ def build_hard_pool(model_engine, train_dataset, args, device):
         )
 
 
-def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=None):
+def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=None, ds_config=None):
     local_rank = int(os.environ.get('LOCAL_RANK', 0)) if 'LOCAL_RANK' in os.environ else 0
     
     amp_device = args.device
@@ -641,7 +641,7 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
         model=model,
         optimizer=optimizer,
         lr_scheduler=scheduler,
-        config=args.deepspeed_config
+        config=ds_config if ds_config is not None else args.deepspeed_config
     )
     # 开始训练循环
     # 构建保存目录名
@@ -924,19 +924,45 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
     if not dist.is_initialized() or local_rank == 0:
         print("训练完成！")
 
-def get_grad_accum_steps_from_ds_config(ds_config_path, world_size):
+def build_deepspeed_runtime_config(ds_config_path, args, world_size):
     with open(ds_config_path, "r") as f:
         ds_config = json.load(f)
 
-    train_batch_size = ds_config["train_batch_size"]
-    micro_batch_size = ds_config["train_micro_batch_size_per_gpu"]
+    micro_batch_size = int(args.batch_size)
+    grad_accum_steps = int(getattr(args, "grad_accum_steps", 1))
 
-    grad_accum_steps = train_batch_size // (micro_batch_size * world_size)
+    if micro_batch_size <= 0:
+        raise ValueError("batch_size 必须大于 0")
+    if grad_accum_steps <= 0:
+        raise ValueError("grad_accum_steps 必须大于 0")
+    if world_size <= 0:
+        raise ValueError("world_size 必须大于 0")
 
-    assert train_batch_size == micro_batch_size * world_size * grad_accum_steps, \
-        "DeepSpeed batch size 配置不整除，请检查 train_batch_size / micro_batch_size / world_size"
+    train_batch_size = micro_batch_size * world_size * grad_accum_steps
+    ds_config["train_micro_batch_size_per_gpu"] = micro_batch_size
+    ds_config["gradient_accumulation_steps"] = grad_accum_steps
+    ds_config["train_batch_size"] = train_batch_size
 
-    return grad_accum_steps
+    return ds_config, grad_accum_steps
+
+
+def print_deepspeed_batch_config(ds_config, args, world_size):
+    if not is_main_process():
+        return
+
+    micro_pid_batch = ds_config["train_micro_batch_size_per_gpu"]
+    grad_accum_steps = ds_config["gradient_accumulation_steps"]
+    global_pid_batch = ds_config["train_batch_size"]
+    views_per_pid = 4 + args.num_drones
+    micro_image_batch = micro_pid_batch * views_per_pid
+    global_image_batch = global_pid_batch * views_per_pid
+
+    print(
+        f"[DeepSpeedBatch] local_pid_batch={micro_pid_batch} | "
+        f"world_size={world_size} | grad_accum_steps={grad_accum_steps} | "
+        f"global_pid_batch={global_pid_batch} | views_per_pid={views_per_pid} | "
+        f"local_image_batch≈{micro_image_batch} | global_image_batch≈{global_image_batch}"
+    )
 
 if __name__ == "__main__":
     import traceback
@@ -947,6 +973,14 @@ if __name__ == "__main__":
     # muti-runk
     parser.add_argument('--deepspeed', action='store_true', help='enable deepspeed')
     parser.add_argument('--deepspeed_config', type=str, default='ds_config.json', help='deepspeed config file')
+    parser.add_argument(
+        '--grad_accum_steps',
+        '--gradient_accumulation_steps',
+        dest='grad_accum_steps',
+        type=int,
+        default=1,
+        help='DeepSpeed 梯度累积步数；全局 PID batch = batch_size * world_size * grad_accum_steps'
+    )
 
     # Learning Rate Config
     parser.add_argument('--lr', default=1e-4, type=float, help='1 * 10^-4 for ViT | 1 * 10^-1 for CNN')
@@ -1006,10 +1040,12 @@ if __name__ == "__main__":
         model = model.to(device)
         # 获取可训练参数并构建优化器和学习率调度器
         optimizer = build_optimizer_and_scale(model, args)
-        grad_accum_steps = get_grad_accum_steps_from_ds_config(
+        ds_config, grad_accum_steps = build_deepspeed_runtime_config(
             args.deepspeed_config,
+            args,
             world_size
         )
+        print_deepspeed_batch_config(ds_config, args, world_size)
 
         scheduler_plan = build_scheduler_plan(
             train_loader,
@@ -1033,6 +1069,7 @@ if __name__ == "__main__":
             optimizer=optimizer,
             scheduler=scheduler,
             val_loaders=val_loaders,
+            ds_config=ds_config,
         )
     except Exception as e:
         print("\n[Error] Exception occurred during training:")
