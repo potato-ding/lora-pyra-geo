@@ -76,6 +76,17 @@ def is_main_process():
     return not dist.is_available() or not dist.is_initialized() or dist.get_rank() == 0
 
 
+def str2bool(value):
+    if isinstance(value, bool):
+        return value
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"invalid boolean value: {value}")
+
+
 def init_run_timestamp(args):
     timestamp = getattr(args, "run_timestamp", None)
     if timestamp is None:
@@ -152,7 +163,31 @@ def get_model_debug_values(model_or_engine):
     with torch.no_grad():
         if hasattr(base_model, "logit_scale"):
             values["scale"] = base_model.logit_scale.exp().item()
+        if hasattr(base_model, "get_fusion_runtime_values"):
+            values.update(base_model.get_fusion_runtime_values())
     return values
+
+
+def print_teacher_feature_fusion_config(model_or_engine):
+    if not is_main_process():
+        return
+
+    base_model = get_base_model(model_or_engine)
+    if not hasattr(base_model, "get_feature_fusion_config"):
+        return
+
+    config = base_model.get_feature_fusion_config()
+    print(
+        f"[TeacherFusion] local_feature_layers = {config['local_feature_layers']} "
+        f"# {config['layer_index_base']}"
+    )
+    for item in config["layer_regions"]:
+        print(f"[TeacherFusion] layer {item['layer']}: {item['region']}")
+    print(
+        f"[TeacherFusion] use_soft_orth_fusion={config['use_soft_orth_fusion']} | "
+        f"soft_orth_lambda_init={config['soft_orth_lambda_init']:.6g} | "
+        f"soft_orth_detach_global={config['soft_orth_detach_global']}"
+    )
 
 
 def format_optional_metric(name, value):
@@ -238,6 +273,7 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
         lr_scheduler=scheduler,
         config=ds_config if ds_config is not None else args.deepspeed_config
     )
+    print_teacher_feature_fusion_config(model_engine)
     # 开始训练循环
     # 构建保存目录名
     init_run_timestamp(args)
@@ -268,6 +304,15 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
         loss_counts = {"total": 0, "tri_drone": 0, "tri_sat": 0, "infonce": 0}
 
         if is_main_process():
+            fusion_values = get_model_debug_values(model_engine)
+            print(
+                f"[Fusion] Epoch {epoch}/{args.epochs} | "
+                f"gamma={fusion_values.get('gamma', 0.0):.6f} | "
+                f"lambda_orth={fusion_values.get('lambda_orth', 0.0):.6f} | "
+                f"use_soft_orth_fusion={fusion_values.get('use_soft_orth_fusion', False)} | "
+                f"soft_orth_detach_global={fusion_values.get('soft_orth_detach_global', True)} | "
+                f"local_feature_layers={fusion_values.get('local_feature_layers', [])}"
+            )
             print(
                 f"[Train] Epoch {epoch}/{args.epochs} start | "
                 f"mode={mode_name} ({mode_desc}) | "
@@ -302,7 +347,7 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                 torch.ones(num_drone, dtype=torch.long)
             ]).to(amp_device)
             
-            # 4. 前向传播：当前 teacher 只使用最后层输出特征。
+            # 4. 前向传播：训练时 TeacherModel 返回 (deep, fused, local)，loss 使用 fused。
             final_feats = model_engine(imgs)
             if isinstance(final_feats, tuple):
                 final_feats = final_feats[1] if len(final_feats) > 1 else final_feats[0]
@@ -580,6 +625,10 @@ if __name__ == "__main__":
     parser.add_argument('--lora_alpha', type=int, default=16, help='LoRA alpha')
     parser.add_argument('--lora_dropout', type=float, default=0.1, help='LoRA dropout')
     parser.add_argument('--lora_target_names', type=str, default='qkv,proj', help='逗号分隔的 LoRA 目标 Linear 名称')
+    parser.add_argument('--local_feature_layers', type=str, default='19,27,36', help='逗号分隔的 local/PYRA transformer block 输出 index，0-based')
+    parser.add_argument('--use_soft_orth_fusion', action='store_true', help='启用 learnable soft orthogonal local fusion')
+    parser.add_argument('--soft_orth_lambda_init', type=float, default=0.8, help='lambda_orth 的 sigmoid 初始化值')
+    parser.add_argument('--soft_orth_detach_global', type=str2bool, nargs='?', const=True, default=True, help='soft orthogonal projection 是否使用 global_feat.detach()')
 
     # Loss weights. Sample4Geo-style training defaults to cross-view InfoNCE only.
     parser.add_argument('--triplet_weight', type=float, default=0.0, help='两个同域三元组损失的权重；设为 0 可关闭')

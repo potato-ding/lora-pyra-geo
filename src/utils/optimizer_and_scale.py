@@ -8,16 +8,19 @@ except ImportError:
 
 def build_optimizer_and_scale(model, args):
     """
-    Build the teacher optimizer for the current final-only DINOv3 setup.
+    Build the teacher optimizer for the current DINOv3 teacher setup.
 
     Trainable groups are LoRA params, fully fine-tuned backbone params,
-    the InfoNCE logit_scale, and a small fallback group for unexpected params.
+    local/fusion params, the InfoNCE logit_scale, and a small fallback group
+    for unexpected params.
     """
     logit_scale = model.logit_scale
     lora_weight_decay = []
     lora_no_weight_decay = []
     backbone_full_decay = []
     backbone_full_no_decay = []
+    fusion_decay = []
+    fusion_no_weight_decay = []
     other_params = []
 
     for name, param in model.named_parameters():
@@ -34,6 +37,12 @@ def build_optimizer_and_scale(model, args):
             or "bn" in name_lower
         )
 
+        is_fusion_param = (
+            name in {"gamma_raw", "lambda_orth_raw"}
+            or name.startswith("local_cross_attn.")
+            or name.startswith("local_proj.")
+        )
+
         if "lora_" in name:
             if no_decay:
                 lora_no_weight_decay.append(param)
@@ -41,6 +50,11 @@ def build_optimizer_and_scale(model, args):
                 lora_weight_decay.append(param)
         elif name.endswith(".m"):
             lora_no_weight_decay.append(param)
+        elif is_fusion_param:
+            if no_decay:
+                fusion_no_weight_decay.append(param)
+            else:
+                fusion_decay.append(param)
         elif name.startswith("backbone."):
             if no_decay:
                 backbone_full_no_decay.append(param)
@@ -54,6 +68,7 @@ def build_optimizer_and_scale(model, args):
         f"[TeacherOptimizer] lora_decay={len(lora_weight_decay)} | "
         f"lora_no_decay={len(lora_no_weight_decay)} | "
         f"full_backbone_decay/no_decay={len(backbone_full_decay)}/{len(backbone_full_no_decay)} | "
+        f"fusion_decay/no_decay={len(fusion_decay)}/{len(fusion_no_weight_decay)} | "
         f"other={len(other_params)} | logit_scale=1"
     )
 
@@ -87,6 +102,19 @@ def build_optimizer_and_scale(model, args):
             "weight_decay": 0.0,
         })
 
+    if fusion_decay:
+        optimizer_grouped_parameters.append({
+            "params": fusion_decay,
+            "lr": args.lr,
+            "weight_decay": 0.01,
+        })
+    if fusion_no_weight_decay:
+        optimizer_grouped_parameters.append({
+            "params": fusion_no_weight_decay,
+            "lr": args.lr,
+            "weight_decay": 0.0,
+        })
+
     if other_params:
         optimizer_grouped_parameters.append({
             "params": other_params,
@@ -112,6 +140,7 @@ def build_optimizer_and_scale(model, args):
     print(f"[TeacherOptimizer] using {optimizer_class.__name__}")
     print(f"[TeacherOptimizer] lora lr: {args.lr:.6g}")
     print(f"[TeacherOptimizer] full_finetune lr: {full_lr:.6g} (mult={full_lr_mult:g})")
+    print(f"[TeacherOptimizer] local/fusion lr: {args.lr:.6g}")
     print(f"[TeacherOptimizer] logit_scale lr: {logit_scale_lr:.6g} (mult={logit_scale_lr_mult:g})")
     return optimizer
 

@@ -29,6 +29,10 @@ MODEL_HPARAM_KEYS = {
     "lora_alpha",
     "lora_dropout",
     "lora_target_names",
+    "local_feature_layers",
+    "use_soft_orth_fusion",
+    "soft_orth_lambda_init",
+    "soft_orth_detach_global",
 }
 
 SUPPORTED_DATASETS = ("1652", "GTA-UAV", "SUES-200")
@@ -36,6 +40,17 @@ SUPPORTED_DATASETS = ("1652", "GTA-UAV", "SUES-200")
 
 def is_main_process():
     return not dist.is_available() or not dist.is_initialized() or dist.get_rank() == 0
+
+
+def str2bool(value):
+    if isinstance(value, bool):
+        return value
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"invalid boolean value: {value}")
 
 
 def distributed_barrier(local_rank):
@@ -325,6 +340,10 @@ def parse_args():
     parser.add_argument("--lora_alpha", type=int, default=16)
     parser.add_argument("--lora_dropout", type=float, default=0.1)
     parser.add_argument("--lora_target_names", type=str, default="qkv,proj")
+    parser.add_argument("--local_feature_layers", type=str, default="19,27,36")
+    parser.add_argument("--use_soft_orth_fusion", action="store_true")
+    parser.add_argument("--soft_orth_lambda_init", type=float, default=0.8)
+    parser.add_argument("--soft_orth_detach_global", type=str2bool, nargs="?", const=True, default=True)
 
     defaults = {action.dest: action.default for action in parser._actions}
     args = parser.parse_args()
