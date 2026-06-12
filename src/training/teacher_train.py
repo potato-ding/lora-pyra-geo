@@ -134,6 +134,40 @@ def save_metrics_json(save_dir, filename, payload):
         json.dump(_json_safe_value(payload), f, indent=2, ensure_ascii=False)
 
 
+def build_validation_metrics(epoch, d2s_metrics, s2d_metrics):
+    d2s_r1, d2s_r5, d2s_r10, d2s_map = d2s_metrics
+    s2d_r1, s2d_r5, s2d_r10, s2d_map = s2d_metrics
+    return {
+        "epoch": epoch,
+        "selection_metric": "D2S_R@1+S2D_R@1",
+        "R@1_sum": d2s_r1 + s2d_r1,
+        "D2S": {
+            "R@1": d2s_r1,
+            "R@5": d2s_r5,
+            "R@10": d2s_r10,
+            "mAP": d2s_map,
+        },
+        "S2D": {
+            "R@1": s2d_r1,
+            "R@5": s2d_r5,
+            "R@10": s2d_r10,
+            "mAP": s2d_map,
+        },
+    }
+
+
+def build_best_metrics_payload(best_metrics, validation_history):
+    payload = {
+        "epoch": best_metrics["epoch"],
+        "selection_metric": best_metrics["selection_metric"],
+        "best_R@1_sum": best_metrics["R@1_sum"],
+        "D2S": best_metrics["D2S"],
+        "S2D": best_metrics["S2D"],
+        "validation_history": validation_history,
+    }
+    return payload
+
+
 def get_current_lr(optimizer, scheduler=None):
     if scheduler is not None and hasattr(scheduler, "get_last_lr"):
         try:
@@ -288,6 +322,8 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
     ema = LiteEMA(get_base_model(model_engine), decay=args.ema_decay)
     best_r1_sum = -1.0
     best_epoch = 0
+    best_metrics = None
+    validation_history = []
     for epoch in range(1, args.epochs + 1):
         if hasattr(dataloader, 'dataset') and hasattr(dataloader.dataset, 'set_epoch'):
             dataloader.dataset.set_epoch(epoch)
@@ -487,34 +523,28 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
 
             if is_main_process():
                 trainable_state = {k: v.cpu() for k, v in ema.shadow.items()}
-                r1_sum = d2s_r1 + s2d_r1
-                is_best = r1_sum > best_r1_sum
+                current_metrics = build_validation_metrics(
+                    cur_epoch,
+                    (d2s_r1, d2s_r5, d2s_r10, d2s_map),
+                    (s2d_r1, s2d_r5, s2d_r10, s2d_map),
+                )
+                r1_sum = current_metrics["R@1_sum"]
+                is_best = best_metrics is None or r1_sum > best_r1_sum
+                history_record = dict(current_metrics)
+                history_record["is_best"] = is_best
+                validation_history.append(history_record)
 
                 if is_best:
                     best_r1_sum = r1_sum
                     best_epoch = cur_epoch
+                    best_metrics = current_metrics
                     torch.save(trainable_state, os.path.join(save_dir, "best_model.pth"))
-                    save_metrics_json(
-                        save_dir,
-                        "best_metrics.json",
-                        {
-                            "epoch": cur_epoch,
-                            "selection_metric": "D2S_R@1+S2D_R@1",
-                            "best_R@1_sum": best_r1_sum,
-                            "D2S": {
-                                "R@1": d2s_r1,
-                                "R@5": d2s_r5,
-                                "R@10": d2s_r10,
-                                "mAP": d2s_map,
-                            },
-                            "S2D": {
-                                "R@1": s2d_r1,
-                                "R@5": s2d_r5,
-                                "R@10": s2d_r10,
-                                "mAP": s2d_map,
-                            },
-                        },
-                    )
+
+                save_metrics_json(
+                    save_dir,
+                    "best_metrics.json",
+                    build_best_metrics_payload(best_metrics, validation_history),
+                )
 
                 if cur_epoch == args.epochs:
                     torch.save(trainable_state, os.path.join(save_dir, "final_model.pth"))
