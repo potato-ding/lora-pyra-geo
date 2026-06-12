@@ -185,6 +185,10 @@ class PYRALocalCrossAttention(nn.Module):
         self.output_norm = nn.LayerNorm(self.dim)
         nn.init.normal_(self.query, std=0.02)
 
+    @staticmethod
+    def _norm_with_module_dtype(norm, x):
+        return norm(x.to(dtype=norm.weight.dtype))
+
     def forward(self, local_tokens):
         if local_tokens.ndim != 3:
             raise RuntimeError(f"local_tokens must be [B, N, D], got {tuple(local_tokens.shape)}")
@@ -193,14 +197,14 @@ class PYRALocalCrossAttention(nn.Module):
                 f"local token dim mismatch: got {local_tokens.size(-1)}, expected {self.dim}"
             )
 
-        tokens = self.token_norm(local_tokens.float())
+        tokens = self._norm_with_module_dtype(self.token_norm, local_tokens)
         query = self.query.to(device=tokens.device, dtype=tokens.dtype).expand(tokens.size(0), -1, -1)
-        query = self.query_norm(query)
+        query = self._norm_with_module_dtype(self.query_norm, query)
 
         attn_logits = torch.matmul(query, tokens.transpose(-1, -2)) / math.sqrt(self.dim)
-        attn_weights = torch.softmax(attn_logits, dim=-1)
+        attn_weights = torch.softmax(attn_logits.float(), dim=-1).to(dtype=tokens.dtype)
         attended = torch.matmul(attn_weights, tokens).squeeze(1)
-        return self.output_norm(attended)
+        return self._norm_with_module_dtype(self.output_norm, attended)
 
 
 class TeacherModel(nn.Module):
@@ -390,7 +394,7 @@ class TeacherModel(nn.Module):
                     f"local layer {layer_idx} token dim {patch_tokens.size(-1)} "
                     f"does not match global dim {global_feat.size(-1)}"
                 )
-            local_patch_tokens.append(patch_tokens.float())
+            local_patch_tokens.append(patch_tokens)
 
         local_tokens = torch.cat(local_patch_tokens, dim=1)
         attended_feat = self.local_cross_attn(local_tokens)
