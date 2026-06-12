@@ -22,6 +22,16 @@ class TinyIndexedDataset(Dataset):
         return x, idx, idx
 
 
+class TinyCoordIndexedDataset(Dataset):
+    def __len__(self):
+        return 6
+
+    def __getitem__(self, idx):
+        x = torch.tensor([idx + 1.0, idx + 2.0], dtype=torch.float32)
+        coord = torch.tensor([idx * 10.0, idx * 10.0 + 1.0], dtype=torch.float32)
+        return x, idx, coord, idx
+
+
 class IdentityModel(torch.nn.Module):
     def __init__(self):
         super().__init__()
@@ -79,6 +89,25 @@ class ExtractFeaturesDistTest(unittest.TestCase):
         self.assertNotIn((6, 2), feature_gather_shapes)
         self.assertEqual(feats.shape, (6, 2))
         self.assertTrue(torch.equal(labels.cpu(), torch.arange(6)))
+
+    def test_preserves_coords_when_index_deduplicates_distributed_padding(self):
+        fake_dist = FakeDist()
+        original_dist = train_eval_utils.dist
+        train_eval_utils.dist = fake_dist
+        try:
+            loader = DataLoader(TinyCoordIndexedDataset(), batch_size=2, shuffle=False)
+            feats, labels, coords = train_eval_utils.extract_features_dist(
+                IdentityModel(),
+                loader,
+                torch.device("cpu"),
+            )
+        finally:
+            train_eval_utils.dist = original_dist
+
+        self.assertEqual(feats.shape, (6, 2))
+        self.assertTrue(torch.equal(labels.cpu(), torch.arange(6)))
+        expected_coords = torch.tensor([[i * 10.0, i * 10.0 + 1.0] for i in range(6)])
+        self.assertTrue(torch.equal(coords.cpu(), expected_coords))
 
     def test_retrieval_metrics_work_with_cpu_gathered_features(self):
         original_dist = train_eval_utils.dist
