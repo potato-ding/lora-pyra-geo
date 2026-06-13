@@ -1,0 +1,389 @@
+# Teacher evaluation script for the current DINOv3 teacher model.
+import argparse
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
+os.environ["NO_ALBUMENTATIONS_UPDATE"] = "1"
+
+import torch
+import torch.distributed as dist
+
+from src.dataset.teacher.val_dataloaders import (
+    build_1652_val_dataloaders,
+    build_gta_val_dataloaders,
+    build_sues200_val_dataloaders,
+)
+from src.models.teacher.model import TeacherModel
+from src.utils.initdist import try_init_dist
+from src.utils.train_eval_utils import getdist_1652_val_and_get_recall, run_gta_val_and_get_metrics, run_sues_val_and_get_metrics
+
+
+MODEL_HPARAM_KEYS = {
+    "lora_start_block",
+    "lora_end_block",
+    "full_finetune_start_block",
+    "full_finetune_end_block",
+    "full_finetune_lr_mult",
+    "logit_scale_lr_mult",
+    "lora_rank",
+    "lora_alpha",
+    "lora_dropout",
+    "lora_target_names",
+    "local_feature_layers",
+    "use_soft_orth_fusion",
+    "soft_orth_lambda_init",
+    "soft_orth_detach_global",
+}
+
+SUPPORTED_DATASETS = ("1652", "GTA-UAV", "SUES-200")
+
+
+def is_main_process():
+    return not dist.is_available() or not dist.is_initialized() or dist.get_rank() == 0
+
+
+def str2bool(value):
+    if isinstance(value, bool):
+        return value
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"invalid boolean value: {value}")
+
+
+def distributed_barrier(local_rank):
+    if not dist.is_available() or not dist.is_initialized():
+        return
+    if torch.cuda.is_available():
+        dist.barrier(device_ids=[local_rank])
+    else:
+        dist.barrier()
+
+
+def default_dataset_dir(dataset, data_root):
+    defaults = {
+        "1652": "U1652",
+        "GTA-UAV": os.path.join("GTA-UAV-LR", "GTA-UAV-LR-baidu"),
+        "SUES-200": os.path.join("SUES-200", "SUES-200-512x512"),
+    }
+    return os.path.join(data_root, defaults[dataset])
+
+
+def load_checkpoint_hparams(args, parser_defaults, cli_args):
+    if args.no_checkpoint_hparams:
+        return
+
+    hparam_path = Path(args.checkpoint).resolve().parent / "hyperparameters.json"
+    if not hparam_path.is_file():
+        return
+
+    with hparam_path.open("r", encoding="utf-8") as f:
+        payload = json.load(f)
+
+    hparams = payload.get("hyperparameters", payload)
+    for key in MODEL_HPARAM_KEYS:
+        cli_name = f"--{key}"
+        if cli_name in cli_args:
+            continue
+        if key in hparams and getattr(args, key, parser_defaults.get(key)) == parser_defaults.get(key):
+            setattr(args, key, hparams[key])
+
+    if "--img_size" not in cli_args and "img_size" in hparams:
+        args.img_size = int(hparams["img_size"])
+
+    if is_main_process():
+        print(f"[HParams] loaded model/test defaults from {hparam_path}")
+
+
+def _strip_module_prefix(key):
+    return key[7:] if key.startswith("module.") else key
+
+
+def _insert_checkpoint_wrapper_module(key):
+    return re.sub(r"(backbone\.model\.blocks\.\d+\.)(?!module\.)", r"\1module.", key)
+
+
+def load_teacher_checkpoint(model, checkpoint_path, device):
+    if not os.path.isfile(checkpoint_path):
+        raise FileNotFoundError(f"checkpoint not found: {checkpoint_path}")
+
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    state_dict = checkpoint.get("state_dict", checkpoint.get("model", checkpoint))
+    model_state = model.state_dict()
+    mapped_state = {}
+    unexpected = []
+
+    for raw_key, value in state_dict.items():
+        key = _strip_module_prefix(raw_key)
+        if key not in model_state:
+            wrapped_key = _insert_checkpoint_wrapper_module(key)
+            if wrapped_key in model_state:
+                key = wrapped_key
+
+        if key in model_state:
+            mapped_state[key] = value
+        else:
+            unexpected.append(raw_key)
+
+    missing, incompatible = model.load_state_dict(mapped_state, strict=False)
+    model.to(device)
+
+    trainable_keys = {name for name, param in model.named_parameters() if param.requires_grad}
+    loaded_trainable = trainable_keys & set(mapped_state.keys())
+    missing_trainable = sorted(trainable_keys - loaded_trainable)
+
+    if is_main_process():
+        print(f"[Checkpoint] loaded: {checkpoint_path}")
+        print(
+            f"[Checkpoint] matched={len(mapped_state)} | "
+            f"trainable_matched={len(loaded_trainable)}/{len(trainable_keys)} | "
+            f"unexpected={len(unexpected)} | missing_total={len(missing)}"
+        )
+        if missing_trainable:
+            print(f"[Checkpoint][WARN] missing trainable keys examples: {missing_trainable[:5]}")
+        if unexpected:
+            print(f"[Checkpoint][WARN] unexpected checkpoint keys examples: {unexpected[:5]}")
+        if incompatible:
+            print(f"[Checkpoint][WARN] incompatible keys: {incompatible}")
+
+    if missing_trainable:
+        raise RuntimeError(
+            f"checkpoint did not cover all trainable teacher parameters; "
+            f"missing {len(missing_trainable)} keys"
+        )
+
+
+def build_loaders_for_dataset(dataset, args):
+    img_size = [args.img_size, args.img_size]
+    data_dir = args.data_dir or default_dataset_dir(dataset, args.data_root)
+
+    if is_main_process():
+        print(f"[Data] dataset={dataset} | data_dir={data_dir}")
+
+    if dataset == "1652":
+        return build_1652_val_dataloaders(
+            data_dir=data_dir,
+            img_size=img_size,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+        )
+    if dataset == "GTA-UAV":
+        return build_gta_val_dataloaders(
+            img_size=img_size,
+            data_dir=data_dir,
+            split_type=args.gta_split,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            query_mode=args.gta_query_mode,
+            mode="pos",
+        )
+    if dataset == "SUES-200":
+        sues_heights = ["150", "200", "250", "300"] if args.sues_height == "all" else [args.sues_height]
+        return build_sues200_val_dataloaders(
+            img_size=img_size,
+            data_dir=data_dir,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            heights=sues_heights,
+        )
+
+    raise ValueError(f"unsupported dataset: {dataset}")
+
+
+def print_loader_summary(dataset, loaders):
+    if not is_main_process():
+        return
+
+    def print_pair(prefix, pair_loaders):
+        q_loader, g_loader = pair_loaders
+        print(
+            f"[Data] {prefix} | query={len(q_loader.dataset)} | gallery={len(g_loader.dataset)}",
+            flush=True,
+        )
+
+    if dataset == "SUES-200":
+        for height, height_loaders in loaders.items():
+            for task_name, pair_loaders in height_loaders.items():
+                print_pair(f"{dataset}:{height}:{task_name}", pair_loaders)
+        return
+
+    for task_name, pair_loaders in loaders.items():
+        print_pair(f"{dataset}:{task_name}", pair_loaders)
+
+
+def evaluate_pair(model, loaders, device, dataset, task_name):
+    q_loader, g_loader = loaders
+    if dataset == "1652":
+        r1, r5, r10, mean_ap = getdist_1652_val_and_get_recall(
+            model,
+            q_loader,
+            g_loader,
+            device,
+            task_name=task_name,
+        )
+        return {
+            "R@1": r1,
+            "R@5": r5,
+            "R@10": r10,
+            "mAP": mean_ap,
+        }
+
+    if dataset == "GTA-UAV":
+        return run_gta_val_and_get_metrics(
+            model,
+            q_loader,
+            g_loader,
+            device,
+        )
+    if dataset == "SUES-200":
+        return run_sues_val_and_get_metrics(
+            model,
+            q_loader,
+            g_loader,
+            device,
+        )
+
+    raise ValueError(f"unsupported dataset: {dataset}")
+
+
+def print_result(prefix, result):
+    metrics = [f"{name}={value:.2f}" for name, value in result.items() if isinstance(value, (int, float))]
+    print(f"{prefix} | " + " | ".join(metrics), flush=True)
+
+
+def evaluate_dataset(model, args, dataset, device, loaders=None):
+    if loaders is None:
+        loaders = build_loaders_for_dataset(dataset, args)
+    results = {}
+
+    if dataset == "SUES-200":
+        for height, height_loaders in loaders.items():
+            results[height] = {}
+            for task_name, pair_loaders in height_loaders.items():
+                result = evaluate_pair(model, pair_loaders, device, dataset, f"{dataset}:{height}:{task_name}")
+                results[height][task_name] = result
+                if is_main_process():
+                    print_result(f"[Result][{dataset}][{height}][{task_name}]", result)
+        return results
+
+    for task_name, pair_loaders in loaders.items():
+        result = evaluate_pair(model, pair_loaders, device, dataset, f"{dataset}:{task_name}")
+        results[task_name] = result
+        if is_main_process():
+            print_result(f"[Result][{dataset}][{task_name}]", result)
+
+    return results
+
+
+def write_results(args, results):
+    if not is_main_process():
+        return
+
+    output_path = args.output_json
+    if not output_path:
+        output_path = os.path.join(Path(args.checkpoint).resolve().parent, "teacher_test_results.json")
+
+    payload = {
+        "checkpoint": args.checkpoint,
+        "dataset": args.dataset,
+        "img_size": args.img_size,
+        "batch_size": args.batch_size,
+        "results": results,
+    }
+    if args.dataset == "GTA-UAV":
+        payload["gta_split"] = args.gta_split
+        payload["gta_query_mode"] = args.gta_query_mode
+    if args.dataset == "SUES-200":
+        payload["sues_height"] = args.sues_height
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+    print(f"[Result] wrote {output_path}")
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Evaluate the current DINOv3 teacher model.")
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default="src/checkpoint/teacher/2026-06-12_01-20/best_model.pth",
+        help="Path to best_model.pth or final_model.pth.",
+    )
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="1652",
+        choices=SUPPORTED_DATASETS,
+        help="Dataset to evaluate.",
+    )
+    parser.add_argument("--data_root", type=str, default="data", help="Root containing U1652, GTA-UAV, and SUES-200 data.")
+    parser.add_argument("--data_dir", type=str, default=None, help="Override data dir for the selected dataset.")
+    parser.add_argument("--gta_split", type=str, default="cross-area", choices=["cross-area", "same-area"])
+    parser.add_argument("--gta_query_mode", type=str, default="D2S", choices=["D2S", "S2D"])
+    parser.add_argument("--sues_height", type=str, default="all", choices=["150", "200", "250", "300", "all"])
+    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--img_size", type=int, default=224)
+    parser.add_argument("--num_workers", type=int, default=8)
+    parser.add_argument("--output_json", type=str, default=None)
+    parser.add_argument("--no_checkpoint_hparams", action="store_true")
+    parser.add_argument("--local_rank", type=int, default=0)
+
+    parser.add_argument("--lora_start_block", type=int, default=None)
+    parser.add_argument("--lora_end_block", type=int, default=None)
+    parser.add_argument("--full_finetune_start_block", type=int, default=None)
+    parser.add_argument("--full_finetune_end_block", type=int, default=None)
+    parser.add_argument("--full_finetune_lr_mult", type=float, default=0.1)
+    parser.add_argument("--logit_scale_lr_mult", type=float, default=1.0)
+    parser.add_argument("--lora_rank", type=int, default=8)
+    parser.add_argument("--lora_alpha", type=int, default=16)
+    parser.add_argument("--lora_dropout", type=float, default=0.1)
+    parser.add_argument("--lora_target_names", type=str, default="qkv,proj")
+    parser.add_argument("--local_feature_layers", type=str, default="19,27,36")
+    parser.add_argument("--use_soft_orth_fusion", action="store_true")
+    parser.add_argument("--soft_orth_lambda_init", type=float, default=0.8)
+    parser.add_argument("--soft_orth_detach_global", type=str2bool, nargs="?", const=True, default=True)
+
+    defaults = {action.dest: action.default for action in parser._actions}
+    args = parser.parse_args()
+    load_checkpoint_hparams(args, defaults, sys.argv[1:])
+    return args
+
+
+def main():
+    args = parse_args()
+    device, rank, local_rank, _ = try_init_dist()
+    if args.device == "cuda" and torch.cuda.is_available():
+        args.device = str(device)
+
+    if is_main_process():
+        print(f"[Eval] device={device} | dataset={args.dataset}")
+
+    loaders = build_loaders_for_dataset(args.dataset, args)
+    print_loader_summary(args.dataset, loaders)
+    distributed_barrier(local_rank)
+
+    model = TeacherModel(args)
+    model.to(device)
+    load_teacher_checkpoint(model, args.checkpoint, device)
+    model.eval()
+
+    results = {}
+    with torch.no_grad():
+        results[args.dataset] = evaluate_dataset(model, args, args.dataset, device, loaders=loaders)
+        distributed_barrier(local_rank)
+
+    write_results(args, results)
+    distributed_barrier(local_rank)
+
+    if rank == 0:
+        print("[Eval] done")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,8 +1,4 @@
-"""Compatibility entrypoint for teacher training.
-
-Use ``src/training/train_teacher.py`` as the canonical entrypoint, or keep
-calling this file from older scripts.
-"""
+"""Teacher training entrypoint."""
 
 import os
 import sys
