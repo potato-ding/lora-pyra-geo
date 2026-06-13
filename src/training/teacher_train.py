@@ -8,15 +8,24 @@ os.environ["NO_ALBUMENTATIONS_UPDATE"] = "1"
 import time
 import torch
 import math
+import cv2
+import torch.nn.functional as F
 import torch.distributed as dist
 import deepspeed
 import argparse
 from datetime import datetime
 import gc
 import json
-from src.dataset.datasets import create_1652_train_dataset
+from torch.utils.data import Dataset, DataLoader
+from src.dataset.datasets import create_1652_teacher_train_dataloaders
+from src.dataset.transforms import get_sample4geo_val_transforms
 from src.loss.tripletloss import IntraDomainTripletLoss
 from src.loss.blocks_infoNCE import infonce
+from src.loss.identity_losses import (
+    CrossDomainIdentityContrastiveLoss,
+    SameDomainBatchHardTripletLoss,
+    WeakSample4GeoAnchorLoss,
+)
 from src.utils.initdist import try_init_dist
 from src.utils.gather_features_and_labels_and_views import gather_features_and_labels_and_views 
 from src.utils.train_eval_utils import getdist_1652_val_and_get_recall
@@ -188,7 +197,56 @@ def get_training_mode_desc(dataset, args):
             f"{len(getattr(dataset, 'pairs', []))} sat-drone pairs, "
             "unique PID per global batch"
         )
+    if mode in {"identity", "identity_hard"}:
+        return mode, (
+            f"{len(getattr(dataset, 'pids', []))} identities, "
+            f"sat_per_id={getattr(dataset, 'sat_per_id', 'unknown')}, "
+            f"drone_per_id={getattr(dataset, 'drone_per_id', 'unknown')}"
+        )
     return mode, "Sample4Geo dataloader expected"
+
+
+def get_training_mode(epoch, args):
+    if not args.enable_identity_stage:
+        return "sample4geo"
+    if epoch <= args.stage1_end_epoch:
+        return "sample4geo"
+    if not args.enable_hard_pool_stage:
+        return "identity"
+    if epoch <= args.stage2_end_epoch:
+        return "identity"
+    return "identity_hard"
+
+
+def select_epoch_dataloader(train_loaders, epoch, args):
+    requested_mode = get_training_mode(epoch, args)
+    if not isinstance(train_loaders, dict):
+        return train_loaders, requested_mode, "sample4geo"
+
+    if requested_mode in train_loaders:
+        return train_loaders[requested_mode], requested_mode, requested_mode
+    if requested_mode == "identity_hard" and "identity" in train_loaders:
+        return train_loaders["identity"], requested_mode, "identity"
+    return train_loaders["sample4geo"], requested_mode, "sample4geo"
+
+
+def set_epoch_on_dataloader(dataloader, epoch):
+    if hasattr(dataloader, 'dataset') and hasattr(dataloader.dataset, 'set_epoch'):
+        dataloader.dataset.set_epoch(epoch)
+    if hasattr(dataloader, 'batch_sampler') and hasattr(dataloader.batch_sampler, 'set_epoch'):
+        dataloader.batch_sampler.set_epoch(epoch)
+    if dist.is_initialized() and hasattr(dataloader, 'sampler') and hasattr(dataloader.sampler, 'set_epoch'):
+        dataloader.sampler.set_epoch(epoch)
+
+
+def get_sampler_debug_desc(dataloader):
+    batch_sampler = getattr(dataloader, "batch_sampler", None)
+    if batch_sampler is not None:
+        return repr(batch_sampler)
+    sampler = getattr(dataloader, "sampler", None)
+    if sampler is not None:
+        return repr(sampler)
+    return "sampler=None"
 
 
 def get_model_debug_values(model_or_engine):
@@ -231,7 +289,10 @@ def format_optional_metric(name, value):
 def get_loss_weight_desc(args):
     return (
         f"tri={args.triplet_weight:g}(drone+sat) | "
-        f"infonce={args.infonce_weight:g}"
+        f"infonce={args.infonce_weight:g} | "
+        f"identity={args.identity_loss_weight:g} | "
+        f"same_triplet={args.same_domain_triplet_weight:g} | "
+        f"weak_s4g={args.weak_sample4geo_weight:g}"
     )
 
 
@@ -239,16 +300,32 @@ def validate_loss_weights(args):
     weight_names = [
         "triplet_weight",
         "infonce_weight",
+        "identity_loss_weight",
+        "same_domain_triplet_weight",
+        "weak_sample4geo_weight",
     ]
     for name in weight_names:
         if getattr(args, name) < 0:
             raise ValueError(f"{name} 不能为负数")
+    if args.triplet_margin <= 0:
+        raise ValueError("triplet_margin 必须大于 0")
+    if args.identity_temperature <= 0:
+        raise ValueError("identity_temperature 必须大于 0")
 
-    intra_triplet_enabled = args.triplet_weight > 0
-    contrastive_enabled = args.infonce_weight > 0
+    sample4geo_loss_enabled = args.triplet_weight > 0 or args.infonce_weight > 0
+    identity_loss_enabled = (
+        args.identity_loss_weight > 0
+        or args.same_domain_triplet_weight > 0
+        or args.weak_sample4geo_weight > 0
+    )
 
-    if not intra_triplet_enabled and not contrastive_enabled:
+    will_use_sample4geo = (not args.enable_identity_stage) or args.stage1_end_epoch >= 1
+    will_use_identity = args.enable_identity_stage and args.epochs > args.stage1_end_epoch
+
+    if will_use_sample4geo and not sample4geo_loss_enabled:
         raise ValueError("所有 loss 大类权重都为 0，训练不会产生有效梯度")
+    if will_use_identity and not identity_loss_enabled:
+        raise ValueError("identity 阶段 loss 权重都为 0，训练不会产生有效梯度")
 
 
 def validate_scheduler_args(args):
@@ -256,13 +333,51 @@ def validate_scheduler_args(args):
         raise ValueError("warmup_ratio 必须在 [0, 1) 范围内")
 
 
+def validate_identity_training_args(args):
+    positive_int_args = [
+        "identity_ids_per_batch",
+        "identity_drone_per_id",
+        "identity_sat_per_id",
+        "hard_drone_per_id",
+        "random_drone_per_id",
+    ]
+    for name in positive_int_args:
+        if getattr(args, name) <= 0:
+            raise ValueError(f"{name} 必须大于 0")
+    hard_pool_positive_int_args = [
+        "hard_pool_topk",
+        "hard_pool_topneg_k",
+    ]
+    for name in hard_pool_positive_int_args:
+        if getattr(args, name) <= 0:
+            raise ValueError(f"{name} 必须大于 0")
+    if args.enable_hard_pool_stage and not args.enable_identity_stage:
+        raise ValueError("enable_hard_pool_stage 需要同时启用 enable_identity_stage")
+
+
 def should_run_validation(cur_epoch, args):
     return True
 
 
 def build_scheduler_plan(train_loader, train_sampler, args, grad_accum_steps):
-    total_train_batches = len(train_loader) * args.epochs
-    mode_desc = f"sample4geo_epochs={args.epochs}, batches/epoch={len(train_loader)}"
+    if isinstance(train_loader, dict):
+        total_train_batches = 0
+        mode_epoch_counts = {}
+        mode_batch_counts = {}
+        for epoch in range(1, args.epochs + 1):
+            epoch_loader, _, effective_mode = select_epoch_dataloader(train_loader, epoch, args)
+            total_train_batches += len(epoch_loader)
+            mode_epoch_counts[effective_mode] = mode_epoch_counts.get(effective_mode, 0) + 1
+            mode_batch_counts[effective_mode] = len(epoch_loader)
+
+        mode_parts = [
+            f"{mode}_epochs={mode_epoch_counts[mode]}, batches/epoch={mode_batch_counts[mode]}"
+            for mode in sorted(mode_epoch_counts.keys())
+        ]
+        mode_desc = "multi_stage(" + "; ".join(mode_parts) + ")"
+    else:
+        total_train_batches = len(train_loader) * args.epochs
+        mode_desc = f"sample4geo_epochs={args.epochs}, batches/epoch={len(train_loader)}"
 
     total_train_steps = math.ceil(total_train_batches / grad_accum_steps)
     warmup_steps = int(total_train_steps * args.warmup_ratio)
@@ -292,6 +407,497 @@ def clear_memory_cache():
         torch.cuda.empty_cache()
 
 
+class HardPoolImageDataset(Dataset):
+    def __init__(self, samples, transform):
+        self.samples = samples
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.samples)
+
+    @staticmethod
+    def _read_rgb(path):
+        img = cv2.imread(path)
+        if img is None:
+            raise RuntimeError(f"Failed to read image: {path}")
+        return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+    def __getitem__(self, idx):
+        sample = self.samples[idx]
+        img = self._read_rgb(sample["image_path"])
+        if self.transform is not None:
+            img = self.transform(image=img)["image"]
+        return img, sample["pid"], sample["image_path"]
+
+
+def resolve_hard_pool_path(path_template, epoch):
+    if path_template is None:
+        path_template = "outputs/hard_pool_epoch{epoch}.json"
+    return path_template.format(epoch=epoch)
+
+
+def get_hard_pool_reference_dataset(train_loaders):
+    if isinstance(train_loaders, dict):
+        for mode in ("identity_hard", "identity", "sample4geo"):
+            loader = train_loaders.get(mode)
+            dataset = getattr(loader, "dataset", None)
+            if (
+                dataset is not None
+                and hasattr(dataset, "pids")
+                and hasattr(dataset, "satellite_dict")
+                and hasattr(dataset, "drone_dict")
+            ):
+                return dataset
+        return None
+
+    dataset = getattr(train_loaders, "dataset", None)
+    if (
+        dataset is not None
+        and hasattr(dataset, "pids")
+        and hasattr(dataset, "satellite_dict")
+        and hasattr(dataset, "drone_dict")
+    ):
+        return dataset
+    return None
+
+
+def build_hard_pool_image_samples(dataset, view_name):
+    view_dict = dataset.satellite_dict if view_name == "satellite" else dataset.drone_dict
+    samples = []
+    for pid in dataset.pids:
+        for path in view_dict.get(pid, []):
+            samples.append({"pid": str(pid), "image_path": path})
+    return samples
+
+
+@torch.no_grad()
+def extract_hard_pool_features(model_engine, samples, transform, args, device, view_name):
+    feature_dataset = HardPoolImageDataset(samples, transform)
+    loader = DataLoader(
+        feature_dataset,
+        batch_size=max(1, int(getattr(args, "batch_size", 1))),
+        shuffle=False,
+        num_workers=getattr(args, "num_workers", 0),
+        pin_memory=True,
+    )
+
+    records = []
+    num_batches = len(loader)
+    for batch_idx, (imgs, pids, paths) in enumerate(loader, start=1):
+        imgs = imgs.to(device, non_blocking=True).to(torch.bfloat16)
+        feats = model_engine(imgs)
+        if isinstance(feats, tuple):
+            feats = feats[1] if len(feats) > 1 else feats[0]
+        feats = F.normalize(feats.float(), p=2, dim=-1, eps=1e-6).cpu()
+
+        for feat, pid, path in zip(feats, pids, paths):
+            records.append({
+                "pid": str(pid),
+                "image_path": path,
+                "feature": feat,
+            })
+
+        if is_main_process() and (batch_idx == 1 or batch_idx == num_batches or batch_idx % 100 == 0):
+            print(
+                f"[HardPool] Extract {view_name} features | "
+                f"batch {batch_idx}/{num_batches} | images={len(records)}/{len(samples)}"
+            )
+
+    return records
+
+
+def compute_hard_pool_from_features(satellite_records, drone_records, args, epoch, model_source):
+    sat_features_by_pid = {}
+    for record in satellite_records:
+        sat_features_by_pid.setdefault(record["pid"], []).append(record["feature"])
+
+    satellite_proto = {}
+    for pid, features in sat_features_by_pid.items():
+        proto = torch.stack(features, dim=0).mean(dim=0)
+        satellite_proto[pid] = F.normalize(proto.float(), p=2, dim=-1, eps=1e-6)
+
+    proto_pids = sorted(satellite_proto.keys())
+    if len(proto_pids) < 2:
+        raise RuntimeError("hard_pool 至少需要 2 个带 satellite prototype 的 ID 才能计算 negative similarity")
+
+    proto_mat = torch.stack([satellite_proto[pid] for pid in proto_pids], dim=0)
+    pid_to_proto_idx = {pid: idx for idx, pid in enumerate(proto_pids)}
+    hard_pool = {}
+
+    for record in drone_records:
+        pid = record["pid"]
+        pos_idx = pid_to_proto_idx.get(pid)
+        if pos_idx is None:
+            continue
+
+        sims = proto_mat @ record["feature"].float()
+        pos_sim = sims[pos_idx].item()
+        neg_sims = sims.clone()
+        neg_sims[pos_idx] = -float("inf")
+        neg_count = min(int(args.hard_pool_topneg_k), neg_sims.numel() - 1)
+        if neg_count <= 0:
+            continue
+
+        top_neg_sims, top_neg_indices = torch.topk(neg_sims, k=neg_count, largest=True)
+        topk_neg_mean = top_neg_sims.mean().item()
+        top1_neg_sim = top_neg_sims[0].item()
+        top1_neg_pid = proto_pids[int(top_neg_indices[0].item())]
+        boundary_risk = topk_neg_mean - pos_sim
+
+        hard_pool.setdefault(pid, []).append({
+            "pid": pid,
+            "image_path": record["image_path"],
+            "boundary_risk": float(boundary_risk),
+            "pos_sim": float(pos_sim),
+            "topk_neg_mean": float(topk_neg_mean),
+            "top1_neg_pid": top1_neg_pid,
+            "top1_neg_sim": float(top1_neg_sim),
+        })
+
+    topk = int(args.hard_pool_topk)
+    id_risk = {}
+    for pid, samples in list(hard_pool.items()):
+        samples.sort(key=lambda item: item["boundary_risk"], reverse=True)
+        kept_samples = samples[:topk]
+        hard_pool[pid] = kept_samples
+        top_risks = [item["boundary_risk"] for item in kept_samples[:3]]
+        if top_risks:
+            id_risk[pid] = float(sum(top_risks) / len(top_risks))
+
+    return {
+        "meta": {
+            "epoch": epoch,
+            "model_source": model_source,
+            "hard_pool_topk": int(args.hard_pool_topk),
+            "hard_pool_topneg_k": int(args.hard_pool_topneg_k),
+        },
+        "hard_pool": hard_pool,
+        "id_risk": id_risk,
+    }
+
+
+def save_hard_pool_payload(path, payload):
+    save_dir = os.path.dirname(path)
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(_json_safe_value(payload), f, indent=2, ensure_ascii=False)
+
+
+def load_hard_pool_payload(path):
+    with open(path, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+
+    if isinstance(payload, dict) and "hard_pool" in payload:
+        hard_pool = payload.get("hard_pool", {})
+        id_risk = payload.get("id_risk", {})
+        meta = payload.get("meta", {})
+    else:
+        hard_pool = payload
+        id_risk = {}
+        meta = {}
+
+    if not isinstance(hard_pool, dict):
+        raise ValueError(f"hard_pool 文件格式错误: {path}")
+
+    return {
+        "meta": meta,
+        "hard_pool": hard_pool,
+        "id_risk": id_risk,
+    }
+
+
+def summarize_hard_pool_payload(payload):
+    hard_pool = payload.get("hard_pool", {})
+    id_risk = payload.get("id_risk", {})
+    covered_ids = sum(1 for samples in hard_pool.values() if samples)
+    sample_count = sum(len(samples) for samples in hard_pool.values())
+    avg_samples = sample_count / covered_ids if covered_ids > 0 else 0.0
+    risk_values = [float(value) for value in id_risk.values()]
+    if risk_values:
+        risk_mean = sum(risk_values) / len(risk_values)
+        risk_max = max(risk_values)
+        risk_min = min(risk_values)
+    else:
+        risk_mean = risk_max = risk_min = 0.0
+    top_ids = sorted(id_risk.items(), key=lambda item: float(item[1]), reverse=True)[:10]
+    top_ids_text = ", ".join(f"{pid}:{float(risk):.4f}" for pid, risk in top_ids)
+    return {
+        "covered_ids": covered_ids,
+        "avg_samples": avg_samples,
+        "risk_mean": risk_mean,
+        "risk_max": risk_max,
+        "risk_min": risk_min,
+        "top_ids_text": top_ids_text or "none",
+    }
+
+
+def print_hard_pool_summary(payload, path, prefix="[HardPool]"):
+    summary = summarize_hard_pool_payload(payload)
+    print(
+        f"{prefix} covered_ids={summary['covered_ids']} | "
+        f"avg_hard_samples_per_id={summary['avg_samples']:.2f} | "
+        f"risk_mean={summary['risk_mean']:.4f} | "
+        f"risk_max={summary['risk_max']:.4f} | "
+        f"risk_min={summary['risk_min']:.4f}"
+    )
+    print(f"{prefix} top10_hardest_ids={summary['top_ids_text']}")
+    print(f"{prefix} path={path}")
+
+
+def apply_hard_pool_to_train_loaders(train_loaders, hard_pool):
+    updated = 0
+    loaders = train_loaders.values() if isinstance(train_loaders, dict) else [train_loaders]
+    for loader in loaders:
+        dataset = getattr(loader, "dataset", None)
+        if dataset is not None and hasattr(dataset, "set_hard_pool"):
+            dataset.set_hard_pool(hard_pool)
+            updated += 1
+    return updated
+
+
+def dataloader_has_hard_pool(dataloader):
+    dataset = getattr(dataloader, "dataset", None)
+    if dataset is None:
+        return False
+    if hasattr(dataset, "has_hard_pool"):
+        return dataset.has_hard_pool()
+    return bool(getattr(dataset, "hard_pool_paths", {}))
+
+
+def get_hard_pool_id_count(dataloader):
+    dataset = getattr(dataloader, "dataset", None)
+    if dataset is None:
+        return 0
+    return len(getattr(dataset, "hard_pool_paths", {}))
+
+
+def ensure_identity_hard_ready(epoch, stage_mode, effective_mode, dataloader, args, hard_pool_loaded):
+    if (
+        getattr(args, "enable_hard_pool_stage", False)
+        and stage_mode == "identity_hard"
+        and effective_mode != "identity_hard"
+    ):
+        raise RuntimeError(
+            f"Epoch {epoch} 请求进入 identity_hard，但没有可用的 identity_hard dataloader；"
+            "请确认 enable_hard_pool_stage=True 时已创建 identity_hard dataloader"
+        )
+
+    if (
+        getattr(args, "enable_hard_pool_stage", False)
+        and effective_mode == "identity_hard"
+        and not dataloader_has_hard_pool(dataloader)
+    ):
+        raise RuntimeError(
+            f"Epoch {epoch} 进入 identity_hard，但 hard_pool 尚未加载或构建。"
+            f" hard_pool_loaded={hard_pool_loaded}; "
+            "请确认 --build_hard_pool_epoch <= --stage2_end_epoch，"
+            "或使用 --load_hard_pool_path 指向已有 hard_pool JSON"
+        )
+
+
+HARD_SAMPLING_STAT_KEYS = (
+    "hard_requested",
+    "hard_from_pool",
+    "hard_fallback",
+    "missing_hard_pool_ids",
+    "short_hard_pool_ids",
+    "random_requested",
+)
+
+
+def new_hard_sampling_stats():
+    return {key: 0 for key in HARD_SAMPLING_STAT_KEYS}
+
+
+def update_hard_sampling_stats(total_stats, batch_stats):
+    for key in HARD_SAMPLING_STAT_KEYS:
+        total_stats[key] += int(batch_stats.get(key, 0))
+
+
+def reduce_hard_sampling_stats(stats, device):
+    if not (dist.is_available() and dist.is_initialized()):
+        return dict(stats)
+
+    values = [float(stats.get(key, 0)) for key in HARD_SAMPLING_STAT_KEYS]
+    stat_tensor = torch.tensor(values, dtype=torch.float64, device=device)
+    dist.all_reduce(stat_tensor, op=dist.ReduceOp.SUM)
+    return {
+        key: int(stat_tensor[idx].item())
+        for idx, key in enumerate(HARD_SAMPLING_STAT_KEYS)
+    }
+
+
+def format_hard_sampler_epoch_summary(stats):
+    hard_requested = max(stats.get("hard_requested", 0), 1)
+    hard_from_pool = stats.get("hard_from_pool", 0)
+    hard_fallback = stats.get("hard_fallback", 0)
+    fallback_rate = 100.0 * hard_fallback / hard_requested
+    return (
+        f"hard_requested={stats.get('hard_requested', 0)} | "
+        f"hard_from_pool={hard_from_pool} | "
+        f"hard_fallback={hard_fallback} ({fallback_rate:.2f}%) | "
+        f"missing_hard_pool_ids={stats.get('missing_hard_pool_ids', 0)} | "
+        f"short_hard_pool_ids={stats.get('short_hard_pool_ids', 0)} | "
+        f"random_requested={stats.get('random_requested', 0)}"
+    )
+
+
+def load_initial_hard_pool_if_needed(args, train_loaders):
+    load_path = getattr(args, "load_hard_pool_path", None)
+    if not load_path:
+        return False
+    if not getattr(args, "enable_identity_stage", False):
+        if is_main_process():
+            print("[HardPool] load_hard_pool_path is set but identity stage is disabled; skip loading")
+        return False
+
+    payload = load_hard_pool_payload(load_path)
+    updated = apply_hard_pool_to_train_loaders(train_loaders, payload["hard_pool"])
+    if is_main_process():
+        print_hard_pool_summary(payload, load_path, prefix="[HardPoolLoad]")
+        print(f"[HardPoolLoad] applied_to_datasets={updated}")
+    return True
+
+
+def should_build_hard_pool(epoch, args, hard_pool_loaded):
+    return (
+        getattr(args, "enable_identity_stage", False)
+        and getattr(args, "enable_hard_pool_stage", False)
+        and not hard_pool_loaded
+        and epoch == int(getattr(args, "build_hard_pool_epoch", -1))
+    )
+
+
+def build_hard_pool_with_model(model_engine, ema, train_loaders, args, epoch, device):
+    reference_dataset = get_hard_pool_reference_dataset(train_loaders)
+    if reference_dataset is None:
+        raise RuntimeError("无法找到包含 pids/satellite_dict/drone_dict 的训练集，不能构建 hard_pool")
+
+    val_transform = get_sample4geo_val_transforms(
+        img_size=[args.img_size, args.img_size],
+        mean=[0.485, 0.456, 0.406],
+        std=[0.229, 0.224, 0.225],
+    )
+    sat_samples = build_hard_pool_image_samples(reference_dataset, "satellite")
+    drone_samples = build_hard_pool_image_samples(reference_dataset, "drone")
+    model_source = "ema" if getattr(args, "use_ema_for_hard_pool", True) else "current"
+
+    eval_model = get_base_model(model_engine)
+    was_training = getattr(model_engine, "training", True)
+    ema_applied = False
+    try:
+        if getattr(args, "use_ema_for_hard_pool", True):
+            ema.apply_shadow(eval_model)
+            ema_applied = True
+        model_engine.eval()
+        with torch.no_grad():
+            satellite_records = extract_hard_pool_features(
+                model_engine,
+                sat_samples,
+                val_transform,
+                args,
+                device,
+                view_name="satellite",
+            )
+            drone_records = extract_hard_pool_features(
+                model_engine,
+                drone_samples,
+                val_transform,
+                args,
+                device,
+                view_name="drone",
+            )
+            payload = compute_hard_pool_from_features(
+                satellite_records,
+                drone_records,
+                args,
+                epoch,
+                model_source=model_source,
+            )
+    finally:
+        if ema_applied:
+            ema.restore(eval_model)
+        if was_training:
+            model_engine.train()
+        else:
+            model_engine.eval()
+        clear_memory_cache()
+
+    return payload
+
+
+def build_save_and_apply_hard_pool(model_engine, ema, train_loaders, args, epoch, device):
+    save_path = resolve_hard_pool_path(args.save_hard_pool_path, epoch)
+
+    if is_main_process():
+        print(
+            f"[HardPool] Build start | epoch={epoch} | "
+            f"use_ema={getattr(args, 'use_ema_for_hard_pool', True)} | "
+            f"topk={args.hard_pool_topk} | topneg_k={args.hard_pool_topneg_k}"
+        )
+        payload = build_hard_pool_with_model(
+            model_engine,
+            ema,
+            train_loaders,
+            args,
+            epoch,
+            device,
+        )
+        save_hard_pool_payload(save_path, payload)
+        print_hard_pool_summary(payload, save_path)
+
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
+
+    payload = load_hard_pool_payload(save_path)
+    updated = apply_hard_pool_to_train_loaders(train_loaders, payload["hard_pool"])
+    if is_main_process():
+        print(f"[HardPool] applied_to_datasets={updated}")
+    return True
+
+
+def unpack_training_batch(batch, training_mode, device):
+    if training_mode == "sample4geo":
+        sat_tensors, drone_tensors, labels, pids = batch
+        if sat_tensors.ndim == 4:
+            sat_tensors = sat_tensors.unsqueeze(1)
+        if drone_tensors.ndim == 4:
+            drone_tensors = drone_tensors.unsqueeze(1)
+
+        sat_views_per_id = sat_tensors.size(1)
+        drone_views_per_id = drone_tensors.size(1)
+        sat_imgs = sat_tensors.reshape(-1, *sat_tensors.shape[2:])
+        drone_imgs = drone_tensors.reshape(-1, *drone_tensors.shape[2:])
+        imgs = torch.cat([sat_imgs, drone_imgs], dim=0).to(device).to(torch.bfloat16)
+
+        sat_labels = labels.repeat_interleave(sat_views_per_id)
+        drone_labels = labels.repeat_interleave(drone_views_per_id)
+        labels = torch.cat([sat_labels, drone_labels], dim=0).to(device)
+
+        num_sat = sat_imgs.size(0)
+        num_drone = drone_imgs.size(0)
+        views = torch.cat([
+            torch.zeros(num_sat, dtype=torch.long),
+            torch.ones(num_drone, dtype=torch.long)
+        ]).to(device)
+
+        meta = {
+            "pids": pids,
+            "sat_views_per_id": sat_views_per_id,
+            "drone_views_per_id": drone_views_per_id,
+        }
+        return imgs, labels, views, meta
+
+    if training_mode in {"identity", "identity_hard"}:
+        imgs = batch["images"].to(device).to(torch.bfloat16)
+        labels = batch["labels"].to(device)
+        views = batch["view_type"].to(device)
+        return imgs, labels, views, batch
+
+    raise ValueError(f"unsupported training_mode: {training_mode}")
+
+
 def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=None, ds_config=None):
     local_rank = int(os.environ.get('LOCAL_RANK', 0)) if 'LOCAL_RANK' in os.environ else 0
     
@@ -300,6 +906,16 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
     # 当前训练固定使用三元组损失和对比损失，具体比例由命令行权重控制。
     triplet_criterion = IntraDomainTripletLoss()
     infonce_criterion = infonce(loss_function=torch.nn.CrossEntropyLoss())
+    identity_contrast_criterion = CrossDomainIdentityContrastiveLoss(
+        temperature=args.identity_temperature
+    )
+    same_domain_triplet_criterion = SameDomainBatchHardTripletLoss(
+        margin=args.triplet_margin
+    )
+    weak_sample4geo_criterion = WeakSample4GeoAnchorLoss(
+        temperature=args.identity_temperature,
+        repr_mode=args.s4g_anchor_repr,
+    )
     # 4. deepspeed 初始化
     model_engine, optimizer, _, scheduler = deepspeed.initialize(
         model=model,
@@ -324,22 +940,62 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
     best_epoch = 0
     best_metrics = None
     validation_history = []
+    train_loaders = dataloader
+    hard_pool_loaded = load_initial_hard_pool_if_needed(args, train_loaders)
     for epoch in range(1, args.epochs + 1):
-        if hasattr(dataloader, 'dataset') and hasattr(dataloader.dataset, 'set_epoch'):
-            dataloader.dataset.set_epoch(epoch)
-        if hasattr(dataloader, 'batch_sampler') and hasattr(dataloader.batch_sampler, 'set_epoch'):
-            dataloader.batch_sampler.set_epoch(epoch)
-        if dist.is_initialized() and hasattr(dataloader, 'sampler') and hasattr(dataloader.sampler, 'set_epoch'):
-            dataloader.sampler.set_epoch(epoch)
+        stage_mode = get_training_mode(epoch, args)
+        epoch_dataloader, _, effective_mode = select_epoch_dataloader(train_loaders, epoch, args)
+        ensure_identity_hard_ready(
+            epoch,
+            stage_mode,
+            effective_mode,
+            epoch_dataloader,
+            args,
+            hard_pool_loaded,
+        )
+        set_epoch_on_dataloader(epoch_dataloader, epoch)
         model_engine.train()
-        mode_name, mode_desc = get_training_mode_desc(dataloader.dataset, args)
-        num_batches = len(dataloader)
+        mode_name, mode_desc = get_training_mode_desc(epoch_dataloader.dataset, args)
+        num_batches = len(epoch_dataloader)
         world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
+        local_pid_batch = (
+            args.batch_size
+            if effective_mode == "sample4geo"
+            else getattr(args, "identity_ids_per_batch", args.batch_size)
+        )
         epoch_start_time = time.time()
-        loss_sums = {"total": 0.0, "tri_drone": 0.0, "tri_sat": 0.0, "infonce": 0.0}
-        loss_counts = {"total": 0, "tri_drone": 0, "tri_sat": 0, "infonce": 0}
+        loss_log_keys = (
+            "total",
+            "tri_drone",
+            "tri_sat",
+            "infonce",
+            "cross_id",
+            "same_triplet",
+            "weak_s4g",
+        )
+        loss_sums = {key: 0.0 for key in loss_log_keys}
+        loss_counts = {key: 0 for key in loss_log_keys}
+        hard_sampling_sums = new_hard_sampling_stats()
 
         if is_main_process():
+            fallback_note = " | fallback_to_sample4geo=True" if stage_mode != effective_mode else ""
+            print(
+                f"[TrainMode] Epoch {epoch}/{args.epochs} | "
+                f"mode={stage_mode} | effective_mode={effective_mode}{fallback_note}"
+            )
+            print(
+                f"[Sampler] Epoch {epoch}/{args.epochs} | "
+                f"mode={effective_mode} | {get_sampler_debug_desc(epoch_dataloader)}"
+            )
+            if effective_mode == "identity_hard":
+                print(
+                    f"[HardSampler] Epoch {epoch}/{args.epochs} | "
+                    f"mode=identity_hard | "
+                    f"hard_drone_per_id={getattr(args, 'hard_drone_per_id', 0)} | "
+                    f"random_drone_per_id={getattr(args, 'random_drone_per_id', 0)} | "
+                    f"hard_pool_loaded={dataloader_has_hard_pool(epoch_dataloader)} | "
+                    f"hard_pool_ids={get_hard_pool_id_count(epoch_dataloader)}"
+                )
             fusion_values = get_model_debug_values(model_engine)
             print(
                 f"[Fusion] Epoch {epoch}/{args.epochs} | "
@@ -352,36 +1008,18 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
             print(
                 f"[Train] Epoch {epoch}/{args.epochs} start | "
                 f"mode={mode_name} ({mode_desc}) | "
-                f"batches={num_batches} | local_pid_batch={args.batch_size} | "
-                f"global_pid_batch={args.batch_size * world_size} | ema_decay={args.ema_decay} | "
+                f"batches={num_batches} | local_pid_batch={local_pid_batch} | "
+                f"global_pid_batch={local_pid_batch * world_size} | ema_decay={args.ema_decay} | "
                 f"loss_weights={get_loss_weight_desc(args)}"
             )
 
-        for batch_idx, (sat_tensors, drone_tensors, labels, pids) in enumerate(dataloader):
-            if sat_tensors.ndim == 4:
-                sat_tensors = sat_tensors.unsqueeze(1)
-            if drone_tensors.ndim == 4:
-                drone_tensors = drone_tensors.unsqueeze(1)
-
-            # 1. 展平并拼接：[B, V, C, H, W] -> [(B * V_sat + B * V_drone), C, H, W]
-            sat_views_per_id = sat_tensors.size(1)
-            drone_views_per_id = drone_tensors.size(1)
-            sat_imgs = sat_tensors.reshape(-1, *sat_tensors.shape[2:])
-            drone_imgs = drone_tensors.reshape(-1, *drone_tensors.shape[2:])
-            imgs = torch.cat([sat_imgs, drone_imgs], dim=0).to(amp_device).to(torch.bfloat16)
-            
-            # 2. 标签精确对齐：每个 ID 的卫星增强数和无人机图数分别复制。
-            sat_labels = labels.repeat_interleave(sat_views_per_id)
-            drone_labels = labels.repeat_interleave(drone_views_per_id)
-            labels = torch.cat([sat_labels, drone_labels], dim=0).to(amp_device)
-            
-            # 3. 动态生成 views (前半截=0，后半截=1)
-            num_sat = sat_imgs.size(0)
-            num_drone = drone_imgs.size(0)
-            views = torch.cat([
-                torch.zeros(num_sat, dtype=torch.long),
-                torch.ones(num_drone, dtype=torch.long)
-            ]).to(amp_device)
+        for batch_idx, batch in enumerate(epoch_dataloader):
+            imgs, labels, views, batch_meta = unpack_training_batch(batch, effective_mode, amp_device)
+            if effective_mode == "identity_hard":
+                update_hard_sampling_stats(
+                    hard_sampling_sums,
+                    batch_meta.get("hard_sampling_stats", {}),
+                )
             
             # 4. 前向传播：训练时 TeacherModel 返回 (deep, fused, local)，loss 使用 fused。
             final_feats = model_engine(imgs)
@@ -391,8 +1029,7 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
             # 跨卡特征聚合
             all_feats, all_labels, all_views = gather_features_and_labels_and_views(final_feats, labels, views)
             loss_terms = []
-            tri_drone_loss_val = None
-            tri_sat_loss_val = None
+            loss_values = {}
             sat_mask = (all_views == 0)
             drone_mask = (all_views == 1)
 
@@ -402,21 +1039,48 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
             sat_feats = all_feats[sat_mask]
             drone_feats = all_feats[drone_mask]
 
-            if args.triplet_weight > 0:
-                tri_drone, tri_sat = triplet_criterion(drone_feats, drone_labels, sat_feats, sat_labels)
-                weighted_tri_drone = args.triplet_weight * tri_drone
-                weighted_tri_sat = args.triplet_weight * tri_sat
-                loss_terms.extend([weighted_tri_drone, weighted_tri_sat])
-                tri_drone_loss_val = weighted_tri_drone.item()
-                tri_sat_loss_val = weighted_tri_sat.item()
+            if effective_mode == "sample4geo":
+                if args.triplet_weight > 0:
+                    tri_drone, tri_sat = triplet_criterion(drone_feats, drone_labels, sat_feats, sat_labels)
+                    weighted_tri_drone = args.triplet_weight * tri_drone
+                    weighted_tri_sat = args.triplet_weight * tri_sat
+                    loss_terms.extend([weighted_tri_drone, weighted_tri_sat])
+                    loss_values["tri_drone"] = weighted_tri_drone.item()
+                    loss_values["tri_sat"] = weighted_tri_sat.item()
 
-            infonce_loss_val = None
-            if args.infonce_weight > 0:
-                logit_scale = get_logit_scale(model_engine)
-                infonce_loss = infonce_criterion(sat_feats, drone_feats, logit_scale)
-                total_infonce_loss = args.infonce_weight * infonce_loss
-                loss_terms.append(total_infonce_loss)
-                infonce_loss_val = total_infonce_loss.item()
+                if args.infonce_weight > 0:
+                    logit_scale = get_logit_scale(model_engine)
+                    infonce_loss = infonce_criterion(sat_feats, drone_feats, logit_scale)
+                    total_infonce_loss = args.infonce_weight * infonce_loss
+                    loss_terms.append(total_infonce_loss)
+                    loss_values["infonce"] = total_infonce_loss.item()
+            elif effective_mode in {"identity", "identity_hard"}:
+                if is_main_process() and batch_idx == 0:
+                    print(
+                        f"[TrainMode] {effective_mode} loss batch | "
+                        f"images={tuple(imgs.shape)} | labels={tuple(labels.shape)} | "
+                        f"views={tuple(views.shape)} | paths={len(batch_meta.get('image_paths', []))}"
+                    )
+
+                if args.identity_loss_weight > 0:
+                    cross_id_loss = identity_contrast_criterion(all_feats, all_labels, all_views)
+                    weighted_cross_id = args.identity_loss_weight * cross_id_loss
+                    loss_terms.append(weighted_cross_id)
+                    loss_values["cross_id"] = weighted_cross_id.item()
+
+                if args.same_domain_triplet_weight > 0:
+                    same_triplet_loss = same_domain_triplet_criterion(all_feats, all_labels, all_views)
+                    weighted_same_triplet = args.same_domain_triplet_weight * same_triplet_loss
+                    loss_terms.append(weighted_same_triplet)
+                    loss_values["same_triplet"] = weighted_same_triplet.item()
+
+                if args.weak_sample4geo_weight > 0:
+                    weak_s4g_loss = weak_sample4geo_criterion(all_feats, all_labels, all_views)
+                    weighted_weak_s4g = args.weak_sample4geo_weight * weak_s4g_loss
+                    loss_terms.append(weighted_weak_s4g)
+                    loss_values["weak_s4g"] = weighted_weak_s4g.item()
+            else:
+                raise ValueError(f"unsupported effective_mode: {effective_mode}")
                 
             # 7. 反向传播与优化 (干净利落，一次到位！)
             loss = sum(loss_terms) if loss_terms else None
@@ -428,17 +1092,12 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                     if hasattr(base_model, "logit_scale") and base_model.logit_scale is not None:
                         base_model.logit_scale.clamp_(max=4.6)
                 ema.update(model_engine.module if hasattr(model_engine, "module") else model_engine)
-                loss_sums["total"] += loss.item()
+                loss_item = loss.item()
+                loss_sums["total"] += loss_item
                 loss_counts["total"] += 1
-                if tri_drone_loss_val is not None:
-                    loss_sums["tri_drone"] += tri_drone_loss_val
-                    loss_counts["tri_drone"] += 1
-                if tri_sat_loss_val is not None:
-                    loss_sums["tri_sat"] += tri_sat_loss_val
-                    loss_counts["tri_sat"] += 1
-                if infonce_loss_val is not None:
-                    loss_sums["infonce"] += infonce_loss_val
-                    loss_counts["infonce"] += 1
+                for key, value in loss_values.items():
+                    loss_sums[key] += value
+                    loss_counts[key] += 1
             else:
                 continue
                 
@@ -459,10 +1118,14 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                 lr = get_current_lr(optimizer, scheduler)
                 debug_values = get_model_debug_values(model_engine)
 
+                metric_keys = (
+                    ("tri_drone", "tri_sat", "infonce")
+                    if effective_mode == "sample4geo"
+                    else ("cross_id", "same_triplet", "weak_s4g")
+                )
                 metric_parts = [
-                    format_optional_metric("tri_drone", tri_drone_loss_val),
-                    format_optional_metric("tri_sat", tri_sat_loss_val),
-                    format_optional_metric("infonce", infonce_loss_val),
+                    format_optional_metric(key, loss_values.get(key))
+                    for key in metric_keys
                 ]
                 metric_parts = [part for part in metric_parts if part is not None]
                 metric_text = " | ".join(metric_parts) if metric_parts else "loss_parts=none"
@@ -470,15 +1133,21 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                 print(
                     f"[Train] Epoch {epoch}/{args.epochs} | mode={mode_name} | "
                     f"batch {step}/{num_batches} ({progress:.1f}%) | "
-                    f"loss={loss.item():.4f} avg={avg_total:.4f} | {metric_text} | "
+                    f"loss={loss_item:.4f} avg={avg_total:.4f} | {metric_text} | "
                     f"lr={lr:.2e} | scale={debug_values.get('scale', 0.0):.3f} | "
                     f"elapsed={elapsed_min:.1f}m"
                 )
 
+        reduced_hard_sampling_sums = (
+            reduce_hard_sampling_stats(hard_sampling_sums, amp_device)
+            if effective_mode == "identity_hard"
+            else hard_sampling_sums
+        )
+
         if is_main_process():
             elapsed_min = (time.time() - epoch_start_time) / 60.0
             avg_parts = []
-            for key in ("total", "tri_drone", "tri_sat", "infonce"):
+            for key in loss_log_keys:
                 if loss_counts[key] > 0:
                     avg_parts.append(f"{key}_avg={loss_sums[key] / loss_counts[key]:.4f}")
             avg_text = " | ".join(avg_parts) if avg_parts else "no_update"
@@ -486,6 +1155,11 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                 f"[Train] Epoch {epoch}/{args.epochs} done | mode={mode_name} | "
                 f"updates={loss_counts['total']} | {avg_text} | time={elapsed_min:.1f}m"
             )
+            if effective_mode == "identity_hard":
+                print(
+                    f"[HardSampler] Epoch {epoch}/{args.epochs} done | "
+                    f"{format_hard_sampler_epoch_summary(reduced_hard_sampling_sums)}"
+                )
         cur_epoch = epoch
         if val_loaders is not None and should_run_validation(cur_epoch, args):
             if is_main_process():
@@ -566,6 +1240,16 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                         f"D2S_R@1={d2s_r1:.2f} | S2D_R@1={s2d_r1:.2f} | R@1_sum={r1_sum:.2f}"
                     )
 
+        if should_build_hard_pool(cur_epoch, args, hard_pool_loaded):
+            hard_pool_loaded = build_save_and_apply_hard_pool(
+                model_engine,
+                ema,
+                train_loaders,
+                args,
+                cur_epoch,
+                amp_device,
+            )
+
         # 7. 分布式同步：让所有显卡等 Rank 0 写完再进下一个 Epoch
         if dist.is_initialized():
             dist.barrier()
@@ -615,7 +1299,7 @@ def print_deepspeed_batch_config(ds_config, args, world_size):
 if __name__ == "__main__":
     import traceback
     parser = argparse.ArgumentParser(description="Train Teacher Model with LoRA and Classifier on U1652")
-    parser.add_argument('--epochs', type=int, default=22, help='训练轮数')
+    parser.add_argument('--epochs', '--max_epochs', dest='epochs', type=int, default=22, help='训练轮数')
     parser.add_argument('--device', type=str, default='cuda', help='训练设备')
 
     # muti-runk
@@ -635,6 +1319,21 @@ if __name__ == "__main__":
     parser.add_argument('--warmup_ratio', default=0.05, type=float, help='warmup 占总 optimizer step 的比例')
     parser.add_argument('--lr_end', default=0.00001, type=float)
     parser.add_argument('--ema_decay', type=float, default=0.999, help='EMA 衰减系数')
+    parser.add_argument('--stage1_end_epoch', type=int, default=8, help='多阶段训练 stage 1 结束 epoch')
+    parser.add_argument('--stage2_end_epoch', type=int, default=30, help='多阶段训练 stage 2 结束 epoch')
+    parser.add_argument('--build_hard_pool_epoch', type=int, default=30, help='预留 hard pool 构建 epoch')
+    parser.add_argument('--enable_identity_stage', action='store_true', help='启用 identity training 阶段判断')
+    parser.add_argument('--enable_hard_pool_stage', action='store_true', help='启用 hard pool 阶段判断')
+    parser.add_argument('--hard_pool_topk', type=int, default=12, help='每个 ID 保留的 hard drone 图片数')
+    parser.add_argument('--hard_pool_topneg_k', type=int, default=10, help='计算 boundary_risk 时使用的 top-K negative prototype 数')
+    parser.add_argument('--use_ema_for_hard_pool', type=str2bool, nargs='?', const=True, default=True, help='构建 hard_pool 时是否使用 EMA 权重')
+    parser.add_argument('--save_hard_pool_path', type=str, default='outputs/hard_pool_epoch{epoch}.json', help='hard_pool 保存路径模板，可使用 {epoch}')
+    parser.add_argument('--load_hard_pool_path', type=str, default=None, help='加载已有 hard_pool JSON 并应用到 identity_hard dataset')
+    parser.add_argument('--identity_ids_per_batch', type=int, default=8, help='identity 模式下每张卡每个 batch 采样的 ID 数')
+    parser.add_argument('--identity_drone_per_id', type=int, default=4, help='identity 模式下每个 ID 随机采样的 drone 图片数')
+    parser.add_argument('--identity_sat_per_id', type=int, default=1, help='identity 模式下每个 ID 随机采样的 satellite 图片数')
+    parser.add_argument('--hard_drone_per_id', type=int, default=2, help='identity_hard 模式预留：每个 ID 的 hard drone 图片数')
+    parser.add_argument('--random_drone_per_id', type=int, default=2, help='identity_hard 模式预留：每个 ID 的 random drone 图片数')
 
     parser.add_argument('--local_rank', type=int, default=0, help='local rank for distributed training')
 
@@ -663,14 +1362,21 @@ if __name__ == "__main__":
     # Loss weights. Sample4Geo-style training defaults to cross-view InfoNCE only.
     parser.add_argument('--triplet_weight', type=float, default=0.0, help='两个同域三元组损失的权重；设为 0 可关闭')
     parser.add_argument('--infonce_weight', type=float, default=1.0, help='InfoNCE 损失整体权重')
+    parser.add_argument('--identity_loss_weight', type=float, default=1.0, help='cross-domain identity contrast loss 权重')
+    parser.add_argument('--same_domain_triplet_weight', type=float, default=0.2, help='identity 阶段同域 batch-hard triplet loss 权重')
+    parser.add_argument('--weak_sample4geo_weight', type=float, default=0.2, help='identity 阶段弱 Sample4Geo anchor InfoNCE 权重')
+    parser.add_argument('--triplet_margin', type=float, default=0.3, help='identity 同域 triplet margin')
+    parser.add_argument('--identity_temperature', type=float, default=0.07, help='identity contrast / weak Sample4Geo temperature')
+    parser.add_argument('--s4g_anchor_repr', type=str, choices=['first', 'mean'], default='mean', help='identity batch 中 weak Sample4Geo anchor 表示方式')
 
     args = parser.parse_args()
     try:
         validate_loss_weights(args)
         validate_scheduler_args(args)
+        validate_identity_training_args(args)
         device, rank, local_rank, world_size = try_init_dist()
         # 构建训练集
-        train_dataset, train_sampler, train_loader = create_1652_train_dataset(args)
+        train_dataset, train_sampler, train_loader = create_1652_teacher_train_dataloaders(args)
         # 构建测试集
         val_loaders = build_1652_val_dataloaders(
             data_dir=args.data_dir,
