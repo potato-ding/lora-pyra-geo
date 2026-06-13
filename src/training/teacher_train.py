@@ -1319,7 +1319,7 @@ if __name__ == "__main__":
     parser.add_argument('--warmup_ratio', default=0.05, type=float, help='warmup 占总 optimizer step 的比例')
     parser.add_argument('--lr_end', default=0.00001, type=float)
     parser.add_argument('--ema_decay', type=float, default=0.999, help='EMA 衰减系数')
-    parser.add_argument('--stage1_end_epoch', type=int, default=8, help='多阶段训练 stage 1 结束 epoch')
+    parser.add_argument('--stage1_end_epoch', type=int, default=10, help='多阶段训练 stage 1 结束 epoch')
     parser.add_argument('--stage2_end_epoch', type=int, default=30, help='多阶段训练 stage 2 结束 epoch')
     parser.add_argument('--build_hard_pool_epoch', type=int, default=30, help='预留 hard pool 构建 epoch')
     parser.add_argument('--enable_identity_stage', action='store_true', help='启用 identity training 阶段判断')

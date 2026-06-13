@@ -517,7 +517,7 @@ D2S_R@1 + S2D_R@1
 
 | 参数 | 默认值 | 作用 |
 |---|---:|---|
-| `--stage1_end_epoch` | `8` | stage 1 结束 epoch |
+| `--stage1_end_epoch` | `10` | stage 1 结束 epoch |
 | `--stage2_end_epoch` | `30` | stage 2 结束 epoch |
 | `--build_hard_pool_epoch` | `30` | hard_pool 构建 epoch |
 | `--enable_identity_stage` | `False` | 启用 identity 阶段 |
@@ -598,7 +598,7 @@ deepspeed --num_gpus=1 src/training/teacher_train.py \
 deepspeed --num_gpus=1 src/training/teacher_train.py \
   --enable_identity_stage \
   --epochs 30 \
-  --stage1_end_epoch 8 \
+  --stage1_end_epoch 10 \
   --identity_ids_per_batch 8 \
   --identity_drone_per_id 4 \
   --identity_sat_per_id 1 \
@@ -614,7 +614,7 @@ deepspeed --num_gpus=1 src/training/teacher_train.py \
   --enable_identity_stage \
   --enable_hard_pool_stage \
   --epochs 40 \
-  --stage1_end_epoch 8 \
+  --stage1_end_epoch 10 \
   --stage2_end_epoch 30 \
   --build_hard_pool_epoch 30 \
   --identity_ids_per_batch 8 \
