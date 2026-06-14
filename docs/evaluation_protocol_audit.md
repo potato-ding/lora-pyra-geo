@@ -5,7 +5,13 @@ This note records how the current evaluation code handles University-1652, SUES-
 ## Summary
 
 - Teacher and student evaluation now use the same dataset builders and metric functions.
-- Teacher and student evaluation are single-card by default.
+- Teacher training-time University-1652 validation is multi-card when launched with DeepSpeed.
+- Teacher pure test is single-card by default.
+- Student training-time University-1652 validation is single-card.
+- Student pure test is single-card by default.
+- Training-time validation and pure test use the same U1652 dataset builder and metric definition, but the execution mode differs for teacher training.
+- Best checkpoint selection for both teacher and student uses `D2S_R@1 + S2D_R@1`.
+- Teacher and student training both write `best_metrics.json` with the best result first and full validation history afterwards.
 - `GTA-UAV` defaults to bidirectional evaluation through `--gta_query_mode both`.
 - `SUES-200` evaluates all four heights by default through `--sues_height all`.
 - `SUES-200` horizontal-flip test-time augmentation is disabled by default. It can be enabled explicitly with `--sues_horizontal_flip`.
@@ -136,6 +142,11 @@ python src/training/student_test.py \
 
 - The teacher and student use the same dataloader functions for SUES-200 and GTA-UAV.
 - The teacher and student use the same metric functions for SUES-200 and GTA-UAV.
+- During training, both teacher and student select the best checkpoint using the same University-1652 validation protocol used by `teacher_test.py` and `student_test.py`.
+- The selection metric is the sum of two directional recalls: `D2S_R@1 + S2D_R@1`.
+- Teacher training runs this protocol in distributed mode under DeepSpeed; teacher pure test runs it on one card.
+- Student training and student pure test both run this protocol on one card.
+- The shared University-1652 protocol uses `build_1652_val_dataloaders` and `getdist_1652_val_and_get_recall`.
 - The only model-specific difference is feature extraction: `TeacherModel` outputs DINOv3 teacher features; `StudentModel` outputs RepViT student features.
 - For paper-default evaluation, do not pass `--sues_horizontal_flip`.
 - If you want optional TTA ablation on SUES-200, pass `--sues_horizontal_flip` explicitly and report it separately.

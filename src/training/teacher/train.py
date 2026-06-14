@@ -345,7 +345,36 @@ def validate_identity_training_args(args):
 
 
 def should_run_validation(cur_epoch, args):
-    return True
+    if cur_epoch < 6:
+        return cur_epoch == args.epochs
+
+    if cur_epoch == args.epochs:
+        return True
+
+    mode = get_training_mode(cur_epoch, args)
+    if mode == "sample4geo":
+        return True
+
+    if mode == "identity":
+        stage_start = int(getattr(args, "stage1_end_epoch", 10)) + 1
+        if getattr(args, "enable_hard_pool_stage", False):
+            stage_end = min(int(getattr(args, "stage2_end_epoch", args.epochs)), args.epochs)
+        else:
+            stage_end = args.epochs
+    elif mode == "identity_hard":
+        stage_start = int(getattr(args, "stage2_end_epoch", 30)) + 1
+        stage_end = args.epochs
+    else:
+        return cur_epoch % 5 == 0
+
+    if cur_epoch < stage_start:
+        return False
+
+    last_ten_start = max(stage_start, stage_end - 9)
+    if cur_epoch >= last_ten_start:
+        return cur_epoch % 2 == 0
+
+    return cur_epoch % 5 == 0
 
 
 def build_scheduler_plan(train_loader, train_sampler, args, grad_accum_steps):
@@ -1306,6 +1335,7 @@ def main():
         val_loaders = build_1652_val_dataloaders(
             data_dir=args.data_dir,
             img_size=[args.img_size, args.img_size],
+            batch_size=getattr(args, "val_batch_size", 32),
             num_workers=args.num_workers
         )
         # 构建模型

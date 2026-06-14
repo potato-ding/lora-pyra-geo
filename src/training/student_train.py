@@ -19,6 +19,7 @@ from src.models.student_model import StudentModel
 from src.utils.optimizer_and_scale import build_student_optimizer
 from src.utils.save_path import get_student_save_pth
 from src.utils.scheduler import build_student_scheduler
+from src.utils.train_eval_utils import getdist_1652_val_and_get_recall
 
 if "OMP_NUM_THREADS" not in os.environ:
     os.environ["OMP_NUM_THREADS"] = "4"
@@ -64,56 +65,25 @@ def unpack_sample4geo_batch(batch, device):
 
 
 @torch.no_grad()
-def extract_features(model, loader, device):
-    model.eval()
-    features = []
-    labels = []
-
-    for images, target in loader:
-        images = images.to(device, non_blocking=True)
-        target = target.to(device, non_blocking=True).long()
-        feat = F.normalize(model(images), p=2, dim=1)
-        features.append(feat.cpu())
-        labels.append(target.cpu())
-
-    return torch.cat(features, dim=0), torch.cat(labels, dim=0)
-
-
-@torch.no_grad()
-def compute_recall_map(q_feat, q_label, g_feat, g_label, topk=(1, 5, 10)):
-    sim = q_feat @ g_feat.t()
-    indices = sim.argsort(dim=1, descending=True)
-    retrieved = g_label[indices]
-    matches = retrieved.eq(q_label.unsqueeze(1))
-
-    result = {}
-    for k in topk:
-        k = min(k, retrieved.size(1))
-        hit = matches[:, :k].any(dim=1).float().mean().item()
-        result[f"R@{k}"] = hit
-
-    ranks = torch.arange(1, retrieved.size(1) + 1, dtype=torch.float32).unsqueeze(0)
-    precision_at_k = matches.float().cumsum(dim=1) / ranks
-    positives = matches.float().sum(dim=1).clamp_min(1.0)
-    result["mAP"] = ((precision_at_k * matches.float()).sum(dim=1) / positives).mean().item()
-    return result
-
-
-@torch.no_grad()
 def validate_u1652(model, val_loaders):
     device = next(model.parameters()).device
     results = {}
 
     for task_name, (q_loader, g_loader) in val_loaders.items():
-        q_feat, q_label = extract_features(model, q_loader, device)
-        g_feat, g_label = extract_features(model, g_loader, device)
-        metrics = compute_recall_map(q_feat, q_label, g_feat, g_label, topk=(1, 5, 10))
-        results[f"{task_name}_R1"] = metrics["R@1"]
-        results[f"{task_name}_R5"] = metrics["R@5"]
-        results[f"{task_name}_R10"] = metrics["R@10"]
-        results[f"{task_name}_mAP"] = metrics["mAP"]
+        r1, r5, r10, mean_ap = getdist_1652_val_and_get_recall(
+            model,
+            q_loader,
+            g_loader,
+            device,
+            task_name=f"student:{task_name}",
+        )
+        results[f"{task_name}_R1"] = r1
+        results[f"{task_name}_R5"] = r5
+        results[f"{task_name}_R10"] = r10
+        results[f"{task_name}_mAP"] = mean_ap
 
     if "D2S_R1" in results and "S2D_R1" in results:
+        results["R1_sum"] = results["D2S_R1"] + results["S2D_R1"]
         results["avg_R1"] = (results["D2S_R1"] + results["S2D_R1"]) / 2.0
     if "D2S_mAP" in results and "S2D_mAP" in results:
         results["avg_mAP"] = (results["D2S_mAP"] + results["S2D_mAP"]) / 2.0
@@ -320,6 +290,53 @@ def write_training_record(args, status, best_epoch=None, best_metric=None, best_
 
     with open(record_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
+
+
+def save_metrics_json(save_dir, filename, payload):
+    os.makedirs(save_dir, exist_ok=True)
+    json_path = os.path.join(save_dir, filename)
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False, sort_keys=False)
+
+
+def build_student_validation_metrics(epoch, result):
+    return {
+        "epoch": epoch,
+        "selection_metric": "D2S_R@1+S2D_R@1",
+        "R@1_sum": result["R1_sum"],
+        "D2S": {
+            "R@1": result.get("D2S_R1"),
+            "R@5": result.get("D2S_R5"),
+            "R@10": result.get("D2S_R10"),
+            "mAP": result.get("D2S_mAP"),
+        },
+        "S2D": {
+            "R@1": result.get("S2D_R1"),
+            "R@5": result.get("S2D_R5"),
+            "R@10": result.get("S2D_R10"),
+            "mAP": result.get("S2D_mAP"),
+        },
+    }
+
+
+def build_student_best_metrics_payload(best_metrics, validation_history):
+    if best_metrics is None:
+        return {
+            "epoch": None,
+            "selection_metric": "D2S_R@1+S2D_R@1",
+            "best_R@1_sum": None,
+            "D2S": None,
+            "S2D": None,
+            "validation_history": validation_history,
+        }
+    return {
+        "epoch": best_metrics["epoch"],
+        "selection_metric": best_metrics["selection_metric"],
+        "best_R@1_sum": best_metrics["R@1_sum"],
+        "D2S": best_metrics["D2S"],
+        "S2D": best_metrics["S2D"],
+        "validation_history": validation_history,
+    }
 
 
 def print_trainable_parameter_summary(model):
@@ -571,9 +588,16 @@ def train(model, train_loader, val_loaders, criterion, optimizer, scheduler, dev
     best_metric = -1.0
     best_epoch = None
     best_result = None
+    best_metrics = None
+    validation_history = []
     last_epoch = None
     last_result = None
     write_training_record(args, status="training")
+    save_metrics_json(
+        args.output_dir,
+        "best_metrics.json",
+        build_student_best_metrics_payload(best_metrics, validation_history),
+    )
 
     for epoch in range(1, args.epochs + 1):
         train_stats = train_one_epoch(
@@ -627,20 +651,36 @@ def train(model, train_loader, val_loaders, criterion, optimizer, scheduler, dev
                 f"S2D_R1={result.get('S2D_R1', 0.0):.6f} | "
                 f"S2D_R5={result.get('S2D_R5', 0.0):.6f} | "
                 f"S2D_R10={result.get('S2D_R10', 0.0):.6f} | "
-                f"S2D_mAP={result.get('S2D_mAP', 0.0):.6f}"
+                f"S2D_mAP={result.get('S2D_mAP', 0.0):.6f} | "
+                f"R1_sum={result.get('R1_sum', 0.0):.6f}"
             )
 
-            current_metric = result.get(args.best_metric_name)
-            if current_metric is not None and current_metric > best_metric:
+            current_metric = result.get("R1_sum")
+            current_metrics = build_student_validation_metrics(epoch, result)
+            is_best = current_metric is not None and current_metric > best_metric
+            history_record = dict(current_metrics)
+            history_record["is_best"] = is_best
+            validation_history.append(history_record)
+
+            if is_best:
                 best_metric = current_metric
                 best_epoch = epoch
                 best_result = result
+                best_metrics = current_metrics
                 save_checkpoint(model, optimizer, scheduler, epoch, os.path.join(args.output_dir, "best_model.pth"))
-                print(f"[Best] {args.best_metric_name} improved to {best_metric:.6f}")
+                print(f"[Best] R1_sum improved to {best_metric:.6f}")
+
+            save_metrics_json(
+                args.output_dir,
+                "best_metrics.json",
+                build_student_best_metrics_payload(best_metrics, validation_history),
+            )
 
             print(
                 f"[Best] best_epoch={best_epoch if best_epoch is not None else 'N/A'} | "
+                f"best_R1_sum={format_optional_float((best_result or {}).get('R1_sum'), 6)} | "
                 f"best_D2S_R1={format_optional_float((best_result or {}).get('D2S_R1'), 6)} | "
+                f"best_S2D_R1={format_optional_float((best_result or {}).get('S2D_R1'), 6)} | "
                 f"best_D2S_mAP={format_optional_float((best_result or {}).get('D2S_mAP'), 6)}"
             )
 
@@ -662,6 +702,11 @@ def train(model, train_loader, val_loaders, criterion, optimizer, scheduler, dev
         best_result=best_result,
         last_epoch=last_epoch,
         last_result=last_result,
+    )
+    save_metrics_json(
+        args.output_dir,
+        "best_metrics.json",
+        build_student_best_metrics_payload(best_metrics, validation_history),
     )
 
 
@@ -689,7 +734,7 @@ def parse_args():
     parser.add_argument("--grad_clip", type=float, default=0.0)
     parser.add_argument("--print_freq", type=int, default=20)
     parser.add_argument("--val_interval", type=int, default=5)
-    parser.add_argument("--best_metric_name", type=str, default="D2S_R1")
+    parser.add_argument("--best_metric_name", type=str, default="R1_sum")
     parser.add_argument("--save_last", dest="save_last", action="store_true", default=True)
     parser.add_argument("--no_save_last", dest="save_last", action="store_false")
     parser.add_argument("--use_local_align", action="store_true", default=False)
@@ -711,6 +756,9 @@ def parse_args():
     parser.add_argument("--brd_risk_threshold", type=float, default=0.0)
 
     args = parser.parse_args()
+    if args.best_metric_name != "R1_sum":
+        print(f"[Best] overriding best_metric_name={args.best_metric_name!r} to 'R1_sum'")
+        args.best_metric_name = "R1_sum"
     args.command_line = " ".join(shlex.quote(x) for x in sys.argv)
     if args.output_dir is None:
         args.output_dir = get_student_save_pth(args)
@@ -720,7 +768,7 @@ def parse_args():
 def main():
     args = parse_args()
     from src.dataset.datasets import create_student_train_dataset_and_loader
-    from src.dataset.val_dataloaders import build_student_val_dataloaders
+    from src.dataset.teacher.val_dataloaders import build_1652_val_dataloaders
 
     if args.use_brd_distill:
         args.teacher_checkpoint = resolve_teacher_checkpoint_path(args)
@@ -730,7 +778,7 @@ def main():
 
     device = torch.device("cuda")
     train_loader = create_student_train_dataset_and_loader(args)
-    val_loaders = build_student_val_dataloaders(
+    val_loaders = build_1652_val_dataloaders(
         data_dir=args.val_data_dir,
         img_size=[args.img_size, args.img_size],
         batch_size=args.val_batch_size,

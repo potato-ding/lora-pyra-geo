@@ -6,8 +6,12 @@ Hardware assumption:
 
 - 8 x RTX 3090
 - Teacher training: 2 GPUs per run
+- Teacher training-time University-1652 validation: multi-card, same DeepSpeed process group as training
+- Teacher pure test: single-card
 - Teacher per-GPU PID batch size: 4
 - Student baseline / distillation: 1 GPU per run
+- Student training-time University-1652 validation: single-card
+- Student pure test: single-card
 - Dataset root examples use `data/U1652`, `data/GTA-UAV-LR/GTA-UAV-LR-baidu`, and `data/SUES-200/SUES-200-512x512`
 
 ## 1. GPU Allocation
@@ -54,6 +58,13 @@ Important:
 - The default local feature layers in code are `19,27,36`.
 - `--use_soft_orth_fusion` automatically enables local fusion.
 - If neither `--use_local_fusion` nor `--use_soft_orth_fusion` is used, the teacher uses the final global feature only.
+- Best teacher checkpoint selection uses `D2S_R@1 + S2D_R@1`.
+- Teacher training-time validation schedule:
+  - epochs `1-5`: no validation;
+  - Sample4Geo stage from epoch `6`: validate every epoch;
+  - identity / hard-pool stages: validate every 5 epochs;
+  - last 10 epochs of each identity / hard-pool stage: validate every 2 epochs;
+  - final epoch: always validate.
 
 ### 2.1 Teacher Baseline: Sample4Geo + InfoNCE
 
@@ -211,6 +222,7 @@ Purpose:
 - Loss: symmetric InfoNCE.
 - No teacher.
 - No distillation.
+- Best student checkpoint selection uses `D2S_R@1 + S2D_R@1`.
 
 Single GPU example:
 
@@ -322,6 +334,8 @@ If online teacher distillation causes OOM on one 3090:
 
 ## 6. Teacher Evaluation
 
+Teacher pure evaluation is single-card. Do not launch these commands with DeepSpeed unless you intentionally want a separate distributed evaluation ablation.
+
 University-1652:
 
 ```bash
@@ -356,6 +370,8 @@ python src/training/teacher_test.py \
 ```
 
 ## 7. Student Evaluation
+
+Student training and student pure evaluation are both single-card.
 
 University-1652:
 
@@ -407,5 +423,7 @@ python src/training/student_test.py \
 - Student checkpoints are saved under `src/checkpoint/student/<run>/`.
 - Teacher `best_model.pth` stores EMA trainable weights.
 - Student `best_model.pth` stores the full student checkpoint dictionary.
+- Teacher and student training both write `best_metrics.json`.
+- In `best_metrics.json`, the first fields record the best result (`epoch`, `best_R@1_sum`, `D2S`, `S2D`), followed by `validation_history` for every validation.
 - For teacher evaluation, checkpoint hyperparameters are loaded automatically from `hyperparameters.json` unless `--no_checkpoint_hparams` is set.
 - For soft orthogonal fusion experiments, always keep the checkpoint's hyperparameters during evaluation, otherwise the model structure may not match the saved weights.
