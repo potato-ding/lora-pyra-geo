@@ -384,7 +384,7 @@ def build_arg_parser():
     parser.add_argument("--print_freq", type=int, default=20)
     parser.add_argument("--grad_clip", type=float, default=0.0)
     parser.add_argument("--temperature", type=float, default=0.07)
-    parser.add_argument("--output_dir", type=str, default="./work_dirs/student")
+    parser.add_argument("--output_dir", type=str, default="src/checkpoint/student")
     parser.add_argument("--save_freq", type=int, default=1)
     parser.add_argument("--val_interval", type=int, default=1)
     parser.add_argument("--data_dir", type=str, default="data/U1652")

@@ -44,10 +44,7 @@ def get_save_pth(args):
 
 def get_student_save_pth(args):
     save_dir = os.path.join(
-        'src/checkpoint/student',
-        ('_contrastive' if args.use_contrastive else '') +
-        ('_triplet' if args.use_triplet else '') +
-        (f'_{args.triplet_weight}w') + 
-        (f'_{args.img_size}')
+        getattr(args, 'output_root', 'src/checkpoint/student'),
+        f"repvit_m15_sample4geo_{getattr(args, 'img_size', 224)}"
     )
     return save_dir
