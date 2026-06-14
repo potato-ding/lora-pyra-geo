@@ -10,6 +10,7 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.amp import GradScaler, autocast
@@ -41,8 +42,90 @@ class AverageMeter:
         self.avg = self.sum / max(1, self.count)
 
 
+def path_lookup_keys(path):
+    raw = str(path)
+    norm = os.path.normpath(raw)
+    abs_path = os.path.abspath(norm)
+    try:
+        rel_path = os.path.relpath(abs_path, os.getcwd())
+    except ValueError:
+        rel_path = norm
+
+    keys = []
+    for item in (raw, norm, abs_path, rel_path):
+        keys.append(item)
+        keys.append(item.replace("\\", "/"))
+    return keys
+
+
+class TeacherFeatureBank:
+    """Disk-backed teacher feature bank loaded via NumPy memmap."""
+
+    def __init__(self, cache_dir):
+        self.cache_dir = cache_dir
+        self.drone_feats = self._load_feats("drone")
+        self.satellite_feats = self._load_feats("satellite")
+        self.drone_index = self._load_index("drone")
+        self.satellite_index = self._load_index("satellite")
+        print(
+            "[TeacherBank] "
+            f"cache_dir={cache_dir} | "
+            f"drone_feats={self.drone_feats.shape}/{self.drone_feats.dtype} | "
+            f"satellite_feats={self.satellite_feats.shape}/{self.satellite_feats.dtype}"
+        )
+
+    def _load_feats(self, view_type):
+        path = os.path.join(self.cache_dir, f"{view_type}_feats_fp16.npy")
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"teacher feature matrix not found: {path}")
+        feats = np.load(path, mmap_mode="r")
+        if feats.dtype != np.float16:
+            raise ValueError(f"expected float16 teacher feature bank at {path}, got {feats.dtype}")
+        return feats
+
+    def _load_index(self, view_type):
+        path = os.path.join(self.cache_dir, f"{view_type}_index.json")
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"teacher feature index not found: {path}")
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    def _resolve_entry(self, index, path, view_type):
+        for key in path_lookup_keys(path):
+            entry = index.get(key)
+            if entry is not None:
+                return entry
+        raise KeyError(f"missing {view_type} teacher feature for image path: {path}")
+
+    def get(self, view_type, paths, device):
+        if paths is None:
+            raise ValueError("teacher feature bank requires image paths in each training batch")
+        if view_type == "drone":
+            feats = self.drone_feats
+            index = self.drone_index
+        elif view_type == "satellite":
+            feats = self.satellite_feats
+            index = self.satellite_index
+        else:
+            raise ValueError(f"unsupported view_type: {view_type}")
+
+        rows = [int(self._resolve_entry(index, path, view_type)["row_index"]) for path in paths]
+        batch_feats = np.asarray(feats[rows], dtype=np.float16)
+        batch_feats = np.ascontiguousarray(batch_feats)
+        tensor = torch.from_numpy(batch_feats).to(device=device, non_blocking=True).float()
+        return F.normalize(tensor, p=2, dim=1, eps=1e-6)
+
+
 def unpack_sample4geo_batch(batch, device):
-    drone, satellite, labels, pids = batch
+    if len(batch) == 4:
+        drone, satellite, labels, pids = batch
+        drone_paths = None
+        satellite_paths = None
+    elif len(batch) == 6:
+        drone, satellite, labels, pids, drone_paths, satellite_paths = batch
+    else:
+        raise ValueError(f"Expected 4 or 6 fields from Sample4Geo batch, got {len(batch)}")
+
     drone = drone.to(device, non_blocking=True)
     satellite = satellite.to(device, non_blocking=True)
     labels = labels.to(device, non_blocking=True).long()
@@ -57,6 +140,8 @@ def unpack_sample4geo_batch(batch, device):
         "pair_batch_size": labels.size(0),
         "effective_batch": images.size(0),
         "pids": pids,
+        "drone_paths": list(drone_paths) if drone_paths is not None else None,
+        "satellite_paths": list(satellite_paths) if satellite_paths is not None else None,
     }
 
 
@@ -173,6 +258,14 @@ def compute_local_align_loss(fmap_drone, fmap_sat, topk=4, tau=0.07, return_debu
     return loss_local
 
 
+def compute_brd_loss(student_features, teacher_features):
+    student_features = F.normalize(student_features.float(), p=2, dim=1, eps=1e-6)
+    teacher_features = F.normalize(teacher_features.float(), p=2, dim=1, eps=1e-6)
+    student_rel = student_features @ student_features.t()
+    teacher_rel = teacher_features @ teacher_features.t()
+    return F.mse_loss(student_rel, teacher_rel)
+
+
 def get_raw_model(model):
     return model.module if hasattr(model, "module") else model
 
@@ -247,13 +340,14 @@ def format_optional_float(value, precision=4):
     return f"{value:.{precision}f}"
 
 
-def train_one_epoch(model, train_loader, criterion, optimizer, scheduler, scaler, device, args, epoch):
+def train_one_epoch(model, train_loader, criterion, optimizer, scheduler, scaler, device, args, epoch, teacher_bank=None):
     model.train()
     batch_time = AverageMeter()
     data_time = AverageMeter()
     loss_total_meter = AverageMeter()
     loss_infonce_meter = AverageMeter()
     loss_local_align_meter = AverageMeter()
+    loss_brd_meter = AverageMeter()
     end = time.time()
     printed_local_align_shapes = False
 
@@ -294,6 +388,15 @@ def train_one_epoch(model, train_loader, criterion, optimizer, scheduler, scaler
                 local_align_loss = main_loss.new_zeros(())
                 loss = main_loss
 
+            if teacher_bank is not None:
+                teacher_drone = teacher_bank.get("drone", meta["drone_paths"], device)
+                teacher_satellite = teacher_bank.get("satellite", meta["satellite_paths"], device)
+                teacher_features = torch.cat([teacher_drone, teacher_satellite], dim=0)
+                brd_loss = compute_brd_loss(features, teacher_features)
+                loss = loss + args.brd_weight * brd_loss
+            else:
+                brd_loss = main_loss.new_zeros(())
+
         if args.use_local_align and not printed_local_align_shapes:
             expected_labels = list(range(pair_batch_size))
             print(
@@ -331,6 +434,7 @@ def train_one_epoch(model, train_loader, criterion, optimizer, scheduler, scaler
         loss_total_meter.update(loss.item(), images.size(0))
         loss_infonce_meter.update(main_loss.item(), images.size(0))
         loss_local_align_meter.update(local_align_loss.item(), images.size(0))
+        loss_brd_meter.update(brd_loss.item(), images.size(0))
         batch_time.update(time.time() - end)
         end = time.time()
 
@@ -347,6 +451,8 @@ def train_one_epoch(model, train_loader, criterion, optimizer, scheduler, scaler
                 f"loss_total {loss_total_meter.val:.4f} ({loss_total_meter.avg:.4f}) | "
                 f"loss_infonce {loss_infonce_meter.val:.4f} ({loss_infonce_meter.avg:.4f}) | "
                 f"loss_local_align {loss_local_align_meter.val:.4f} ({loss_local_align_meter.avg:.4f}) | "
+                f"loss_brd {loss_brd_meter.val:.4f} ({loss_brd_meter.avg:.4f}) | "
+                f"brd_weight {args.brd_weight:.6f} | "
                 f"local_align_weight {args.local_align_weight:.6f} | "
                 f"local_align_topk {args.local_align_topk} | "
                 f"local_align_tau {args.local_align_tau:.6f} | "
@@ -358,10 +464,11 @@ def train_one_epoch(model, train_loader, criterion, optimizer, scheduler, scaler
         "loss_total": loss_total_meter.avg,
         "loss_infonce": loss_infonce_meter.avg,
         "loss_local_align": loss_local_align_meter.avg,
+        "loss_brd": loss_brd_meter.avg,
     }
 
 
-def train(model, train_loader, val_loaders, criterion, optimizer, scheduler, device, args):
+def train(model, train_loader, val_loaders, criterion, optimizer, scheduler, device, args, teacher_bank=None):
     os.makedirs(args.output_dir, exist_ok=True)
     scaler = GradScaler("cuda", enabled=args.amp)
 
@@ -373,12 +480,25 @@ def train(model, train_loader, val_loaders, criterion, optimizer, scheduler, dev
     write_training_record(args, status="training")
 
     for epoch in range(1, args.epochs + 1):
-        train_stats = train_one_epoch(model, train_loader, criterion, optimizer, scheduler, scaler, device, args, epoch)
+        train_stats = train_one_epoch(
+            model,
+            train_loader,
+            criterion,
+            optimizer,
+            scheduler,
+            scaler,
+            device,
+            args,
+            epoch,
+            teacher_bank=teacher_bank,
+        )
         print(
             f"[Train] Epoch {epoch}/{args.epochs} | "
             f"loss_total={train_stats['loss_total']:.4f} | "
             f"loss_infonce={train_stats['loss_infonce']:.4f} | "
             f"loss_local_align={train_stats['loss_local_align']:.4f} | "
+            f"loss_brd={train_stats['loss_brd']:.4f} | "
+            f"brd_weight={args.brd_weight:.6f} | "
             f"local_align_weight={args.local_align_weight:.6f} | "
             f"local_align_topk={args.local_align_topk} | "
             f"local_align_tau={args.local_align_tau:.6f}"
@@ -469,6 +589,8 @@ def parse_args():
     parser.add_argument("--local_align_weight", type=float, default=0.01)
     parser.add_argument("--local_align_topk", type=int, default=4)
     parser.add_argument("--local_align_tau", type=float, default=0.07)
+    parser.add_argument("--teacher_cache_dir", type=str, default=None)
+    parser.add_argument("--brd_weight", type=float, default=0.0)
 
     args = parser.parse_args()
     args.command_line = " ".join(shlex.quote(x) for x in sys.argv)
@@ -506,8 +628,13 @@ def main():
     )
     scheduler = build_student_scheduler(optimizer, args, steps_per_epoch=len(train_loader))
     criterion = Sample4GeoLoss(label_smoothing=args.label_smoothing)
+    teacher_bank = None
+    if args.teacher_cache_dir is not None:
+        if args.brd_weight <= 0:
+            raise ValueError("--teacher_cache_dir was provided, but --brd_weight must be > 0 to use BRD distillation.")
+        teacher_bank = TeacherFeatureBank(args.teacher_cache_dir)
 
-    train(model, train_loader, val_loaders, criterion, optimizer, scheduler, device, args)
+    train(model, train_loader, val_loaders, criterion, optimizer, scheduler, device, args, teacher_bank=teacher_bank)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 """Extract normalized DINOv3 teacher descriptors for U1652 train images."""
 
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
@@ -8,13 +9,13 @@ from pathlib import Path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../../..")))
 os.environ["NO_ALBUMENTATIONS_UPDATE"] = "1"
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 from src.dataset.teacher.datasets import Sample4GeoU1652Dataset
-from src.dataset.teacher.transforms import get_sample4geo_val_transforms
 from src.models.teacher.model import TeacherModel
 from src.training.teacher.evaluate import load_checkpoint_hparams, load_teacher_checkpoint, str2bool
 
@@ -92,8 +93,13 @@ def resolve_device(device_arg):
     return requested
 
 
+def write_json(path, payload):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
 @torch.no_grad()
-def extract_view_cache(model, samples, transform, args, device, view_type):
+def extract_view_bank(model, samples, transform, args, device, view_type, output_dir):
     dataset = U1652TrainImageDataset(samples, transform)
     loader = DataLoader(
         dataset,
@@ -105,29 +111,83 @@ def extract_view_cache(model, samples, transform, args, device, view_type):
         collate_fn=collate_cache_batch,
     )
 
-    cache = {}
+    feat_path = output_dir / f"{view_type}_feats_fp16.npy"
+    index_path = output_dir / f"{view_type}_index.json"
+    index = {}
+    feat_bank = None
+    row_start = 0
+
+    if len(dataset) == 0:
+        feat_bank = np.lib.format.open_memmap(feat_path, mode="w+", dtype=np.float16, shape=(0, 0))
+        feat_bank.flush()
+        write_json(index_path, index)
+        return {"num_images": 0, "feat_dim": 0, "feat_path": str(feat_path), "index_path": str(index_path)}
+
     for images, labels, pids, paths, view_types in tqdm(loader, desc=f"extract {view_type}", ncols=100):
         images = images.to(device, non_blocking=True)
-        labels = labels.tolist()
         feats = model(images)
-        feats = F.normalize(feats.float(), p=2, dim=1, eps=1e-6).cpu()
+        feats = F.normalize(feats.float(), p=2, dim=1, eps=1e-6)
+        feats_np = feats.detach().to(torch.float16).cpu().numpy()
 
-        for path, label, pid, entry_view_type, feat in zip(paths, labels, pids, view_types, feats):
-            cache[path] = {
-                "image_path": path,
+        if feat_bank is None:
+            feat_bank = np.lib.format.open_memmap(
+                feat_path,
+                mode="w+",
+                dtype=np.float16,
+                shape=(len(dataset), feats_np.shape[1]),
+            )
+
+        row_end = row_start + feats_np.shape[0]
+        feat_bank[row_start:row_end] = feats_np
+
+        for offset, (path, label, pid, entry_view_type) in enumerate(zip(paths, labels.tolist(), pids, view_types)):
+            index[path] = {
+                "row_index": int(row_start + offset),
                 "label": int(label),
                 "pid": pid,
                 "view_type": entry_view_type,
-                "feat": feat,
             }
-    return cache
+        row_start = row_end
+
+    feat_bank.flush()
+    write_json(index_path, index)
+    return {
+        "num_images": int(row_start),
+        "feat_dim": int(feat_bank.shape[1]),
+        "feat_path": str(feat_path),
+        "index_path": str(index_path),
+    }
 
 
 def build_arg_parser():
-    parser = argparse.ArgumentParser(description="Extract teacher descriptor cache for U1652 train images.")
-    parser.add_argument("--checkpoint", type=str, required=True, help="Path to trained teacher best_model.pth/final_model.pth.")
+    parser = argparse.ArgumentParser(description="Extract disk-backed teacher feature banks for U1652 train images.")
+    parser.add_argument("--checkpoint", type=str, default=None, help="Path to trained teacher best_model.pth/final_model.pth.")
+    parser.add_argument(
+        "--teacher_run_name",
+        type=str,
+        default=None,
+        help="Date/run folder name under --teacher_checkpoint_root, for example 2026-06-12_01-20.",
+    )
+    parser.add_argument(
+        "--teacher_checkpoint_root",
+        type=str,
+        default="src/checkpoint/teacher",
+        help="Root directory containing teacher run folders.",
+    )
+    parser.add_argument(
+        "--teacher_checkpoint_name",
+        type=str,
+        default="best_model.pth",
+        help="Checkpoint filename inside the teacher run folder.",
+    )
+    parser.add_argument(
+        "--cache_subdir",
+        type=str,
+        default="teacher_cache",
+        help="Subdirectory under the teacher run folder/checkpoint folder for extracted features.",
+    )
     parser.add_argument("--data_dir", type=str, default="data/U1652", help="University-1652 dataset root.")
-    parser.add_argument("--output", type=str, default="teacher_cache.pt", help="Output cache path.")
+    parser.add_argument("--output_dir", type=str, default=None, help="Output feature-bank directory. Defaults to <teacher_run_dir>/<cache_subdir>.")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--img_size", type=int, default=224)
@@ -151,15 +211,40 @@ def build_arg_parser():
     return parser
 
 
+def resolve_teacher_run_paths(args):
+    run_dir = None
+
+    if args.teacher_run_name:
+        run_dir = Path(args.teacher_checkpoint_root) / args.teacher_run_name
+        if args.checkpoint is None:
+            args.checkpoint = str(run_dir / args.teacher_checkpoint_name)
+    elif args.checkpoint is not None:
+        run_dir = Path(args.checkpoint).resolve().parent
+
+    if args.checkpoint is None:
+        raise ValueError("Please provide either --teacher_run_name or --checkpoint.")
+
+    if args.output_dir is None:
+        args.output_dir = str(run_dir / args.cache_subdir)
+
+    args.teacher_run_dir = str(run_dir) if run_dir is not None else None
+    return args
+
+
 def main(argv=None):
     parser = build_arg_parser()
     defaults = {action.dest: action.default for action in parser._actions}
     args = parser.parse_args(argv)
+    args = resolve_teacher_run_paths(args)
     load_checkpoint_hparams(args, defaults, sys.argv[1:] if argv is None else argv)
+    args = resolve_teacher_run_paths(args)
 
     device = resolve_device(args.device)
     args.device = str(device)
     print(f"[Extract] device={device} | checkpoint={args.checkpoint}")
+    print(f"[Extract] teacher_run_dir={args.teacher_run_dir} | output_dir={args.output_dir}")
+
+    from src.dataset.teacher.transforms import get_sample4geo_val_transforms
 
     transform = get_sample4geo_val_transforms(
         img_size=[args.img_size, args.img_size],
@@ -178,17 +263,26 @@ def main(argv=None):
     for param in model.parameters():
         param.requires_grad_(False)
 
-    with torch.no_grad():
-        cache = {
-            "drone": extract_view_cache(model, samples["drone"], transform, args, device, "drone"),
-            "satellite": extract_view_cache(model, samples["satellite"], transform, args, device, "satellite"),
-        }
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    output_path = Path(args.output)
-    if str(output_path.parent):
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(cache, output_path)
-    print(f"[Extract] saved teacher cache: {output_path}")
+    summary = {
+        "checkpoint": args.checkpoint,
+        "teacher_run_name": args.teacher_run_name,
+        "teacher_run_dir": args.teacher_run_dir,
+        "data_dir": args.data_dir,
+        "img_size": args.img_size,
+        "dtype": "float16",
+        "normalized": True,
+        "views": {
+            "drone": extract_view_bank(model, samples["drone"], transform, args, device, "drone", output_dir),
+            "satellite": extract_view_bank(model, samples["satellite"], transform, args, device, "satellite", output_dir),
+        },
+    }
+    write_json(output_dir / "metadata.json", summary)
+    print(f"[Extract] saved teacher feature bank directory: {output_dir}")
+    print(f"[Extract] drone feats: {summary['views']['drone']['feat_path']}")
+    print(f"[Extract] satellite feats: {summary['views']['satellite']['feat_path']}")
 
 
 if __name__ == "__main__":
