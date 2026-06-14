@@ -11,13 +11,11 @@ import math
 import os
 import random
 
-import cv2
 import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.sampler import Sampler
 
-from src.dataset.transforms import get_train_transforms
 from src.dataset.teacher.datasets import (
     IdentityBatchSampler,
     IdentityU1652Dataset,
@@ -28,6 +26,21 @@ from src.dataset.teacher.datasets import (
     create_1652_train_dataset,
     create_identity_1652_train_dataset,
 )
+
+
+def _read_rgb_image(path):
+    try:
+        import cv2
+    except ImportError as exc:
+        raise ImportError(
+            "OpenCV is required for U1652Dataset image loading. "
+            "Install opencv-python-headless from requirements.txt."
+        ) from exc
+
+    img = cv2.imread(path)
+    if img is None:
+        raise FileNotFoundError(f"failed to read image: {path}")
+    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
 
 class U1652Dataset(Dataset):
@@ -199,7 +212,7 @@ class U1652Dataset(Dataset):
             selected_drones = self._get_random_drones(drone_paths)
 
         # 处理卫星图 (1原 + 3增)
-        img_sat = cv2.cvtColor(cv2.imread(sat_path), cv2.COLOR_BGR2RGB)
+        img_sat = _read_rgb_image(sat_path)
         
         sat_clean = self.val_transforms(image=img_sat)['image']
         sat_aug1 = self.sat_transforms(image=img_sat)['image']
@@ -212,7 +225,7 @@ class U1652Dataset(Dataset):
         # 处理无人机图 (4张增)
         drone_tensors = []
         for dp in selected_drones:
-            img_d = cv2.cvtColor(cv2.imread(dp), cv2.COLOR_BGR2RGB)
+            img_d = _read_rgb_image(dp)
             d_tensor = self.drone_transforms(image=img_d)['image']
             drone_tensors.append(d_tensor)
             
@@ -322,34 +335,45 @@ class DistributedCoverageBatchSampler(Sampler):
         )
 
 
-def create_student_train_dataset_and_loader(args):
-    # 1. 获取训练增强和验证增强 (保持不变)
-    val_tf, train_sat_tf, train_drone_tf = get_train_transforms(
+def create_student_sample4geo_train_dataset_and_loader(args):
+    from src.dataset.teacher.transforms import get_sample4geo_train_transforms
+
+    data_dir = getattr(args, "data_dir", "data/U1652")
+    train_data_dir = getattr(args, "train_data_dir", None) or os.path.join(data_dir, "train")
+    num_workers = getattr(args, "num_workers", 8)
+    pin_memory = getattr(args, "pin_memory", True)
+    seed = getattr(args, "seed", 0)
+    prob_flip = getattr(args, "prob_flip", 0.5)
+
+    train_sat_tf, train_drone_tf = get_sample4geo_train_transforms(
         img_size=[args.img_size, args.img_size],
         mean=[0.485, 0.456, 0.406],
-        std=[0.229, 0.224, 0.225]
+        std=[0.229, 0.224, 0.225],
     )
 
-    # 2. 创建训练数据集 (保持不变)
-    train_dataset = U1652Dataset(
-        data_dir='data/U1652/train',
-        val_transforms=val_tf,
+    train_dataset = Sample4GeoU1652Dataset(
+        data_dir=train_data_dir,
         sat_transforms=train_sat_tf,
         drone_transforms=train_drone_tf,
-        num_drones=4
+        prob_flip=prob_flip,
     )
-
+    train_sampler = Sample4GeoBatchSampler(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        seed=seed,
+    )
     train_loader = DataLoader(
         dataset=train_dataset,
-        batch_size=args.batch_size, # 这里的 batch_size 即为单卡的实际输入量
-        shuffle=True,               # 单卡训练务必开启 shuffle
-        num_workers=8,              # 根据你的 CPU 核心数调整，单卡通常 4-8 即可
-        pin_memory=True,            # 依然建议开启，加速数据从内存拷贝到显存
-        drop_last=True              # 保证每个 batch 的大小一致，有利于训练稳定
+        batch_sampler=train_sampler,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
     )
-
-    # 4. 返回数据集和加载器 (单卡通常不需要 sampler)
     return train_loader
+
+
+def create_student_train_dataset_and_loader(args):
+    return create_student_sample4geo_train_dataset_and_loader(args)
 
 
 __all__ = [
@@ -363,5 +387,6 @@ __all__ = [
     "create_1652_teacher_train_dataloaders",
     "create_1652_train_dataset",
     "create_identity_1652_train_dataset",
+    "create_student_sample4geo_train_dataset_and_loader",
     "create_student_train_dataset_and_loader",
 ]

@@ -19,7 +19,7 @@ def _make_divisible(v, divisor, min_value=None):
         new_v += divisor
     return new_v
 
-from timm.models.layers import SqueezeExcite
+from timm.layers import SqueezeExcite
 
 import torch
 
@@ -159,7 +159,7 @@ class RepViTBlock(nn.Module):
     def forward(self, x):
         return self.channel_mixer(self.token_mixer(x))
 
-from timm.models.vision_transformer import trunc_normal_
+from timm.layers import trunc_normal_
 class BN_Linear(torch.nn.Sequential):
     def __init__(self, a, b, bias=True, std=0.02):
         super().__init__()

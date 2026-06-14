@@ -1,28 +1,24 @@
-# 用于对学生模型进行stage1阶段根据参数配置进行训练的脚本
-import sys
-import os
-from pathlib import Path
-import torch
-import torch.nn as nn
-import time
-from torch.amp import autocast, GradScaler
-import torch.nn.functional as F
-import math
-import torch.distributed as dist
 import argparse
-from src.dataset.datasets import create_student_train_dataset_and_loader
-from src.loss.tripletloss import IntraDomainTripletLoss
-from src.utils.initdist import try_init_dist
-from src.utils.gather_features_and_labels_and_views import gather_features_and_labels_and_views 
-from src.utils.train_eval_utils import run_val_and_get_recall
-from src.models.student_model import StudentModel
-from src.utils.scheduler import build_student_scheduler
+import os
+import time
+
+import torch
+import torch.nn.functional as F
+from torch.amp import GradScaler, autocast
+
 from src.utils.optimizer_and_scale import build_student_optimizer
-from src.dataset.val_dataloaders import build_student_val_dataloaders
-from src.loss.blocks_infoNCE import SupConLoss
-from src.utils.save_path import get_student_save_pth
-if 'OMP_NUM_THREADS' not in os.environ:
-    os.environ['OMP_NUM_THREADS'] = '4'
+from src.utils.scheduler import build_student_scheduler
+
+if "OMP_NUM_THREADS" not in os.environ:
+    os.environ["OMP_NUM_THREADS"] = "4"
+
+
+def resolve_device(device_arg):
+    device = torch.device(device_arg)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        print("[Device][WARN] CUDA is not available, fallback to CPU.")
+        return torch.device("cpu")
+    return device
 
 
 @torch.no_grad()
@@ -36,65 +32,48 @@ def extract_features_student(model, loader, device, normalize=True):
         images = images.to(device, non_blocking=True)
         target = target.to(device, non_blocking=True).long()
 
-        feat = model(images)   # eval 模式下 StudentModel 只返回 feat
-
+        feat = model(images)
         if normalize:
             feat = F.normalize(feat, p=2, dim=1)
 
         feats.append(feat.cpu())
         labels.append(target.cpu())
 
-    feats = torch.cat(feats, dim=0)
-    labels = torch.cat(labels, dim=0)
-    return feats, labels
+    return torch.cat(feats, dim=0), torch.cat(labels, dim=0)
 
 
 @torch.no_grad()
 def compute_recall_from_features(q_feat, q_label, g_feat, g_label, topk=(1, 5, 10)):
-    """
-    q_feat: [Nq, D]
-    g_feat: [Ng, D]
-    q_label: [Nq]
-    g_label: [Ng]
-    """
-    sim = q_feat @ g_feat.t()   # 如果做了 L2 normalize，这里就是 cosine similarity
-
-    max_k = min(max(topk), g_feat.size(0))
-    indices = sim.topk(k=max_k, dim=1, largest=True, sorted=True).indices   # [Nq, max_k]
-
-    retrieved_labels = g_label[indices]   # [Nq, max_k]
+    sim = q_feat @ g_feat.t()
+    num_gallery = g_feat.size(0)
+    max_k = min(max(topk), num_gallery)
+    indices = sim.topk(k=num_gallery, dim=1, largest=True, sorted=True).indices
+    retrieved_labels = g_label[indices]
 
     result = {}
     for k in topk:
-        k = min(k, retrieved_labels.size(1))
-        hit = (retrieved_labels[:, :k] == q_label.unsqueeze(1)).any(dim=1).float().mean().item()
-        result[f"R@{k}"] = hit
+        effective_k = min(k, max_k)
+        hit = (retrieved_labels[:, :effective_k] == q_label.unsqueeze(1)).any(dim=1)
+        result[f"R@{k}"] = hit.float().mean().item()
 
+    matches = (retrieved_labels == q_label.unsqueeze(1)).float()
+    relevant_counts = matches.sum(dim=1).clamp_min(1.0)
+    ranks = torch.arange(1, num_gallery + 1, dtype=torch.float32, device=matches.device).unsqueeze(0)
+    precision_at_rank = matches.cumsum(dim=1) / ranks
+    average_precision = (precision_at_rank * matches).sum(dim=1) / relevant_counts
+    result["mAP"] = average_precision.mean().item()
     return result
 
 
 @torch.no_grad()
 def validate_student_u1652(model, val_loaders, args):
-    """
-    val_loaders 结构:
-    {
-        "D2S": (q_drone_loader, g_sat_loader),
-        "S2D": (q_sat_loader, g_drone_loader)
-    }
-    """
     device = next(model.parameters()).device
     normalize = getattr(args, "eval_normalize", True)
-
     results = {}
 
     for task_name, (q_loader, g_loader) in val_loaders.items():
-        q_feat, q_label = extract_features_student(
-            model, q_loader, device, normalize=normalize
-        )
-        g_feat, g_label = extract_features_student(
-            model, g_loader, device, normalize=normalize
-        )
-
+        q_feat, q_label = extract_features_student(model, q_loader, device, normalize=normalize)
+        g_feat, g_label = extract_features_student(model, g_loader, device, normalize=normalize)
         recall_dict = compute_recall_from_features(
             q_feat=q_feat,
             q_label=q_label,
@@ -102,16 +81,13 @@ def validate_student_u1652(model, val_loaders, args):
             g_label=g_label,
             topk=(1, 5, 10),
         )
-
         results[f"{task_name}_R1"] = recall_dict["R@1"]
         results[f"{task_name}_R5"] = recall_dict["R@5"]
         results[f"{task_name}_R10"] = recall_dict["R@10"]
-
-    # 一个总指标，方便选 best model
-    if "D2S_R1" in results and "S2D_R1" in results:
-        results["avg_R1"] = (results["D2S_R1"] + results["S2D_R1"]) / 2.0
+        results[f"{task_name}_mAP"] = recall_dict["mAP"]
 
     return results
+
 
 class AverageMeter:
     def __init__(self):
@@ -130,106 +106,55 @@ class AverageMeter:
         self.avg = self.sum / max(1, self.count)
 
 
-def unpack_u1652_batch(batch, device):
-    """
-    batch after default collate:
-        sat_tensor   : [B, 4, C, H, W]
-        drone_tensor : [B, 4, C, H, W]
-        labels       : [B]
-        pids         : list/tuple of length B
+def unpack_sample4geo_batch(batch, device):
+    sat_imgs, drone_imgs, labels, pids = batch
+    sat_imgs = sat_imgs.to(device, non_blocking=True)
+    drone_imgs = drone_imgs.to(device, non_blocking=True)
+    labels = labels.to(device, non_blocking=True).long()
 
-    返回:
-        all_imgs     : [B*8, C, H, W]
-        all_labels   : [B*8]
-        meta         : 方便后续调试/扩展
-    """
-    sat_tensor, drone_tensor, labels, pids = batch
-
-    sat_tensor = sat_tensor.to(device, non_blocking=True)       # [B, 4, C, H, W]
-    drone_tensor = drone_tensor.to(device, non_blocking=True)   # [B, 4, C, H, W]
-    labels = labels.to(device, non_blocking=True).long()        # [B]
-
-    if sat_tensor.ndim != 5:
-        raise ValueError(f"sat_tensor 应为 [B, 4, C, H, W]，当前 shape={sat_tensor.shape}")
-    if drone_tensor.ndim != 5:
-        raise ValueError(f"drone_tensor 应为 [B, 4, C, H, W]，当前 shape={drone_tensor.shape}")
-
-    B, S, C, H, W = sat_tensor.shape
-    B2, D, C2, H2, W2 = drone_tensor.shape
-    if B != B2 or C != C2 or H != H2 or W != W2:
-        raise ValueError(
-            f"sat/drone batch 维度不一致: sat={sat_tensor.shape}, drone={drone_tensor.shape}"
-        )
-
-    # [B, 4, C, H, W] -> [B*4, C, H, W]
-    sat_imgs = sat_tensor.reshape(B * S, C, H, W)
-    drone_imgs = drone_tensor.reshape(B * D, C, H, W)
-
-    # labels 同步展开
-    sat_labels = labels.repeat_interleave(S)      # [B*4]
-    drone_labels = labels.repeat_interleave(D)    # [B*4]
-
-    # 拼成一个大 batch，统一送进 StudentModel
-    all_imgs = torch.cat([sat_imgs, drone_imgs], dim=0)        # [B*8, C, H, W]
-    all_labels = torch.cat([sat_labels, drone_labels], dim=0)  # [B*8]
+    if sat_imgs.ndim != 4:
+        raise ValueError(f"sat_imgs must be [B, C, H, W], got {tuple(sat_imgs.shape)}")
+    if drone_imgs.ndim != 4:
+        raise ValueError(f"drone_imgs must be [B, C, H, W], got {tuple(drone_imgs.shape)}")
+    if sat_imgs.size(0) != drone_imgs.size(0):
+        raise ValueError(f"sat/drone batch size mismatch: {sat_imgs.size(0)} vs {drone_imgs.size(0)}")
 
     meta = {
-        "batch_size_pid": B,
-        "num_sat_views": S,
-        "num_drone_views": D,
-        "effective_batch": all_imgs.size(0),
+        "batch_size_pid": sat_imgs.size(0),
+        "effective_batch": sat_imgs.size(0) + drone_imgs.size(0),
         "pids": pids,
     }
-    return all_imgs, all_labels, meta
+    return sat_imgs, drone_imgs, labels, meta
 
 
-def compute_student_loss(
-    feat,
-    logits_list,
-    labels,
-    cls_criterion,
-    metric_criterion=None,
-    cls_weights=(0.3, 0.3, 0.3, 1.0),
-    metric_weight=1.0,
-):
-    """
-    StudentModel(train) -> feat, [z1, z2, z3, z4]
-    """
-    if len(logits_list) != 4:
-        raise ValueError(f"logits_list 长度应为 4，当前为 {len(logits_list)}")
+def compute_sample4geo_loss(sat_feats, drone_feats, temperature=0.07):
+    if sat_feats.size(0) != drone_feats.size(0):
+        raise ValueError(
+            f"Sample4Geo loss requires paired sat/drone features, got "
+            f"sat={sat_feats.size(0)} and drone={drone_feats.size(0)}"
+        )
 
-    z1, z2, z3, z4 = logits_list
+    sat_feats = F.normalize(sat_feats.float(), p=2, dim=1)
+    drone_feats = F.normalize(drone_feats.float(), p=2, dim=1)
+    logit_scale = sat_feats.new_tensor(1.0 / float(temperature))
+    logits = drone_feats @ sat_feats.t() * logit_scale
+    targets = torch.arange(logits.size(0), dtype=torch.long, device=logits.device)
 
-    loss_z1 = cls_criterion(z1, labels)
-    loss_z2 = cls_criterion(z2, labels)
-    loss_z3 = cls_criterion(z3, labels)
-    loss_z4 = cls_criterion(z4, labels)
-
-    cls_loss = (
-        cls_weights[0] * loss_z1
-        + cls_weights[1] * loss_z2
-        + cls_weights[2] * loss_z3
-        + cls_weights[3] * loss_z4
-    )
-
-    metric_loss = feat.new_tensor(0.0)
-    if metric_criterion is not None:
-        metric_loss = metric_criterion(feat, labels)
-
-    total_loss = cls_loss + metric_weight * metric_loss
+    loss_d2s = F.cross_entropy(logits, targets)
+    loss_s2d = F.cross_entropy(logits.t(), targets)
+    total_loss = (loss_d2s + loss_s2d) / 2.0
 
     with torch.no_grad():
-        acc = (z4.argmax(dim=1) == labels).float().mean()
+        acc_d2s = (logits.argmax(dim=1) == targets).float().mean()
+        acc_s2d = (logits.t().argmax(dim=1) == targets).float().mean()
+        batch_acc = (acc_d2s + acc_s2d) / 2.0
 
     return {
         "total_loss": total_loss,
-        "cls_loss": cls_loss,
-        "metric_loss": metric_loss,
-        "loss_z1": loss_z1,
-        "loss_z2": loss_z2,
-        "loss_z3": loss_z3,
-        "loss_z4": loss_z4,
-        "acc": acc,
+        "loss_d2s": loss_d2s,
+        "loss_s2d": loss_s2d,
+        "logit_scale": logit_scale.detach(),
+        "batch_acc": batch_acc,
     }
 
 
@@ -247,6 +172,18 @@ def save_student_checkpoint(model, optimizer, scheduler, epoch, save_path):
     print(f"[Checkpoint] saved to: {save_path}")
 
 
+def set_loader_epoch(train_loader, epoch):
+    batch_sampler = getattr(train_loader, "batch_sampler", None)
+    sampler = getattr(train_loader, "sampler", None)
+    if hasattr(batch_sampler, "set_epoch"):
+        batch_sampler.set_epoch(epoch)
+    if sampler is not batch_sampler and hasattr(sampler, "set_epoch"):
+        sampler.set_epoch(epoch)
+    dataset = getattr(train_loader, "dataset", None)
+    if hasattr(dataset, "set_epoch"):
+        dataset.set_epoch(epoch)
+
+
 def train_one_epoch_student(
     model,
     train_loader,
@@ -255,51 +192,44 @@ def train_one_epoch_student(
     device,
     epoch,
     args,
-    cls_criterion,
-    metric_criterion=None,
     scaler=None,
 ):
     model.train()
+    set_loader_epoch(train_loader, epoch)
 
     batch_time = AverageMeter()
     data_time = AverageMeter()
-    total_loss_meter = AverageMeter()
-    cls_loss_meter = AverageMeter()
-    metric_loss_meter = AverageMeter()
+    loss_meter = AverageMeter()
+    d2s_loss_meter = AverageMeter()
+    s2d_loss_meter = AverageMeter()
+    logit_scale_meter = AverageMeter()
     acc_meter = AverageMeter()
 
     end = time.time()
-
-    cls_weights = getattr(args, "cls_weights", (0.3, 0.3, 0.3, 1.0))
-    metric_weight = getattr(args, "metric_weight", 1.0)
     print_freq = getattr(args, "print_freq", 20)
     grad_clip = getattr(args, "grad_clip", 0.0)
-    use_amp = getattr(args, "amp", True)
+    temperature = getattr(args, "temperature", 0.07)
+    use_amp = bool(getattr(args, "amp", True)) and device.type == "cuda"
 
     for step, batch in enumerate(train_loader):
         data_time.update(time.time() - end)
-
-        images, labels, meta = unpack_u1652_batch(batch, device)
-
+        sat_imgs, drone_imgs, _, meta = unpack_sample4geo_batch(batch, device)
         optimizer.zero_grad(set_to_none=True)
 
-        with autocast(device_type="cuda", enabled=use_amp):
-            feat, logits_list = model(images)
-
-            loss_dict = compute_student_loss(
-                feat=feat,
-                logits_list=logits_list,
-                labels=labels,
-                cls_criterion=cls_criterion,
-                metric_criterion=metric_criterion,
-                cls_weights=cls_weights,
-                metric_weight=metric_weight,
+        with autocast(device_type=device.type, enabled=use_amp):
+            imgs = torch.cat([sat_imgs, drone_imgs], dim=0)
+            feats = model(imgs)
+            sat_feats, drone_feats = feats.split(sat_imgs.size(0), dim=0)
+            loss_dict = compute_sample4geo_loss(
+                sat_feats=sat_feats,
+                drone_feats=drone_feats,
+                temperature=temperature,
             )
             total_loss = loss_dict["total_loss"]
 
+        optimizer_stepped = False
         if scaler is not None and scaler.is_enabled():
             scaler.scale(total_loss).backward()
-
             if grad_clip > 0:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
@@ -307,59 +237,52 @@ def train_one_epoch_student(
             scale_before = scaler.get_scale()
             scaler.step(optimizer)
             scaler.update()
-            scale_after = scaler.get_scale()
-
-            # 只有当 optimizer.step 真正执行时，才更新 scheduler
-            if scheduler is not None and scale_after >= scale_before:
-                scheduler.step()
+            optimizer_stepped = scaler.get_scale() >= scale_before
         else:
             total_loss.backward()
+            if grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            optimizer.step()
+            optimizer_stepped = True
 
-    if grad_clip > 0:
-        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-
-    optimizer.step()
-
-    if scheduler is not None:
-        scheduler.step()
-
-        # 你前面用的是 iteration 级 scheduler，所以每个 batch 都 step
-        if scheduler is not None:
+        if scheduler is not None and optimizer_stepped:
             scheduler.step()
 
-        bs = images.size(0)
-        total_loss_meter.update(loss_dict["total_loss"].item(), bs)
-        cls_loss_meter.update(loss_dict["cls_loss"].item(), bs)
-        metric_loss_meter.update(loss_dict["metric_loss"].item(), bs)
-        acc_meter.update(loss_dict["acc"].item(), bs)
+        bs = sat_imgs.size(0)
+        loss_meter.update(loss_dict["total_loss"].item(), bs)
+        d2s_loss_meter.update(loss_dict["loss_d2s"].item(), bs)
+        s2d_loss_meter.update(loss_dict["loss_s2d"].item(), bs)
+        logit_scale_meter.update(loss_dict["logit_scale"].item(), bs)
+        acc_meter.update(loss_dict["batch_acc"].item(), bs)
 
         batch_time.update(time.time() - end)
         end = time.time()
 
         if step % print_freq == 0 or step == len(train_loader) - 1:
             lr_backbone = optimizer.param_groups[0]["lr"]
-            lr_head = optimizer.param_groups[2]["lr"] if len(optimizer.param_groups) > 2 else optimizer.param_groups[0]["lr"]
-
+            lr_neck = optimizer.param_groups[-1]["lr"]
             print(
-                f"Epoch [{epoch+1}/{args.epochs}] "
-                f"Step [{step+1}/{len(train_loader)}] | "
+                f"Epoch [{epoch + 1}/{args.epochs}] "
+                f"Step [{step + 1}/{len(train_loader)}] | "
                 f"pid_batch {meta['batch_size_pid']} | "
                 f"effective_batch {meta['effective_batch']} | "
                 f"data {data_time.val:.3f}s ({data_time.avg:.3f}s) | "
                 f"batch {batch_time.val:.3f}s ({batch_time.avg:.3f}s) | "
-                f"total {total_loss_meter.val:.4f} ({total_loss_meter.avg:.4f}) | "
-                f"cls {cls_loss_meter.val:.4f} ({cls_loss_meter.avg:.4f}) | "
-                f"metric {metric_loss_meter.val:.4f} ({metric_loss_meter.avg:.4f}) | "
-                f"acc {acc_meter.val:.4f} ({acc_meter.avg:.4f}) | "
-                f"lr_backbone {lr_backbone:.8f} | "
-                f"lr_head {lr_head:.8f}"
+                f"total_loss {loss_meter.val:.4f} ({loss_meter.avg:.4f}) | "
+                f"loss_d2s {d2s_loss_meter.val:.4f} ({d2s_loss_meter.avg:.4f}) | "
+                f"loss_s2d {s2d_loss_meter.val:.4f} ({s2d_loss_meter.avg:.4f}) | "
+                f"logit_scale {logit_scale_meter.val:.4f} | "
+                f"batch_acc {acc_meter.val:.4f} ({acc_meter.avg:.4f}) | "
+                f"lr {lr_backbone:.8f} | "
+                f"lr_neck {lr_neck:.8f}"
             )
 
     return {
-        "total_loss": total_loss_meter.avg,
-        "cls_loss": cls_loss_meter.avg,
-        "metric_loss": metric_loss_meter.avg,
-        "acc": acc_meter.avg,
+        "total_loss": loss_meter.avg,
+        "loss_d2s": d2s_loss_meter.avg,
+        "loss_s2d": s2d_loss_meter.avg,
+        "logit_scale": logit_scale_meter.avg,
+        "batch_acc": acc_meter.avg,
     }
 
 
@@ -372,18 +295,19 @@ def train_student(
     args,
     val_fn=None,
     val_loaders=None,
-    metric_criterion=None,
 ):
     os.makedirs(args.output_dir, exist_ok=True)
+    scaler = GradScaler("cuda", enabled=bool(getattr(args, "amp", True)) and device.type == "cuda")
 
-    cls_criterion = nn.CrossEntropyLoss(
-        label_smoothing=getattr(args, "label_smoothing", 0.0)
-    ).to(device)
-
-    scaler = GradScaler("cuda", enabled=getattr(args, "amp", True))
-
-    best_metric = -1.0
-    best_metric_name = getattr(args, "best_metric_name", "recall@1")
+    best_d2s_r1 = -1.0
+    best_d2s_map = -1.0
+    best_epoch = 0
+    latest_val_result = {
+        "D2S_R1": float("nan"),
+        "D2S_mAP": float("nan"),
+        "S2D_R1": float("nan"),
+        "S2D_mAP": float("nan"),
+    }
 
     for epoch in range(args.epochs):
         train_stats = train_one_epoch_student(
@@ -394,85 +318,127 @@ def train_student(
             device=device,
             epoch=epoch,
             args=args,
-            cls_criterion=cls_criterion,
-            metric_criterion=metric_criterion,
             scaler=scaler,
-        )
-
-        print(
-            f"[Train] Epoch {epoch+1}/{args.epochs} | "
-            f"total={train_stats['total_loss']:.4f} | "
-            f"cls={train_stats['cls_loss']:.4f} | "
-            f"metric={train_stats['metric_loss']:.4f} | "
-            f"acc={train_stats['acc']:.4f}"
         )
 
         save_freq = getattr(args, "save_freq", 1)
         if (epoch + 1) % save_freq == 0:
-            save_path = os.path.join(args.output_dir, f"checkpoint_epoch_{epoch+1}.pth")
+            save_path = os.path.join(args.output_dir, f"checkpoint_epoch_{epoch + 1}.pth")
             save_student_checkpoint(model, optimizer, scheduler, epoch + 1, save_path)
 
+        val_result = None
         if val_fn is not None and val_loaders is not None:
             val_interval = getattr(args, "val_interval", 1)
-            if ((epoch + 1) % val_interval == 0) or (epoch + 1 == args.epochs):
+            if (epoch + 1) % val_interval == 0 or epoch + 1 == args.epochs:
                 model.eval()
                 val_result = val_fn(model, val_loaders, args)
-                print(f"[Val] Epoch {epoch+1}: {val_result}")
+                latest_val_result.update(val_result)
 
-                if best_metric_name in val_result:
-                    current_metric = val_result[best_metric_name]
-                    if current_metric > best_metric:
-                        best_metric = current_metric
-                        best_path = os.path.join(args.output_dir, "best_model.pth")
-                        save_student_checkpoint(model, optimizer, scheduler, epoch + 1, best_path)
-                        print(f"[Best] {best_metric_name} improved to {best_metric:.6f}")
+                current_d2s_r1 = val_result.get("D2S_R1", float("nan"))
+                current_d2s_map = val_result.get("D2S_mAP", float("nan"))
+                better_primary = current_d2s_r1 > best_d2s_r1
+                tied_primary = current_d2s_r1 == best_d2s_r1
+                better_secondary = tied_primary and current_d2s_map > best_d2s_map
+                if better_primary or better_secondary:
+                    best_d2s_r1 = current_d2s_r1
+                    best_d2s_map = current_d2s_map
+                    best_epoch = epoch + 1
+                    best_path = os.path.join(args.output_dir, "best_model.pth")
+                    save_student_checkpoint(model, optimizer, scheduler, epoch + 1, best_path)
+                    print(
+                        f"[Best] epoch={best_epoch} | "
+                        f"D2S_R1={best_d2s_r1:.6f} | D2S_mAP={best_d2s_map:.6f}"
+                    )
 
-if __name__ == "__main__":
-    import traceback
-    parser = argparse.ArgumentParser(description="Train Student Model with LoRA and Classifier on U1652")
+        lr = optimizer.param_groups[0]["lr"]
+        print(
+            f"[EpochLog] epoch={epoch + 1}/{args.epochs} | "
+            f"loss_d2s={train_stats['loss_d2s']:.6f} | "
+            f"loss_s2d={train_stats['loss_s2d']:.6f} | "
+            f"total_loss={train_stats['total_loss']:.6f} | "
+            f"logit_scale={train_stats['logit_scale']:.6f} | "
+            f"lr={lr:.8f} | "
+            f"D2S_R1={latest_val_result['D2S_R1']:.6f} | "
+            f"D2S_mAP={latest_val_result['D2S_mAP']:.6f} | "
+            f"S2D_R1={latest_val_result['S2D_R1']:.6f} | "
+            f"S2D_mAP={latest_val_result['S2D_mAP']:.6f} | "
+            f"best_epoch={best_epoch}"
+        )
+
+
+def build_arg_parser():
+    parser = argparse.ArgumentParser(description="Train pure RepViT student with Sample4Geo InfoNCE on U1652")
     parser.add_argument("--epochs", type=int, default=60)
-    parser.add_argument("--num_classes", type=int, default=701)
+    parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--backbone_lr", type=float, default=1e-4)
-    parser.add_argument("--head_lr", type=float, default=1e-3)
+    parser.add_argument("--neck_lr", type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
+    parser.add_argument("--warmup_epochs", type=int, default=None)
+    parser.add_argument("--min_lr_ratio", type=float, default=0.01)
 
-    parser.add_argument("--amp", action="store_true", default=True)
+    amp_group = parser.add_mutually_exclusive_group()
+    amp_group.add_argument("--amp", dest="amp", action="store_true")
+    amp_group.add_argument("--no_amp", dest="amp", action="store_false")
+    parser.set_defaults(amp=True)
+
     parser.add_argument("--print_freq", type=int, default=20)
     parser.add_argument("--grad_clip", type=float, default=0.0)
-    parser.add_argument("--label_smoothing", type=float, default=0.0)
-
+    parser.add_argument("--temperature", type=float, default=0.07)
     parser.add_argument("--output_dir", type=str, default="./work_dirs/student")
     parser.add_argument("--save_freq", type=int, default=1)
-    parser.add_argument("--val_interval", type=int, default=5)
-    parser.add_argument('--img_size', type=int, default=224, help='输入图像的尺寸')
-    parser.add_argument('--batch_size', type=int, default=8, help='每个 GPU 的 batch size')
-    parser.add_argument('--best_metric_name ', type=str, default="avg_R1", help='用于选择最佳模型的指标名称')
+    parser.add_argument("--val_interval", type=int, default=1)
+    parser.add_argument("--data_dir", type=str, default="data/U1652")
+    parser.add_argument("--train_data_dir", type=str, default=None)
+    parser.add_argument("--num_workers", type=int, default=8)
+    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--val_batch_size", type=int, default=32)
+    parser.add_argument("--img_size", type=int, default=224)
+    parser.add_argument("--prob_flip", type=float, default=0.5)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--repvit_ckpt", type=str, default=None)
     parser.add_argument("--eval_normalize", action="store_true", default=True)
-    parser.add_argument("--metric_weight", type=float, default=0.2)
-    parser.add_argument("--temperature", type=float, default=0.07)
-    args = parser.parse_args()
-    try:
-        # 构建1652单卡训练dataloader
-        train_loader = create_student_train_dataset_and_loader(args)
-        # 构建1652测试集
-        val_loaders = build_student_val_dataloaders(img_size=[args.img_size, args.img_size])
 
-        # 1. 构建模型并立刻移动到对应的 GPU
-        model = StudentModel().cuda()
+    pin_memory_group = parser.add_mutually_exclusive_group()
+    pin_memory_group.add_argument("--pin_memory", dest="pin_memory", action="store_true")
+    pin_memory_group.add_argument("--no_pin_memory", dest="pin_memory", action="store_false")
+    parser.set_defaults(pin_memory=True)
+    return parser
+
+
+def main(argv=None):
+    import traceback
+
+    args = build_arg_parser().parse_args(argv)
+    try:
+        from src.dataset.datasets import create_student_train_dataset_and_loader
+        from src.dataset.val_dataloaders import build_student_val_dataloaders
+        from src.models.student_model import StudentModel
+
+        device = resolve_device(args.device)
+        if device.type != "cuda":
+            args.amp = False
+            args.pin_memory = False
+
+        train_loader = create_student_train_dataset_and_loader(args)
+        val_loaders = build_student_val_dataloaders(
+            data_dir=args.data_dir,
+            img_size=[args.img_size, args.img_size],
+            batch_size=args.val_batch_size,
+            num_workers=args.num_workers,
+        )
+
+        model = StudentModel(backbone_ckpt_path=args.repvit_ckpt).to(device)
         optimizer = build_student_optimizer(
             model,
-            backbone_lr=args.backbone_lr,   
-            head_lr=args.head_lr,
+            backbone_lr=args.backbone_lr,
+            neck_lr=args.neck_lr,
             weight_decay=args.weight_decay,
         )
         scheduler = build_student_scheduler(
             optimizer,
             args,
-            steps_per_epoch=len(train_loader)
+            steps_per_epoch=len(train_loader),
         )
-        device = torch.device("cuda")
-
-        metric_criterion = SupConLoss(temperature=args.temperature)
 
         train_student(
             model=model,
@@ -481,21 +447,14 @@ if __name__ == "__main__":
             scheduler=scheduler,
             device=device,
             args=args,
-            val_fn=validate_student_u1652,              # 你后面接自己的验证函数
+            val_fn=validate_student_u1652,
             val_loaders=val_loaders,
-            metric_criterion=metric_criterion,
         )
-        # train(
-        #     model,
-        #     train_loader,
-        #     args,
-        #     optimizer=optimizer,
-        #     scheduler=scheduler,
-        #     logit_scale=logit_scale,
-        #     val_loaders=val_loaders,
-        # )
-    except Exception as e:
+    except Exception:
         print("\n[Error] Exception occurred during training:")
         traceback.print_exc()
-        import sys
-        sys.exit(1)
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    main()

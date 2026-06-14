@@ -1,4 +1,3 @@
-import cv2
 import torchvision.transforms as transforms
 import numpy as np
 import albumentations as A

@@ -4,6 +4,7 @@ numpy
 pandas
 torch
 torchvision
+timm
 transformers
 tqdm
 pyyaml
