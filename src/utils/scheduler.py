@@ -7,7 +7,17 @@ import math
 
 from torch.optim.lr_scheduler import LambdaLR
 
-from src.utils.teacher.scheduler import build_teacher_scheduler, get_scheduler
+
+def get_scheduler(*args, **kwargs):
+    from src.utils.teacher.scheduler import get_scheduler as _get_scheduler
+
+    return _get_scheduler(*args, **kwargs)
+
+
+def build_teacher_scheduler(*args, **kwargs):
+    from src.utils.teacher.scheduler import build_teacher_scheduler as _build_teacher_scheduler
+
+    return _build_teacher_scheduler(*args, **kwargs)
 
 
 def build_student_scheduler(optimizer, args, steps_per_epoch=None):
@@ -39,7 +49,7 @@ def build_student_scheduler(optimizer, args, steps_per_epoch=None):
     # 2. 按 iteration 更新
     else:
         total_steps = total_epochs * steps_per_epoch
-        warmup_steps = warmup_epochs * steps_per_epoch
+        warmup_steps = int(warmup_epochs * steps_per_epoch)
 
     def lr_lambda(current_step):
         # warmup

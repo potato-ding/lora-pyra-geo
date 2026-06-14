@@ -1,92 +1,27 @@
 import argparse
+import json
+import math
 import os
+import shlex
+import sys
 import time
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
 
 import torch
 import torch.nn.functional as F
 from torch.amp import GradScaler, autocast
 
+from src.loss.blocks_infoNCE import Sample4GeoLoss
+from src.models.student_model import StudentModel
 from src.utils.optimizer_and_scale import build_student_optimizer
+from src.utils.save_path import get_student_save_pth
 from src.utils.scheduler import build_student_scheduler
 
 if "OMP_NUM_THREADS" not in os.environ:
     os.environ["OMP_NUM_THREADS"] = "4"
-
-
-def resolve_device(device_arg):
-    device = torch.device(device_arg)
-    if device.type == "cuda" and not torch.cuda.is_available():
-        print("[Device][WARN] CUDA is not available, fallback to CPU.")
-        return torch.device("cpu")
-    return device
-
-
-@torch.no_grad()
-def extract_features_student(model, loader, device, normalize=True):
-    model.eval()
-
-    feats = []
-    labels = []
-
-    for images, target in loader:
-        images = images.to(device, non_blocking=True)
-        target = target.to(device, non_blocking=True).long()
-
-        feat = model(images)
-        if normalize:
-            feat = F.normalize(feat, p=2, dim=1)
-
-        feats.append(feat.cpu())
-        labels.append(target.cpu())
-
-    return torch.cat(feats, dim=0), torch.cat(labels, dim=0)
-
-
-@torch.no_grad()
-def compute_recall_from_features(q_feat, q_label, g_feat, g_label, topk=(1, 5, 10)):
-    sim = q_feat @ g_feat.t()
-    num_gallery = g_feat.size(0)
-    max_k = min(max(topk), num_gallery)
-    indices = sim.topk(k=num_gallery, dim=1, largest=True, sorted=True).indices
-    retrieved_labels = g_label[indices]
-
-    result = {}
-    for k in topk:
-        effective_k = min(k, max_k)
-        hit = (retrieved_labels[:, :effective_k] == q_label.unsqueeze(1)).any(dim=1)
-        result[f"R@{k}"] = hit.float().mean().item()
-
-    matches = (retrieved_labels == q_label.unsqueeze(1)).float()
-    relevant_counts = matches.sum(dim=1).clamp_min(1.0)
-    ranks = torch.arange(1, num_gallery + 1, dtype=torch.float32, device=matches.device).unsqueeze(0)
-    precision_at_rank = matches.cumsum(dim=1) / ranks
-    average_precision = (precision_at_rank * matches).sum(dim=1) / relevant_counts
-    result["mAP"] = average_precision.mean().item()
-    return result
-
-
-@torch.no_grad()
-def validate_student_u1652(model, val_loaders, args):
-    device = next(model.parameters()).device
-    normalize = getattr(args, "eval_normalize", True)
-    results = {}
-
-    for task_name, (q_loader, g_loader) in val_loaders.items():
-        q_feat, q_label = extract_features_student(model, q_loader, device, normalize=normalize)
-        g_feat, g_label = extract_features_student(model, g_loader, device, normalize=normalize)
-        recall_dict = compute_recall_from_features(
-            q_feat=q_feat,
-            q_label=q_label,
-            g_feat=g_feat,
-            g_label=g_label,
-            topk=(1, 5, 10),
-        )
-        results[f"{task_name}_R1"] = recall_dict["R@1"]
-        results[f"{task_name}_R5"] = recall_dict["R@5"]
-        results[f"{task_name}_R10"] = recall_dict["R@10"]
-        results[f"{task_name}_mAP"] = recall_dict["mAP"]
-
-    return results
 
 
 class AverageMeter:
@@ -107,58 +42,142 @@ class AverageMeter:
 
 
 def unpack_sample4geo_batch(batch, device):
-    sat_imgs, drone_imgs, labels, pids = batch
-    sat_imgs = sat_imgs.to(device, non_blocking=True)
-    drone_imgs = drone_imgs.to(device, non_blocking=True)
+    drone, satellite, labels, pids = batch
+    drone = drone.to(device, non_blocking=True)
+    satellite = satellite.to(device, non_blocking=True)
     labels = labels.to(device, non_blocking=True).long()
 
-    if sat_imgs.ndim != 4:
-        raise ValueError(f"sat_imgs must be [B, C, H, W], got {tuple(sat_imgs.shape)}")
-    if drone_imgs.ndim != 4:
-        raise ValueError(f"drone_imgs must be [B, C, H, W], got {tuple(drone_imgs.shape)}")
-    if sat_imgs.size(0) != drone_imgs.size(0):
-        raise ValueError(f"sat/drone batch size mismatch: {sat_imgs.size(0)} vs {drone_imgs.size(0)}")
+    if drone.ndim != 4 or satellite.ndim != 4:
+        raise ValueError(f"Expected [B, C, H, W] images, got drone={drone.shape}, satellite={satellite.shape}")
+    if drone.shape != satellite.shape:
+        raise ValueError(f"Drone/satellite shape mismatch: drone={drone.shape}, satellite={satellite.shape}")
 
-    meta = {
-        "batch_size_pid": sat_imgs.size(0),
-        "effective_batch": sat_imgs.size(0) + drone_imgs.size(0),
+    images = torch.cat([drone, satellite], dim=0)
+    return images, labels, {
+        "pair_batch_size": labels.size(0),
+        "effective_batch": images.size(0),
         "pids": pids,
     }
-    return sat_imgs, drone_imgs, labels, meta
 
 
-def compute_sample4geo_loss(sat_feats, drone_feats, temperature=0.07):
-    if sat_feats.size(0) != drone_feats.size(0):
+@torch.no_grad()
+def extract_features(model, loader, device):
+    model.eval()
+    features = []
+    labels = []
+
+    for images, target in loader:
+        images = images.to(device, non_blocking=True)
+        target = target.to(device, non_blocking=True).long()
+        feat = F.normalize(model(images), p=2, dim=1)
+        features.append(feat.cpu())
+        labels.append(target.cpu())
+
+    return torch.cat(features, dim=0), torch.cat(labels, dim=0)
+
+
+@torch.no_grad()
+def compute_recall_map(q_feat, q_label, g_feat, g_label, topk=(1, 5, 10)):
+    sim = q_feat @ g_feat.t()
+    indices = sim.argsort(dim=1, descending=True)
+    retrieved = g_label[indices]
+    matches = retrieved.eq(q_label.unsqueeze(1))
+
+    result = {}
+    for k in topk:
+        k = min(k, retrieved.size(1))
+        hit = matches[:, :k].any(dim=1).float().mean().item()
+        result[f"R@{k}"] = hit
+
+    ranks = torch.arange(1, retrieved.size(1) + 1, dtype=torch.float32).unsqueeze(0)
+    precision_at_k = matches.float().cumsum(dim=1) / ranks
+    positives = matches.float().sum(dim=1).clamp_min(1.0)
+    result["mAP"] = ((precision_at_k * matches.float()).sum(dim=1) / positives).mean().item()
+    return result
+
+
+@torch.no_grad()
+def validate_u1652(model, val_loaders):
+    device = next(model.parameters()).device
+    results = {}
+
+    for task_name, (q_loader, g_loader) in val_loaders.items():
+        q_feat, q_label = extract_features(model, q_loader, device)
+        g_feat, g_label = extract_features(model, g_loader, device)
+        metrics = compute_recall_map(q_feat, q_label, g_feat, g_label, topk=(1, 5, 10))
+        results[f"{task_name}_R1"] = metrics["R@1"]
+        results[f"{task_name}_R5"] = metrics["R@5"]
+        results[f"{task_name}_R10"] = metrics["R@10"]
+        results[f"{task_name}_mAP"] = metrics["mAP"]
+
+    if "D2S_R1" in results and "S2D_R1" in results:
+        results["avg_R1"] = (results["D2S_R1"] + results["S2D_R1"]) / 2.0
+    if "D2S_mAP" in results and "S2D_mAP" in results:
+        results["avg_mAP"] = (results["D2S_mAP"] + results["S2D_mAP"]) / 2.0
+    return results
+
+
+def sample4geo_loss(model, features, criterion, pair_batch_size):
+    drone_feat = features[:pair_batch_size]
+    satellite_feat = features[pair_batch_size:pair_batch_size * 2]
+    raw_model = get_raw_model(model)
+    logit_scale = raw_model.logit_scale.exp()
+    return criterion(drone_feat, satellite_feat, logit_scale)
+
+
+def compute_local_align_loss(fmap_drone, fmap_sat, topk=4, tau=0.07, return_debug=False):
+    if fmap_drone.ndim != 4 or fmap_sat.ndim != 4:
         raise ValueError(
-            f"Sample4Geo loss requires paired sat/drone features, got "
-            f"sat={sat_feats.size(0)} and drone={drone_feats.size(0)}"
+            "Expected [B, C, H, W] feature maps, got "
+            f"drone={tuple(fmap_drone.shape)}, satellite={tuple(fmap_sat.shape)}"
+        )
+    if fmap_drone.shape != fmap_sat.shape:
+        raise ValueError(
+            "Drone/satellite feature map shape mismatch: "
+            f"drone={tuple(fmap_drone.shape)}, satellite={tuple(fmap_sat.shape)}"
+        )
+    if topk < 1:
+        raise ValueError(f"local_align_topk must be >= 1, got {topk}")
+    if tau <= 0:
+        raise ValueError(f"local_align_tau must be > 0, got {tau}")
+
+    batch_size = fmap_drone.size(0)
+    device = fmap_drone.device
+
+    fd = fmap_drone.flatten(2).transpose(1, 2).float()
+    fs = fmap_sat.flatten(2).transpose(1, 2).float()
+    fd = F.normalize(fd, p=2, dim=-1)
+    fs = F.normalize(fs, p=2, dim=-1)
+
+    sim = torch.einsum("inc,jmc->ijnm", fd, fs)
+    k_sat = min(topk, sim.size(-1))
+    k_drone = min(topk, sim.size(-2))
+
+    score_d2s = sim.topk(k=k_sat, dim=-1).values.mean(dim=(-1, -2))
+    score_s2d = sim.topk(k=k_drone, dim=-2).values.mean(dim=(-1, -2))
+    local_score = 0.5 * (score_d2s + score_s2d)
+    if local_score.shape != (batch_size, batch_size):
+        raise RuntimeError(
+            "Expected local_score shape [B, B], got "
+            f"{tuple(local_score.shape)} for B={batch_size}"
         )
 
-    sat_feats = F.normalize(sat_feats.float(), p=2, dim=1)
-    drone_feats = F.normalize(drone_feats.float(), p=2, dim=1)
-    logit_scale = sat_feats.new_tensor(1.0 / float(temperature))
-    logits = drone_feats @ sat_feats.t() * logit_scale
-    targets = torch.arange(logits.size(0), dtype=torch.long, device=logits.device)
+    logits = local_score / tau
+    labels = torch.arange(batch_size, device=device)
+    loss_local_d2s = F.cross_entropy(logits, labels)
+    loss_local_s2d = F.cross_entropy(logits.t(), labels)
+    loss_local = 0.5 * (loss_local_d2s + loss_local_s2d)
 
-    loss_d2s = F.cross_entropy(logits, targets)
-    loss_s2d = F.cross_entropy(logits.t(), targets)
-    total_loss = (loss_d2s + loss_s2d) / 2.0
-
-    with torch.no_grad():
-        acc_d2s = (logits.argmax(dim=1) == targets).float().mean()
-        acc_s2d = (logits.t().argmax(dim=1) == targets).float().mean()
-        batch_acc = (acc_d2s + acc_s2d) / 2.0
-
-    return {
-        "total_loss": total_loss,
-        "loss_d2s": loss_d2s,
-        "loss_s2d": loss_s2d,
-        "logit_scale": logit_scale.detach(),
-        "batch_acc": batch_acc,
-    }
+    if return_debug:
+        return loss_local, local_score, labels
+    return loss_local
 
 
-def save_student_checkpoint(model, optimizer, scheduler, epoch, save_path):
+def get_raw_model(model):
+    return model.module if hasattr(model, "module") else model
+
+
+def save_checkpoint(model, optimizer, scheduler, epoch, save_path):
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     torch.save(
         {
@@ -172,289 +191,330 @@ def save_student_checkpoint(model, optimizer, scheduler, epoch, save_path):
     print(f"[Checkpoint] saved to: {save_path}")
 
 
-def set_loader_epoch(train_loader, epoch):
-    batch_sampler = getattr(train_loader, "batch_sampler", None)
-    sampler = getattr(train_loader, "sampler", None)
-    if hasattr(batch_sampler, "set_epoch"):
-        batch_sampler.set_epoch(epoch)
-    if sampler is not batch_sampler and hasattr(sampler, "set_epoch"):
-        sampler.set_epoch(epoch)
-    dataset = getattr(train_loader, "dataset", None)
-    if hasattr(dataset, "set_epoch"):
-        dataset.set_epoch(epoch)
+def write_training_record(args, status, best_epoch=None, best_metric=None, best_result=None, last_epoch=None, last_result=None):
+    os.makedirs(args.output_dir, exist_ok=True)
+    record_path = os.path.join(args.output_dir, "training_record.txt")
+    command_line = getattr(args, "command_line", " ".join(shlex.quote(x) for x in sys.argv))
+
+    lines = [
+        "Sample4Geo RepViT Training Record",
+        "================================",
+        "",
+        f"status: {status}",
+        f"output_dir: {args.output_dir}",
+        "",
+        "Command",
+        "-------",
+        command_line,
+        "",
+        "Best Result",
+        "-----------",
+        f"best_metric_name: {args.best_metric_name}",
+        f"best_epoch: {best_epoch if best_epoch is not None else 'N/A'}",
+        f"best_metric: {best_metric if best_metric is not None else 'N/A'}",
+        json.dumps(best_result or {}, ensure_ascii=False, indent=2),
+        "",
+        "Last Validation",
+        "---------------",
+        f"last_epoch: {last_epoch if last_epoch is not None else 'N/A'}",
+        json.dumps(last_result or {}, ensure_ascii=False, indent=2),
+        "",
+        "Args",
+        "----",
+        json.dumps(vars(args), ensure_ascii=False, indent=2, sort_keys=True),
+        "",
+    ]
+
+    with open(record_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
 
 
-def train_one_epoch_student(
-    model,
-    train_loader,
-    optimizer,
-    scheduler,
-    device,
-    epoch,
-    args,
-    scaler=None,
-):
+def print_trainable_parameter_summary(model):
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    frozen = total - trainable
+    print(
+        "[Params] "
+        f"total={total / 1e6:.3f}M | "
+        f"trainable={trainable / 1e6:.3f}M | "
+        f"frozen={frozen / 1e6:.3f}M"
+    )
+
+
+def format_optional_float(value, precision=4):
+    if value is None:
+        return "N/A"
+    return f"{value:.{precision}f}"
+
+
+def train_one_epoch(model, train_loader, criterion, optimizer, scheduler, scaler, device, args, epoch):
     model.train()
-    set_loader_epoch(train_loader, epoch)
-
     batch_time = AverageMeter()
     data_time = AverageMeter()
-    loss_meter = AverageMeter()
-    d2s_loss_meter = AverageMeter()
-    s2d_loss_meter = AverageMeter()
-    logit_scale_meter = AverageMeter()
-    acc_meter = AverageMeter()
-
+    loss_total_meter = AverageMeter()
+    loss_infonce_meter = AverageMeter()
+    loss_local_align_meter = AverageMeter()
     end = time.time()
-    print_freq = getattr(args, "print_freq", 20)
-    grad_clip = getattr(args, "grad_clip", 0.0)
-    temperature = getattr(args, "temperature", 0.07)
-    use_amp = bool(getattr(args, "amp", True)) and device.type == "cuda"
+    printed_local_align_shapes = False
+
+    if hasattr(train_loader.dataset, "shuffle"):
+        train_loader.dataset.shuffle()
 
     for step, batch in enumerate(train_loader):
         data_time.update(time.time() - end)
-        sat_imgs, drone_imgs, _, meta = unpack_sample4geo_batch(batch, device)
+        images, labels, meta = unpack_sample4geo_batch(batch, device)
+        pair_batch_size = meta["pair_batch_size"]
+
         optimizer.zero_grad(set_to_none=True)
+        with autocast(device_type="cuda", enabled=args.amp):
+            if args.use_local_align:
+                features, fmap = model(images, return_fmap=True)
+                fmap_drone = fmap[:pair_batch_size]
+                fmap_sat = fmap[pair_batch_size:pair_batch_size * 2]
+                main_loss = sample4geo_loss(model, features, criterion, pair_batch_size)
+                if not printed_local_align_shapes:
+                    local_align_loss, local_score, local_labels = compute_local_align_loss(
+                        fmap_drone,
+                        fmap_sat,
+                        topk=args.local_align_topk,
+                        tau=args.local_align_tau,
+                        return_debug=True,
+                    )
+                else:
+                    local_align_loss = compute_local_align_loss(
+                        fmap_drone,
+                        fmap_sat,
+                        topk=args.local_align_topk,
+                        tau=args.local_align_tau,
+                    )
+                loss = main_loss + args.local_align_weight * local_align_loss
+            else:
+                features = model(images)
+                main_loss = sample4geo_loss(model, features, criterion, pair_batch_size)
+                local_align_loss = main_loss.new_zeros(())
+                loss = main_loss
 
-        with autocast(device_type=device.type, enabled=use_amp):
-            imgs = torch.cat([sat_imgs, drone_imgs], dim=0)
-            feats = model(imgs)
-            sat_feats, drone_feats = feats.split(sat_imgs.size(0), dim=0)
-            loss_dict = compute_sample4geo_loss(
-                sat_feats=sat_feats,
-                drone_feats=drone_feats,
-                temperature=temperature,
+        if args.use_local_align and not printed_local_align_shapes:
+            expected_labels = list(range(pair_batch_size))
+            print(
+                "[LocalAlign] "
+                f"fmap_drone={tuple(fmap_drone.shape)} | "
+                f"fmap_sat={tuple(fmap_sat.shape)} | "
+                f"local_score={tuple(local_score.shape)} | "
+                f"labels={local_labels.detach().cpu().tolist()} | "
+                f"expected_labels={expected_labels}"
             )
-            total_loss = loss_dict["total_loss"]
+            printed_local_align_shapes = True
 
-        optimizer_stepped = False
-        if scaler is not None and scaler.is_enabled():
-            scaler.scale(total_loss).backward()
-            if grad_clip > 0:
+        raw_model = get_raw_model(model)
+        if scaler.is_enabled():
+            scaler.scale(loss).backward()
+            if args.grad_clip > 0:
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             scale_before = scaler.get_scale()
             scaler.step(optimizer)
             scaler.update()
-            optimizer_stepped = scaler.get_scale() >= scale_before
+            if scheduler is not None and scaler.get_scale() >= scale_before:
+                scheduler.step()
         else:
-            total_loss.backward()
-            if grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            loss.backward()
+            if args.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             optimizer.step()
-            optimizer_stepped = True
+            if scheduler is not None:
+                scheduler.step()
 
-        if scheduler is not None and optimizer_stepped:
-            scheduler.step()
+        raw_model = get_raw_model(model)
+        raw_model.logit_scale.data.clamp_(0, math.log(100))
 
-        bs = sat_imgs.size(0)
-        loss_meter.update(loss_dict["total_loss"].item(), bs)
-        d2s_loss_meter.update(loss_dict["loss_d2s"].item(), bs)
-        s2d_loss_meter.update(loss_dict["loss_s2d"].item(), bs)
-        logit_scale_meter.update(loss_dict["logit_scale"].item(), bs)
-        acc_meter.update(loss_dict["batch_acc"].item(), bs)
-
+        loss_total_meter.update(loss.item(), images.size(0))
+        loss_infonce_meter.update(main_loss.item(), images.size(0))
+        loss_local_align_meter.update(local_align_loss.item(), images.size(0))
         batch_time.update(time.time() - end)
         end = time.time()
 
-        if step % print_freq == 0 or step == len(train_loader) - 1:
-            lr_backbone = optimizer.param_groups[0]["lr"]
-            lr_neck = optimizer.param_groups[-1]["lr"]
+        if step % args.print_freq == 0 or step == len(train_loader) - 1:
+            lr = optimizer.param_groups[0]["lr"]
+            logit_scale = raw_model.logit_scale.exp().item()
             print(
-                f"Epoch [{epoch + 1}/{args.epochs}] "
+                f"Epoch [{epoch}/{args.epochs}] "
                 f"Step [{step + 1}/{len(train_loader)}] | "
-                f"pid_batch {meta['batch_size_pid']} | "
+                f"pair_batch {meta['pair_batch_size']} | "
                 f"effective_batch {meta['effective_batch']} | "
                 f"data {data_time.val:.3f}s ({data_time.avg:.3f}s) | "
                 f"batch {batch_time.val:.3f}s ({batch_time.avg:.3f}s) | "
-                f"total_loss {loss_meter.val:.4f} ({loss_meter.avg:.4f}) | "
-                f"loss_d2s {d2s_loss_meter.val:.4f} ({d2s_loss_meter.avg:.4f}) | "
-                f"loss_s2d {s2d_loss_meter.val:.4f} ({s2d_loss_meter.avg:.4f}) | "
-                f"logit_scale {logit_scale_meter.val:.4f} | "
-                f"batch_acc {acc_meter.val:.4f} ({acc_meter.avg:.4f}) | "
-                f"lr {lr_backbone:.8f} | "
-                f"lr_neck {lr_neck:.8f}"
+                f"loss_total {loss_total_meter.val:.4f} ({loss_total_meter.avg:.4f}) | "
+                f"loss_infonce {loss_infonce_meter.val:.4f} ({loss_infonce_meter.avg:.4f}) | "
+                f"loss_local_align {loss_local_align_meter.val:.4f} ({loss_local_align_meter.avg:.4f}) | "
+                f"local_align_weight {args.local_align_weight:.6f} | "
+                f"local_align_topk {args.local_align_topk} | "
+                f"local_align_tau {args.local_align_tau:.6f} | "
+                f"logit_scale {logit_scale:.3f} | "
+                f"lr {lr:.8f}"
             )
 
     return {
-        "total_loss": loss_meter.avg,
-        "loss_d2s": d2s_loss_meter.avg,
-        "loss_s2d": s2d_loss_meter.avg,
-        "logit_scale": logit_scale_meter.avg,
-        "batch_acc": acc_meter.avg,
+        "loss_total": loss_total_meter.avg,
+        "loss_infonce": loss_infonce_meter.avg,
+        "loss_local_align": loss_local_align_meter.avg,
     }
 
 
-def train_student(
-    model,
-    train_loader,
-    optimizer,
-    scheduler,
-    device,
-    args,
-    val_fn=None,
-    val_loaders=None,
-):
+def train(model, train_loader, val_loaders, criterion, optimizer, scheduler, device, args):
     os.makedirs(args.output_dir, exist_ok=True)
-    scaler = GradScaler("cuda", enabled=bool(getattr(args, "amp", True)) and device.type == "cuda")
+    scaler = GradScaler("cuda", enabled=args.amp)
 
-    best_d2s_r1 = -1.0
-    best_d2s_map = -1.0
-    best_epoch = 0
-    latest_val_result = {
-        "D2S_R1": float("nan"),
-        "D2S_mAP": float("nan"),
-        "S2D_R1": float("nan"),
-        "S2D_mAP": float("nan"),
-    }
+    best_metric = -1.0
+    best_epoch = None
+    best_result = None
+    last_epoch = None
+    last_result = None
+    write_training_record(args, status="training")
 
-    for epoch in range(args.epochs):
-        train_stats = train_one_epoch_student(
-            model=model,
-            train_loader=train_loader,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            device=device,
-            epoch=epoch,
-            args=args,
-            scaler=scaler,
-        )
-
-        save_freq = getattr(args, "save_freq", 1)
-        if (epoch + 1) % save_freq == 0:
-            save_path = os.path.join(args.output_dir, f"checkpoint_epoch_{epoch + 1}.pth")
-            save_student_checkpoint(model, optimizer, scheduler, epoch + 1, save_path)
-
-        val_result = None
-        if val_fn is not None and val_loaders is not None:
-            val_interval = getattr(args, "val_interval", 1)
-            if (epoch + 1) % val_interval == 0 or epoch + 1 == args.epochs:
-                model.eval()
-                val_result = val_fn(model, val_loaders, args)
-                latest_val_result.update(val_result)
-
-                current_d2s_r1 = val_result.get("D2S_R1", float("nan"))
-                current_d2s_map = val_result.get("D2S_mAP", float("nan"))
-                better_primary = current_d2s_r1 > best_d2s_r1
-                tied_primary = current_d2s_r1 == best_d2s_r1
-                better_secondary = tied_primary and current_d2s_map > best_d2s_map
-                if better_primary or better_secondary:
-                    best_d2s_r1 = current_d2s_r1
-                    best_d2s_map = current_d2s_map
-                    best_epoch = epoch + 1
-                    best_path = os.path.join(args.output_dir, "best_model.pth")
-                    save_student_checkpoint(model, optimizer, scheduler, epoch + 1, best_path)
-                    print(
-                        f"[Best] epoch={best_epoch} | "
-                        f"D2S_R1={best_d2s_r1:.6f} | D2S_mAP={best_d2s_map:.6f}"
-                    )
-
-        lr = optimizer.param_groups[0]["lr"]
+    for epoch in range(1, args.epochs + 1):
+        train_stats = train_one_epoch(model, train_loader, criterion, optimizer, scheduler, scaler, device, args, epoch)
         print(
-            f"[EpochLog] epoch={epoch + 1}/{args.epochs} | "
-            f"loss_d2s={train_stats['loss_d2s']:.6f} | "
-            f"loss_s2d={train_stats['loss_s2d']:.6f} | "
-            f"total_loss={train_stats['total_loss']:.6f} | "
-            f"logit_scale={train_stats['logit_scale']:.6f} | "
-            f"lr={lr:.8f} | "
-            f"D2S_R1={latest_val_result['D2S_R1']:.6f} | "
-            f"D2S_mAP={latest_val_result['D2S_mAP']:.6f} | "
-            f"S2D_R1={latest_val_result['S2D_R1']:.6f} | "
-            f"S2D_mAP={latest_val_result['S2D_mAP']:.6f} | "
-            f"best_epoch={best_epoch}"
+            f"[Train] Epoch {epoch}/{args.epochs} | "
+            f"loss_total={train_stats['loss_total']:.4f} | "
+            f"loss_infonce={train_stats['loss_infonce']:.4f} | "
+            f"loss_local_align={train_stats['loss_local_align']:.4f} | "
+            f"local_align_weight={args.local_align_weight:.6f} | "
+            f"local_align_topk={args.local_align_topk} | "
+            f"local_align_tau={args.local_align_tau:.6f}"
         )
 
+        if args.save_last:
+            save_checkpoint(model, optimizer, scheduler, epoch, os.path.join(args.output_dir, "last_model.pth"))
 
-def build_arg_parser():
-    parser = argparse.ArgumentParser(description="Train pure RepViT student with Sample4Geo InfoNCE on U1652")
+        if args.val_interval > 0 and (epoch % args.val_interval == 0 or epoch == args.epochs):
+            result = validate_u1652(model, val_loaders)
+            last_epoch = epoch
+            last_result = result
+            print(
+                f"[Val] Epoch {epoch} | "
+                f"D2S_R1={result.get('D2S_R1', 0.0):.6f} | "
+                f"D2S_R5={result.get('D2S_R5', 0.0):.6f} | "
+                f"D2S_R10={result.get('D2S_R10', 0.0):.6f} | "
+                f"D2S_mAP={result.get('D2S_mAP', 0.0):.6f} | "
+                f"S2D_R1={result.get('S2D_R1', 0.0):.6f} | "
+                f"S2D_R5={result.get('S2D_R5', 0.0):.6f} | "
+                f"S2D_R10={result.get('S2D_R10', 0.0):.6f} | "
+                f"S2D_mAP={result.get('S2D_mAP', 0.0):.6f}"
+            )
+
+            current_metric = result.get(args.best_metric_name)
+            if current_metric is not None and current_metric > best_metric:
+                best_metric = current_metric
+                best_epoch = epoch
+                best_result = result
+                save_checkpoint(model, optimizer, scheduler, epoch, os.path.join(args.output_dir, "best_model.pth"))
+                print(f"[Best] {args.best_metric_name} improved to {best_metric:.6f}")
+
+            print(
+                f"[Best] best_epoch={best_epoch if best_epoch is not None else 'N/A'} | "
+                f"best_D2S_R1={format_optional_float((best_result or {}).get('D2S_R1'), 6)} | "
+                f"best_D2S_mAP={format_optional_float((best_result or {}).get('D2S_mAP'), 6)}"
+            )
+
+            write_training_record(
+                args,
+                status="training",
+                best_epoch=best_epoch,
+                best_metric=best_metric if best_epoch is not None else None,
+                best_result=best_result,
+                last_epoch=last_epoch,
+                last_result=last_result,
+            )
+
+    write_training_record(
+        args,
+        status="finished",
+        best_epoch=best_epoch,
+        best_metric=best_metric if best_epoch is not None else None,
+        best_result=best_result,
+        last_epoch=last_epoch,
+        last_result=last_result,
+    )
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train RepViT-M1.5 with Sample4Geo InfoNCE on U1652")
+    parser.add_argument("--train_data_dir", type=str, default="data/U1652/train")
+    parser.add_argument("--val_data_dir", type=str, default="data/U1652")
+    parser.add_argument("--output_root", type=str, default="src/checkpoint/student")
+    parser.add_argument("--output_dir", type=str, default=None)
+
     parser.add_argument("--epochs", type=int, default=60)
-    parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--backbone_lr", type=float, default=1e-4)
-    parser.add_argument("--neck_lr", type=float, default=1e-3)
-    parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument("--warmup_epochs", type=int, default=None)
-    parser.add_argument("--min_lr_ratio", type=float, default=0.01)
-
-    amp_group = parser.add_mutually_exclusive_group()
-    amp_group.add_argument("--amp", dest="amp", action="store_true")
-    amp_group.add_argument("--no_amp", dest="amp", action="store_false")
-    parser.set_defaults(amp=True)
-
-    parser.add_argument("--print_freq", type=int, default=20)
-    parser.add_argument("--grad_clip", type=float, default=0.0)
-    parser.add_argument("--temperature", type=float, default=0.07)
-    parser.add_argument("--output_dir", type=str, default="src/checkpoint/student")
-    parser.add_argument("--save_freq", type=int, default=1)
-    parser.add_argument("--val_interval", type=int, default=1)
-    parser.add_argument("--data_dir", type=str, default="data/U1652")
-    parser.add_argument("--train_data_dir", type=str, default=None)
-    parser.add_argument("--num_workers", type=int, default=8)
+    parser.add_argument("--img_size", type=int, default=224)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--val_batch_size", type=int, default=32)
-    parser.add_argument("--img_size", type=int, default=224)
-    parser.add_argument("--prob_flip", type=float, default=0.5)
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--repvit_ckpt", type=str, default=None)
-    parser.add_argument("--eval_normalize", action="store_true", default=True)
+    parser.add_argument("--num_workers", type=int, default=8)
 
-    pin_memory_group = parser.add_mutually_exclusive_group()
-    pin_memory_group.add_argument("--pin_memory", dest="pin_memory", action="store_true")
-    pin_memory_group.add_argument("--no_pin_memory", dest="pin_memory", action="store_false")
-    parser.set_defaults(pin_memory=True)
-    return parser
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--weight_decay", type=float, default=1e-4)
+    parser.add_argument("--warmup_epochs", type=float, default=0.1)
+    parser.add_argument("--min_lr_ratio", type=float, default=0.01)
+    parser.add_argument("--temperature", type=float, default=0.07)
+    parser.add_argument("--label_smoothing", type=float, default=0.1)
+    parser.add_argument("--amp", dest="amp", action="store_true", default=True)
+    parser.add_argument("--no_amp", dest="amp", action="store_false")
+    parser.add_argument("--grad_clip", type=float, default=0.0)
+    parser.add_argument("--print_freq", type=int, default=20)
+    parser.add_argument("--val_interval", type=int, default=5)
+    parser.add_argument("--best_metric_name", type=str, default="D2S_R1")
+    parser.add_argument("--save_last", dest="save_last", action="store_true", default=True)
+    parser.add_argument("--no_save_last", dest="save_last", action="store_false")
+    parser.add_argument("--use_local_align", action="store_true", default=False)
+    parser.add_argument("--local_align_weight", type=float, default=0.01)
+    parser.add_argument("--local_align_topk", type=int, default=4)
+    parser.add_argument("--local_align_tau", type=float, default=0.07)
+
+    args = parser.parse_args()
+    args.command_line = " ".join(shlex.quote(x) for x in sys.argv)
+    if args.output_dir is None:
+        args.output_dir = get_student_save_pth(args)
+    return args
 
 
-def main(argv=None):
-    import traceback
+def main():
+    args = parse_args()
+    from src.dataset.datasets import create_student_train_dataset_and_loader
+    from src.dataset.val_dataloaders import build_student_val_dataloaders
 
-    args = build_arg_parser().parse_args(argv)
-    try:
-        from src.dataset.datasets import create_student_train_dataset_and_loader
-        from src.dataset.val_dataloaders import build_student_val_dataloaders
-        from src.models.student_model import StudentModel
+    print(f"[Output] checkpoints will be saved to: {args.output_dir}")
+    write_training_record(args, status="initialized")
 
-        device = resolve_device(args.device)
-        if device.type != "cuda":
-            args.amp = False
-            args.pin_memory = False
+    device = torch.device("cuda")
+    train_loader = create_student_train_dataset_and_loader(args)
+    val_loaders = build_student_val_dataloaders(
+        data_dir=args.val_data_dir,
+        img_size=[args.img_size, args.img_size],
+        batch_size=args.val_batch_size,
+        num_workers=args.num_workers,
+    )
 
-        train_loader = create_student_train_dataset_and_loader(args)
-        val_loaders = build_student_val_dataloaders(
-            data_dir=args.data_dir,
-            img_size=[args.img_size, args.img_size],
-            batch_size=args.val_batch_size,
-            num_workers=args.num_workers,
-        )
+    model = StudentModel(
+        temperature=args.temperature,
+    ).to(device)
+    print_trainable_parameter_summary(model)
 
-        model = StudentModel(backbone_ckpt_path=args.repvit_ckpt).to(device)
-        optimizer = build_student_optimizer(
-            model,
-            backbone_lr=args.backbone_lr,
-            neck_lr=args.neck_lr,
-            weight_decay=args.weight_decay,
-        )
-        scheduler = build_student_scheduler(
-            optimizer,
-            args,
-            steps_per_epoch=len(train_loader),
-        )
+    optimizer = build_student_optimizer(
+        model,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+    )
+    scheduler = build_student_scheduler(optimizer, args, steps_per_epoch=len(train_loader))
+    criterion = Sample4GeoLoss(label_smoothing=args.label_smoothing)
 
-        train_student(
-            model=model,
-            train_loader=train_loader,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            device=device,
-            args=args,
-            val_fn=validate_student_u1652,
-            val_loaders=val_loaders,
-        )
-    except Exception:
-        print("\n[Error] Exception occurred during training:")
-        traceback.print_exc()
-        raise SystemExit(1)
+    train(model, train_loader, val_loaders, criterion, optimizer, scheduler, device, args)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        print("\n[Error] Exception occurred during training:")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)

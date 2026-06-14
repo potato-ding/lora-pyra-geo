@@ -2,28 +2,34 @@
 
 import torch
 
-from src.utils.teacher.optimizer import build_optimizer_and_scale, build_teacher_optimizer
+
+def build_optimizer_and_scale(*args, **kwargs):
+    from src.utils.teacher.optimizer import build_optimizer_and_scale as _build_optimizer_and_scale
+
+    return _build_optimizer_and_scale(*args, **kwargs)
+
+
+def build_teacher_optimizer(*args, **kwargs):
+    from src.utils.teacher.optimizer import build_teacher_optimizer as _build_teacher_optimizer
+
+    return _build_teacher_optimizer(*args, **kwargs)
 
 
 def build_student_optimizer(
     model,
-    backbone_lr=1e-4,
-    neck_lr=1e-3,
+    lr=1e-4,
     weight_decay=1e-4,
     betas=(0.9, 0.999),
 ):
-    """Build AdamW for the pure RepViT student baseline."""
+    """Build AdamW for all trainable RepViT student parameters."""
 
-    backbone_decay = []
-    backbone_no_decay = []
-    neck_decay = []
-    neck_no_decay = []
+    decay = []
+    no_decay = []
 
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
 
-        is_backbone = name.startswith("backbone.")
         name_lower = name.lower()
         is_no_decay = (
             param.ndim <= 1
@@ -32,54 +38,24 @@ def build_student_optimizer(
             or "norm" in name_lower
         )
 
-        if is_backbone:
-            if is_no_decay:
-                backbone_no_decay.append(param)
-            else:
-                backbone_decay.append(param)
+        if is_no_decay:
+            no_decay.append(param)
         else:
-            if is_no_decay:
-                neck_no_decay.append(param)
-            else:
-                neck_decay.append(param)
+            decay.append(param)
 
-    optimizer_grouped_parameters = []
-    if backbone_decay:
-        optimizer_grouped_parameters.append({
-            "params": backbone_decay,
-            "lr": backbone_lr,
-            "weight_decay": weight_decay,
-        })
-    if backbone_no_decay:
-        optimizer_grouped_parameters.append({
-            "params": backbone_no_decay,
-            "lr": backbone_lr,
-            "weight_decay": 0.0,
-        })
-    if neck_decay:
-        optimizer_grouped_parameters.append({
-            "params": neck_decay,
-            "lr": neck_lr,
-            "weight_decay": weight_decay,
-        })
-    if neck_no_decay:
-        optimizer_grouped_parameters.append({
-            "params": neck_no_decay,
-            "lr": neck_lr,
-            "weight_decay": 0.0,
-        })
+    param_groups = [
+        {"params": decay, "name": "decay", "lr": lr, "weight_decay": weight_decay},
+        {"params": no_decay, "name": "no_decay", "lr": lr, "weight_decay": 0.0},
+    ]
 
-    if not optimizer_grouped_parameters:
+    if not decay and not no_decay:
         raise ValueError("No trainable student parameters found.")
 
-    optimizer_class = torch.optim.AdamW
-    optimizer = optimizer_class(optimizer_grouped_parameters, betas=betas)
+    optimizer = torch.optim.AdamW(param_groups, betas=betas)
 
-    print("[Optimizer] backbone_decay params   :", len(backbone_decay))
-    print("[Optimizer] backbone_no_decay params:", len(backbone_no_decay))
-    print("[Optimizer] neck_decay params       :", len(neck_decay))
-    print("[Optimizer] neck_no_decay params    :", len(neck_no_decay))
-    print(f"[Optimizer] using optimizer: {optimizer_class.__name__}")
+    print("[Optimizer] student decay params   :", len(decay))
+    print("[Optimizer] student no_decay params:", len(no_decay))
+    print(f"[Optimizer] student lr={lr:g} | weight_decay={weight_decay:g} | optimizer=AdamW")
 
     return optimizer
 

@@ -1,4 +1,5 @@
 import os
+from datetime import datetime
 # 用于根据args返回路径
 
 def _fmt_weight(value):
@@ -43,8 +44,7 @@ def get_save_pth(args):
     return save_dir
 
 def get_student_save_pth(args):
-    save_dir = os.path.join(
-        getattr(args, 'output_root', 'src/checkpoint/student'),
-        f"repvit_m15_sample4geo_{getattr(args, 'img_size', 224)}"
-    )
+    date_name = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_root = getattr(args, "output_root", "src/checkpoint/student")
+    save_dir = os.path.join(output_root, date_name)
     return save_dir

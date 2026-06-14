@@ -11,8 +11,10 @@ import math
 import os
 import random
 
+import numpy as np
 import torch
 import torch.distributed as dist
+from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.sampler import Sampler
 
@@ -41,6 +43,10 @@ def _read_rgb_image(path):
     if img is None:
         raise FileNotFoundError(f"failed to read image: {path}")
     return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+
+def read_rgb_image(path):
+    return np.array(Image.open(path).convert("RGB"))
 
 
 class U1652Dataset(Dataset):
@@ -335,45 +341,139 @@ class DistributedCoverageBatchSampler(Sampler):
         )
 
 
-def create_student_sample4geo_train_dataset_and_loader(args):
-    from src.dataset.teacher.transforms import get_sample4geo_train_transforms
+class U1652PairDataset(Dataset):
+    """Sample4Geo pair dataset for student RepViT training."""
 
-    data_dir = getattr(args, "data_dir", "data/U1652")
-    train_data_dir = getattr(args, "train_data_dir", None) or os.path.join(data_dir, "train")
+    def __init__(self, data_dir, sat_transforms=None, drone_transforms=None, prob_flip=0.5, shuffle_batch_size=128):
+        self.data_dir = data_dir
+        self.sat_transforms = sat_transforms
+        self.drone_transforms = drone_transforms
+        self.prob_flip = prob_flip
+        self.shuffle_batch_size = shuffle_batch_size
+        self.pairs = []
+        self.samples = []
+        self._parse_dataset()
+        self.samples = self.pairs[:]
+
+    def _parse_dataset(self):
+        sat_root = os.path.join(self.data_dir, "satellite")
+        drone_root = os.path.join(self.data_dir, "drone")
+        if not os.path.exists(sat_root):
+            raise FileNotFoundError(f"satellite directory not found: {sat_root}")
+        if not os.path.exists(drone_root):
+            raise FileNotFoundError(f"drone directory not found: {drone_root}")
+
+        pids = sorted(pid for pid in os.listdir(sat_root) if os.path.isdir(os.path.join(sat_root, pid)))
+        for label, pid in enumerate(pids):
+            sat_dir = os.path.join(sat_root, pid)
+            drone_dir = os.path.join(drone_root, pid)
+            if not os.path.isdir(drone_dir):
+                continue
+
+            sat_paths = [
+                os.path.join(sat_dir, name)
+                for name in sorted(os.listdir(sat_dir))
+                if name.lower().endswith((".jpg", ".jpeg", ".png"))
+            ]
+            drone_paths = [
+                os.path.join(drone_dir, name)
+                for name in sorted(os.listdir(drone_dir))
+                if name.lower().endswith((".jpg", ".jpeg", ".png"))
+            ]
+            if not sat_paths or not drone_paths:
+                continue
+
+            for drone_path in drone_paths:
+                self.pairs.append((pid, label, sat_paths[0], drone_path))
+
+        if not self.pairs:
+            raise RuntimeError(f"No valid drone/satellite pairs found under: {self.data_dir}")
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        pid, label, sat_path, drone_path = self.samples[idx]
+        drone_img = read_rgb_image(drone_path)
+        sat_img = read_rgb_image(sat_path)
+
+        if random.random() < self.prob_flip:
+            drone_img = np.ascontiguousarray(np.flip(drone_img, axis=1))
+            sat_img = np.ascontiguousarray(np.flip(sat_img, axis=1))
+
+        drone_tensor = self.drone_transforms(image=drone_img)["image"]
+        sat_tensor = self.sat_transforms(image=sat_img)["image"]
+        return drone_tensor, sat_tensor, label, pid
+
+    def shuffle(self):
+        pair_pool = self.pairs[:]
+        random.shuffle(pair_pool)
+
+        used_pairs = set()
+        ids_in_batch = set()
+        current_batch = []
+        shuffled = []
+        break_counter = 0
+
+        while pair_pool:
+            pair = pair_pool.pop(0)
+            pid = pair[0]
+            if pid not in ids_in_batch and pair not in used_pairs:
+                ids_in_batch.add(pid)
+                current_batch.append(pair)
+                used_pairs.add(pair)
+                break_counter = 0
+            else:
+                if pair not in used_pairs:
+                    pair_pool.append(pair)
+                break_counter += 1
+                if break_counter >= 512:
+                    break
+
+            if len(current_batch) == self.shuffle_batch_size:
+                shuffled.extend(current_batch)
+                ids_in_batch = set()
+                current_batch = []
+
+        self.samples = shuffled
+        print(
+            "[Sample4Geo Loader] "
+            f"pairs={len(self.pairs)} | shuffled_pairs={len(self.samples)} | "
+            f"batch_size={self.shuffle_batch_size} | steps_per_epoch={len(self) // self.shuffle_batch_size}"
+        )
+
+
+def create_student_train_dataset_and_loader(args):
+    from src.dataset.transforms import get_train_transforms
+
+    train_data_dir = getattr(args, "train_data_dir", None)
+    if train_data_dir is None:
+        train_data_dir = os.path.join(getattr(args, "data_dir", "data/U1652"), "train")
     num_workers = getattr(args, "num_workers", 8)
     pin_memory = getattr(args, "pin_memory", True)
-    seed = getattr(args, "seed", 0)
     prob_flip = getattr(args, "prob_flip", 0.5)
 
-    train_sat_tf, train_drone_tf = get_sample4geo_train_transforms(
+    _, train_sat_tf, train_drone_tf = get_train_transforms(
         img_size=[args.img_size, args.img_size],
         mean=[0.485, 0.456, 0.406],
         std=[0.229, 0.224, 0.225],
     )
 
-    train_dataset = Sample4GeoU1652Dataset(
+    train_dataset = U1652PairDataset(
         data_dir=train_data_dir,
         sat_transforms=train_sat_tf,
         drone_transforms=train_drone_tf,
         prob_flip=prob_flip,
+        shuffle_batch_size=args.batch_size,
     )
-    train_sampler = Sample4GeoBatchSampler(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        seed=seed,
-    )
-    train_loader = DataLoader(
+    return DataLoader(
         dataset=train_dataset,
-        batch_sampler=train_sampler,
+        batch_size=args.batch_size,
+        shuffle=False,
         num_workers=num_workers,
         pin_memory=pin_memory,
+        drop_last=False,
     )
-    return train_loader
-
-
-def create_student_train_dataset_and_loader(args):
-    return create_student_sample4geo_train_dataset_and_loader(args)
 
 
 __all__ = [
@@ -383,10 +483,10 @@ __all__ = [
     "Sample4GeoBatchSampler",
     "Sample4GeoU1652Dataset",
     "U1652Dataset",
+    "U1652PairDataset",
     "collate_identity_u1652_batch",
     "create_1652_teacher_train_dataloaders",
     "create_1652_train_dataset",
     "create_identity_1652_train_dataset",
-    "create_student_sample4geo_train_dataset_and_loader",
     "create_student_train_dataset_and_loader",
 ]
