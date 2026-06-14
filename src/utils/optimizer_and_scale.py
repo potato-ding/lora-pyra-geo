@@ -4,13 +4,6 @@ import torch
 
 from src.utils.teacher.optimizer import build_optimizer_and_scale, build_teacher_optimizer
 
-try:
-    from deepspeed.ops.adam import DeepSpeedCPUAdam
-
-    HAS_DEEPSPEED_ADAM = True
-except ImportError:
-    HAS_DEEPSPEED_ADAM = False
-
 
 def build_student_optimizer(
     model,
@@ -79,7 +72,7 @@ def build_student_optimizer(
     if not optimizer_grouped_parameters:
         raise ValueError("No trainable student parameters found.")
 
-    optimizer_class = DeepSpeedCPUAdam if HAS_DEEPSPEED_ADAM else torch.optim.AdamW
+    optimizer_class = torch.optim.AdamW
     optimizer = optimizer_class(optimizer_grouped_parameters, betas=betas)
 
     print("[Optimizer] backbone_decay params   :", len(backbone_decay))
