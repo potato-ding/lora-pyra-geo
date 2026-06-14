@@ -255,6 +255,10 @@ def print_teacher_feature_fusion_config(model_or_engine):
 
     config = base_model.get_feature_fusion_config()
     print(
+        f"[TeacherFusion] use_local_fusion = {config.get('use_local_fusion', False)} | "
+        f"use_soft_orth_fusion = {config['use_soft_orth_fusion']}"
+    )
+    print(
         f"[TeacherFusion] local_feature_layers = {config['local_feature_layers']} "
         f"# {config['layer_index_base']}"
     )
@@ -992,6 +996,7 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                 f"[Fusion] Epoch {epoch}/{args.epochs} | "
                 f"gamma={fusion_values.get('gamma', 0.0):.6f} | "
                 f"lambda_orth={fusion_values.get('lambda_orth', 0.0):.6f} | "
+                f"use_local_fusion={fusion_values.get('use_local_fusion', False)} | "
                 f"use_soft_orth_fusion={fusion_values.get('use_soft_orth_fusion', False)} | "
                 f"soft_orth_detach_global={fusion_values.get('soft_orth_detach_global', True)} | "
                 f"local_feature_layers={fusion_values.get('local_feature_layers', [])}"

@@ -403,7 +403,7 @@ class U1652PairDataset(Dataset):
 
         drone_tensor = self.drone_transforms(image=drone_img)["image"]
         sat_tensor = self.sat_transforms(image=sat_img)["image"]
-        return drone_tensor, sat_tensor, label, pid, drone_path, sat_path
+        return drone_tensor, sat_tensor, label, pid
 
     def shuffle(self):
         pair_pool = self.pairs[:]

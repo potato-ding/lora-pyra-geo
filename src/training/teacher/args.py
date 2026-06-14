@@ -72,6 +72,7 @@ def build_arg_parser():
     parser.add_argument('--lora_dropout', type=float, default=0.1, help='LoRA dropout')
     parser.add_argument('--lora_target_names', type=str, default='qkv,proj', help='逗号分隔的 LoRA 目标 Linear 名称')
     parser.add_argument('--local_feature_layers', type=str, default='19,27,36', help='逗号分隔的 local/PYRA transformer block 输出 index，0-based')
+    parser.add_argument('--use_local_fusion', action='store_true', help='启用 local token 分支并与最终 CLS 特征融合')
     parser.add_argument('--use_soft_orth_fusion', action='store_true', help='启用 learnable soft orthogonal local fusion')
     parser.add_argument('--soft_orth_lambda_init', type=float, default=0.8, help='lambda_orth 的 sigmoid 初始化值')
     parser.add_argument('--soft_orth_detach_global', type=str2bool, nargs='?', const=True, default=True, help='soft orthogonal projection 是否使用 global_feat.detach()')

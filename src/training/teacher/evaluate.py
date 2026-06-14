@@ -18,7 +18,6 @@ from src.dataset.teacher.val_dataloaders import (
     build_sues200_val_dataloaders,
 )
 from src.models.teacher.model import TeacherModel
-from src.utils.initdist import try_init_dist
 from src.utils.train_eval_utils import getdist_1652_val_and_get_recall, run_gta_val_and_get_metrics, run_sues_val_and_get_metrics
 
 
@@ -34,6 +33,7 @@ MODEL_HPARAM_KEYS = {
     "lora_dropout",
     "lora_target_names",
     "local_feature_layers",
+    "use_local_fusion",
     "use_soft_orth_fusion",
     "soft_orth_lambda_init",
     "soft_orth_detach_global",
@@ -217,7 +217,7 @@ def print_loader_summary(dataset, loaders):
         print_pair(f"{dataset}:{task_name}", pair_loaders)
 
 
-def evaluate_pair(model, loaders, device, dataset, task_name):
+def evaluate_pair(model, loaders, device, dataset, task_name, args=None):
     q_loader, g_loader = loaders
     if dataset == "1652":
         r1, r5, r10, mean_ap = getdist_1652_val_and_get_recall(
@@ -247,6 +247,7 @@ def evaluate_pair(model, loaders, device, dataset, task_name):
             q_loader,
             g_loader,
             device,
+            horizontal_flip=bool(getattr(args, "sues_horizontal_flip", False)),
         )
 
     raise ValueError(f"unsupported dataset: {dataset}")
@@ -266,14 +267,14 @@ def evaluate_dataset(model, args, dataset, device, loaders=None):
         for height, height_loaders in loaders.items():
             results[height] = {}
             for task_name, pair_loaders in height_loaders.items():
-                result = evaluate_pair(model, pair_loaders, device, dataset, f"{dataset}:{height}:{task_name}")
+                result = evaluate_pair(model, pair_loaders, device, dataset, f"{dataset}:{height}:{task_name}", args=args)
                 results[height][task_name] = result
                 if is_main_process():
                     print_result(f"[Result][{dataset}][{height}][{task_name}]", result)
         return results
 
     for task_name, pair_loaders in loaders.items():
-        result = evaluate_pair(model, pair_loaders, device, dataset, f"{dataset}:{task_name}")
+        result = evaluate_pair(model, pair_loaders, device, dataset, f"{dataset}:{task_name}", args=args)
         results[task_name] = result
         if is_main_process():
             print_result(f"[Result][{dataset}][{task_name}]", result)
@@ -301,6 +302,7 @@ def write_results(args, results):
         payload["gta_query_mode"] = args.gta_query_mode
     if args.dataset == "SUES-200":
         payload["sues_height"] = args.sues_height
+        payload["sues_horizontal_flip"] = args.sues_horizontal_flip
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, ensure_ascii=False)
     print(f"[Result] wrote {output_path}")
@@ -324,8 +326,9 @@ def parse_args():
     parser.add_argument("--data_root", type=str, default="data", help="Root containing U1652, GTA-UAV, and SUES-200 data.")
     parser.add_argument("--data_dir", type=str, default=None, help="Override data dir for the selected dataset.")
     parser.add_argument("--gta_split", type=str, default="cross-area", choices=["cross-area", "same-area"])
-    parser.add_argument("--gta_query_mode", type=str, default="D2S", choices=["D2S", "S2D"])
+    parser.add_argument("--gta_query_mode", type=str, default="both", choices=["D2S", "S2D", "both"])
     parser.add_argument("--sues_height", type=str, default="all", choices=["150", "200", "250", "300", "all"])
+    parser.add_argument("--sues_horizontal_flip", action="store_true", help="Enable optional horizontal-flip test-time augmentation for SUES-200.")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--img_size", type=int, default=224)
@@ -345,6 +348,7 @@ def parse_args():
     parser.add_argument("--lora_dropout", type=float, default=0.1)
     parser.add_argument("--lora_target_names", type=str, default="qkv,proj")
     parser.add_argument("--local_feature_layers", type=str, default="19,27,36")
+    parser.add_argument("--use_local_fusion", action="store_true")
     parser.add_argument("--use_soft_orth_fusion", action="store_true")
     parser.add_argument("--soft_orth_lambda_init", type=float, default=0.8)
     parser.add_argument("--soft_orth_detach_global", type=str2bool, nargs="?", const=True, default=True)
@@ -357,12 +361,14 @@ def parse_args():
 
 def main():
     args = parse_args()
-    device, rank, local_rank, _ = try_init_dist()
-    if args.device == "cuda" and torch.cuda.is_available():
-        args.device = str(device)
+    if args.device == "cuda" and not torch.cuda.is_available():
+        args.device = "cpu"
+    device = torch.device(args.device)
+    local_rank = int(getattr(args, "local_rank", 0))
+    rank = 0
 
     if is_main_process():
-        print(f"[Eval] device={device} | dataset={args.dataset}")
+        print(f"[Eval] single-card device={device} | dataset={args.dataset}")
 
     loaders = build_loaders_for_dataset(args.dataset, args)
     print_loader_summary(args.dataset, loaders)

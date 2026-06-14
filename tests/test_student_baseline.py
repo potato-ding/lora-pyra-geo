@@ -10,7 +10,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from src.models.student_model import StudentModel
-from src.training.student_train import compute_local_align_loss
+from src.training.student_train import compute_brd_loss, compute_local_align_loss
 
 
 def test_student_baseline_forward_outputs_normalized_f4_embedding():
@@ -96,3 +96,24 @@ def test_local_align_loss_is_batch_level_contrastive():
     assert torch.isfinite(loss)
     assert local_score.shape == (3, 3)
     torch.testing.assert_close(labels, torch.arange(3))
+
+
+def test_brd_loss_is_ranking_level_and_backpropagates_to_student_only():
+    class Args:
+        brd_temperature = 0.07
+        brd_risk_margin = 0.0
+        brd_risk_tau = 0.05
+
+    torch.manual_seed(37)
+    raw_student_features = torch.randn(6, 512, requires_grad=True)
+    student_features = F.normalize(raw_student_features, dim=1)
+    teacher_features = F.normalize(torch.randn(6, 768), dim=1)
+
+    loss, stats = compute_brd_loss(student_features, teacher_features, pair_batch_size=3, args=Args)
+    loss.backward()
+
+    assert loss.ndim == 0
+    assert torch.isfinite(loss)
+    assert raw_student_features.grad is not None
+    assert teacher_features.grad is None
+    assert set(stats) == {"loss_brd_d2s", "loss_brd_s2d", "brd_risk_d2s", "brd_risk_s2d"}

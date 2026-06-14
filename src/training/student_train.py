@@ -10,7 +10,6 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.amp import GradScaler, autocast
@@ -42,89 +41,10 @@ class AverageMeter:
         self.avg = self.sum / max(1, self.count)
 
 
-def path_lookup_keys(path):
-    raw = str(path)
-    norm = os.path.normpath(raw)
-    abs_path = os.path.abspath(norm)
-    try:
-        rel_path = os.path.relpath(abs_path, os.getcwd())
-    except ValueError:
-        rel_path = norm
-
-    keys = []
-    for item in (raw, norm, abs_path, rel_path):
-        keys.append(item)
-        keys.append(item.replace("\\", "/"))
-    return keys
-
-
-class TeacherFeatureBank:
-    """Disk-backed teacher feature bank loaded via NumPy memmap."""
-
-    def __init__(self, cache_dir):
-        self.cache_dir = cache_dir
-        self.drone_feats = self._load_feats("drone")
-        self.satellite_feats = self._load_feats("satellite")
-        self.drone_index = self._load_index("drone")
-        self.satellite_index = self._load_index("satellite")
-        print(
-            "[TeacherBank] "
-            f"cache_dir={cache_dir} | "
-            f"drone_feats={self.drone_feats.shape}/{self.drone_feats.dtype} | "
-            f"satellite_feats={self.satellite_feats.shape}/{self.satellite_feats.dtype}"
-        )
-
-    def _load_feats(self, view_type):
-        path = os.path.join(self.cache_dir, f"{view_type}_feats_fp16.npy")
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"teacher feature matrix not found: {path}")
-        feats = np.load(path, mmap_mode="r")
-        if feats.dtype != np.float16:
-            raise ValueError(f"expected float16 teacher feature bank at {path}, got {feats.dtype}")
-        return feats
-
-    def _load_index(self, view_type):
-        path = os.path.join(self.cache_dir, f"{view_type}_index.json")
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"teacher feature index not found: {path}")
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-
-    def _resolve_entry(self, index, path, view_type):
-        for key in path_lookup_keys(path):
-            entry = index.get(key)
-            if entry is not None:
-                return entry
-        raise KeyError(f"missing {view_type} teacher feature for image path: {path}")
-
-    def get(self, view_type, paths, device):
-        if paths is None:
-            raise ValueError("teacher feature bank requires image paths in each training batch")
-        if view_type == "drone":
-            feats = self.drone_feats
-            index = self.drone_index
-        elif view_type == "satellite":
-            feats = self.satellite_feats
-            index = self.satellite_index
-        else:
-            raise ValueError(f"unsupported view_type: {view_type}")
-
-        rows = [int(self._resolve_entry(index, path, view_type)["row_index"]) for path in paths]
-        batch_feats = np.asarray(feats[rows], dtype=np.float16)
-        batch_feats = np.ascontiguousarray(batch_feats)
-        tensor = torch.from_numpy(batch_feats).to(device=device, non_blocking=True).float()
-        return F.normalize(tensor, p=2, dim=1, eps=1e-6)
-
-
 def unpack_sample4geo_batch(batch, device):
-    if len(batch) == 4:
-        drone, satellite, labels, pids = batch
-        drone_paths = None
-        satellite_paths = None
-    elif len(batch) == 6:
-        drone, satellite, labels, pids, drone_paths, satellite_paths = batch
-    else:
-        raise ValueError(f"Expected 4 or 6 fields from Sample4Geo batch, got {len(batch)}")
+    if len(batch) != 4:
+        raise ValueError(f"Expected 4 fields from Sample4Geo batch, got {len(batch)}")
+    drone, satellite, labels, pids = batch
 
     drone = drone.to(device, non_blocking=True)
     satellite = satellite.to(device, non_blocking=True)
@@ -140,8 +60,6 @@ def unpack_sample4geo_batch(batch, device):
         "pair_batch_size": labels.size(0),
         "effective_batch": images.size(0),
         "pids": pids,
-        "drone_paths": list(drone_paths) if drone_paths is not None else None,
-        "satellite_paths": list(satellite_paths) if satellite_paths is not None else None,
     }
 
 
@@ -258,12 +176,94 @@ def compute_local_align_loss(fmap_drone, fmap_sat, topk=4, tau=0.07, return_debu
     return loss_local
 
 
-def compute_brd_loss(student_features, teacher_features):
+def compute_boundary_risk_weights(teacher_logits, margin=0.0, tau=0.05):
+    if teacher_logits.ndim != 2 or teacher_logits.size(0) != teacher_logits.size(1):
+        raise ValueError(f"BRD expects square cross-view logits, got {tuple(teacher_logits.shape)}")
+
+    batch_size = teacher_logits.size(0)
+    if batch_size <= 1:
+        return torch.ones(batch_size, device=teacher_logits.device, dtype=teacher_logits.dtype)
+
+    positive = teacher_logits.diag()
+    eye = torch.eye(batch_size, device=teacher_logits.device, dtype=torch.bool)
+    hardest_negative = teacher_logits.masked_fill(eye, -torch.inf).max(dim=1).values
+    tau = max(float(tau), 1e-6)
+    return torch.sigmoid((hardest_negative - positive + float(margin)) / tau).detach()
+
+
+def boundary_risk_pairwise_ranking_loss(student_logits, teacher_logits, args):
+    if student_logits.shape != teacher_logits.shape:
+        raise ValueError(
+            "BRD student/teacher logits shape mismatch: "
+            f"student={tuple(student_logits.shape)} teacher={tuple(teacher_logits.shape)}"
+        )
+    if student_logits.ndim != 2 or student_logits.size(0) != student_logits.size(1):
+        raise ValueError(f"BRD expects square cross-view logits, got {tuple(student_logits.shape)}")
+
+    batch_size = student_logits.size(0)
+    if batch_size <= 1:
+        zero = student_logits.sum() * 0.0
+        return zero, torch.zeros((), device=student_logits.device, dtype=student_logits.dtype)
+
+    teacher_logits = teacher_logits.detach()
+    device = student_logits.device
+    eye = torch.eye(batch_size, device=device, dtype=torch.bool)
+
+    teacher_pos = teacher_logits.diag().unsqueeze(1)
+    teacher_risk_score = (teacher_logits - teacher_pos + float(args.brd_risk_margin)) / max(float(args.brd_risk_tau), 1e-6)
+    risk_weights = torch.sigmoid(teacher_risk_score).masked_fill(eye, 0.0).detach()
+
+    topk = int(getattr(args, "brd_topk", 4))
+    if topk > 0:
+        topk = min(topk, batch_size - 1)
+        masked_teacher = teacher_logits.masked_fill(eye, -torch.inf)
+        _, topk_indices = torch.topk(masked_teacher, k=topk, dim=1, largest=True)
+        topk_mask = torch.zeros_like(risk_weights, dtype=torch.bool)
+        topk_mask.scatter_(1, topk_indices, True)
+        risk_weights = risk_weights.masked_fill(~topk_mask, 0.0)
+
+    threshold = float(getattr(args, "brd_risk_threshold", 0.0))
+    if threshold > 0:
+        risk_weights = risk_weights.masked_fill(risk_weights < threshold, 0.0)
+
+    student_pos = student_logits.diag().unsqueeze(1)
+    ranking_margin = float(getattr(args, "brd_pair_margin", 0.05))
+    temperature = max(float(getattr(args, "brd_temperature", 0.07)), 1e-6)
+    pairwise_violation = (student_logits - student_pos + ranking_margin) / temperature
+    pairwise_loss = F.softplus(pairwise_violation).masked_fill(eye, 0.0)
+
+    weight_sum = risk_weights.sum()
+    if weight_sum.item() <= 0:
+        zero = student_logits.sum() * 0.0
+        return zero, torch.zeros((), device=device, dtype=student_logits.dtype)
+
+    loss = (pairwise_loss * risk_weights).sum() / weight_sum.clamp_min(1e-6)
+    mean_risk = risk_weights.sum(dim=1).div((risk_weights > 0).sum(dim=1).clamp_min(1)).mean()
+    return loss, mean_risk.detach()
+
+
+def compute_brd_loss(student_features, teacher_features, pair_batch_size, args):
     student_features = F.normalize(student_features.float(), p=2, dim=1, eps=1e-6)
-    teacher_features = F.normalize(teacher_features.float(), p=2, dim=1, eps=1e-6)
-    student_rel = student_features @ student_features.t()
-    teacher_rel = teacher_features @ teacher_features.t()
-    return F.mse_loss(student_rel, teacher_rel)
+    teacher_features = F.normalize(teacher_features.detach().float(), p=2, dim=1, eps=1e-6)
+
+    student_drone = student_features[:pair_batch_size]
+    student_satellite = student_features[pair_batch_size:pair_batch_size * 2]
+    teacher_drone = teacher_features[:pair_batch_size]
+    teacher_satellite = teacher_features[pair_batch_size:pair_batch_size * 2]
+
+    student_logits = student_drone @ student_satellite.t()
+    teacher_logits = teacher_drone @ teacher_satellite.t()
+
+    loss_d2s, risk_d2s = boundary_risk_pairwise_ranking_loss(student_logits, teacher_logits, args)
+    loss_s2d, risk_s2d = boundary_risk_pairwise_ranking_loss(student_logits.t(), teacher_logits.t(), args)
+    loss = 0.5 * (loss_d2s + loss_s2d)
+    stats = {
+        "loss_brd_d2s": loss_d2s.detach(),
+        "loss_brd_s2d": loss_s2d.detach(),
+        "brd_risk_d2s": risk_d2s.detach(),
+        "brd_risk_s2d": risk_s2d.detach(),
+    }
+    return loss, stats
 
 
 def get_raw_model(model):
@@ -340,7 +340,73 @@ def format_optional_float(value, precision=4):
     return f"{value:.{precision}f}"
 
 
-def train_one_epoch(model, train_loader, criterion, optimizer, scheduler, scaler, device, args, epoch, teacher_bank=None):
+def resolve_teacher_checkpoint_path(args):
+    if args.teacher_checkpoint:
+        return args.teacher_checkpoint
+    if args.teacher_run_name:
+        return os.path.join(
+            args.teacher_checkpoint_root,
+            args.teacher_run_name,
+            args.teacher_checkpoint_name,
+        )
+    raise ValueError("--use_brd_distill requires --teacher_checkpoint or --teacher_run_name.")
+
+
+def build_online_teacher_model(args, device):
+    from src.models.teacher.model import TeacherModel
+    from src.training.teacher.args import build_arg_parser as build_teacher_arg_parser
+    from src.training.teacher.evaluate import load_checkpoint_hparams, load_teacher_checkpoint
+
+    checkpoint_path = resolve_teacher_checkpoint_path(args)
+    args.teacher_checkpoint = checkpoint_path
+
+    teacher_parser = build_teacher_arg_parser()
+    teacher_defaults = {action.dest: action.default for action in teacher_parser._actions}
+    teacher_args = teacher_parser.parse_args([])
+    teacher_args.checkpoint = checkpoint_path
+    teacher_args.no_checkpoint_hparams = args.no_teacher_checkpoint_hparams
+    teacher_args.device = str(device)
+
+    load_checkpoint_hparams(teacher_args, teacher_defaults, [])
+    teacher_args.device = str(device)
+
+    teacher = TeacherModel(teacher_args).to(device)
+    load_teacher_checkpoint(teacher, checkpoint_path, device)
+    teacher.eval()
+    for param in teacher.parameters():
+        param.requires_grad_(False)
+
+    trainable = sum(param.numel() for param in teacher.parameters() if param.requires_grad)
+    print(f"[BRD] online teacher loaded: {checkpoint_path} | trainable_params={trainable}")
+    return teacher
+
+
+def forward_teacher_online(teacher_model, images):
+    teacher_dtype = None
+    backbone = getattr(teacher_model, "backbone", None)
+    backbone_model = getattr(backbone, "model", None)
+    if backbone_model is not None:
+        try:
+            teacher_dtype = next(backbone_model.parameters()).dtype
+        except StopIteration:
+            teacher_dtype = None
+    if teacher_dtype is None:
+        try:
+            teacher_dtype = next(teacher_model.parameters()).dtype
+        except StopIteration:
+            teacher_dtype = images.dtype
+
+    teacher_images = images.to(dtype=teacher_dtype) if images.is_floating_point() else images
+    with torch.inference_mode():
+        teacher_features = teacher_model(teacher_images)
+        if isinstance(teacher_features, (tuple, list)):
+            teacher_features = teacher_features[1] if len(teacher_features) > 1 else teacher_features[0]
+        teacher_features = teacher_features.detach()
+        teacher_features = F.normalize(teacher_features.float(), p=2, dim=1, eps=1e-6)
+    return teacher_features
+
+
+def train_one_epoch(model, train_loader, criterion, optimizer, scheduler, scaler, device, args, epoch, teacher_model=None):
     model.train()
     batch_time = AverageMeter()
     data_time = AverageMeter()
@@ -348,6 +414,10 @@ def train_one_epoch(model, train_loader, criterion, optimizer, scheduler, scaler
     loss_infonce_meter = AverageMeter()
     loss_local_align_meter = AverageMeter()
     loss_brd_meter = AverageMeter()
+    loss_brd_d2s_meter = AverageMeter()
+    loss_brd_s2d_meter = AverageMeter()
+    brd_risk_d2s_meter = AverageMeter()
+    brd_risk_s2d_meter = AverageMeter()
     end = time.time()
     printed_local_align_shapes = False
 
@@ -358,6 +428,10 @@ def train_one_epoch(model, train_loader, criterion, optimizer, scheduler, scaler
         data_time.update(time.time() - end)
         images, labels, meta = unpack_sample4geo_batch(batch, device)
         pair_batch_size = meta["pair_batch_size"]
+        if teacher_model is not None:
+            teacher_features = forward_teacher_online(teacher_model, images)
+        else:
+            teacher_features = None
 
         optimizer.zero_grad(set_to_none=True)
         with autocast(device_type="cuda", enabled=args.amp):
@@ -388,14 +462,17 @@ def train_one_epoch(model, train_loader, criterion, optimizer, scheduler, scaler
                 local_align_loss = main_loss.new_zeros(())
                 loss = main_loss
 
-            if teacher_bank is not None:
-                teacher_drone = teacher_bank.get("drone", meta["drone_paths"], device)
-                teacher_satellite = teacher_bank.get("satellite", meta["satellite_paths"], device)
-                teacher_features = torch.cat([teacher_drone, teacher_satellite], dim=0)
-                brd_loss = compute_brd_loss(features, teacher_features)
+            if teacher_features is not None:
+                brd_loss, brd_stats = compute_brd_loss(features, teacher_features, pair_batch_size, args)
                 loss = loss + args.brd_weight * brd_loss
             else:
                 brd_loss = main_loss.new_zeros(())
+                brd_stats = {
+                    "loss_brd_d2s": brd_loss.detach(),
+                    "loss_brd_s2d": brd_loss.detach(),
+                    "brd_risk_d2s": brd_loss.detach(),
+                    "brd_risk_s2d": brd_loss.detach(),
+                }
 
         if args.use_local_align and not printed_local_align_shapes:
             expected_labels = list(range(pair_batch_size))
@@ -435,12 +512,28 @@ def train_one_epoch(model, train_loader, criterion, optimizer, scheduler, scaler
         loss_infonce_meter.update(main_loss.item(), images.size(0))
         loss_local_align_meter.update(local_align_loss.item(), images.size(0))
         loss_brd_meter.update(brd_loss.item(), images.size(0))
+        loss_brd_d2s_meter.update(brd_stats["loss_brd_d2s"].item(), images.size(0))
+        loss_brd_s2d_meter.update(brd_stats["loss_brd_s2d"].item(), images.size(0))
+        brd_risk_d2s_meter.update(brd_stats["brd_risk_d2s"].item(), images.size(0))
+        brd_risk_s2d_meter.update(brd_stats["brd_risk_s2d"].item(), images.size(0))
         batch_time.update(time.time() - end)
         end = time.time()
 
         if step % args.print_freq == 0 or step == len(train_loader) - 1:
             lr = optimizer.param_groups[0]["lr"]
             logit_scale = raw_model.logit_scale.exp().item()
+            brd_text = ""
+            if teacher_model is not None:
+                brd_text = (
+                    f"loss_brd {loss_brd_meter.val:.4f} ({loss_brd_meter.avg:.4f}) | "
+                    f"loss_brd_d2s {loss_brd_d2s_meter.val:.4f} ({loss_brd_d2s_meter.avg:.4f}) | "
+                    f"loss_brd_s2d {loss_brd_s2d_meter.val:.4f} ({loss_brd_s2d_meter.avg:.4f}) | "
+                    f"risk_d2s {brd_risk_d2s_meter.val:.4f} ({brd_risk_d2s_meter.avg:.4f}) | "
+                    f"risk_s2d {brd_risk_s2d_meter.val:.4f} ({brd_risk_s2d_meter.avg:.4f}) | "
+                    f"brd_weight {args.brd_weight:.6f} | "
+                    f"brd_topk {args.brd_topk} | "
+                    f"brd_pair_margin {args.brd_pair_margin:.6f} | "
+                    )
             print(
                 f"Epoch [{epoch}/{args.epochs}] "
                 f"Step [{step + 1}/{len(train_loader)}] | "
@@ -451,8 +544,7 @@ def train_one_epoch(model, train_loader, criterion, optimizer, scheduler, scaler
                 f"loss_total {loss_total_meter.val:.4f} ({loss_total_meter.avg:.4f}) | "
                 f"loss_infonce {loss_infonce_meter.val:.4f} ({loss_infonce_meter.avg:.4f}) | "
                 f"loss_local_align {loss_local_align_meter.val:.4f} ({loss_local_align_meter.avg:.4f}) | "
-                f"loss_brd {loss_brd_meter.val:.4f} ({loss_brd_meter.avg:.4f}) | "
-                f"brd_weight {args.brd_weight:.6f} | "
+                f"{brd_text}"
                 f"local_align_weight {args.local_align_weight:.6f} | "
                 f"local_align_topk {args.local_align_topk} | "
                 f"local_align_tau {args.local_align_tau:.6f} | "
@@ -465,10 +557,14 @@ def train_one_epoch(model, train_loader, criterion, optimizer, scheduler, scaler
         "loss_infonce": loss_infonce_meter.avg,
         "loss_local_align": loss_local_align_meter.avg,
         "loss_brd": loss_brd_meter.avg,
+        "loss_brd_d2s": loss_brd_d2s_meter.avg,
+        "loss_brd_s2d": loss_brd_s2d_meter.avg,
+        "brd_risk_d2s": brd_risk_d2s_meter.avg,
+        "brd_risk_s2d": brd_risk_s2d_meter.avg,
     }
 
 
-def train(model, train_loader, val_loaders, criterion, optimizer, scheduler, device, args, teacher_bank=None):
+def train(model, train_loader, val_loaders, criterion, optimizer, scheduler, device, args, teacher_model=None):
     os.makedirs(args.output_dir, exist_ok=True)
     scaler = GradScaler("cuda", enabled=args.amp)
 
@@ -490,15 +586,26 @@ def train(model, train_loader, val_loaders, criterion, optimizer, scheduler, dev
             device,
             args,
             epoch,
-            teacher_bank=teacher_bank,
+            teacher_model=teacher_model,
         )
+        brd_epoch_text = ""
+        if teacher_model is not None:
+            brd_epoch_text = (
+                f"loss_brd={train_stats['loss_brd']:.4f} | "
+                f"loss_brd_d2s={train_stats['loss_brd_d2s']:.4f} | "
+                f"loss_brd_s2d={train_stats['loss_brd_s2d']:.4f} | "
+                f"risk_d2s={train_stats['brd_risk_d2s']:.4f} | "
+                f"risk_s2d={train_stats['brd_risk_s2d']:.4f} | "
+                f"brd_weight={args.brd_weight:.6f} | "
+                f"brd_topk={args.brd_topk} | "
+                f"brd_pair_margin={args.brd_pair_margin:.6f} | "
+            )
         print(
             f"[Train] Epoch {epoch}/{args.epochs} | "
             f"loss_total={train_stats['loss_total']:.4f} | "
             f"loss_infonce={train_stats['loss_infonce']:.4f} | "
             f"loss_local_align={train_stats['loss_local_align']:.4f} | "
-            f"loss_brd={train_stats['loss_brd']:.4f} | "
-            f"brd_weight={args.brd_weight:.6f} | "
+            f"{brd_epoch_text}"
             f"local_align_weight={args.local_align_weight:.6f} | "
             f"local_align_topk={args.local_align_topk} | "
             f"local_align_tau={args.local_align_tau:.6f}"
@@ -589,8 +696,19 @@ def parse_args():
     parser.add_argument("--local_align_weight", type=float, default=0.01)
     parser.add_argument("--local_align_topk", type=int, default=4)
     parser.add_argument("--local_align_tau", type=float, default=0.07)
-    parser.add_argument("--teacher_cache_dir", type=str, default=None)
-    parser.add_argument("--brd_weight", type=float, default=0.0)
+    parser.add_argument("--use_brd_distill", action="store_true", default=False)
+    parser.add_argument("--teacher_checkpoint", type=str, default=None)
+    parser.add_argument("--teacher_run_name", type=str, default=None)
+    parser.add_argument("--teacher_checkpoint_root", type=str, default="src/checkpoint/teacher")
+    parser.add_argument("--teacher_checkpoint_name", type=str, default="best_model.pth")
+    parser.add_argument("--no_teacher_checkpoint_hparams", action="store_true")
+    parser.add_argument("--brd_weight", type=float, default=1.0)
+    parser.add_argument("--brd_temperature", type=float, default=0.07)
+    parser.add_argument("--brd_risk_margin", type=float, default=0.0)
+    parser.add_argument("--brd_risk_tau", type=float, default=0.05)
+    parser.add_argument("--brd_topk", type=int, default=4)
+    parser.add_argument("--brd_pair_margin", type=float, default=0.05)
+    parser.add_argument("--brd_risk_threshold", type=float, default=0.0)
 
     args = parser.parse_args()
     args.command_line = " ".join(shlex.quote(x) for x in sys.argv)
@@ -603,6 +721,9 @@ def main():
     args = parse_args()
     from src.dataset.datasets import create_student_train_dataset_and_loader
     from src.dataset.val_dataloaders import build_student_val_dataloaders
+
+    if args.use_brd_distill:
+        args.teacher_checkpoint = resolve_teacher_checkpoint_path(args)
 
     print(f"[Output] checkpoints will be saved to: {args.output_dir}")
     write_training_record(args, status="initialized")
@@ -628,13 +749,13 @@ def main():
     )
     scheduler = build_student_scheduler(optimizer, args, steps_per_epoch=len(train_loader))
     criterion = Sample4GeoLoss(label_smoothing=args.label_smoothing)
-    teacher_bank = None
-    if args.teacher_cache_dir is not None:
+    teacher_model = None
+    if args.use_brd_distill:
         if args.brd_weight <= 0:
-            raise ValueError("--teacher_cache_dir was provided, but --brd_weight must be > 0 to use BRD distillation.")
-        teacher_bank = TeacherFeatureBank(args.teacher_cache_dir)
+            raise ValueError("--use_brd_distill requires --brd_weight > 0.")
+        teacher_model = build_online_teacher_model(args, device)
 
-    train(model, train_loader, val_loaders, criterion, optimizer, scheduler, device, args, teacher_bank=teacher_bank)
+    train(model, train_loader, val_loaders, criterion, optimizer, scheduler, device, args, teacher_model=teacher_model)
 
 
 if __name__ == "__main__":

@@ -278,13 +278,23 @@ class TeacherModel(nn.Module):
         init_value = torch.log(torch.tensor(1 / 0.07, dtype=torch.float32))
         self.logit_scale = nn.Parameter(init_value)
 
+        self.use_soft_orth_fusion = _as_bool(getattr(args, "use_soft_orth_fusion", False))
+        self.use_local_fusion = (
+            _as_bool(getattr(args, "use_local_fusion", False))
+            or self.use_soft_orth_fusion
+        )
+        args.resolved_use_local_fusion = self.use_local_fusion
+
         self.local_feature_layers = validate_local_feature_layers(
             parse_local_feature_layers(getattr(args, "local_feature_layers", None)),
             num_blocks,
         )
         args.resolved_local_feature_layers = list(self.local_feature_layers)
 
-        self.target_layers = sorted(set(self.local_feature_layers + [self.final_layer_index]))
+        if self.use_local_fusion:
+            self.target_layers = sorted(set(self.local_feature_layers + [self.final_layer_index]))
+        else:
+            self.target_layers = [self.final_layer_index]
 
         feature_dim = getattr(dino_model, "embed_dim", None)
         if feature_dim is None:
@@ -298,11 +308,17 @@ class TeacherModel(nn.Module):
 
         self.gamma_raw = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
 
-        self.use_soft_orth_fusion = _as_bool(getattr(args, "use_soft_orth_fusion", False))
         self.soft_orth_detach_global = _as_bool(getattr(args, "soft_orth_detach_global", True))
         self.soft_orth_lambda_init = _clamp_lambda_init(getattr(args, "soft_orth_lambda_init", 0.8))
         lambda_init_value = torch.logit(torch.tensor(self.soft_orth_lambda_init, dtype=torch.float32))
         self.lambda_orth_raw = nn.Parameter(lambda_init_value.clone().float())
+
+        if not self.use_local_fusion:
+            for module in (self.local_cross_attn, self.local_proj):
+                for param in module.parameters():
+                    param.requires_grad_(False)
+            self.gamma_raw.requires_grad_(False)
+            self.lambda_orth_raw.requires_grad_(False)
 
     def _layer_region_desc(self, layer_idx):
         lora_start, lora_end = self.lora_range
@@ -327,6 +343,7 @@ class TeacherModel(nn.Module):
                 {"layer": layer_idx, "region": self._layer_region_desc(layer_idx)}
                 for layer_idx in self.local_feature_layers
             ],
+            "use_local_fusion": self.use_local_fusion,
             "use_soft_orth_fusion": self.use_soft_orth_fusion,
             "soft_orth_lambda_init": self.soft_orth_lambda_init,
             "soft_orth_detach_global": self.soft_orth_detach_global,
@@ -340,6 +357,7 @@ class TeacherModel(nn.Module):
             return {
                 "gamma": self.get_gamma().detach().float().item(),
                 "lambda_orth": torch.sigmoid(self.lambda_orth_raw).detach().float().item(),
+                "use_local_fusion": self.use_local_fusion,
                 "use_soft_orth_fusion": self.use_soft_orth_fusion,
                 "soft_orth_detach_global": self.soft_orth_detach_global,
                 "local_feature_layers": list(self.local_feature_layers),
@@ -376,6 +394,11 @@ class TeacherModel(nn.Module):
 
         global_feat = final_cls.float()
         deep_feats = F.normalize(global_feat, p=2, dim=-1, eps=1e-6)
+
+        if not self.use_local_fusion:
+            if self.training:
+                return deep_feats, deep_feats, deep_feats
+            return deep_feats
 
         local_patch_tokens = []
         for layer_idx in self.local_feature_layers:

@@ -1,3 +1,5 @@
+import math
+
 import torch
 import torch.distributed as dist
 
@@ -434,8 +436,7 @@ def run_gta_val_and_get_metrics(model, val_query_loader, val_gallery_loader, dev
     g_l_device = g_l.to(device)
     g_c_device = g_c.to(device)
 
-    top1_percent_index = round(real_num_gallery * 0.01)
-    top1_percent_k = min(top1_percent_index + 1, real_num_gallery)
+    top1_percent_k = min(max(1, math.ceil(real_num_gallery * 0.01)), real_num_gallery)
 
     local_correct_1 = torch.tensor(0.0, device=device)
     local_correct_5 = torch.tensor(0.0, device=device)
@@ -515,9 +516,19 @@ def run_gta_val_and_get_metrics(model, val_query_loader, val_gallery_loader, dev
 
 
 @torch.no_grad()
-def run_sues_val_and_get_metrics(model, val_query_loader, val_gallery_loader, device):
-    q_f, q_l, _ = extract_features_dist(model, val_query_loader, device, horizontal_flip=True)
-    g_f, g_l, _ = extract_features_dist(model, val_gallery_loader, device, horizontal_flip=True)
+def run_sues_val_and_get_metrics(model, val_query_loader, val_gallery_loader, device, horizontal_flip=False):
+    q_f, q_l, _ = extract_features_dist(
+        model,
+        val_query_loader,
+        device,
+        horizontal_flip=horizontal_flip,
+    )
+    g_f, g_l, _ = extract_features_dist(
+        model,
+        val_gallery_loader,
+        device,
+        horizontal_flip=horizontal_flip,
+    )
 
     real_num_queries = len(val_query_loader.dataset)
     real_num_gallery = len(val_gallery_loader.dataset)
@@ -538,8 +549,7 @@ def run_sues_val_and_get_metrics(model, val_query_loader, val_gallery_loader, de
 
     g_f_device = g_f.to(device)
     g_l_device = g_l.to(device)
-    top1_percent_index = round(real_num_gallery * 0.01)
-    top1_percent_k = min(top1_percent_index + 1, real_num_gallery)
+    top1_percent_k = min(max(1, math.ceil(real_num_gallery * 0.01)), real_num_gallery)
 
     local_correct_1 = torch.tensor(0.0, device=device)
     local_correct_5 = torch.tensor(0.0, device=device)
