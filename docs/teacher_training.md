@@ -640,6 +640,94 @@ deepspeed --num_gpus=1 src/training/teacher_train.py \
 
 该命令会从第 1 个 epoch 开始进入 `identity_hard`。如果不希望跳过前两个阶段，不要把 `stage1_end_epoch` 和 `stage2_end_epoch` 设为 `0`。
 
+### 10.5 Recommended staged-restart curriculum
+
+This is the preferred route when the Sample4Geo stage peaks before epoch 10. Each stage starts a new run, reloads the previous stage `best_model.pth`, and rebuilds optimizer/scheduler from scratch.
+
+Step 1: Sample4Geo + InfoNCE for 10 epochs.
+
+```bash
+deepspeed --include localhost:0,1 src/training/teacher_train.py \
+  --epochs 10 \
+  --device cuda \
+  --deepspeed_config ds_config.json \
+  --data_dir data/U1652 \
+  --batch_size 4 \
+  --grad_accum_steps 1 \
+  --triplet_weight 0 \
+  --infonce_weight 1.0 \
+  --use_soft_orth_fusion \
+  --local_feature_layers 19,27,36 \
+  --soft_orth_lambda_init 0.8 \
+  --soft_orth_detach_global true
+```
+
+Step 2: identity-only continuation from the Sample4Geo best checkpoint.
+
+```bash
+deepspeed --include localhost:2,3 src/training/teacher_train.py \
+  --epochs 20 \
+  --device cuda \
+  --deepspeed_config ds_config.json \
+  --data_dir data/U1652 \
+  --batch_size 4 \
+  --grad_accum_steps 1 \
+  --init_checkpoint src/checkpoint/teacher/<sample4geo_run>/best_model.pth \
+  --enable_identity_stage \
+  --stage1_end_epoch 0 \
+  --identity_ids_per_batch 8 \
+  --identity_drone_per_id 4 \
+  --identity_sat_per_id 1 \
+  --identity_loss_weight 1.0 \
+  --same_domain_triplet_weight 0.2 \
+  --weak_sample4geo_weight 0.2 \
+  --use_soft_orth_fusion \
+  --local_feature_layers 19,27,36 \
+  --soft_orth_lambda_init 0.8 \
+  --soft_orth_detach_global true
+```
+
+Step 3: hard-pool-only continuation from the identity best checkpoint.
+
+```bash
+deepspeed --include localhost:4,5 src/training/teacher_train.py \
+  --epochs 10 \
+  --device cuda \
+  --deepspeed_config ds_config.json \
+  --data_dir data/U1652 \
+  --batch_size 4 \
+  --grad_accum_steps 1 \
+  --init_checkpoint src/checkpoint/teacher/<identity_run>/best_model.pth \
+  --enable_identity_stage \
+  --enable_hard_pool_stage \
+  --stage1_end_epoch 0 \
+  --stage2_end_epoch 0 \
+  --build_hard_pool_before_train \
+  --build_hard_pool_epoch 0 \
+  --save_hard_pool_path outputs/hard_pool_from_<identity_run>_epoch{epoch}.json \
+  --identity_ids_per_batch 8 \
+  --identity_drone_per_id 4 \
+  --identity_sat_per_id 1 \
+  --identity_loss_weight 1.0 \
+  --same_domain_triplet_weight 0.2 \
+  --weak_sample4geo_weight 0.2 \
+  --hard_drone_per_id 2 \
+  --random_drone_per_id 2 \
+  --hard_pool_topk 12 \
+  --hard_pool_topneg_k 10 \
+  --use_ema_for_hard_pool true \
+  --use_soft_orth_fusion \
+  --local_feature_layers 19,27,36 \
+  --soft_orth_lambda_init 0.8 \
+  --soft_orth_detach_global true
+```
+
+Notes:
+
+- `--init_checkpoint` loads the previous stage's trainable EMA weights after the original DINOv3 pretrained backbone is constructed.
+- Keep architecture flags identical across stages unless this is an intentional ablation.
+- `--build_hard_pool_before_train` is required when `stage1_end_epoch=0` and `stage2_end_epoch=0`, because epoch 1 starts directly in `identity_hard`.
+
 ## 11. 最小检查方法
 
 ### 11.1 检查代码能否编译

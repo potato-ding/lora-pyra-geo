@@ -12,6 +12,7 @@ import torch.distributed as dist
 from datetime import datetime
 import gc
 import json
+import re
 from torch.utils.data import Dataset, DataLoader
 from src.loss.tripletloss import IntraDomainTripletLoss
 from src.loss.blocks_infoNCE import infonce
@@ -126,6 +127,76 @@ def save_metrics_json(save_dir, filename, payload):
     json_path = os.path.join(save_dir, filename)
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(_json_safe_value(payload), f, indent=2, ensure_ascii=False)
+
+
+def _strip_module_prefix(key):
+    return key[7:] if key.startswith("module.") else key
+
+
+def _insert_checkpoint_wrapper_module(key):
+    return re.sub(r"(backbone\.model\.blocks\.\d+\.)(?!module\.)", r"\1module.", key)
+
+
+def load_teacher_init_checkpoint(model, checkpoint_path, device, strict_trainable=True):
+    if not checkpoint_path:
+        return
+    if not os.path.isfile(checkpoint_path):
+        raise FileNotFoundError(f"init checkpoint not found: {checkpoint_path}")
+
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    state_dict = checkpoint.get("state_dict", checkpoint.get("model", checkpoint))
+    model_state = model.state_dict()
+    mapped_state = {}
+    unexpected = []
+    incompatible = []
+
+    for raw_key, value in state_dict.items():
+        key = _strip_module_prefix(raw_key)
+        if key not in model_state:
+            wrapped_key = _insert_checkpoint_wrapper_module(key)
+            if wrapped_key in model_state:
+                key = wrapped_key
+
+        if key not in model_state:
+            unexpected.append(raw_key)
+            continue
+
+        if tuple(model_state[key].shape) != tuple(value.shape):
+            incompatible.append((raw_key, tuple(value.shape), tuple(model_state[key].shape)))
+            continue
+
+        mapped_state[key] = value
+
+    missing, load_unexpected = model.load_state_dict(mapped_state, strict=False)
+    model.to(device)
+
+    trainable_keys = {name for name, param in model.named_parameters() if param.requires_grad}
+    loaded_trainable = trainable_keys & set(mapped_state.keys())
+    missing_trainable = sorted(trainable_keys - loaded_trainable)
+
+    if is_main_process():
+        print(f"[InitCheckpoint] loaded: {checkpoint_path}")
+        print(
+            f"[InitCheckpoint] matched={len(mapped_state)} | "
+            f"trainable_matched={len(loaded_trainable)}/{len(trainable_keys)} | "
+            f"unexpected={len(unexpected) + len(load_unexpected)} | "
+            f"incompatible={len(incompatible)} | missing_total={len(missing)}"
+        )
+        if missing_trainable:
+            print(f"[InitCheckpoint][WARN] missing trainable keys examples: {missing_trainable[:5]}")
+        if unexpected:
+            print(f"[InitCheckpoint][WARN] unexpected checkpoint keys examples: {unexpected[:5]}")
+        if load_unexpected:
+            print(f"[InitCheckpoint][WARN] load unexpected keys examples: {load_unexpected[:5]}")
+        if incompatible:
+            print(f"[InitCheckpoint][WARN] incompatible examples: {incompatible[:3]}")
+
+    if strict_trainable and (missing_trainable or incompatible):
+        raise RuntimeError(
+            "init checkpoint did not fully cover the current trainable teacher parameters; "
+            f"missing_trainable={len(missing_trainable)}, incompatible={len(incompatible)}. "
+            "Use --init_checkpoint_strict_trainable false only for intentional architecture changes."
+        )
 
 
 def build_validation_metrics(epoch, d2s_metrics, s2d_metrics):
@@ -344,10 +415,38 @@ def validate_identity_training_args(args):
         raise ValueError("enable_hard_pool_stage 需要同时启用 enable_identity_stage")
 
 
-def should_run_validation(cur_epoch, args):
-    if cur_epoch < 6:
-        return cur_epoch == args.epochs
+def normalize_explicit_training_stage(args):
+    stage = getattr(args, "training_stage", "auto")
+    if stage in (None, "auto"):
+        return
 
+    if stage == "sample4geo":
+        args.enable_identity_stage = False
+        args.enable_hard_pool_stage = False
+        return
+
+    if not getattr(args, "init_checkpoint", None):
+        raise ValueError(f"--training_stage {stage} requires --init_checkpoint from the previous best_model.pth")
+
+    if stage == "identity":
+        args.enable_identity_stage = True
+        args.enable_hard_pool_stage = False
+        args.stage1_end_epoch = 0
+        return
+
+    if stage == "hard_pool":
+        args.enable_identity_stage = True
+        args.enable_hard_pool_stage = True
+        args.stage1_end_epoch = 0
+        args.stage2_end_epoch = 0
+        if not getattr(args, "load_hard_pool_path", None):
+            args.build_hard_pool_before_train = True
+        return
+
+    raise ValueError(f"unsupported training_stage: {stage}")
+
+
+def should_run_validation(cur_epoch, args):
     if cur_epoch == args.epochs:
         return True
 
@@ -780,6 +879,34 @@ def load_initial_hard_pool_if_needed(args, train_loaders):
     return True
 
 
+def build_initial_hard_pool_if_needed(model_engine, ema, train_loaders, args, device, hard_pool_loaded):
+    if not getattr(args, "build_hard_pool_before_train", False):
+        return hard_pool_loaded
+
+    if not getattr(args, "enable_identity_stage", False) or not getattr(args, "enable_hard_pool_stage", False):
+        raise ValueError("--build_hard_pool_before_train requires identity and hard_pool stages")
+
+    if hard_pool_loaded:
+        if is_main_process():
+            print("[HardPool] build_hard_pool_before_train is set, but hard_pool is already loaded; skip building")
+        return True
+
+    pool_epoch = int(getattr(args, "build_hard_pool_epoch", 0))
+    if pool_epoch < 0:
+        pool_epoch = 0
+
+    if is_main_process():
+        print(f"[HardPool] pre-train build requested | save_epoch_label={pool_epoch}")
+    return build_save_and_apply_hard_pool(
+        model_engine,
+        ema,
+        train_loaders,
+        args,
+        pool_epoch,
+        device,
+    )
+
+
 def should_build_hard_pool(epoch, args, hard_pool_loaded):
     return (
         getattr(args, "enable_identity_stage", False)
@@ -966,6 +1093,14 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
     validation_history = []
     train_loaders = dataloader
     hard_pool_loaded = load_initial_hard_pool_if_needed(args, train_loaders)
+    hard_pool_loaded = build_initial_hard_pool_if_needed(
+        model_engine,
+        ema,
+        train_loaders,
+        args,
+        amp_device,
+        hard_pool_loaded,
+    )
     for epoch in range(1, args.epochs + 1):
         stage_mode = get_training_mode(epoch, args)
         epoch_dataloader, _, effective_mode = select_epoch_dataloader(train_loaders, epoch, args)
@@ -1325,6 +1460,7 @@ def main():
     import traceback
     args = parse_args()
     try:
+        normalize_explicit_training_stage(args)
         validate_loss_weights(args)
         validate_scheduler_args(args)
         validate_identity_training_args(args)
@@ -1341,6 +1477,12 @@ def main():
         # 构建模型
         model = TeacherModel(args)
         model = model.to(device)
+        load_teacher_init_checkpoint(
+            model,
+            getattr(args, "init_checkpoint", None),
+            device,
+            strict_trainable=getattr(args, "init_checkpoint_strict_trainable", True),
+        )
         # 获取可训练参数并构建优化器和学习率调度器
         optimizer = build_optimizer_and_scale(model, args)
         ds_config, grad_accum_steps = build_deepspeed_runtime_config(

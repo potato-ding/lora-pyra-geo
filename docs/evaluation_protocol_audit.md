@@ -145,6 +145,7 @@ python src/training/student_test.py \
 - During training, both teacher and student select the best checkpoint using the same University-1652 validation protocol used by `teacher_test.py` and `student_test.py`.
 - The selection metric is the sum of two directional recalls: `D2S_R@1 + S2D_R@1`.
 - Teacher training runs this protocol in distributed mode under DeepSpeed; teacher pure test runs it on one card.
+- Teacher Sample4Geo-stage training validates every epoch from epoch 1.
 - Student training and student pure test both run this protocol on one card.
 - The shared University-1652 protocol uses `build_1652_val_dataloaders` and `getdist_1652_val_and_get_recall`.
 - The only model-specific difference is feature extraction: `TeacherModel` outputs DINOv3 teacher features; `StudentModel` outputs RepViT student features.

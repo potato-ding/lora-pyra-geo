@@ -1,82 +1,115 @@
-# 8 x RTX 3090 Training Plan
+# 8 x RTX 3090 训练计划：教师训练仅 6 组
 
-This document records the planned teacher/student training and evaluation commands for the current project.
+本文档记录当前实验的主训练方案。教师模型训练种类严格只有 6 个：`T0` 到 `T5`。学生 baseline、边界风险感知蒸馏、教师纯测试、学生纯测试都属于配套流程，不计入教师训练种类。
 
-Hardware assumption:
+核心原则是：无论后续是否使用 identity 训练和 hard_pool 训练，都先保留前 10 个 epoch 的 Sample4Geo 最佳结果；后续阶段全部从上一阶段的 `best_model.pth` 重新启动，而不是从上一阶段最后一个 epoch 接着跑。
+
+## 1. 教师 6 组实验总览
+
+教师模型分成两条完全平行的分支：
+
+| 分支 | Stage 1 | Stage 2 | Stage 3 |
+|---|---|---|---|
+| 无软正交 | Sample4Geo + InfoNCE | 加载 Stage 1 best 后训练 identity | 加载 Stage 2 best 后训练 hard_pool |
+| 有软正交 | Sample4Geo + InfoNCE + soft orth | 加载 Stage 1 best 后训练 identity | 加载 Stage 2 best 后训练 hard_pool |
+
+教师训练种类固定为下面 6 个，不再额外增加一次性 curriculum 版本：
+
+| ID | 训练设置 | 初始化来源 | 是否软正交 | 是否 hard_pool |
+|---|---|---|---:|---:|
+| T0 | Sample4Geo + InfoNCE | DINOv3 pretrained | no | no |
+| T1 | Sample4Geo + InfoNCE | DINOv3 pretrained | yes | no |
+| T2 | T0 best -> identity | T0 `best_model.pth` | no | no |
+| T3 | T1 best -> identity | T1 `best_model.pth` | yes | no |
+| T4 | T2 best -> hard_pool | T2 `best_model.pth` | no | yes |
+| T5 | T3 best -> hard_pool | T3 `best_model.pth` | yes | yes |
+
+一句话口径：
+
+```text
+教师训练 = T0, T1, T2, T3, T4, T5
+总数 = 6
+```
+
+这样可以保证：
+
+- T0/T1 永远是独立保存的前 10 epoch Sample4Geo 最佳结果。
+- T2/T3 不受 Sample4Geo 后期降点影响，只从 Sample4Geo best 起步。
+- T4/T5 不受 identity 后期降点影响，只从 identity best 起步。
+- 无软正交和有软正交两条分支完全对齐，方便写论文消融。
+
+## 2. 代码开关
+
+教师训练新增/使用以下关键参数：
+
+| 参数 | 用途 |
+|---|---|
+| `--training_stage sample4geo` | 只训练 Sample4Geo + InfoNCE 阶段 |
+| `--training_stage identity` | 从 `--init_checkpoint` 直接进入 identity 训练 |
+| `--training_stage hard_pool` | 从 `--init_checkpoint` 直接进入 identity_hard 训练 |
+| `--init_checkpoint` | 加载上一阶段的 `best_model.pth` |
+| `--init_checkpoint_strict_trainable true` | 默认开启，要求 checkpoint 覆盖当前所有可训练参数 |
+| `--build_hard_pool_before_train` | hard_pool 阶段训练前先构建 hard_pool；`--training_stage hard_pool` 且没有 `--load_hard_pool_path` 时会自动开启 |
+
+等价关系：
+
+```text
+--training_stage identity
+= --enable_identity_stage --stage1_end_epoch 0
+
+--training_stage hard_pool
+= --enable_identity_stage --enable_hard_pool_stage --stage1_end_epoch 0 --stage2_end_epoch 0
+```
+
+重要一致性规则：
+
+- 无软正交分支后续阶段不要加 `--use_soft_orth_fusion`。
+- 有软正交分支后续阶段必须继续加同样的结构参数：
+
+```bash
+--use_soft_orth_fusion \
+--local_feature_layers 19,27,36 \
+--soft_orth_lambda_init 0.8 \
+--soft_orth_detach_global true
+```
+
+- 不建议在同一条分支中改变 LoRA block、full fine-tune block、local feature layers 或 soft orth 设置。
+- 如果确实要做结构消融，再使用 `--init_checkpoint_strict_trainable false`，并仔细检查日志中的 missing keys。
+
+## 3. 硬件分配
+
+硬件假设：
 
 - 8 x RTX 3090
-- Teacher training: 2 GPUs per run
-- Teacher training-time University-1652 validation: multi-card, same DeepSpeed process group as training
-- Teacher pure test: single-card
-- Teacher per-GPU PID batch size: 4
-- Student baseline / distillation: 1 GPU per run
-- Student training-time University-1652 validation: single-card
-- Student pure test: single-card
-- Dataset root examples use `data/U1652`, `data/GTA-UAV-LR/GTA-UAV-LR-baidu`, and `data/SUES-200/SUES-200-512x512`
+- 教师训练：2 张卡一个 run，单卡 `batch_size=4`
+- 教师训练阶段 University-1652 验证：多卡，跟随当前 DeepSpeed 训练进程
+- 教师纯测试：单卡
+- 学生训练、蒸馏、测试：单卡
 
-## 1. GPU Allocation
+推荐 GPU 组：
 
-Recommended GPU grouping for teacher experiments:
-
-| Run slot | GPUs | Usage |
+| Slot | GPUs | 用途 |
 |---|---:|---|
-| Slot A | `localhost:0,1` | teacher experiment 1 |
-| Slot B | `localhost:2,3` | teacher experiment 2 |
-| Slot C | `localhost:4,5` | teacher experiment 3 |
-| Slot D | `localhost:6,7` | teacher experiment 4 |
+| A | `localhost:0,1` | 无软正交分支 |
+| B | `localhost:2,3` | 有软正交分支 |
+| C | `localhost:4,5` | 等待依赖后用于 T4，或空闲 |
+| D | `localhost:6,7` | 等待依赖后用于 T5，或空闲 |
 
-If you want to train only one teacher at a time, use any one pair, for example:
+依赖关系决定训练顺序：
 
-```bash
-deepspeed --include localhost:6,7 src/training/teacher_train.py ...
-```
+1. T0/T1 可以并行。
+2. T2/T3 必须等 T0/T1 的 `best_model.pth` 产生后再启动。
+3. T4/T5 必须等 T2/T3 的 `best_model.pth` 产生后再启动。
 
-Student distillation is planned as single-GPU training. Example GPU choices:
+## 4. 教师 Stage 1：Sample4Geo 训练
 
-```bash
-CUDA_VISIBLE_DEVICES=0 python src/training/student_train.py ...
-```
+你已经完成了前两次实验并保存了 `best_model.pth`。下面命令用于复现实验。
 
-On Windows PowerShell:
-
-```powershell
-$env:CUDA_VISIBLE_DEVICES="0"
-python src/training/student_train.py ...
-```
-
-## 2. Teacher Experiments
-
-The teacher code currently supports the following switches:
-
-- Baseline: no local fusion, no soft orthogonal fusion.
-- Soft orthogonal fusion: `--use_soft_orth_fusion`.
-- Sample4Geo to identity curriculum: `--enable_identity_stage --stage1_end_epoch 10`.
-- Hard-pool curriculum: `--enable_identity_stage --enable_hard_pool_stage`.
-
-Important:
-
-- The default local feature layers in code are `19,27,36`.
-- `--use_soft_orth_fusion` automatically enables local fusion.
-- If neither `--use_local_fusion` nor `--use_soft_orth_fusion` is used, the teacher uses the final global feature only.
-- Best teacher checkpoint selection uses `D2S_R@1 + S2D_R@1`.
-- Teacher training-time validation schedule:
-  - epochs `1-5`: no validation;
-  - Sample4Geo stage from epoch `6`: validate every epoch;
-  - identity / hard-pool stages: validate every 5 epochs;
-  - last 10 epochs of each identity / hard-pool stage: validate every 2 epochs;
-  - final epoch: always validate.
-
-### 2.1 Teacher Baseline: Sample4Geo + InfoNCE
-
-Purpose:
-
-- Baseline teacher.
-- Data loading: Sample4Geo pair loading.
-- Loss: symmetric InfoNCE.
-- Retrieval feature: final global feature only.
+### 4.1 T0：无软正交 Sample4Geo baseline
 
 ```bash
 deepspeed --include localhost:0,1 src/training/teacher_train.py \
+  --training_stage sample4geo \
   --epochs 10 \
   --device cuda \
   --deepspeed_config ds_config.json \
@@ -87,16 +120,17 @@ deepspeed --include localhost:0,1 src/training/teacher_train.py \
   --infonce_weight 1.0
 ```
 
-### 2.2 Innovation 1: Soft Orthogonal Local Fusion
+记录：
 
-Purpose:
+```text
+src/checkpoint/teacher/<T0_sample4geo_no_soft_run>/best_model.pth
+```
 
-- Add local token branch.
-- Use soft orthogonal filtering before local-global fusion.
-- Default selected DINOv3 blocks: `19,27,36`.
+### 4.2 T1：有软正交 Sample4Geo
 
 ```bash
 deepspeed --include localhost:2,3 src/training/teacher_train.py \
+  --training_stage sample4geo \
   --epochs 10 \
   --device cuda \
   --deepspeed_config ds_config.json \
@@ -111,30 +145,28 @@ deepspeed --include localhost:2,3 src/training/teacher_train.py \
   --soft_orth_detach_global true
 ```
 
-This is the corrected form of the command. The local layers are not `5,10,15`; they are `19,27,36` unless you intentionally run an ablation.
+记录：
 
-### 2.3 Innovation 2: Sample4Geo then Identity-Level Contrastive Training
+```text
+src/checkpoint/teacher/<T1_sample4geo_soft_run>/best_model.pth
+```
 
-Purpose:
+## 5. 教师 Stage 2：加载 Sample4Geo Best 后训练 Identity
 
-- Stage 1: Sample4Geo + InfoNCE for 10 epochs.
-- Stage 2: identity-level data loading and identity-level contrastive losses.
-- No hard-pool yet.
+推荐训练长度：20 epoch。这样总训练量对应旧方案的 `10 + 20 = identity30`。
 
-Recommended total epochs: 30.
+### 5.1 T2：T0 best -> identity
 
 ```bash
-deepspeed --include localhost:4,5 src/training/teacher_train.py \
-  --epochs 30 \
+deepspeed --include localhost:0,1 src/training/teacher_train.py \
+  --training_stage identity \
+  --epochs 20 \
   --device cuda \
   --deepspeed_config ds_config.json \
   --data_dir data/U1652 \
   --batch_size 4 \
   --grad_accum_steps 1 \
-  --triplet_weight 0 \
-  --infonce_weight 1.0 \
-  --enable_identity_stage \
-  --stage1_end_epoch 10 \
+  --init_checkpoint src/checkpoint/teacher/<T0_sample4geo_no_soft_run>/best_model.pth \
   --identity_ids_per_batch 8 \
   --identity_drone_per_id 4 \
   --identity_sat_per_id 1 \
@@ -143,44 +175,68 @@ deepspeed --include localhost:4,5 src/training/teacher_train.py \
   --weak_sample4geo_weight 0.2
 ```
 
-If this experiment should also include soft orthogonal fusion, add:
+记录：
 
-```bash
---use_soft_orth_fusion \
---local_feature_layers 19,27,36 \
---soft_orth_lambda_init 0.8 \
---soft_orth_detach_global true
+```text
+src/checkpoint/teacher/<T2_identity_no_soft_run>/best_model.pth
 ```
 
-### 2.4 Innovation 3: Identity-Level Training with Hard Pool
-
-Purpose:
-
-- Stage 1: Sample4Geo + InfoNCE.
-- Stage 2: identity-level training.
-- Stage 3: identity-level hard-pool training.
-- Hard-pool is built from EMA teacher features.
-
-Recommended total epochs: 40.
+### 5.2 T3：T1 best -> identity
 
 ```bash
-deepspeed --include localhost:6,7 src/training/teacher_train.py \
-  --epochs 40 \
+deepspeed --include localhost:2,3 src/training/teacher_train.py \
+  --training_stage identity \
+  --epochs 20 \
   --device cuda \
   --deepspeed_config ds_config.json \
   --data_dir data/U1652 \
   --batch_size 4 \
   --grad_accum_steps 1 \
-  --triplet_weight 0 \
-  --infonce_weight 1.0 \
-  --enable_identity_stage \
-  --enable_hard_pool_stage \
-  --stage1_end_epoch 10 \
-  --stage2_end_epoch 30 \
-  --build_hard_pool_epoch 30 \
+  --init_checkpoint src/checkpoint/teacher/<T1_sample4geo_soft_run>/best_model.pth \
   --identity_ids_per_batch 8 \
   --identity_drone_per_id 4 \
   --identity_sat_per_id 1 \
+  --identity_loss_weight 1.0 \
+  --same_domain_triplet_weight 0.2 \
+  --weak_sample4geo_weight 0.2 \
+  --use_soft_orth_fusion \
+  --local_feature_layers 19,27,36 \
+  --soft_orth_lambda_init 0.8 \
+  --soft_orth_detach_global true
+```
+
+记录：
+
+```text
+src/checkpoint/teacher/<T3_identity_soft_run>/best_model.pth
+```
+
+## 6. 教师 Stage 3：加载 Identity Best 后训练 Hard Pool
+
+推荐训练长度：10 epoch。这样总训练量对应旧方案的 `10 + 20 + 10 = hardpool40`。
+
+`--training_stage hard_pool` 会让第 1 个 epoch 直接进入 `identity_hard`。如果没有传入 `--load_hard_pool_path`，代码会在训练前用当前初始化后的教师模型构建 hard_pool。
+
+### 6.1 T4：T2 best -> hard_pool
+
+```bash
+deepspeed --include localhost:4,5 src/training/teacher_train.py \
+  --training_stage hard_pool \
+  --epochs 10 \
+  --device cuda \
+  --deepspeed_config ds_config.json \
+  --data_dir data/U1652 \
+  --batch_size 4 \
+  --grad_accum_steps 1 \
+  --init_checkpoint src/checkpoint/teacher/<T2_identity_no_soft_run>/best_model.pth \
+  --build_hard_pool_epoch 0 \
+  --save_hard_pool_path outputs/hard_pool_T4_from_<T2_identity_no_soft_run>_epoch{epoch}.json \
+  --identity_ids_per_batch 8 \
+  --identity_drone_per_id 4 \
+  --identity_sat_per_id 1 \
+  --identity_loss_weight 1.0 \
+  --same_domain_triplet_weight 0.2 \
+  --weak_sample4geo_weight 0.2 \
   --hard_drone_per_id 2 \
   --random_drone_per_id 2 \
   --hard_pool_topk 12 \
@@ -188,43 +244,78 @@ deepspeed --include localhost:6,7 src/training/teacher_train.py \
   --use_ema_for_hard_pool true
 ```
 
-If this experiment should also include soft orthogonal fusion, add:
+记录：
 
-```bash
---use_soft_orth_fusion \
---local_feature_layers 19,27,36 \
---soft_orth_lambda_init 0.8 \
---soft_orth_detach_global true
+```text
+src/checkpoint/teacher/<T4_hardpool_no_soft_run>/best_model.pth
 ```
 
-## 3. Suggested Parallel Teacher Schedule
+### 6.2 T5：T3 best -> hard_pool
 
-If memory allows four concurrent teacher runs, use the four GPU slots:
+```bash
+deepspeed --include localhost:6,7 src/training/teacher_train.py \
+  --training_stage hard_pool \
+  --epochs 10 \
+  --device cuda \
+  --deepspeed_config ds_config.json \
+  --data_dir data/U1652 \
+  --batch_size 4 \
+  --grad_accum_steps 1 \
+  --init_checkpoint src/checkpoint/teacher/<T3_identity_soft_run>/best_model.pth \
+  --build_hard_pool_epoch 0 \
+  --save_hard_pool_path outputs/hard_pool_T5_from_<T3_identity_soft_run>_epoch{epoch}.json \
+  --identity_ids_per_batch 8 \
+  --identity_drone_per_id 4 \
+  --identity_sat_per_id 1 \
+  --identity_loss_weight 1.0 \
+  --same_domain_triplet_weight 0.2 \
+  --weak_sample4geo_weight 0.2 \
+  --hard_drone_per_id 2 \
+  --random_drone_per_id 2 \
+  --hard_pool_topk 12 \
+  --hard_pool_topneg_k 10 \
+  --use_ema_for_hard_pool true \
+  --use_soft_orth_fusion \
+  --local_feature_layers 19,27,36 \
+  --soft_orth_lambda_init 0.8 \
+  --soft_orth_detach_global true
+```
 
-| Experiment | GPUs | Epochs | Key switches |
-|---|---:|---:|---|
-| Teacher baseline | `0,1` | 10 | Sample4Geo + InfoNCE |
-| Soft orthogonal fusion | `2,3` | 10 | `--use_soft_orth_fusion` |
-| Identity curriculum | `4,5` | 30 | `--enable_identity_stage` |
-| Hard-pool curriculum | `6,7` | 40 | `--enable_identity_stage --enable_hard_pool_stage` |
+记录：
 
-If memory, CPU RAM, or disk I/O is tight, run only two teacher jobs at once:
+```text
+src/checkpoint/teacher/<T5_hardpool_soft_run>/best_model.pth
+```
 
-- First wave: baseline + soft orthogonal fusion.
-- Second wave: identity curriculum + hard-pool curriculum.
+## 7. 验证与最佳权重保存
 
-## 4. Student Baseline
+教师训练阶段：
 
-Purpose:
+- Sample4Geo 阶段：每个 epoch 都验证 University-1652。
+- Identity 阶段：每 5 个 epoch 验证一次；最后 10 个 epoch 每 2 个 epoch 验证一次；最后一个 epoch 必定验证。
+- Hard_pool 阶段：每 5 个 epoch 验证一次；最后 10 个 epoch 每 2 个 epoch 验证一次；最后一个 epoch 必定验证。
+- 训练阶段验证是多卡，跟随当前 DeepSpeed 进程。
 
-- Pure RepViT student baseline.
-- Data loading: Sample4Geo pair loading.
-- Loss: symmetric InfoNCE.
-- No teacher.
-- No distillation.
-- Best student checkpoint selection uses `D2S_R@1 + S2D_R@1`.
+最佳模型判断：
 
-Single GPU example:
+```text
+best = max(D2S_R@1 + S2D_R@1)
+```
+
+每个 run 都会保存：
+
+```text
+src/checkpoint/teacher/<run>/best_model.pth
+src/checkpoint/teacher/<run>/final_model.pth
+src/checkpoint/teacher/<run>/best_metrics.json
+src/checkpoint/teacher/<run>/hyperparameters.json
+```
+
+`best_metrics.json` 的第一部分是最佳结果，后面 `validation_history` 记录每一次验证。
+
+## 8. 非教师训练：学生模型 Baseline
+
+学生 baseline 是纯 RepViT，始终单卡训练和测试。
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python src/training/student_train.py \
@@ -240,7 +331,7 @@ CUDA_VISIBLE_DEVICES=0 python src/training/student_train.py \
   --label_smoothing 0.1
 ```
 
-PowerShell equivalent:
+PowerShell：
 
 ```powershell
 $env:CUDA_VISIBLE_DEVICES="0"
@@ -257,27 +348,9 @@ python src/training/student_train.py `
   --label_smoothing 0.1
 ```
 
-## 5. Student Boundary-Risk-Aware Distillation
+## 9. 非教师训练：边界风险感知蒸馏
 
-Purpose:
-
-- Student still uses Sample4Geo data loading.
-- Student still uses InfoNCE as the main loss.
-- Teacher is loaded online from:
-
-```text
-src/checkpoint/teacher/<teacher_run>/best_model.pth
-```
-
-- For each batch, teacher extracts drone/satellite features.
-- Teacher cross-view similarity identifies high-risk negatives near the positive ranking boundary.
-- Student is optimized with pairwise ranking:
-
-```text
-s_pos > s_neg + margin
-```
-
-Single GPU example:
+蒸馏建议使用最终教师 best，例如 T5 或你选择的最优教师 run。
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python src/training/student_train.py \
@@ -301,42 +374,17 @@ CUDA_VISIBLE_DEVICES=0 python src/training/student_train.py \
   --brd_temperature 0.07
 ```
 
-PowerShell equivalent:
+如果显存不够：
 
-```powershell
-$env:CUDA_VISIBLE_DEVICES="0"
-python src/training/student_train.py `
-  --epochs 60 `
-  --train_data_dir data/U1652/train `
-  --val_data_dir data/U1652 `
-  --batch_size 4 `
-  --val_batch_size 32 `
-  --num_workers 8 `
-  --lr 1e-4 `
-  --weight_decay 1e-4 `
-  --temperature 0.07 `
-  --label_smoothing 0.1 `
-  --use_brd_distill `
-  --teacher_checkpoint src/checkpoint/teacher/<teacher_run>/best_model.pth `
-  --brd_weight 1.0 `
-  --brd_topk 4 `
-  --brd_pair_margin 0.05 `
-  --brd_risk_margin 0.0 `
-  --brd_risk_tau 0.05 `
-  --brd_temperature 0.07
-```
+- 先把 student `--batch_size` 从 `4` 降到 `2`。
+- 再把 `--brd_topk` 从 `4` 降到 `2`。
+- 验证阶段可以单独降低 `--val_batch_size`。
 
-If online teacher distillation causes OOM on one 3090:
+## 10. 教师纯测试：不计入训练种类
 
-- reduce student `--batch_size` to `2`;
-- keep `--val_batch_size 32` or reduce it for evaluation;
-- reduce `--brd_topk` from `4` to `2`.
+教师纯测试是单卡，不使用 DeepSpeed。
 
-## 6. Teacher Evaluation
-
-Teacher pure evaluation is single-card. Do not launch these commands with DeepSpeed unless you intentionally want a separate distributed evaluation ablation.
-
-University-1652:
+University-1652：
 
 ```bash
 python src/training/teacher_test.py \
@@ -346,7 +394,7 @@ python src/training/teacher_test.py \
   --batch_size 32
 ```
 
-GTA-UAV:
+GTA-UAV：
 
 ```bash
 python src/training/teacher_test.py \
@@ -358,7 +406,7 @@ python src/training/teacher_test.py \
   --batch_size 32
 ```
 
-SUES-200:
+SUES-200：
 
 ```bash
 python src/training/teacher_test.py \
@@ -369,11 +417,11 @@ python src/training/teacher_test.py \
   --batch_size 32
 ```
 
-## 7. Student Evaluation
+## 11. 学生纯测试：不计入教师训练种类
 
-Student training and student pure evaluation are both single-card.
+学生纯测试也是单卡。
 
-University-1652:
+University-1652：
 
 ```bash
 python src/training/student_test.py \
@@ -383,7 +431,7 @@ python src/training/student_test.py \
   --batch_size 32
 ```
 
-GTA-UAV:
+GTA-UAV：
 
 ```bash
 python src/training/student_test.py \
@@ -395,7 +443,7 @@ python src/training/student_test.py \
   --batch_size 32
 ```
 
-SUES-200:
+SUES-200：
 
 ```bash
 python src/training/student_test.py \
@@ -406,24 +454,17 @@ python src/training/student_test.py \
   --batch_size 32
 ```
 
-## 8. Recommended Experiment Table
+## 12. 记录模板
 
-| ID | Model | Training | Fusion | Hard pool | Main comparison |
-|---|---|---|---|---|---|
-| T0 | Teacher | Sample4Geo + InfoNCE | none | no | teacher baseline |
-| T1 | Teacher | Sample4Geo + InfoNCE | soft orthogonal | no | innovation 1 |
-| T2 | Teacher | Sample4Geo then identity | optional | no | innovation 2 |
-| T3 | Teacher | Sample4Geo then identity_hard | optional | yes | innovation 3 |
-| S0 | Student | Sample4Geo + InfoNCE | none | no | student baseline |
-| S1 | Student | Sample4Geo + InfoNCE + BRD | teacher-guided | teacher hard negatives | distillation |
+建议每次训练完成后记录以下路径：
 
-## 9. Notes
+| ID | run name | best checkpoint | best metric json | 备注 |
+|---|---|---|---|---|
+| T0 |  | `src/checkpoint/teacher/<run>/best_model.pth` | `src/checkpoint/teacher/<run>/best_metrics.json` | no soft Sample4Geo |
+| T1 |  | `src/checkpoint/teacher/<run>/best_model.pth` | `src/checkpoint/teacher/<run>/best_metrics.json` | soft Sample4Geo |
+| T2 |  | `src/checkpoint/teacher/<run>/best_model.pth` | `src/checkpoint/teacher/<run>/best_metrics.json` | T0 -> identity |
+| T3 |  | `src/checkpoint/teacher/<run>/best_model.pth` | `src/checkpoint/teacher/<run>/best_metrics.json` | T1 -> identity |
+| T4 |  | `src/checkpoint/teacher/<run>/best_model.pth` | `src/checkpoint/teacher/<run>/best_metrics.json` | T2 -> hard_pool |
+| T5 |  | `src/checkpoint/teacher/<run>/best_model.pth` | `src/checkpoint/teacher/<run>/best_metrics.json` | T3 -> hard_pool |
 
-- Teacher checkpoints are saved under `src/checkpoint/teacher/<run>/`.
-- Student checkpoints are saved under `src/checkpoint/student/<run>/`.
-- Teacher `best_model.pth` stores EMA trainable weights.
-- Student `best_model.pth` stores the full student checkpoint dictionary.
-- Teacher and student training both write `best_metrics.json`.
-- In `best_metrics.json`, the first fields record the best result (`epoch`, `best_R@1_sum`, `D2S`, `S2D`), followed by `validation_history` for every validation.
-- For teacher evaluation, checkpoint hyperparameters are loaded automatically from `hyperparameters.json` unless `--no_checkpoint_hparams` is set.
-- For soft orthogonal fusion experiments, always keep the checkpoint's hyperparameters during evaluation, otherwise the model structure may not match the saved weights.
+论文中主消融可以按 `T0 -> T1 -> T3 -> T5` 展示软正交分支，也可以按 `T0 -> T2 -> T4` 展示无软正交分支；完整表格保留 T0-T5。
