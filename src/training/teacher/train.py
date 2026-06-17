@@ -11,6 +11,7 @@ import torch.nn.functional as F
 import torch.distributed as dist
 from datetime import datetime
 import gc
+import inspect
 import json
 import re
 from torch.utils.data import Dataset, DataLoader
@@ -33,6 +34,14 @@ from src.utils.teacher.scheduler import get_scheduler
 from src.utils.save_path import get_save_pth
 if 'OMP_NUM_THREADS' not in os.environ:
     os.environ['OMP_NUM_THREADS'] = '4'
+
+
+def safe_torch_load(path, map_location):
+    load_kwargs = {"map_location": map_location}
+    if "weights_only" in inspect.signature(torch.load).parameters:
+        load_kwargs["weights_only"] = True
+    return torch.load(path, **load_kwargs)
+
 
 class LiteEMA:
     def __init__(self, model, decay=0.999):
@@ -143,7 +152,7 @@ def load_teacher_init_checkpoint(model, checkpoint_path, device, strict_trainabl
     if not os.path.isfile(checkpoint_path):
         raise FileNotFoundError(f"init checkpoint not found: {checkpoint_path}")
 
-    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    checkpoint = safe_torch_load(checkpoint_path, map_location="cpu")
     state_dict = checkpoint.get("state_dict", checkpoint.get("model", checkpoint))
     model_state = model.state_dict()
     mapped_state = {}

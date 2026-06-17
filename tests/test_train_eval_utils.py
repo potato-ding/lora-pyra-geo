@@ -41,6 +41,20 @@ class IdentityModel(torch.nn.Module):
         return x * self.scale
 
 
+class TeacherLikeDtypeModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.logit_scale = torch.nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
+        self.backbone = torch.nn.Linear(2, 2).to(dtype=torch.bfloat16)
+        self.seen_dtype = None
+
+    def forward(self, x):
+        self.seen_dtype = x.dtype
+        if x.dtype != self.backbone.weight.dtype:
+            raise RuntimeError(f"input dtype {x.dtype} != backbone dtype {self.backbone.weight.dtype}")
+        return x.float()
+
+
 class FakeDist:
     class ReduceOp:
         SUM = "sum"
@@ -88,6 +102,19 @@ class ExtractFeaturesDistTest(unittest.TestCase):
         self.assertEqual(feature_gather_shapes, [(2, 2), (2, 2), (2, 2)])
         self.assertNotIn((6, 2), feature_gather_shapes)
         self.assertEqual(feats.shape, (6, 2))
+        self.assertTrue(torch.equal(labels.cpu(), torch.arange(6)))
+
+    def test_uses_backbone_dtype_for_teacher_like_model(self):
+        model = TeacherLikeDtypeModel()
+        loader = DataLoader(TinyIndexedDataset(), batch_size=2, shuffle=False)
+        feats, labels, _ = train_eval_utils.extract_features_dist(
+            model,
+            loader,
+            torch.device("cpu"),
+        )
+
+        self.assertEqual(model.seen_dtype, torch.bfloat16)
+        self.assertEqual(feats.dtype, torch.float32)
         self.assertTrue(torch.equal(labels.cpu(), torch.arange(6)))
 
     def test_preserves_coords_when_index_deduplicates_distributed_padding(self):

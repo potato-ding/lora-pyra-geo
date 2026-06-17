@@ -20,6 +20,25 @@ def _gather_tensor_same_shape(tensor):
     return torch.cat(gathered, dim=0)
 
 
+def _first_floating_param_dtype(module):
+    for param in module.parameters():
+        if param.is_floating_point():
+            return param.dtype
+    return None
+
+
+def _model_input_dtype(model):
+    base_model = model.module if hasattr(model, "module") else model
+    backbone = getattr(base_model, "backbone", None)
+    if backbone is not None:
+        backbone_dtype = _first_floating_param_dtype(backbone)
+        if backbone_dtype is not None:
+            return backbone_dtype
+
+    model_dtype = _first_floating_param_dtype(base_model)
+    return model_dtype if model_dtype is not None else torch.float32
+
+
 @torch.no_grad()
 def extract_features_dist(model, dataloader, device, stage_name=None, horizontal_flip=False):
     model.eval()
@@ -36,9 +55,10 @@ def extract_features_dist(model, dataloader, device, stage_name=None, horizontal
             flush=True,
         )
 
+    input_dtype = _model_input_dtype(model)
     for batch_idx, batch_data in enumerate(dataloader, start=1):
         # 1. 动态对齐精度，防止 FP32 和 FP16/BF16 冲突报错
-        imgs = batch_data[0].to(device).to(next(model.parameters()).dtype)
+        imgs = batch_data[0].to(device=device, dtype=input_dtype)
         labels = batch_data[1].to(device)
 
         if horizontal_flip:

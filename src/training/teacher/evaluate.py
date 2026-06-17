@@ -1,5 +1,6 @@
 # Teacher evaluation script for the current DINOv3 teacher model.
 import argparse
+import inspect
 import json
 import os
 import re
@@ -40,6 +41,13 @@ MODEL_HPARAM_KEYS = {
 }
 
 SUPPORTED_DATASETS = ("1652", "GTA-UAV", "SUES-200")
+
+
+def safe_torch_load(path, map_location):
+    load_kwargs = {"map_location": map_location}
+    if "weights_only" in inspect.signature(torch.load).parameters:
+        load_kwargs["weights_only"] = True
+    return torch.load(path, **load_kwargs)
 
 
 def is_main_process():
@@ -127,7 +135,7 @@ def load_teacher_checkpoint(model, checkpoint_path, device):
     if not os.path.isfile(checkpoint_path):
         raise FileNotFoundError(f"checkpoint not found: {checkpoint_path}")
 
-    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    checkpoint = safe_torch_load(checkpoint_path, map_location="cpu")
     state_dict = checkpoint.get("state_dict", checkpoint.get("model", checkpoint))
     if not isinstance(state_dict, dict):
         raise RuntimeError(f"checkpoint payload is not a state dict: {checkpoint_path}")

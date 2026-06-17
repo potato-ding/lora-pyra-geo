@@ -2,7 +2,17 @@ import torch
 import torch.nn as nn
 from pathlib import Path
 import sys, os
+import inspect
 from torch.nn.attention import sdpa_kernel, SDPBackend
+
+
+def _safe_torch_load(path, map_location):
+	load_kwargs = {"map_location": map_location}
+	if "weights_only" in inspect.signature(torch.load).parameters:
+		load_kwargs["weights_only"] = True
+	return torch.load(path, **load_kwargs)
+
+
 class DINOv3Backbone(nn.Module):
 	"""
 	DINOv3-7B 主干网络加载与推理基类。
@@ -33,7 +43,7 @@ class DINOv3Backbone(nn.Module):
 		# 使用 pretrained=False，从本地权重加载
 		model = dinov3_vit7b16(pretrained=False)
 		print(f"Loading checkpoint from: {self.ckpt_path}")
-		checkpoint = torch.load(self.ckpt_path, map_location='cpu')
+		checkpoint = _safe_torch_load(self.ckpt_path, map_location='cpu')
 		# 扒出真正的权重字典
 		if 'model' in checkpoint:
 			state_dict = checkpoint['model']
