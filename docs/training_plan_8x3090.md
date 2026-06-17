@@ -155,6 +155,24 @@ src/checkpoint/teacher/<T1_sample4geo_soft_run>/best_model.pth
 
 推荐训练长度：20 epoch。这样总训练量对应旧方案的 `10 + 20 = identity30`。
 
+Identity 阶段的 batch 口径：
+
+- `--batch_size` 仍用于 DeepSpeed micro batch 配置，但 identity dataloader 的每卡 ID 数由 `--identity_ids_per_batch` 控制。
+- 每个 identity batch 会采样 `identity_ids_per_batch` 个 ID；每个 ID 再取 `identity_sat_per_id` 张 satellite 和 `identity_drone_per_id` 张 drone。
+- 每个 epoch 的 batch 数按 ID 数计算，而不是按 drone 图片总数计算：
+
+```text
+identity_batches_per_epoch = ceil(num_train_ids / (identity_ids_per_batch * world_size))
+```
+
+例如 University-1652 train 有 701 个 ID，2 卡训练且 `--identity_ids_per_batch 8` 时：
+
+```text
+ceil(701 / (8 * 2)) = 44
+```
+
+所以日志中出现 `batches=44` 是当前 identity sampler 的预期行为。如果希望同样 2 卡下约 88 个 batch，需要把 `--identity_ids_per_batch` 改成 `4`。
+
 ### 5.1 T2：T0 best -> identity
 
 ```bash
@@ -384,11 +402,22 @@ CUDA_VISIBLE_DEVICES=0 python src/training/student_train.py \
 
 教师纯测试是单卡，不使用 DeepSpeed。
 
+当前教师测试入口和保存路径规则：
+
+- 推荐入口是 `src/training/teacher_test.py`。
+- 旧入口 `src/training/test.py` 已作为兼容 wrapper 保留，会转发到同一套 teacher evaluator。
+- `--checkpoint` 可以传 run 目录、`best_model.pth` 或 `final_model.pth`。如果传 run 目录，会优先使用目录下的 `best_model.pth`，没有时再使用 `final_model.pth`。
+- 测试脚本会自动读取 checkpoint 同目录下的 `hyperparameters.json`，恢复 LoRA、full fine-tune、local fusion、soft orth 等模型结构参数。除非明确做结构消融，不要加 `--no_checkpoint_hparams`。
+- checkpoint 加载会检查 trainable 参数覆盖情况和 shape mismatch；如果报 missing/incompatible，优先检查测试参数是否和训练 run 的 `hyperparameters.json` 一致。
+- 默认结果写到 checkpoint 所在目录的 `teacher_test_results.json`；也可以用 `--output_json` 指定路径，输出目录会自动创建。
+- GTA-UAV 测试支持 `--gta_query_mode both`，会同时评估 D2S 和 S2D；satellite tile 坐标按 `zoom_offset_x_y` 文件名解析，当前常量为 `GTA_SATE_LENGTH=24576`、`GTA_TILE_LENGTH=512`。
+- SUES-200 默认 `--sues_height all`，会评估 `150/200/250/300` 四个高度；query/gallery 类别映射会在 dataloader 构建时显式校验。水平翻转 TTA 默认关闭，只在传 `--sues_horizontal_flip` 时启用。
+
 University-1652：
 
 ```bash
 python src/training/teacher_test.py \
-  --checkpoint src/checkpoint/teacher/<teacher_run>/best_model.pth \
+  --checkpoint src/checkpoint/teacher/<teacher_run> \
   --dataset 1652 \
   --data_dir data/U1652 \
   --batch_size 32
@@ -398,7 +427,7 @@ GTA-UAV：
 
 ```bash
 python src/training/teacher_test.py \
-  --checkpoint src/checkpoint/teacher/<teacher_run>/best_model.pth \
+  --checkpoint src/checkpoint/teacher/<teacher_run> \
   --dataset GTA-UAV \
   --data_dir data/GTA-UAV-LR/GTA-UAV-LR-baidu \
   --gta_split cross-area \
@@ -410,7 +439,7 @@ SUES-200：
 
 ```bash
 python src/training/teacher_test.py \
-  --checkpoint src/checkpoint/teacher/<teacher_run>/best_model.pth \
+  --checkpoint src/checkpoint/teacher/<teacher_run> \
   --dataset SUES-200 \
   --data_dir data/SUES-200/SUES-200-512x512 \
   --sues_height all \

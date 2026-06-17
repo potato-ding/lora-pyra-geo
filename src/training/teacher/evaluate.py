@@ -75,6 +75,20 @@ def default_dataset_dir(dataset, data_root):
     return os.path.join(data_root, defaults[dataset])
 
 
+def resolve_checkpoint_path(checkpoint):
+    checkpoint_path = Path(checkpoint)
+    if checkpoint_path.is_dir():
+        for filename in ("best_model.pth", "final_model.pth"):
+            candidate = checkpoint_path / filename
+            if candidate.is_file():
+                return str(candidate)
+        raise FileNotFoundError(
+            f"checkpoint directory does not contain best_model.pth or final_model.pth: "
+            f"{checkpoint_path}"
+        )
+    return str(checkpoint_path)
+
+
 def load_checkpoint_hparams(args, parser_defaults, cli_args):
     if args.no_checkpoint_hparams:
         return
@@ -115,9 +129,13 @@ def load_teacher_checkpoint(model, checkpoint_path, device):
 
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
     state_dict = checkpoint.get("state_dict", checkpoint.get("model", checkpoint))
+    if not isinstance(state_dict, dict):
+        raise RuntimeError(f"checkpoint payload is not a state dict: {checkpoint_path}")
+
     model_state = model.state_dict()
     mapped_state = {}
     unexpected = []
+    incompatible = []
 
     for raw_key, value in state_dict.items():
         key = _strip_module_prefix(raw_key)
@@ -126,12 +144,17 @@ def load_teacher_checkpoint(model, checkpoint_path, device):
             if wrapped_key in model_state:
                 key = wrapped_key
 
-        if key in model_state:
-            mapped_state[key] = value
-        else:
+        if key not in model_state:
             unexpected.append(raw_key)
+            continue
 
-    missing, incompatible = model.load_state_dict(mapped_state, strict=False)
+        if tuple(model_state[key].shape) != tuple(value.shape):
+            incompatible.append((raw_key, tuple(value.shape), tuple(model_state[key].shape)))
+            continue
+
+        mapped_state[key] = value
+
+    missing, load_unexpected = model.load_state_dict(mapped_state, strict=False)
     model.to(device)
 
     trainable_keys = {name for name, param in model.named_parameters() if param.requires_grad}
@@ -143,19 +166,24 @@ def load_teacher_checkpoint(model, checkpoint_path, device):
         print(
             f"[Checkpoint] matched={len(mapped_state)} | "
             f"trainable_matched={len(loaded_trainable)}/{len(trainable_keys)} | "
-            f"unexpected={len(unexpected)} | missing_total={len(missing)}"
+            f"unexpected={len(unexpected) + len(load_unexpected)} | "
+            f"incompatible={len(incompatible)} | missing_total={len(missing)}"
         )
         if missing_trainable:
             print(f"[Checkpoint][WARN] missing trainable keys examples: {missing_trainable[:5]}")
         if unexpected:
             print(f"[Checkpoint][WARN] unexpected checkpoint keys examples: {unexpected[:5]}")
+        if load_unexpected:
+            print(f"[Checkpoint][WARN] load unexpected keys examples: {load_unexpected[:5]}")
         if incompatible:
-            print(f"[Checkpoint][WARN] incompatible keys: {incompatible}")
+            print(f"[Checkpoint][WARN] incompatible shape examples: {incompatible[:3]}")
 
-    if missing_trainable:
+    if missing_trainable or incompatible:
         raise RuntimeError(
             f"checkpoint did not cover all trainable teacher parameters; "
-            f"missing {len(missing_trainable)} keys"
+            f"missing={len(missing_trainable)}, incompatible={len(incompatible)}. "
+            "Check that the evaluation hyperparameters match the training run, "
+            "or keep hyperparameters.json next to the checkpoint."
         )
 
 
@@ -303,6 +331,7 @@ def write_results(args, results):
     if args.dataset == "SUES-200":
         payload["sues_height"] = args.sues_height
         payload["sues_horizontal_flip"] = args.sues_horizontal_flip
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, ensure_ascii=False)
     print(f"[Result] wrote {output_path}")
@@ -314,7 +343,7 @@ def parse_args():
         "--checkpoint",
         type=str,
         default="src/checkpoint/teacher/2026-06-12_01-20/best_model.pth",
-        help="Path to best_model.pth or final_model.pth.",
+        help="Path to a run directory, best_model.pth, or final_model.pth.",
     )
     parser.add_argument(
         "--dataset",
@@ -355,6 +384,7 @@ def parse_args():
 
     defaults = {action.dest: action.default for action in parser._actions}
     args = parser.parse_args()
+    args.checkpoint = resolve_checkpoint_path(args.checkpoint)
     load_checkpoint_hparams(args, defaults, sys.argv[1:])
     return args
 

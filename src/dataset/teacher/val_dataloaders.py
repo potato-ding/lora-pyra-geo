@@ -12,6 +12,10 @@ from torch.utils.data.distributed import DistributedSampler
 from torchvision import transforms
 from torchvision.datasets import ImageFolder
 
+GTA_SATE_LENGTH = 24576
+GTA_TILE_LENGTH = 512
+
+
 class IndexedDataset(Dataset):
     def __init__(self, dataset):
         self.dataset = dataset
@@ -182,6 +186,15 @@ def build_sues200_val_dataloaders(
             drop_last=False,
         )
 
+    def ensure_query_classes_in_gallery(query_classes, gallery_class_to_idx, context):
+        missing = [cls for cls in query_classes if cls not in gallery_class_to_idx]
+        if missing:
+            examples = ", ".join(missing[:5])
+            raise ValueError(
+                f"SUES-200 {context} has query classes missing from gallery: "
+                f"{examples} (total={len(missing)})"
+            )
+
     for h in heights:
         current_height_dir = os.path.join(testing_dir, h)
         if not os.path.isdir(current_height_dir):
@@ -191,12 +204,14 @@ def build_sues200_val_dataloaders(
         val_g_sat_ds = ImageFolder(os.path.join(current_height_dir, "gallery_satellite"), transform=val_transform)
         q_drone_classes = val_q_drone_ds.classes
         g_sat_class_to_idx = val_g_sat_ds.class_to_idx
+        ensure_query_classes_in_gallery(q_drone_classes, g_sat_class_to_idx, f"{h}m D2S")
         val_q_drone_ds.target_transform = lambda old_label, classes=q_drone_classes, class_to_idx=g_sat_class_to_idx: class_to_idx[classes[old_label]]
 
         val_q_sat_ds = ImageFolder(os.path.join(current_height_dir, "query_satellite"), transform=val_transform)
         val_g_drone_ds = ImageFolder(os.path.join(current_height_dir, "gallery_drone"), transform=val_transform)
         q_sat_classes = val_q_sat_ds.classes
         g_drone_class_to_idx = val_g_drone_ds.class_to_idx
+        ensure_query_classes_in_gallery(q_sat_classes, g_drone_class_to_idx, f"{h}m S2D")
         val_q_sat_ds.target_transform = lambda old_label, classes=q_sat_classes, class_to_idx=g_drone_class_to_idx: class_to_idx[classes[old_label]]
 
         loaders_by_height[f"{h}m"] = {
@@ -222,12 +237,15 @@ def get_gta_sate_paths(satellite_dir):
         for file in files:
             if file.lower().endswith((".png", ".jpg", ".jpeg")):
                 paths.append(os.path.join(root, file))
-    return paths
+    return sorted(paths)
 
 
 def gta_sate_center_from_path(path):
     name = os.path.splitext(os.path.basename(path))[0]
-    tile_zoom, offset, tile_x, tile_y = name.split("_")
+    parts = name.split("_")
+    if len(parts) != 4:
+        raise ValueError(f"Unexpected GTA-UAV satellite tile filename: {os.path.basename(path)}")
+    tile_zoom, offset, tile_x, tile_y = parts
     loc_center_x, loc_center_y, _, _ = gta_sate2loc(
         int(tile_zoom),
         int(offset),
@@ -286,6 +304,8 @@ def build_gta_val_dataloaders(
         json_data = json.load(f)
 
     all_sate_paths = get_gta_sate_paths(satellite_dir)
+    if not all_sate_paths:
+        raise RuntimeError(f"GTA-UAV satellite gallery is empty: {satellite_dir}")
     sate_name_to_id = {os.path.basename(path): idx for idx, path in enumerate(all_sate_paths)}
     sate_labels = list(range(len(all_sate_paths)))
     sate_coords = [gta_sate_center_from_path(path) for path in all_sate_paths]
