@@ -52,6 +52,20 @@ def default_dataset_dir(dataset, data_root):
     return os.path.join(data_root, defaults[dataset])
 
 
+def resolve_checkpoint_path(checkpoint):
+    checkpoint_path = Path(checkpoint)
+    if checkpoint_path.is_dir():
+        for filename in ("best_model.pth", "last_model.pth"):
+            candidate = checkpoint_path / filename
+            if candidate.is_file():
+                return str(candidate)
+        raise FileNotFoundError(
+            f"checkpoint directory does not contain best_model.pth or last_model.pth: "
+            f"{checkpoint_path}"
+        )
+    return str(checkpoint_path)
+
+
 def build_loaders_for_dataset(dataset, args):
     img_size = [args.img_size, args.img_size]
     data_dir = args.data_dir or default_dataset_dir(dataset, args.data_root)
@@ -173,12 +187,17 @@ def write_results(args, results):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate a trained RepViT student checkpoint.")
-    parser.add_argument("--checkpoint", type=str, required=True, help="Path to student best_model.pth or last_model.pth.")
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        required=True,
+        help="Path to a student run directory, best_model.pth, or last_model.pth.",
+    )
     parser.add_argument("--dataset", type=str, default="1652", choices=SUPPORTED_DATASETS)
     parser.add_argument("--data_root", type=str, default="data")
     parser.add_argument("--data_dir", type=str, default=None, help="Override data dir for selected dataset.")
     parser.add_argument("--gta_split", type=str, default="cross-area", choices=["cross-area", "same-area"])
-    parser.add_argument("--gta_query_mode", type=str, default="both", choices=["D2S", "S2D", "both"])
+    parser.add_argument("--gta_query_mode", type=str, default="D2S", choices=["D2S", "S2D", "both"])
     parser.add_argument("--sues_height", type=str, default="all", choices=["150", "200", "250", "300", "all"])
     parser.add_argument("--sues_horizontal_flip", action="store_true", help="Enable optional horizontal-flip test-time augmentation for SUES-200.")
     parser.add_argument("--device", type=str, default="cuda")
@@ -190,7 +209,9 @@ def parse_args():
     parser.add_argument("--strict", dest="strict", action="store_true", default=True)
     parser.add_argument("--no_strict", dest="strict", action="store_false")
     parser.add_argument("--local_rank", type=int, default=0)
-    return parser.parse_args()
+    args = parser.parse_args()
+    args.checkpoint = resolve_checkpoint_path(args.checkpoint)
+    return args
 
 
 def main():

@@ -456,16 +456,12 @@ def run_gta_val_and_get_metrics(model, val_query_loader, val_gallery_loader, dev
     g_l_device = g_l.to(device)
     g_c_device = g_c.to(device)
 
-    top1_percent_k = min(max(1, math.ceil(real_num_gallery * 0.01)), real_num_gallery)
-
     local_correct_1 = torch.tensor(0.0, device=device)
     local_correct_5 = torch.tensor(0.0, device=device)
-    local_correct_10 = torch.tensor(0.0, device=device)
-    local_correct_top1 = torch.tensor(0.0, device=device)
     local_ap_sum = torch.tensor(0.0, device=device)
 
-    local_sdm_sums = {1: torch.tensor(0.0, device=device), 3: torch.tensor(0.0, device=device), 5: torch.tensor(0.0, device=device)}
-    local_dis_sums = {1: torch.tensor(0.0, device=device), 3: torch.tensor(0.0, device=device), 5: torch.tensor(0.0, device=device)}
+    local_sdm3_sum = torch.tensor(0.0, device=device)
+    local_dis1_sum = torch.tensor(0.0, device=device)
 
     if local_num_queries > 0:
         chunk_size = 1000
@@ -485,8 +481,6 @@ def run_gta_val_and_get_metrics(model, val_query_loader, val_gallery_loader, dev
 
             local_correct_1 += matches[:, :1].any(dim=1).float().sum()
             local_correct_5 += matches[:, :5].any(dim=1).float().sum()
-            local_correct_10 += matches[:, :10].any(dim=1).float().sum()
-            local_correct_top1 += matches[:, :top1_percent_k].any(dim=1).float().sum()
 
             cum_matches = torch.cumsum(matches, dim=1)
             ranks = torch.arange(1, real_num_gallery + 1, device=device).float().unsqueeze(0)
@@ -495,26 +489,28 @@ def run_gta_val_and_get_metrics(model, val_query_loader, val_gallery_loader, dev
             ap_per_query = (precisions * matches).sum(dim=1) / (total_true_matches + 1e-12)
             local_ap_sum += ap_per_query.sum()
 
-            top5_indices = sorted_indices[:, :5]
-            pred_coords_top5 = g_c_device[top5_indices]
-            distances_top5 = torch.sqrt(torch.sum((q_c_chunk.unsqueeze(1) - pred_coords_top5) ** 2, dim=2))
+            top3_indices = sorted_indices[:, :3]
+            pred_coords_top3 = g_c_device[top3_indices]
+            distances_top3 = torch.sqrt(torch.sum((q_c_chunk.unsqueeze(1) - pred_coords_top3) ** 2, dim=2))
 
-            for k in (1, 3, 5):
-                distances_topk = distances_top5[:, :k]
-                local_dis_sums[k] += distances_topk.mean(dim=1).sum()
+            local_dis1_sum += distances_top3[:, 0].sum()
 
-                weights = torch.arange(k, 0, -1, device=device, dtype=distances_topk.dtype).unsqueeze(0)
-                sdm_scores = weights / torch.exp(0.001 * distances_topk)
-                local_sdm_sums[k] += (sdm_scores.sum(dim=1) / weights.sum()).sum()
+            weights = torch.arange(
+                distances_top3.size(1),
+                0,
+                -1,
+                device=device,
+                dtype=distances_top3.dtype,
+            ).unsqueeze(0)
+            sdm_scores = weights * torch.exp(-0.001 * distances_top3)
+            local_sdm3_sum += (sdm_scores.sum(dim=1) / weights.sum()).sum()
 
     tensors_to_reduce = [
         local_correct_1,
         local_correct_5,
-        local_correct_10,
-        local_correct_top1,
         local_ap_sum,
-        *local_sdm_sums.values(),
-        *local_dis_sums.values(),
+        local_sdm3_sum,
+        local_dis1_sum,
     ]
     if dist.is_initialized():
         for tensor in tensors_to_reduce:
@@ -523,15 +519,9 @@ def run_gta_val_and_get_metrics(model, val_query_loader, val_gallery_loader, dev
     return {
         "R@1": local_correct_1.item() / real_num_queries * 100,
         "R@5": local_correct_5.item() / real_num_queries * 100,
-        "R@10": local_correct_10.item() / real_num_queries * 100,
-        "R@top1": local_correct_top1.item() / real_num_queries * 100,
         "AP": local_ap_sum.item() / real_num_queries * 100,
-        "SDM@1": local_sdm_sums[1].item() / real_num_queries,
-        "SDM@3": local_sdm_sums[3].item() / real_num_queries,
-        "SDM@5": local_sdm_sums[5].item() / real_num_queries,
-        "Dis@1": local_dis_sums[1].item() / real_num_queries,
-        "Dis@3": local_dis_sums[3].item() / real_num_queries,
-        "Dis@5": local_dis_sums[5].item() / real_num_queries,
+        "SDM@3": local_sdm3_sum.item() / real_num_queries * 100,
+        "DIS@1": local_dis1_sum.item() / real_num_queries,
     }
 
 

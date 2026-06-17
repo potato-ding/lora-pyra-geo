@@ -363,7 +363,7 @@ def parse_args():
     parser.add_argument("--data_root", type=str, default="data", help="Root containing U1652, GTA-UAV, and SUES-200 data.")
     parser.add_argument("--data_dir", type=str, default=None, help="Override data dir for the selected dataset.")
     parser.add_argument("--gta_split", type=str, default="cross-area", choices=["cross-area", "same-area"])
-    parser.add_argument("--gta_query_mode", type=str, default="both", choices=["D2S", "S2D", "both"])
+    parser.add_argument("--gta_query_mode", type=str, default="D2S", choices=["D2S", "S2D", "both"])
     parser.add_argument("--sues_height", type=str, default="all", choices=["150", "200", "250", "300", "all"])
     parser.add_argument("--sues_horizontal_flip", action="store_true", help="Enable optional horizontal-flip test-time augmentation for SUES-200.")
     parser.add_argument("--device", type=str, default="cuda")

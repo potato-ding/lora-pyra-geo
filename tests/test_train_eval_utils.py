@@ -32,6 +32,19 @@ class TinyCoordIndexedDataset(Dataset):
         return x, idx, coord, idx
 
 
+class TinyGtaDataset(Dataset):
+    def __init__(self, features, labels, coords):
+        self.features = features
+        self.labels = labels
+        self.coords = coords
+
+    def __len__(self):
+        return len(self.features)
+
+    def __getitem__(self, idx):
+        return self.features[idx], self.labels[idx], self.coords[idx], idx
+
+
 class IdentityModel(torch.nn.Module):
     def __init__(self):
         super().__init__()
@@ -155,6 +168,47 @@ class ExtractFeaturesDistTest(unittest.TestCase):
         self.assertEqual(r5, 100.0)
         self.assertEqual(r10, 100.0)
         self.assertEqual(mean_ap, 100.0)
+
+    def test_gta_metrics_use_paper_subset_and_percentage_sdm(self):
+        query_features = torch.tensor([[1.0, 0.0], [0.0, 1.0]], dtype=torch.float32)
+        query_labels = torch.tensor([[0], [2]], dtype=torch.long)
+        query_coords = torch.tensor([[0.0, 0.0], [10.0, 0.0]], dtype=torch.float32)
+
+        gallery_features = torch.tensor(
+            [[1.0, 0.0], [0.9, 0.1], [0.0, 1.0]],
+            dtype=torch.float32,
+        )
+        gallery_labels = torch.tensor([0, 1, 2], dtype=torch.long)
+        gallery_coords = torch.tensor(
+            [[0.0, 0.0], [3.0, 4.0], [10.0, 0.0]],
+            dtype=torch.float32,
+        )
+
+        query_loader = DataLoader(
+            TinyGtaDataset(query_features, query_labels, query_coords),
+            batch_size=2,
+            shuffle=False,
+        )
+        gallery_loader = DataLoader(
+            TinyGtaDataset(gallery_features, gallery_labels, gallery_coords),
+            batch_size=3,
+            shuffle=False,
+        )
+
+        metrics = train_eval_utils.run_gta_val_and_get_metrics(
+            IdentityModel(),
+            query_loader,
+            gallery_loader,
+            torch.device("cpu"),
+        )
+
+        self.assertEqual(set(metrics), {"R@1", "R@5", "AP", "SDM@3", "DIS@1"})
+        self.assertEqual(metrics["R@1"], 100.0)
+        self.assertEqual(metrics["R@5"], 100.0)
+        self.assertEqual(metrics["AP"], 100.0)
+        self.assertEqual(metrics["DIS@1"], 0.0)
+        self.assertGreater(metrics["SDM@3"], 1.0)
+        self.assertLessEqual(metrics["SDM@3"], 100.0)
 
 
 if __name__ == "__main__":

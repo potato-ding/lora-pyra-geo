@@ -407,12 +407,15 @@ CUDA_VISIBLE_DEVICES=0 python src/training/student_train.py \
 - 推荐入口是 `src/training/teacher_test.py`。
 - 旧入口 `src/training/test.py` 已作为兼容 wrapper 保留，会转发到同一套 teacher evaluator。
 - `--checkpoint` 可以传 run 目录、`best_model.pth` 或 `final_model.pth`。如果传 run 目录，会优先使用目录下的 `best_model.pth`，没有时再使用 `final_model.pth`。
+- 注意：教师训练当前保存的是 `best_model.pth` 和 `final_model.pth`，不是 `last_model.pth`；`last_model.pth` 是学生训练侧的保存命名。
 - 测试脚本会自动读取 checkpoint 同目录下的 `hyperparameters.json`，恢复 LoRA、full fine-tune、local fusion、soft orth 等模型结构参数。除非明确做结构消融，不要加 `--no_checkpoint_hparams`。
 - checkpoint 加载会检查 trainable 参数覆盖情况和 shape mismatch；如果报 missing/incompatible，优先检查测试参数是否和训练 run 的 `hyperparameters.json` 一致。
 - 教师测试特征提取会按实际 image backbone 的 dtype 转输入。当前 DINOv3 teacher backbone 在 CUDA 上是 `bfloat16`，即使模型里有 `float32` 的 `logit_scale`、fusion 或 LoRA 参数，输入图片也会转成 backbone dtype，避免 `Input type (float) and bias type (c10::BFloat16) should be the same`。
 - DINOv3 预训练权重、teacher 测试 checkpoint、teacher 续训 `--init_checkpoint` 都使用兼容式 `torch.load(weights_only=True)` 加载；正常情况下不会再打印 PyTorch 关于 `weights_only=False` 的长安全警告。
 - 默认结果写到 checkpoint 所在目录的 `teacher_test_results.json`；也可以用 `--output_json` 指定路径，输出目录会自动创建。
-- GTA-UAV 测试支持 `--gta_query_mode both`，会同时评估 D2S 和 S2D；satellite tile 坐标按 `zoom_offset_x_y` 文件名解析，当前常量为 `GTA_SATE_LENGTH=24576`、`GTA_TILE_LENGTH=512`。
+- GTA-UAV 按原论文默认只评估 D2S，即 drone query -> satellite gallery；`--gta_query_mode` 默认值为 `D2S`。不建议把 S2D 写入主结果，除非单独做额外消融。
+- GTA-UAV 只输出论文需要的 5 个指标：`R@1`、`R@5`、`AP`、`SDM@3`、`DIS@1`。其中 `R@1/R@5/AP/SDM@3` 都是百分制；例如论文中的 `SDM@3=54.07` 对应测试输出 `54.07`，不是 `0.5407`。`DIS@1` 是 top1 预测坐标与 query 坐标的欧氏距离，保持距离单位。
+- GTA-UAV satellite tile 坐标按 `zoom_offset_x_y` 文件名解析，当前常量为 `GTA_SATE_LENGTH=24576`、`GTA_TILE_LENGTH=512`。
 - SUES-200 默认 `--sues_height all`，会评估 `150/200/250/300` 四个高度；query/gallery 类别映射会在 dataloader 构建时显式校验。水平翻转 TTA 默认关闭，只在传 `--sues_horizontal_flip` 时启用。
 
 University-1652：
@@ -433,7 +436,7 @@ python src/training/teacher_test.py \
   --dataset GTA-UAV \
   --data_dir data/GTA-UAV-LR/GTA-UAV-LR-baidu \
   --gta_split cross-area \
-  --gta_query_mode both \
+  --gta_query_mode D2S \
   --batch_size 32
 ```
 
@@ -452,11 +455,18 @@ python src/training/teacher_test.py \
 
 学生纯测试也是单卡。
 
+当前学生测试入口和保存路径规则：
+
+- 推荐入口是 `src/training/student_test.py`。
+- 学生训练保存 `best_model.pth` 和 `last_model.pth`。
+- `--checkpoint` 可以传 student run 目录、`best_model.pth` 或 `last_model.pth`。如果传 run 目录，会优先使用目录下的 `best_model.pth`，没有时再使用 `last_model.pth`。
+- 默认结果写到 checkpoint 所在目录的 `student_test_results.json`；也可以用 `--output_json` 指定路径。
+
 University-1652：
 
 ```bash
 python src/training/student_test.py \
-  --checkpoint src/checkpoint/student/<student_run>/best_model.pth \
+  --checkpoint src/checkpoint/student/<student_run> \
   --dataset 1652 \
   --data_dir data/U1652 \
   --batch_size 32
@@ -466,11 +476,11 @@ GTA-UAV：
 
 ```bash
 python src/training/student_test.py \
-  --checkpoint src/checkpoint/student/<student_run>/best_model.pth \
+  --checkpoint src/checkpoint/student/<student_run> \
   --dataset GTA-UAV \
   --data_dir data/GTA-UAV-LR/GTA-UAV-LR-baidu \
   --gta_split cross-area \
-  --gta_query_mode both \
+  --gta_query_mode D2S \
   --batch_size 32
 ```
 
@@ -478,7 +488,7 @@ SUES-200：
 
 ```bash
 python src/training/student_test.py \
-  --checkpoint src/checkpoint/student/<student_run>/best_model.pth \
+  --checkpoint src/checkpoint/student/<student_run> \
   --dataset SUES-200 \
   --data_dir data/SUES-200/SUES-200-512x512 \
   --sues_height all \

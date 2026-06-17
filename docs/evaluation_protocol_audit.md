@@ -12,7 +12,7 @@ This note records how the current evaluation code handles University-1652, SUES-
 - Training-time validation and pure test use the same U1652 dataset builder and metric definition, but the execution mode differs for teacher training.
 - Best checkpoint selection for both teacher and student uses `D2S_R@1 + S2D_R@1`.
 - Teacher and student training both write `best_metrics.json` with the best result first and full validation history afterwards.
-- `GTA-UAV` defaults to bidirectional evaluation through `--gta_query_mode both`.
+- `GTA-UAV` defaults to paper-style D2S evaluation through `--gta_query_mode D2S`.
 - `SUES-200` evaluates all four heights by default through `--sues_height all`.
 - `SUES-200` horizontal-flip test-time augmentation is disabled by default. It can be enabled explicitly with `--sues_horizontal_flip`.
 
@@ -95,23 +95,17 @@ Implemented logic:
   - `D2S`
   - `S2D`
   - `both`
-- Default is `both` for teacher and student.
+- Default is `D2S` for teacher and student, matching the original GTA-UAV paper protocol.
 - D2S uses drone images as queries and all satellite tiles as gallery.
 - S2D uses satellite tiles with matched drone images as queries and drone images as gallery.
 - Positive satellite lists are read from `pair_pos_sate_img_list`.
-- Metrics:
+- Paper-default D2S metrics:
   - `R@1`
   - `R@5`
-  - `R@10`
-  - `R@top1`
   - `AP`
-  - `SDM@1`
   - `SDM@3`
-  - `SDM@5`
-  - `Dis@1`
-  - `Dis@3`
-  - `Dis@5`
-- `R@top1` uses `ceil(0.01 * gallery_size)`.
+- `DIS@1`
+- `R@1`, `R@5`, `AP`, and `SDM@3` are reported as percentages. `DIS@1` is the top-1 coordinate distance.
 - GTA coordinate metrics use the stored drone coordinates and satellite tile-derived coordinates.
 
 Important command:
@@ -122,7 +116,7 @@ python src/training/teacher_test.py \
   --dataset GTA-UAV \
   --data_dir data/GTA-UAV-LR/GTA-UAV-LR-baidu \
   --gta_split cross-area \
-  --gta_query_mode both \
+  --gta_query_mode D2S \
   --batch_size 32
 ```
 
@@ -134,7 +128,7 @@ python src/training/student_test.py \
   --dataset GTA-UAV \
   --data_dir data/GTA-UAV-LR/GTA-UAV-LR-baidu \
   --gta_split cross-area \
-  --gta_query_mode both \
+  --gta_query_mode D2S \
   --batch_size 32
 ```
 
