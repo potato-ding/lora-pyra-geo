@@ -418,6 +418,53 @@ CUDA_VISIBLE_DEVICES=0 python src/training/student_train.py \
 - GTA-UAV satellite tile 坐标按 `zoom_offset_x_y` 文件名解析，当前常量为 `GTA_SATE_LENGTH=24576`、`GTA_TILE_LENGTH=512`。
 - SUES-200 默认 `--sues_height all`，会评估 `150/200/250/300` 四个高度；query/gallery 类别映射会在 dataloader 构建时显式校验。水平翻转 TTA 默认关闭，只在传 `--sues_horizontal_flip` 时启用。
 
+### 10.1 教师 best_model / final_model 测试配置
+
+教师每个 run 目录下会同时保存：
+
+```text
+src/checkpoint/teacher/<teacher_run>/best_model.pth
+src/checkpoint/teacher/<teacher_run>/final_model.pth
+src/checkpoint/teacher/<teacher_run>/hyperparameters.json
+```
+
+两个权重的含义：
+
+| 权重 | 含义 | 推荐用途 |
+|---|---|---|
+| `best_model.pth` | 训练过程中按验证集最佳指标保存的权重 | 论文主结果、后续蒸馏、跨数据集测试默认用这个 |
+| `final_model.pth` | 最后一个 epoch 结束时保存的权重 | 只用于检查最后 epoch 是否退化或做对照，不作为默认主结果 |
+
+`--checkpoint` 有三种写法：
+
+| 写法 | 实际加载 |
+|---|---|
+| `--checkpoint src/checkpoint/teacher/<teacher_run>` | 自动优先加载 `best_model.pth`；如果没有 best，再加载 `final_model.pth` |
+| `--checkpoint src/checkpoint/teacher/<teacher_run>/best_model.pth` | 明确测试 best 权重 |
+| `--checkpoint src/checkpoint/teacher/<teacher_run>/final_model.pth` | 明确测试 final 权重 |
+
+如果要同时比较 best 和 final，不要共用默认输出名，否则后一次会覆盖同目录下的 `teacher_test_results.json`。建议显式指定不同的 `--output_json`：
+
+```bash
+# 测 best_model.pth
+python src/training/teacher_test.py \
+  --checkpoint src/checkpoint/teacher/<teacher_run>/best_model.pth \
+  --dataset 1652 \
+  --data_dir data/U1652 \
+  --batch_size 32 \
+  --output_json src/checkpoint/teacher/<teacher_run>/teacher_test_best_1652.json
+
+# 测 final_model.pth
+python src/training/teacher_test.py \
+  --checkpoint src/checkpoint/teacher/<teacher_run>/final_model.pth \
+  --dataset 1652 \
+  --data_dir data/U1652 \
+  --batch_size 32 \
+  --output_json src/checkpoint/teacher/<teacher_run>/teacher_test_final_1652.json
+```
+
+GTA-UAV 和 SUES-200 也用同样的 checkpoint 写法，只替换 `--dataset`、`--data_dir` 和对应数据集参数即可。
+
 University-1652：
 
 ```bash
