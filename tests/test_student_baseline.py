@@ -1,8 +1,12 @@
 import os
 import sys
+import json
 
+import pytest
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset
 
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -10,7 +14,14 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from src.models.student_model import StudentModel
-from src.training.student_train import compute_brd_loss, compute_local_align_loss
+import src.training.student_train as student_train
+from src.training.student_train import (
+    build_deepspeed_runtime_config,
+    compute_brd_loss,
+    compute_local_align_loss,
+    gather_paired_views,
+    train_one_epoch_deepspeed,
+)
 
 
 def test_student_baseline_forward_outputs_normalized_f4_embedding():
@@ -117,3 +128,145 @@ def test_brd_loss_is_ranking_level_and_backpropagates_to_student_only():
     assert raw_student_features.grad is not None
     assert teacher_features.grad is None
     assert set(stats) == {"loss_brd_d2s", "loss_brd_s2d", "brd_risk_d2s", "brd_risk_s2d"}
+
+
+def test_distributed_pair_gather_preserves_global_positive_diagonal(monkeypatch):
+    def fake_gather(tensor):
+        return torch.cat([tensor, tensor + 100.0], dim=0)
+
+    monkeypatch.setattr(student_train, "gather_tensor_with_grad", fake_gather)
+    local = torch.tensor([
+        [1.0], [2.0],
+        [11.0], [12.0],
+    ])
+
+    gathered, global_pair_batch = gather_paired_views(
+        local,
+        pair_batch_size=2,
+        with_grad=True,
+    )
+
+    assert global_pair_batch == 4
+    assert gathered.squeeze(1).tolist() == [
+        1.0, 2.0, 101.0, 102.0,
+        11.0, 12.0, 111.0, 112.0,
+    ]
+
+
+def test_deepspeed_runtime_config_uses_local_pair_batch(tmp_path):
+    config_path = tmp_path / "ds.json"
+    config_path.write_text(
+        json.dumps({
+            "train_batch_size": 1,
+            "train_micro_batch_size_per_gpu": 1,
+            "gradient_accumulation_steps": 1,
+        }),
+        encoding="utf-8",
+    )
+
+    class Args:
+        batch_size = 4
+        grad_accum_steps = 2
+        grad_clip = 1.5
+        amp = True
+
+    config = build_deepspeed_runtime_config(str(config_path), Args, world_size=3)
+    assert config["train_micro_batch_size_per_gpu"] == 4
+    assert config["gradient_accumulation_steps"] == 2
+    assert config["train_batch_size"] == 24
+    assert config["gradient_clipping"] == 1.5
+
+
+def test_deepspeed_runtime_config_respects_no_amp_and_rejects_zero3(tmp_path):
+    config_path = tmp_path / "ds.json"
+    config_path.write_text(
+        json.dumps({
+            "zero_optimization": {"stage": 2},
+            "bf16": {"enabled": True},
+            "fp16": {"enabled": False},
+        }),
+        encoding="utf-8",
+    )
+
+    class Args:
+        batch_size = 2
+        grad_accum_steps = 1
+        grad_clip = 0.0
+        amp = False
+
+    config = build_deepspeed_runtime_config(str(config_path), Args, world_size=2)
+    assert config["bf16"]["enabled"] is False
+    assert config["fp16"]["enabled"] is False
+
+    config_path.write_text(
+        json.dumps({"zero_optimization": {"stage": 3}}),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="ZeRO stages 0, 1, and 2"):
+        build_deepspeed_runtime_config(str(config_path), Args, world_size=2)
+
+
+def test_deepspeed_epoch_path_updates_student_without_changing_loss_definition():
+    class PairDataset(Dataset):
+        def __len__(self):
+            return 2
+
+        def __getitem__(self, idx):
+            drone = torch.tensor([[[float(idx + 1), 0.0]]])
+            satellite = torch.tensor([[[float(idx + 1), 0.5]]])
+            return drone, satellite, idx, f"{idx:04d}"
+
+    class TinyStudent(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = nn.Linear(2, 2, bias=False)
+            self.logit_scale = nn.Parameter(torch.tensor(0.0))
+
+        def forward(self, x):
+            return F.normalize(self.proj(x.float().flatten(1)), dim=1)
+
+    class FakeDeepSpeedEngine(nn.Module):
+        def __init__(self, module):
+            super().__init__()
+            self.module = module
+            self.optimizer = torch.optim.SGD(module.parameters(), lr=0.1)
+
+        def forward(self, x):
+            return self.module(x)
+
+        def backward(self, loss):
+            loss.backward()
+
+        def step(self):
+            self.optimizer.step()
+            self.optimizer.zero_grad(set_to_none=True)
+
+    class Args:
+        use_local_align = False
+        local_align_weight = 0.01
+        local_align_topk = 4
+        local_align_tau = 0.07
+        brd_weight = 1.0
+        print_freq = 100
+        epochs = 1
+
+    torch.manual_seed(5)
+    engine = FakeDeepSpeedEngine(TinyStudent())
+    before = engine.module.proj.weight.detach().clone()
+    loader = DataLoader(PairDataset(), batch_size=2, shuffle=False)
+    criterion = student_train.Sample4GeoLoss(label_smoothing=0.1)
+
+    stats = train_one_epoch_deepspeed(
+        engine,
+        loader,
+        criterion,
+        engine.optimizer,
+        torch.device("cpu"),
+        Args,
+        epoch=1,
+        teacher_model=None,
+    )
+
+    assert torch.isfinite(torch.tensor(stats["loss_total"]))
+    assert stats["loss_brd"] == 0.0
+    assert not torch.equal(before, engine.module.proj.weight.detach())

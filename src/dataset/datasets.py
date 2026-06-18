@@ -351,6 +351,7 @@ class U1652PairDataset(Dataset):
         self.prob_flip = prob_flip
         self.shuffle_batch_size = shuffle_batch_size
         self.pairs = []
+        self.pair_pids = []
         self.samples = []
         self._parse_dataset()
         self.samples = self.pairs[:]
@@ -385,6 +386,7 @@ class U1652PairDataset(Dataset):
 
             for drone_path in drone_paths:
                 self.pairs.append((pid, label, sat_paths[0], drone_path))
+                self.pair_pids.append(pid)
 
         if not self.pairs:
             raise RuntimeError(f"No valid drone/satellite pairs found under: {self.data_dir}")
@@ -466,6 +468,21 @@ def create_student_train_dataset_and_loader(args):
         prob_flip=prob_flip,
         shuffle_batch_size=args.batch_size,
     )
+
+    if dist.is_available() and dist.is_initialized():
+        train_sampler = Sample4GeoBatchSampler(
+            train_dataset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            seed=getattr(args, "seed", 0),
+        )
+        return DataLoader(
+            dataset=train_dataset,
+            batch_sampler=train_sampler,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+        )
+
     return DataLoader(
         dataset=train_dataset,
         batch_size=args.batch_size,

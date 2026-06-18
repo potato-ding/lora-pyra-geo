@@ -19,6 +19,7 @@ except ModuleNotFoundError:
     sys.modules.setdefault("src.dataset.transforms", fake_transforms)
 
 from src.dataset.datasets import Sample4GeoBatchSampler
+import src.dataset.teacher.datasets as teacher_datasets
 
 
 class FakeSample4GeoDataset:
@@ -53,6 +54,57 @@ class Sample4GeoBatchSamplerTest(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             Sample4GeoBatchSampler(dataset, batch_size=3)
+
+    def test_distributed_ranks_receive_disjoint_slices_of_pid_unique_global_batches(self):
+        class FakeDist:
+            def __init__(self, rank):
+                self.rank = rank
+
+            @staticmethod
+            def is_available():
+                return True
+
+            @staticmethod
+            def is_initialized():
+                return True
+
+            @staticmethod
+            def get_world_size():
+                return 2
+
+            def get_rank(self):
+                return self.rank
+
+        pair_pids = []
+        for pid in range(8):
+            pair_pids.extend([f"{pid:04d}"] * 2)
+        dataset = FakeSample4GeoDataset(pair_pids)
+
+        original_dist = teacher_datasets.dist
+        try:
+            teacher_datasets.dist = FakeDist(rank=0)
+            rank0_sampler = Sample4GeoBatchSampler(dataset, batch_size=2, seed=17)
+            rank0_sampler.set_epoch(3)
+            rank0_batches = list(rank0_sampler)
+
+            teacher_datasets.dist = FakeDist(rank=1)
+            rank1_sampler = Sample4GeoBatchSampler(dataset, batch_size=2, seed=17)
+            rank1_sampler.set_epoch(3)
+            rank1_batches = list(rank1_sampler)
+        finally:
+            teacher_datasets.dist = original_dist
+
+        self.assertEqual(len(rank0_batches), len(rank1_batches))
+        all_used_indices = []
+        for batch0, batch1 in zip(rank0_batches, rank1_batches):
+            global_batch = batch0 + batch1
+            global_pids = [dataset.pair_pids[idx] for idx in global_batch]
+            self.assertEqual(len(global_batch), 4)
+            self.assertEqual(len(global_pids), len(set(global_pids)))
+            self.assertTrue(set(batch0).isdisjoint(batch1))
+            all_used_indices.extend(global_batch)
+
+        self.assertEqual(len(all_used_indices), len(set(all_used_indices)))
 
 
 if __name__ == "__main__":

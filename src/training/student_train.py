@@ -11,11 +11,14 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch.amp import GradScaler, autocast
 
 from src.loss.blocks_infoNCE import Sample4GeoLoss
 from src.models.student_model import StudentModel
+from src.utils.gather_features_and_labels_and_views import GatherLayer, concat_all_gather
+from src.utils.initdist import try_init_dist
 from src.utils.optimizer_and_scale import build_student_optimizer
 from src.utils.save_path import get_student_save_pth
 from src.utils.scheduler import build_student_scheduler
@@ -23,6 +26,27 @@ from src.utils.train_eval_utils import getdist_1652_val_and_get_recall
 
 if "OMP_NUM_THREADS" not in os.environ:
     os.environ["OMP_NUM_THREADS"] = "4"
+
+
+def is_distributed():
+    return dist.is_available() and dist.is_initialized()
+
+
+def get_rank():
+    return dist.get_rank() if is_distributed() else 0
+
+
+def get_world_size():
+    return dist.get_world_size() if is_distributed() else 1
+
+
+def is_main_process():
+    return get_rank() == 0
+
+
+def distributed_barrier():
+    if is_distributed():
+        dist.barrier()
 
 
 class AverageMeter:
@@ -96,6 +120,48 @@ def sample4geo_loss(model, features, criterion, pair_batch_size):
     raw_model = get_raw_model(model)
     logit_scale = raw_model.logit_scale.exp()
     return criterion(drone_feat, satellite_feat, logit_scale)
+
+
+def gather_tensor_with_grad(tensor):
+    if not is_distributed():
+        return tensor
+    return torch.cat(GatherLayer.apply(tensor), dim=0)
+
+
+@torch.no_grad()
+def gather_tensor_without_grad(tensor):
+    if not is_distributed():
+        return tensor
+    return concat_all_gather(tensor)
+
+
+def gather_paired_views(tensor, pair_batch_size, with_grad):
+    """
+    Gather paired drone/satellite tensors while preserving Sample4Geo ordering.
+
+    Local tensors are laid out as [local_drone, local_satellite]. Gathering the
+    concatenated tensor directly would interleave ranks. Splitting first keeps
+    the global layout [all_drone, all_satellite], so diagonal entries remain
+    the positive pairs for InfoNCE and BRD.
+    """
+    if tensor.size(0) != pair_batch_size * 2:
+        raise ValueError(
+            f"Expected paired tensor first dimension {pair_batch_size * 2}, "
+            f"got {tensor.size(0)}"
+        )
+
+    local_drone = tensor[:pair_batch_size]
+    local_satellite = tensor[pair_batch_size:pair_batch_size * 2]
+    gather_fn = gather_tensor_with_grad if with_grad else gather_tensor_without_grad
+    global_drone = gather_fn(local_drone)
+    global_satellite = gather_fn(local_satellite)
+
+    if global_drone.size(0) != global_satellite.size(0):
+        raise RuntimeError(
+            "Distributed paired gather produced unequal view sizes: "
+            f"drone={global_drone.size(0)} satellite={global_satellite.size(0)}"
+        )
+    return torch.cat([global_drone, global_satellite], dim=0), global_drone.size(0)
 
 
 def compute_local_align_loss(fmap_drone, fmap_sat, topk=4, tau=0.07, return_debug=False):
@@ -252,6 +318,72 @@ def save_checkpoint(model, optimizer, scheduler, epoch, save_path):
         save_path,
     )
     print(f"[Checkpoint] saved to: {save_path}")
+
+
+def save_model_only_checkpoint(model, epoch, save_path):
+    if not is_main_process():
+        return
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    raw_model = get_raw_model(model)
+    state_dict = {
+        key: value.detach().cpu()
+        for key, value in raw_model.state_dict().items()
+    }
+    torch.save({"epoch": epoch, "model": state_dict}, save_path)
+    print(f"[Checkpoint] saved model weights to: {save_path}")
+
+
+def build_deepspeed_runtime_config(config_path, args, world_size):
+    with open(config_path, "r", encoding="utf-8") as f:
+        config = json.load(f)
+
+    micro_batch_size = int(args.batch_size)
+    grad_accum_steps = int(args.grad_accum_steps)
+    if micro_batch_size <= 0:
+        raise ValueError("--batch_size must be greater than 0")
+    if grad_accum_steps <= 0:
+        raise ValueError("--grad_accum_steps must be greater than 0")
+    if world_size <= 0:
+        raise ValueError("world_size must be greater than 0")
+
+    config["train_micro_batch_size_per_gpu"] = micro_batch_size
+    config["gradient_accumulation_steps"] = grad_accum_steps
+    config["train_batch_size"] = micro_batch_size * world_size * grad_accum_steps
+    if args.grad_clip > 0:
+        config["gradient_clipping"] = float(args.grad_clip)
+
+    if not args.amp:
+        config.setdefault("bf16", {})["enabled"] = False
+        config.setdefault("fp16", {})["enabled"] = False
+
+    zero_stage = int(config.get("zero_optimization", {}).get("stage", 0))
+    if zero_stage not in {0, 1, 2}:
+        raise ValueError(
+            "Student DeepSpeed training currently supports ZeRO stages 0, 1, and 2. "
+            f"Got stage={zero_stage}. ZeRO-3 partitions model parameters and requires "
+            "a different consolidated model export path."
+        )
+    return config
+
+
+def print_deepspeed_batch_config(config):
+    if not is_main_process():
+        return
+    local_pair_batch = int(config["train_micro_batch_size_per_gpu"])
+    world_size = get_world_size()
+    grad_accum_steps = int(config["gradient_accumulation_steps"])
+    global_pair_batch = local_pair_batch * world_size
+    effective_pair_batch = global_pair_batch * grad_accum_steps
+    print(
+        "[DeepSpeedBatch] "
+        f"local_pair_batch={local_pair_batch} | "
+        f"world_size={world_size} | "
+        f"global_pair_batch_per_step={global_pair_batch} | "
+        f"grad_accum_steps={grad_accum_steps} | "
+        f"effective_pair_batch={effective_pair_batch} | "
+        f"local_images={local_pair_batch * 2} | "
+        f"global_images_per_step={global_pair_batch * 2}"
+    )
 
 
 def write_training_record(args, status, best_epoch=None, best_metric=None, best_result=None, last_epoch=None, last_result=None):
@@ -423,6 +555,123 @@ def forward_teacher_online(teacher_model, images):
     return teacher_features
 
 
+def model_input_dtype(model):
+    raw_model = get_raw_model(model)
+    backbone = getattr(raw_model, "backbone", None)
+    if backbone is not None:
+        for param in backbone.parameters():
+            if param.is_floating_point():
+                return param.dtype
+    for param in raw_model.parameters():
+        if param.is_floating_point():
+            return param.dtype
+    return torch.float32
+
+
+def compute_student_batch_losses(
+    model,
+    images,
+    pair_batch_size,
+    criterion,
+    args,
+    teacher_features=None,
+    return_local_debug=False,
+):
+    if args.use_local_align:
+        local_features, local_fmap = model(images, return_fmap=True)
+        features, global_pair_batch_size = gather_paired_views(
+            local_features,
+            pair_batch_size,
+            with_grad=True,
+        )
+        fmap, fmap_pair_batch_size = gather_paired_views(
+            local_fmap,
+            pair_batch_size,
+            with_grad=True,
+        )
+        if fmap_pair_batch_size != global_pair_batch_size:
+            raise RuntimeError(
+                "Feature and feature-map gathers disagree on global pair batch size: "
+                f"features={global_pair_batch_size}, fmap={fmap_pair_batch_size}"
+            )
+
+        fmap_drone = fmap[:global_pair_batch_size]
+        fmap_sat = fmap[global_pair_batch_size:global_pair_batch_size * 2]
+        main_loss = sample4geo_loss(model, features, criterion, global_pair_batch_size)
+        if return_local_debug:
+            local_align_loss, local_score, local_labels = compute_local_align_loss(
+                fmap_drone,
+                fmap_sat,
+                topk=args.local_align_topk,
+                tau=args.local_align_tau,
+                return_debug=True,
+            )
+        else:
+            local_align_loss = compute_local_align_loss(
+                fmap_drone,
+                fmap_sat,
+                topk=args.local_align_topk,
+                tau=args.local_align_tau,
+            )
+            local_score = None
+            local_labels = None
+        loss = main_loss + args.local_align_weight * local_align_loss
+    else:
+        local_features = model(images)
+        features, global_pair_batch_size = gather_paired_views(
+            local_features,
+            pair_batch_size,
+            with_grad=True,
+        )
+        main_loss = sample4geo_loss(model, features, criterion, global_pair_batch_size)
+        local_align_loss = main_loss.new_zeros(())
+        local_score = None
+        local_labels = None
+        fmap_drone = None
+        fmap_sat = None
+        loss = main_loss
+
+    if teacher_features is not None:
+        global_teacher_features, teacher_pair_batch_size = gather_paired_views(
+            teacher_features,
+            pair_batch_size,
+            with_grad=False,
+        )
+        if teacher_pair_batch_size != global_pair_batch_size:
+            raise RuntimeError(
+                "Student and teacher gathers disagree on global pair batch size: "
+                f"student={global_pair_batch_size}, teacher={teacher_pair_batch_size}"
+            )
+        brd_loss, brd_stats = compute_brd_loss(
+            features,
+            global_teacher_features,
+            global_pair_batch_size,
+            args,
+        )
+        loss = loss + args.brd_weight * brd_loss
+    else:
+        brd_loss = main_loss.new_zeros(())
+        brd_stats = {
+            "loss_brd_d2s": brd_loss.detach(),
+            "loss_brd_s2d": brd_loss.detach(),
+            "brd_risk_d2s": brd_loss.detach(),
+            "brd_risk_s2d": brd_loss.detach(),
+        }
+
+    return {
+        "loss": loss,
+        "main_loss": main_loss,
+        "local_align_loss": local_align_loss,
+        "brd_loss": brd_loss,
+        "brd_stats": brd_stats,
+        "global_pair_batch_size": global_pair_batch_size,
+        "fmap_drone": fmap_drone,
+        "fmap_sat": fmap_sat,
+        "local_score": local_score,
+        "local_labels": local_labels,
+    }
+
+
 def train_one_epoch(model, train_loader, criterion, optimizer, scheduler, scaler, device, args, epoch, teacher_model=None):
     model.train()
     batch_time = AverageMeter()
@@ -438,7 +687,9 @@ def train_one_epoch(model, train_loader, criterion, optimizer, scheduler, scaler
     end = time.time()
     printed_local_align_shapes = False
 
-    if hasattr(train_loader.dataset, "shuffle"):
+    if hasattr(train_loader.batch_sampler, "set_epoch"):
+        train_loader.batch_sampler.set_epoch(epoch)
+    elif hasattr(train_loader.dataset, "shuffle"):
         train_loader.dataset.shuffle()
 
     for step, batch in enumerate(train_loader):
@@ -452,47 +703,27 @@ def train_one_epoch(model, train_loader, criterion, optimizer, scheduler, scaler
 
         optimizer.zero_grad(set_to_none=True)
         with autocast(device_type="cuda", enabled=args.amp):
-            if args.use_local_align:
-                features, fmap = model(images, return_fmap=True)
-                fmap_drone = fmap[:pair_batch_size]
-                fmap_sat = fmap[pair_batch_size:pair_batch_size * 2]
-                main_loss = sample4geo_loss(model, features, criterion, pair_batch_size)
-                if not printed_local_align_shapes:
-                    local_align_loss, local_score, local_labels = compute_local_align_loss(
-                        fmap_drone,
-                        fmap_sat,
-                        topk=args.local_align_topk,
-                        tau=args.local_align_tau,
-                        return_debug=True,
-                    )
-                else:
-                    local_align_loss = compute_local_align_loss(
-                        fmap_drone,
-                        fmap_sat,
-                        topk=args.local_align_topk,
-                        tau=args.local_align_tau,
-                    )
-                loss = main_loss + args.local_align_weight * local_align_loss
-            else:
-                features = model(images)
-                main_loss = sample4geo_loss(model, features, criterion, pair_batch_size)
-                local_align_loss = main_loss.new_zeros(())
-                loss = main_loss
-
-            if teacher_features is not None:
-                brd_loss, brd_stats = compute_brd_loss(features, teacher_features, pair_batch_size, args)
-                loss = loss + args.brd_weight * brd_loss
-            else:
-                brd_loss = main_loss.new_zeros(())
-                brd_stats = {
-                    "loss_brd_d2s": brd_loss.detach(),
-                    "loss_brd_s2d": brd_loss.detach(),
-                    "brd_risk_d2s": brd_loss.detach(),
-                    "brd_risk_s2d": brd_loss.detach(),
-                }
+            batch_losses = compute_student_batch_losses(
+                model,
+                images,
+                pair_batch_size,
+                criterion,
+                args,
+                teacher_features=teacher_features,
+                return_local_debug=args.use_local_align and not printed_local_align_shapes,
+            )
+            loss = batch_losses["loss"]
+            main_loss = batch_losses["main_loss"]
+            local_align_loss = batch_losses["local_align_loss"]
+            brd_loss = batch_losses["brd_loss"]
+            brd_stats = batch_losses["brd_stats"]
 
         if args.use_local_align and not printed_local_align_shapes:
-            expected_labels = list(range(pair_batch_size))
+            fmap_drone = batch_losses["fmap_drone"]
+            fmap_sat = batch_losses["fmap_sat"]
+            local_score = batch_losses["local_score"]
+            local_labels = batch_losses["local_labels"]
+            expected_labels = list(range(batch_losses["global_pair_batch_size"]))
             print(
                 "[LocalAlign] "
                 f"fmap_drone={tuple(fmap_drone.shape)} | "
@@ -579,6 +810,119 @@ def train_one_epoch(model, train_loader, criterion, optimizer, scheduler, scaler
         "brd_risk_d2s": brd_risk_d2s_meter.avg,
         "brd_risk_s2d": brd_risk_s2d_meter.avg,
     }
+
+
+def train_one_epoch_deepspeed(
+    model_engine,
+    train_loader,
+    criterion,
+    optimizer,
+    device,
+    args,
+    epoch,
+    teacher_model=None,
+):
+    model_engine.train()
+    if hasattr(train_loader.batch_sampler, "set_epoch"):
+        train_loader.batch_sampler.set_epoch(epoch)
+
+    meters = {
+        "loss_total": AverageMeter(),
+        "loss_infonce": AverageMeter(),
+        "loss_local_align": AverageMeter(),
+        "loss_brd": AverageMeter(),
+        "loss_brd_d2s": AverageMeter(),
+        "loss_brd_s2d": AverageMeter(),
+        "brd_risk_d2s": AverageMeter(),
+        "brd_risk_s2d": AverageMeter(),
+    }
+    batch_time = AverageMeter()
+    data_time = AverageMeter()
+    end = time.time()
+    printed_local_align_shapes = False
+    input_dtype = model_input_dtype(model_engine)
+
+    for step, batch in enumerate(train_loader):
+        data_time.update(time.time() - end)
+        images, _, meta = unpack_sample4geo_batch(batch, device)
+        images = images.to(dtype=input_dtype)
+        pair_batch_size = meta["pair_batch_size"]
+
+        teacher_features = (
+            forward_teacher_online(teacher_model, images)
+            if teacher_model is not None
+            else None
+        )
+        batch_losses = compute_student_batch_losses(
+            model_engine,
+            images,
+            pair_batch_size,
+            criterion,
+            args,
+            teacher_features=teacher_features,
+            return_local_debug=args.use_local_align and not printed_local_align_shapes,
+        )
+        loss = batch_losses["loss"]
+
+        model_engine.backward(loss)
+        model_engine.step()
+
+        with torch.no_grad():
+            raw_model = get_raw_model(model_engine)
+            raw_model.logit_scale.data.clamp_(0, math.log(100))
+
+        if args.use_local_align and not printed_local_align_shapes and is_main_process():
+            local_score = batch_losses["local_score"]
+            local_labels = batch_losses["local_labels"]
+            print(
+                "[LocalAlign] "
+                f"fmap_drone={tuple(batch_losses['fmap_drone'].shape)} | "
+                f"fmap_sat={tuple(batch_losses['fmap_sat'].shape)} | "
+                f"local_score={tuple(local_score.shape)} | "
+                f"labels={local_labels.detach().cpu().tolist()}"
+            )
+            printed_local_align_shapes = True
+        elif args.use_local_align:
+            printed_local_align_shapes = True
+
+        weight = batch_losses["global_pair_batch_size"] * 2
+        meters["loss_total"].update(loss.item(), weight)
+        meters["loss_infonce"].update(batch_losses["main_loss"].item(), weight)
+        meters["loss_local_align"].update(batch_losses["local_align_loss"].item(), weight)
+        meters["loss_brd"].update(batch_losses["brd_loss"].item(), weight)
+        meters["loss_brd_d2s"].update(batch_losses["brd_stats"]["loss_brd_d2s"].item(), weight)
+        meters["loss_brd_s2d"].update(batch_losses["brd_stats"]["loss_brd_s2d"].item(), weight)
+        meters["brd_risk_d2s"].update(batch_losses["brd_stats"]["brd_risk_d2s"].item(), weight)
+        meters["brd_risk_s2d"].update(batch_losses["brd_stats"]["brd_risk_s2d"].item(), weight)
+        batch_time.update(time.time() - end)
+        end = time.time()
+
+        if is_main_process() and (step % args.print_freq == 0 or step == len(train_loader) - 1):
+            lr = optimizer.param_groups[0]["lr"]
+            logit_scale = get_raw_model(model_engine).logit_scale.exp().item()
+            brd_text = ""
+            if teacher_model is not None:
+                brd_text = (
+                    f"loss_brd {meters['loss_brd'].val:.4f} ({meters['loss_brd'].avg:.4f}) | "
+                    f"risk_d2s {meters['brd_risk_d2s'].val:.4f} ({meters['brd_risk_d2s'].avg:.4f}) | "
+                    f"risk_s2d {meters['brd_risk_s2d'].val:.4f} ({meters['brd_risk_s2d'].avg:.4f}) | "
+                )
+            print(
+                f"Epoch [{epoch}/{args.epochs}] "
+                f"Step [{step + 1}/{len(train_loader)}] | "
+                f"local_pair_batch {pair_batch_size} | "
+                f"global_pair_batch {batch_losses['global_pair_batch_size']} | "
+                f"data {data_time.val:.3f}s ({data_time.avg:.3f}s) | "
+                f"batch {batch_time.val:.3f}s ({batch_time.avg:.3f}s) | "
+                f"loss_total {meters['loss_total'].val:.4f} ({meters['loss_total'].avg:.4f}) | "
+                f"loss_infonce {meters['loss_infonce'].val:.4f} ({meters['loss_infonce'].avg:.4f}) | "
+                f"loss_local_align {meters['loss_local_align'].val:.4f} "
+                f"({meters['loss_local_align'].avg:.4f}) | "
+                f"{brd_text}"
+                f"logit_scale {logit_scale:.3f} | lr {lr:.8f}"
+            )
+
+    return {name: meter.avg for name, meter in meters.items()}
 
 
 def train(model, train_loader, val_loaders, criterion, optimizer, scheduler, device, args, teacher_model=None):
@@ -710,12 +1054,161 @@ def train(model, train_loader, val_loaders, criterion, optimizer, scheduler, dev
     )
 
 
+def train_deepspeed(
+    model_engine,
+    train_loader,
+    val_loaders,
+    criterion,
+    optimizer,
+    device,
+    args,
+    teacher_model=None,
+):
+    if is_main_process():
+        os.makedirs(args.output_dir, exist_ok=True)
+        write_training_record(args, status="training")
+    distributed_barrier()
+
+    best_metric = -1.0
+    best_epoch = None
+    best_result = None
+    best_metrics = None
+    validation_history = []
+    last_epoch = None
+    last_result = None
+
+    if is_main_process():
+        save_metrics_json(
+            args.output_dir,
+            "best_metrics.json",
+            build_student_best_metrics_payload(best_metrics, validation_history),
+        )
+
+    for epoch in range(1, args.epochs + 1):
+        train_stats = train_one_epoch_deepspeed(
+            model_engine,
+            train_loader,
+            criterion,
+            optimizer,
+            device,
+            args,
+            epoch,
+            teacher_model=teacher_model,
+        )
+
+        if is_main_process():
+            brd_epoch_text = ""
+            if teacher_model is not None:
+                brd_epoch_text = (
+                    f"loss_brd={train_stats['loss_brd']:.4f} | "
+                    f"loss_brd_d2s={train_stats['loss_brd_d2s']:.4f} | "
+                    f"loss_brd_s2d={train_stats['loss_brd_s2d']:.4f} | "
+                    f"risk_d2s={train_stats['brd_risk_d2s']:.4f} | "
+                    f"risk_s2d={train_stats['brd_risk_s2d']:.4f} | "
+                )
+            print(
+                f"[Train] Epoch {epoch}/{args.epochs} | "
+                f"loss_total={train_stats['loss_total']:.4f} | "
+                f"loss_infonce={train_stats['loss_infonce']:.4f} | "
+                f"loss_local_align={train_stats['loss_local_align']:.4f} | "
+                f"{brd_epoch_text}"
+                f"world_size={get_world_size()}"
+            )
+
+        if args.save_last:
+            deepspeed_dir = os.path.join(args.output_dir, "deepspeed")
+            model_engine.save_checkpoint(
+                deepspeed_dir,
+                tag="last",
+                client_state={"epoch": epoch},
+            )
+            save_model_only_checkpoint(
+                model_engine,
+                epoch,
+                os.path.join(args.output_dir, "last_model.pth"),
+            )
+
+        if args.val_interval > 0 and (epoch % args.val_interval == 0 or epoch == args.epochs):
+            result = validate_u1652(model_engine, val_loaders)
+            last_epoch = epoch
+            last_result = result
+            current_metric = result.get("R1_sum")
+            current_metrics = build_student_validation_metrics(epoch, result)
+            is_best = current_metric is not None and current_metric > best_metric
+            history_record = dict(current_metrics)
+            history_record["is_best"] = is_best
+            validation_history.append(history_record)
+
+            if is_best:
+                best_metric = current_metric
+                best_epoch = epoch
+                best_result = result
+                best_metrics = current_metrics
+                save_model_only_checkpoint(
+                    model_engine,
+                    epoch,
+                    os.path.join(args.output_dir, "best_model.pth"),
+                )
+
+            if is_main_process():
+                print(
+                    f"[Val] Epoch {epoch} | "
+                    f"D2S_R1={result.get('D2S_R1', 0.0):.6f} | "
+                    f"D2S_R5={result.get('D2S_R5', 0.0):.6f} | "
+                    f"D2S_R10={result.get('D2S_R10', 0.0):.6f} | "
+                    f"D2S_mAP={result.get('D2S_mAP', 0.0):.6f} | "
+                    f"S2D_R1={result.get('S2D_R1', 0.0):.6f} | "
+                    f"S2D_R5={result.get('S2D_R5', 0.0):.6f} | "
+                    f"S2D_R10={result.get('S2D_R10', 0.0):.6f} | "
+                    f"S2D_mAP={result.get('S2D_mAP', 0.0):.6f} | "
+                    f"R1_sum={result.get('R1_sum', 0.0):.6f}"
+                )
+                save_metrics_json(
+                    args.output_dir,
+                    "best_metrics.json",
+                    build_student_best_metrics_payload(best_metrics, validation_history),
+                )
+                write_training_record(
+                    args,
+                    status="training",
+                    best_epoch=best_epoch,
+                    best_metric=best_metric if best_epoch is not None else None,
+                    best_result=best_result,
+                    last_epoch=last_epoch,
+                    last_result=last_result,
+                )
+
+        distributed_barrier()
+
+    if is_main_process():
+        write_training_record(
+            args,
+            status="finished",
+            best_epoch=best_epoch,
+            best_metric=best_metric if best_epoch is not None else None,
+            best_result=best_result,
+            last_epoch=last_epoch,
+            last_result=last_result,
+        )
+        save_metrics_json(
+            args.output_dir,
+            "best_metrics.json",
+            build_student_best_metrics_payload(best_metrics, validation_history),
+        )
+    distributed_barrier()
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Train RepViT-M1.5 with Sample4Geo InfoNCE on U1652")
     parser.add_argument("--train_data_dir", type=str, default="data/U1652/train")
     parser.add_argument("--val_data_dir", type=str, default="data/U1652")
     parser.add_argument("--output_root", type=str, default="src/checkpoint/student")
     parser.add_argument("--output_dir", type=str, default=None)
+    parser.add_argument("--deepspeed", action="store_true", default=False)
+    parser.add_argument("--deepspeed_config", type=str, default="configs/ds_student_distill.json")
+    parser.add_argument("--grad_accum_steps", type=int, default=1)
+    parser.add_argument("--local_rank", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=0)
 
     parser.add_argument("--epochs", type=int, default=60)
     parser.add_argument("--img_size", type=int, default=224)
@@ -760,8 +1253,6 @@ def parse_args():
         print(f"[Best] overriding best_metric_name={args.best_metric_name!r} to 'R1_sum'")
         args.best_metric_name = "R1_sum"
     args.command_line = " ".join(shlex.quote(x) for x in sys.argv)
-    if args.output_dir is None:
-        args.output_dir = get_student_save_pth(args)
     return args
 
 
@@ -770,13 +1261,39 @@ def main():
     from src.dataset.datasets import create_student_train_dataset_and_loader
     from src.dataset.teacher.val_dataloaders import build_1652_val_dataloaders
 
+    device, rank, local_rank, world_size = try_init_dist()
+    args.device = str(device)
+    args.local_rank = local_rank
+    args.rank = rank
+    args.world_size = world_size
+    args.deepspeed = bool(args.deepspeed or world_size > 1)
+
+    if args.deepspeed and not is_distributed():
+        raise RuntimeError(
+            "DeepSpeed mode requires the DeepSpeed launcher. "
+            "Use: deepspeed --num_gpus=N src/training/student_train.py ..."
+        )
+
+    if args.output_dir is None:
+        output_dir = get_student_save_pth(args) if is_main_process() else None
+        if is_distributed():
+            payload = [output_dir]
+            dist.broadcast_object_list(payload, src=0)
+            output_dir = payload[0]
+        args.output_dir = output_dir
+
     if args.use_brd_distill:
         args.teacher_checkpoint = resolve_teacher_checkpoint_path(args)
 
-    print(f"[Output] checkpoints will be saved to: {args.output_dir}")
-    write_training_record(args, status="initialized")
+    if is_main_process():
+        print(f"[Output] checkpoints will be saved to: {args.output_dir}")
+        write_training_record(args, status="initialized")
+    distributed_barrier()
 
-    device = torch.device("cuda")
+    torch.manual_seed(args.seed + rank)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed + rank)
+
     train_loader = create_student_train_dataset_and_loader(args)
     val_loaders = build_1652_val_dataloaders(
         data_dir=args.val_data_dir,
@@ -795,15 +1312,66 @@ def main():
         lr=args.lr,
         weight_decay=args.weight_decay,
     )
-    scheduler = build_student_scheduler(optimizer, args, steps_per_epoch=len(train_loader))
     criterion = Sample4GeoLoss(label_smoothing=args.label_smoothing)
+
+    if args.deepspeed:
+        import deepspeed
+
+        ds_config = build_deepspeed_runtime_config(
+            args.deepspeed_config,
+            args,
+            world_size,
+        )
+        print_deepspeed_batch_config(ds_config)
+        optimizer_steps_per_epoch = math.ceil(len(train_loader) / args.grad_accum_steps)
+        scheduler = build_student_scheduler(
+            optimizer,
+            args,
+            steps_per_epoch=optimizer_steps_per_epoch,
+        )
+        model, optimizer, _, scheduler = deepspeed.initialize(
+            model=model,
+            optimizer=optimizer,
+            lr_scheduler=scheduler,
+            config=ds_config,
+            dist_init_required=False,
+        )
+    else:
+        scheduler = build_student_scheduler(
+            optimizer,
+            args,
+            steps_per_epoch=len(train_loader),
+        )
+
     teacher_model = None
     if args.use_brd_distill:
         if args.brd_weight <= 0:
             raise ValueError("--use_brd_distill requires --brd_weight > 0.")
         teacher_model = build_online_teacher_model(args, device)
 
-    train(model, train_loader, val_loaders, criterion, optimizer, scheduler, device, args, teacher_model=teacher_model)
+    if args.deepspeed:
+        train_deepspeed(
+            model,
+            train_loader,
+            val_loaders,
+            criterion,
+            optimizer,
+            device,
+            args,
+            teacher_model=teacher_model,
+        )
+    else:
+        train(
+            model,
+            train_loader,
+            val_loaders,
+            criterion,
+            optimizer,
+            scheduler,
+            device,
+            args,
+            teacher_model=teacher_model,
+        )
 
 
 if __name__ == "__main__":
