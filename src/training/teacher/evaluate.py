@@ -34,10 +34,17 @@ MODEL_HPARAM_KEYS = {
     "lora_dropout",
     "lora_target_names",
     "local_feature_layers",
+    "fusion_mode",
     "use_local_fusion",
     "use_soft_orth_fusion",
     "soft_orth_lambda_init",
     "soft_orth_detach_global",
+    "gamma_max",
+    "gamma_19_parallel_init",
+    "gamma_19_perp_init",
+    "gamma_27_parallel_init",
+    "gamma_27_perp_init",
+    "gamma_36_init",
 }
 
 SUPPORTED_DATASETS = ("1652", "GTA-UAV", "SUES-200")
@@ -387,8 +394,15 @@ def parse_args():
     parser.add_argument("--local_feature_layers", type=str, default="19,27,36")
     parser.add_argument("--use_local_fusion", action="store_true")
     parser.add_argument("--use_soft_orth_fusion", action="store_true")
+    parser.add_argument("--fusion_mode", type=str, choices=["none", "local", "soft_orthogonal", "hybrid_dual_path_fusion"], default=None)
     parser.add_argument("--soft_orth_lambda_init", type=float, default=0.8)
     parser.add_argument("--soft_orth_detach_global", type=str2bool, nargs="?", const=True, default=True)
+    parser.add_argument("--gamma_max", type=float, default=0.05)
+    parser.add_argument("--gamma_19_parallel_init", type=float, default=0.005)
+    parser.add_argument("--gamma_19_perp_init", type=float, default=0.015)
+    parser.add_argument("--gamma_27_parallel_init", type=float, default=0.010)
+    parser.add_argument("--gamma_27_perp_init", type=float, default=0.015)
+    parser.add_argument("--gamma_36_init", type=float, default=0.010)
 
     defaults = {action.dest: action.default for action in parser._actions}
     args = parser.parse_args()

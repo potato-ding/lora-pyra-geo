@@ -335,7 +335,8 @@ def print_teacher_feature_fusion_config(model_or_engine):
 
     config = base_model.get_feature_fusion_config()
     print(
-        f"[TeacherFusion] use_local_fusion = {config.get('use_local_fusion', False)} | "
+        f"[TeacherFusion] fusion_mode = {config.get('fusion_mode', 'none')} | "
+        f"use_local_fusion = {config.get('use_local_fusion', False)} | "
         f"use_soft_orth_fusion = {config['use_soft_orth_fusion']}"
     )
     print(
@@ -348,6 +349,40 @@ def print_teacher_feature_fusion_config(model_or_engine):
         f"[TeacherFusion] use_soft_orth_fusion={config['use_soft_orth_fusion']} | "
         f"soft_orth_lambda_init={config['soft_orth_lambda_init']:.6g} | "
         f"soft_orth_detach_global={config['soft_orth_detach_global']}"
+    )
+    if config.get("fusion_mode") == "hybrid_dual_path_fusion":
+        gate_inits = config.get("hybrid_gate_inits", {})
+        print(
+            f"[TeacherFusion] gamma_max={config.get('gamma_max', 0.05):.6f} | "
+            f"gamma_19_parallel_init={gate_inits.get('gamma_19_parallel', 0.0):.6f} | "
+            f"gamma_19_perp_init={gate_inits.get('gamma_19_perp', 0.0):.6f} | "
+            f"gamma_27_parallel_init={gate_inits.get('gamma_27_parallel', 0.0):.6f} | "
+            f"gamma_27_perp_init={gate_inits.get('gamma_27_perp', 0.0):.6f} | "
+            f"gamma_36_init={gate_inits.get('gamma_36', 0.0):.6f}"
+        )
+
+
+def format_hybrid_fusion_runtime(values):
+    if values.get("fusion_mode") != "hybrid_dual_path_fusion":
+        return None
+    gate_text = (
+        f"gamma_19_parallel={values.get('gamma_19_parallel', 0.0):.6f} | "
+        f"gamma_19_perp={values.get('gamma_19_perp', 0.0):.6f} | "
+        f"gamma_27_parallel={values.get('gamma_27_parallel', 0.0):.6f} | "
+        f"gamma_27_perp={values.get('gamma_27_perp', 0.0):.6f} | "
+        f"gamma_36={values.get('gamma_36', 0.0):.6f}"
+    )
+    if "cos_local_19_global" not in values:
+        return gate_text
+    return (
+        f"{gate_text} | "
+        f"cos(local_19,global)={values.get('cos_local_19_global', float('nan')):.4f} | "
+        f"cos(local_27,global)={values.get('cos_local_27_global', float('nan')):.4f} | "
+        f"cos(local_36,global)={values.get('cos_local_36_global', float('nan')):.4f} | "
+        f"ratio_19_parallel={values.get('ratio_19_parallel', float('nan')):.4f} | "
+        f"ratio_19_perp={values.get('ratio_19_perp', float('nan')):.4f} | "
+        f"ratio_27_parallel={values.get('ratio_27_parallel', float('nan')):.4f} | "
+        f"ratio_27_perp={values.get('ratio_27_perp', float('nan')):.4f}"
     )
 
 
@@ -1167,6 +1202,7 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
             fusion_values = get_model_debug_values(model_engine)
             print(
                 f"[Fusion] Epoch {epoch}/{args.epochs} | "
+                f"fusion_mode={fusion_values.get('fusion_mode', 'none')} | "
                 f"gamma={fusion_values.get('gamma', 0.0):.6f} | "
                 f"lambda_orth={fusion_values.get('lambda_orth', 0.0):.6f} | "
                 f"use_local_fusion={fusion_values.get('use_local_fusion', False)} | "
@@ -1174,6 +1210,9 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                 f"soft_orth_detach_global={fusion_values.get('soft_orth_detach_global', True)} | "
                 f"local_feature_layers={fusion_values.get('local_feature_layers', [])}"
             )
+            hybrid_runtime = format_hybrid_fusion_runtime(fusion_values)
+            if hybrid_runtime is not None:
+                print(f"[FusionHybrid] Epoch {epoch}/{args.epochs} | {hybrid_runtime}")
             print(
                 f"[Train] Epoch {epoch}/{args.epochs} start | "
                 f"mode={mode_name} ({mode_desc}) | "
@@ -1306,6 +1345,12 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                     f"lr={lr:.2e} | scale={debug_values.get('scale', 0.0):.3f} | "
                     f"elapsed={elapsed_min:.1f}m"
                 )
+                hybrid_runtime = format_hybrid_fusion_runtime(debug_values)
+                if hybrid_runtime is not None:
+                    print(
+                        f"[FusionHybrid] Epoch {epoch}/{args.epochs} | "
+                        f"batch {step}/{num_batches} | {hybrid_runtime}"
+                    )
 
         reduced_hard_sampling_sums = (
             reduce_hard_sampling_stats(hard_sampling_sums, amp_device)

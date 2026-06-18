@@ -43,6 +43,7 @@ def build_optimizer_and_scale(model, args):
 
         is_fusion_param = (
             name in {"gamma_raw", "lambda_orth_raw"}
+            or (name.startswith("gamma_") and name.endswith("_raw"))
             or name.startswith("local_cross_attn.")
             or name.startswith("local_proj.")
         )

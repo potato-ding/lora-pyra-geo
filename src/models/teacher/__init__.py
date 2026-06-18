@@ -16,7 +16,12 @@ _EXPORTS = {
         "src.models.teacher.model",
         "apply_soft_orthogonal_local_fusion",
     ),
+    "decompose_local_feature": (
+        "src.models.teacher.model",
+        "decompose_local_feature",
+    ),
     "parse_local_feature_layers": ("src.models.teacher.model", "parse_local_feature_layers"),
+    "resolve_fusion_mode": ("src.models.teacher.model", "resolve_fusion_mode"),
     "resolve_teacher_tuning_ranges": (
         "src.models.teacher.model",
         "resolve_teacher_tuning_ranges",

@@ -79,8 +79,15 @@ def build_arg_parser():
     parser.add_argument('--local_feature_layers', type=str, default='19,27,36', help='逗号分隔的 local/PYRA transformer block 输出 index，0-based')
     parser.add_argument('--use_local_fusion', action='store_true', help='启用 local token 分支并与最终 CLS 特征融合')
     parser.add_argument('--use_soft_orth_fusion', action='store_true', help='启用 learnable soft orthogonal local fusion')
+    parser.add_argument('--fusion_mode', type=str, choices=['none', 'local', 'soft_orthogonal', 'hybrid_dual_path_fusion'], default=None, help='Feature fusion mode; explicit value takes precedence over legacy fusion flags')
     parser.add_argument('--soft_orth_lambda_init', type=float, default=0.8, help='lambda_orth 的 sigmoid 初始化值')
     parser.add_argument('--soft_orth_detach_global', type=str2bool, nargs='?', const=True, default=True, help='soft orthogonal projection 是否使用 global_feat.detach()')
+    parser.add_argument('--gamma_max', type=float, default=0.05, help='Maximum value for hybrid dual-path gates')
+    parser.add_argument('--gamma_19_parallel_init', type=float, default=0.005)
+    parser.add_argument('--gamma_19_perp_init', type=float, default=0.015)
+    parser.add_argument('--gamma_27_parallel_init', type=float, default=0.010)
+    parser.add_argument('--gamma_27_perp_init', type=float, default=0.015)
+    parser.add_argument('--gamma_36_init', type=float, default=0.010)
 
     # Loss weights. Sample4Geo-style training defaults to cross-view InfoNCE only.
     parser.add_argument('--triplet_weight', type=float, default=0.0, help='两个同域三元组损失的权重；设为 0 可关闭')

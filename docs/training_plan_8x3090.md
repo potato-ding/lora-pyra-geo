@@ -3,7 +3,7 @@
 本文档是本项目唯一维护的实验文档，覆盖：
 
 - 教师模型 T0–T5 六组训练计划；
-- 教师的数据采样、损失、Hard Pool、LoRA 与软正交融合；
+- 教师的数据采样、损失、Hard Pool、LoRA 与 hybrid dual-path 软正交融合；
 - 学生 RepViT baseline；
 - DeepSpeed 多卡边界风险感知蒸馏；
 - University-1652、SUES-200、GTA-UAV 的统一评估协议；
@@ -51,14 +51,14 @@ data/U1652/train/drone/<pid>/*
 
 教师训练严格分为 T0–T5 六组。学生 baseline、学生蒸馏和纯测试不计入教师实验数量。
 
-| ID | 阶段 | 初始化来源 | 软正交 | Hard Pool |
-|---|---|---|---:|---:|
-| T0 | Sample4Geo + InfoNCE | DINOv3 pretrained | 否 | 否 |
-| T1 | Sample4Geo + InfoNCE | DINOv3 pretrained | 是 | 否 |
-| T2 | Identity | T0 best | 否 | 否 |
-| T3 | Identity | T1 best | 是 | 否 |
-| T4 | Identity Hard | T2 best | 否 | 是 |
-| T5 | Identity Hard | T3 best | 是 | 是 |
+| ID | 阶段 | 初始化来源 | 融合模式 | Hard Pool |
+|---|---|---|---|---:|
+| T0 | Sample4Geo + InfoNCE | DINOv3 pretrained | `none` | 否 |
+| T1 | Sample4Geo + InfoNCE | DINOv3 pretrained | `hybrid_dual_path_fusion` | 否 |
+| T2 | Identity | T0 best | `none` | 否 |
+| T3 | Identity | T1 best | `hybrid_dual_path_fusion` | 否 |
+| T4 | Identity Hard | T2 best | `none` | 是 |
+| T5 | Identity Hard | T3 best | `hybrid_dual_path_fusion` | 是 |
 
 主原则：
 
@@ -66,7 +66,7 @@ data/U1652/train/drone/<pid>/*
 2. T2/T3 从对应的 Sample4Geo `best_model.pth` 重新启动优化器和调度器。
 3. T4/T5 从对应的 Identity `best_model.pth` 重新启动。
 4. 后续阶段不从上一阶段最后一个 epoch 直接续跑。
-5. 同一分支必须保持 LoRA block、full fine-tune block、local layers 和软正交设置一致。
+5. 同一分支必须保持 LoRA block、full fine-tune block、local layers、`fusion_mode` 和 gate 配置一致。
 
 训练依赖：
 
@@ -322,28 +322,115 @@ lora_start_block          = min(20, full_start)
 lora_end_block            = full_start
 ```
 
-Local/PYRA 默认从 block `19,27,36` 提取 patch tokens，通过 local cross-attention 得到局部特征。
+对 40-block DINOv3，代码使用 0-based block index：
 
-普通融合：
+```text
+block 0–19  ：冻结（对应第 1–20 层）
+block 20–35 ：LoRA（对应第 21–36 层）
+block 36–39 ：full fine-tune（最后 4 层）
+```
+
+Global feature 使用最终层 CLS token。Local/PYRA 固定从 block `19,27,36` 提取 patch tokens。
+
+教师至少支持以下融合模式：
+
+| `fusion_mode` | 行为 |
+|---|---|
+| `none` | 只使用最终层 global CLS，不计算 local 分支 |
+| `soft_orthogonal` | 保留旧逻辑：先合并三层 token 得到一个 local feature，再按可学习 `lambda_orth` 消除部分 global 投影 |
+| `hybrid_dual_path_fusion` | 当前软正交方案：三层分别得到 local feature，19/27 做双路径分解，36 直接作为高层语义 residual |
+
+旧命令行参数 `--use_soft_orth_fusion` 仍兼容，并自动解析为 `fusion_mode=soft_orthogonal`。新实验应显式使用 `--fusion_mode`。
+
+#### 4.7.1 Hybrid dual-path 软正交
+
+对第 19、27、36 层分别使用共享的 local cross-attention 和 `local_proj`，得到：
 
 \[
-f_{\text{fused}}=f_{\text{global}}+\gamma f_{\text{local}}
+l_{19},l_{27},l_{36}\in\mathbb{R}^{B\times D}
+\]
+
+不得先拼接三层 token 后再生成单个 local feature。第 19、27 层使用 detached global feature 作为分解参考：
+
+\[
+u=\operatorname{Normalize}(\operatorname{detach}(g))
 \]
 
 \[
-\gamma=0.05\cdot\sigma(\gamma_{\text{raw}})
+l_{i}^{\parallel}=(l_i^\top u)u,\qquad
+l_i^{\perp}=l_i-l_i^{\parallel},\qquad i\in\{19,27\}
 \]
 
-启用 `--use_soft_orth_fusion` 后，local feature 先进行可学习软正交投影。
+第 36 层不做正交分解：
 
-软正交分支后续阶段必须始终携带：
+\[
+l_{36}^{semantic}=l_{36}
+\]
+
+五个 gate 独立学习：
+
+\[
+\gamma_k=\gamma_{\max}\cdot\sigma(\gamma_{k,\mathrm{raw}})
+\]
+
+默认 `gamma_max=0.05`，raw 参数使用
+`logit(gamma_init / gamma_max)` 初始化：
+
+| Gate | 初始实际值 |
+|---|---:|
+| `gamma_19_parallel` | `0.005` |
+| `gamma_19_perp` | `0.015` |
+| `gamma_27_parallel` | `0.010` |
+| `gamma_27_perp` | `0.015` |
+| `gamma_36` | `0.010` |
+
+最终融合为：
+
+\[
+\begin{aligned}
+f=&\,g
++\gamma_{19}^{\parallel}l_{19}^{\parallel}
++\gamma_{19}^{\perp}l_{19}^{\perp}\\
+&+\gamma_{27}^{\parallel}l_{27}^{\parallel}
++\gamma_{27}^{\perp}l_{27}^{\perp}
++\gamma_{36}l_{36}
+\end{aligned}
+\]
+
+\[
+f_{\mathrm{fused}}=\operatorname{Normalize}(f)
+\]
+
+该设计保留与 global 同方向的局部信息，但给它较小初始 gate；同时以更高初始权重注入正交互补信息。第 36 层作为靠近最终层的高层语义 residual，不进行硬性分解。
+
+Hybrid 分支在后续阶段必须始终携带：
 
 ```bash
---use_soft_orth_fusion \
+--fusion_mode hybrid_dual_path_fusion \
 --local_feature_layers 19,27,36 \
---soft_orth_lambda_init 0.8 \
---soft_orth_detach_global true
+--gamma_max 0.05 \
+--gamma_19_parallel_init 0.005 \
+--gamma_19_perp_init 0.015 \
+--gamma_27_parallel_init 0.010 \
+--gamma_27_perp_init 0.015 \
+--gamma_36_init 0.010
 ```
+
+训练日志会打印：
+
+```text
+gamma_19_parallel, gamma_19_perp
+gamma_27_parallel, gamma_27_perp
+gamma_36
+cos(local_19, global), cos(local_27, global), cos(local_36, global)
+ratio_19_parallel, ratio_19_perp
+ratio_27_parallel, ratio_27_perp
+```
+
+其中 `ratio_i_parallel` 和 `ratio_i_perp` 分别为对应分量范数除以原始
+`local_i` 范数后的 batch 均值。
+
+`fusion_mode` 和 gate 初始化参数会写入 `hyperparameters.json`，测试时会随 checkpoint 自动恢复。T1 → T3 → T5 必须保持相同的 hybrid 配置。旧版 `soft_orthogonal` checkpoint 不包含五个 hybrid gate，不能在默认的严格 trainable 参数检查下直接作为 hybrid 分支初始化；如需迁移，必须明确使用 `--init_checkpoint_strict_trainable false`，并把它视为新的消融实验，而不是原分支续训。
 
 ### 4.8 教师优化器
 
@@ -354,14 +441,14 @@ f_{\text{fused}}=f_{\text{global}}+\gamma f_{\text{local}}
 | full backbone decay | `lr × full_finetune_lr_mult` | `0.01` |
 | full backbone no-decay | `lr × full_finetune_lr_mult` | `0` |
 | local/fusion decay | `lr` | `0.01` |
-| local/fusion no-decay | `lr` | `0` |
+| local/fusion no-decay（含五个 hybrid gate） | `lr` | `0` |
 | logit scale | `lr × logit_scale_lr_mult` | `0` |
 
 安装 DeepSpeed CPU Adam 时使用 `DeepSpeedCPUAdam`，否则使用 AdamW。
 
 ## 5. 教师 T0–T5 命令
 
-### 5.1 T0：无软正交 Sample4Geo
+### 5.1 T0：仅 global CLS 的 Sample4Geo
 
 ```bash
 deepspeed --include localhost:0,1 src/training/teacher_train.py \
@@ -373,10 +460,11 @@ deepspeed --include localhost:0,1 src/training/teacher_train.py \
   --batch_size 4 \
   --grad_accum_steps 1 \
   --triplet_weight 0 \
-  --infonce_weight 1.0
+  --infonce_weight 1.0 \
+  --fusion_mode none
 ```
 
-### 5.2 T1：有软正交 Sample4Geo
+### 5.2 T1：Hybrid dual-path 软正交 Sample4Geo
 
 ```bash
 deepspeed --include localhost:2,3 src/training/teacher_train.py \
@@ -389,10 +477,14 @@ deepspeed --include localhost:2,3 src/training/teacher_train.py \
   --grad_accum_steps 1 \
   --triplet_weight 0 \
   --infonce_weight 1.0 \
-  --use_soft_orth_fusion \
+  --fusion_mode hybrid_dual_path_fusion \
   --local_feature_layers 19,27,36 \
-  --soft_orth_lambda_init 0.8 \
-  --soft_orth_detach_global true
+  --gamma_max 0.05 \
+  --gamma_19_parallel_init 0.005 \
+  --gamma_19_perp_init 0.015 \
+  --gamma_27_parallel_init 0.010 \
+  --gamma_27_perp_init 0.015 \
+  --gamma_36_init 0.010
 ```
 
 ### 5.3 T2：T0 best → Identity
@@ -412,7 +504,8 @@ deepspeed --include localhost:0,1 src/training/teacher_train.py \
   --identity_sat_per_id 1 \
   --identity_loss_weight 1.0 \
   --same_domain_triplet_weight 0.2 \
-  --weak_sample4geo_weight 0.2
+  --weak_sample4geo_weight 0.2 \
+  --fusion_mode none
 ```
 
 ### 5.4 T3：T1 best → Identity
@@ -433,10 +526,14 @@ deepspeed --include localhost:2,3 src/training/teacher_train.py \
   --identity_loss_weight 1.0 \
   --same_domain_triplet_weight 0.2 \
   --weak_sample4geo_weight 0.2 \
-  --use_soft_orth_fusion \
+  --fusion_mode hybrid_dual_path_fusion \
   --local_feature_layers 19,27,36 \
-  --soft_orth_lambda_init 0.8 \
-  --soft_orth_detach_global true
+  --gamma_max 0.05 \
+  --gamma_19_parallel_init 0.005 \
+  --gamma_19_perp_init 0.015 \
+  --gamma_27_parallel_init 0.010 \
+  --gamma_27_perp_init 0.015 \
+  --gamma_36_init 0.010
 ```
 
 ### 5.5 T4：T2 best → Hard Pool
@@ -462,7 +559,8 @@ deepspeed --include localhost:4,5 src/training/teacher_train.py \
   --weak_sample4geo_weight 0.2 \
   --hard_pool_topk 12 \
   --hard_pool_topneg_k 10 \
-  --use_ema_for_hard_pool true
+  --use_ema_for_hard_pool true \
+  --fusion_mode none
 ```
 
 ### 5.6 T5：T3 best → Hard Pool
@@ -489,10 +587,14 @@ deepspeed --include localhost:6,7 src/training/teacher_train.py \
   --hard_pool_topk 12 \
   --hard_pool_topneg_k 10 \
   --use_ema_for_hard_pool true \
-  --use_soft_orth_fusion \
+  --fusion_mode hybrid_dual_path_fusion \
   --local_feature_layers 19,27,36 \
-  --soft_orth_lambda_init 0.8 \
-  --soft_orth_detach_global true
+  --gamma_max 0.05 \
+  --gamma_19_parallel_init 0.005 \
+  --gamma_19_perp_init 0.015 \
+  --gamma_27_parallel_init 0.010 \
+  --gamma_27_perp_init 0.015 \
+  --gamma_36_init 0.010
 ```
 
 如果已有 Hard Pool，可使用：
@@ -984,7 +1086,15 @@ python src/training/student_test.py \
 | `--lora_dropout` | `0.1` | LoRA dropout |
 | `--full_finetune_lr_mult` | `0.1` | full backbone LR 倍率 |
 | `--local_feature_layers` | `19,27,36` | local token 层 |
-| `--soft_orth_lambda_init` | `0.8` | 软正交初始化 |
+| `--fusion_mode` | `None`（解析为 `none`） | `none`、`soft_orthogonal` 或 `hybrid_dual_path_fusion` |
+| `--gamma_max` | `0.05` | Hybrid gate 的最大值 |
+| `--gamma_19_parallel_init` | `0.005` | 第 19 层平行分量 gate 初值 |
+| `--gamma_19_perp_init` | `0.015` | 第 19 层正交分量 gate 初值 |
+| `--gamma_27_parallel_init` | `0.010` | 第 27 层平行分量 gate 初值 |
+| `--gamma_27_perp_init` | `0.015` | 第 27 层正交分量 gate 初值 |
+| `--gamma_36_init` | `0.010` | 第 36 层语义 residual gate 初值 |
+| `--soft_orth_lambda_init` | `0.8` | 旧 `soft_orthogonal` 模式的投影消除比例初值 |
+| `--soft_orth_detach_global` | `true` | 旧 `soft_orthogonal` 模式是否 detach global 参考 |
 | `--identity_loss_weight` | `1.0` | Cross-ID loss |
 | `--same_domain_triplet_weight` | `0.2` | Same-domain triplet |
 | `--weak_sample4geo_weight` | `0.2` | Weak S4G |
@@ -1020,8 +1130,8 @@ python src/training/student_test.py \
 
 | ID | run | best checkpoint | best metrics | 备注 |
 |---|---|---|---|---|
-| T0 |  | `src/checkpoint/teacher/<run>/best_model.pth` | `best_metrics.json` | no-soft S4G |
-| T1 |  | `src/checkpoint/teacher/<run>/best_model.pth` | `best_metrics.json` | soft S4G |
+| T0 |  | `src/checkpoint/teacher/<run>/best_model.pth` | `best_metrics.json` | global-only S4G |
+| T1 |  | `src/checkpoint/teacher/<run>/best_model.pth` | `best_metrics.json` | hybrid dual-path S4G |
 | T2 |  | `src/checkpoint/teacher/<run>/best_model.pth` | `best_metrics.json` | T0 → identity |
 | T3 |  | `src/checkpoint/teacher/<run>/best_model.pth` | `best_metrics.json` | T1 → identity |
 | T4 |  | `src/checkpoint/teacher/<run>/best_model.pth` | `best_metrics.json` | T2 → hard |
@@ -1065,7 +1175,7 @@ python -m py_compile \
 
 ```text
 检查同目录 hyperparameters.json
-检查软正交、local layers、LoRA/full block 是否一致
+检查 fusion_mode、hybrid gate 配置、local layers、LoRA/full block 是否一致
 ```
 
 3. 学生多卡显存不足：
@@ -1106,8 +1216,8 @@ GTA 主结果使用 cross-area + D2S
 建议教师消融：
 
 ```text
-无软正交：T0 → T2 → T4
-有软正交：T1 → T3 → T5
+Global-only：T0 → T2 → T4
+Hybrid dual-path 软正交：T1 → T3 → T5
 ```
 
 建议学生对比：
