@@ -862,6 +862,70 @@ torchrun --standalone --nproc_per_node=2 \
 student distributed paired gather smoke test passed
 ```
 
+### 8.10 BRD 日志与审计口径
+
+当前日志中的旧字段：
+
+```text
+loss_brd(raw)
+```
+
+明确表示未乘权重的双向 BRD raw loss。训练实际使用：
+
+\[
+L_{\text{BRD-weighted}}
+=
+\text{current\_brd\_weight}
+\times
+L_{\text{BRD-raw}}
+\]
+
+默认未启用 local alignment 时：
+
+\[
+L_{\text{total}}
+=
+L_{\text{InfoNCE}}
++
+L_{\text{BRD-weighted}}
+\]
+
+启用 local alignment 时还会额外加：
+
+\[
+\text{local\_align\_weight}\times L_{\text{local}}
+\]
+
+每个训练日志会打印：
+
+| 字段 | 含义 |
+|---|---|
+| `brd_raw_loss` | D2S/S2D 平均后的未加权 BRD |
+| `brd_weighted_loss` | `current_brd_weight × brd_raw_loss` |
+| `current_brd_weight` | 当前实际进入总损失的 BRD 权重；目前等于 `--brd_weight` |
+| `teacher_d2s_pos_sim_mean` | 教师 D2S 正样本相似度均值 |
+| `teacher_d2s_topk_neg_sim_mean` | 教师选中 top-K 风险 negatives 的相似度均值 |
+| `teacher_d2s_margin_mean` | 教师 `positive similarity - selected negative similarity` 均值 |
+| `teacher_d2s_margin_min` | 上述 margin 最小值 |
+| `teacher_wrong_neg_ratio` | 教师 selected negatives 中相似度不低于 positive 的比例 |
+| `student_d2s_pos_sim_mean` | 学生 D2S 正样本相似度均值 |
+| `student_d2s_topk_neg_sim_mean` | 学生在教师选中 negatives 上的相似度均值 |
+| `student_violation_ratio` | 满足 `s_neg - s_pos + pair_margin > 0` 的有效 D2S negative 比例 |
+| `brd_valid_neg_count` | D2S 与 S2D 最终参与 BRD 的 negative 总数 |
+| `risk_weight_mean` | D2S/S2D 全部有效 negatives 的风险权重均值 |
+| `risk_weight_max` | D2S/S2D 全部有效 negatives 的最大风险权重 |
+
+多卡正负样本规则：
+
+1. 先分别 all-gather drone 和 satellite，形成
+   `[all_drone, all_satellite]`；
+2. 同步 all-gather pair labels；
+3. D2S 和 S2D 都通过全局 label 匹配得到 `pos_index_global`；
+4. 正常 PID 唯一采样下，`pos_index_global == arange(global_pair_batch)`；
+5. negative mask 使用 `anchor_label != candidate_label`，不是单纯依赖对角线；
+6. 如果全局 batch 出现重复 PID、缺失 positive 或 all-gather 顺序错位，训练会立即报错；
+7. `brd_topk` 在完整 global gallery 中，按教师 negative similarity 从高到低选择。对同一个 anchor，positive 是常数，因此这等价于选择教师边界 margin 最小的 negatives。
+
 ## 9. 统一评估协议
 
 教师和学生使用相同的数据构建与指标函数，区别仅在特征提取模型。

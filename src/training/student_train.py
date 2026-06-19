@@ -212,22 +212,99 @@ def compute_local_align_loss(fmap_drone, fmap_sat, topk=4, tau=0.07, return_debu
     return loss_local
 
 
-def compute_boundary_risk_weights(teacher_logits, margin=0.0, tau=0.05):
-    if teacher_logits.ndim != 2 or teacher_logits.size(0) != teacher_logits.size(1):
-        raise ValueError(f"BRD expects square cross-view logits, got {tuple(teacher_logits.shape)}")
+def resolve_brd_pair_structure(anchor_labels, candidate_labels, expect_diagonal=True):
+    if anchor_labels.ndim != 1 or candidate_labels.ndim != 1:
+        raise ValueError(
+            "BRD labels must be 1-D, got "
+            f"anchor={tuple(anchor_labels.shape)} candidate={tuple(candidate_labels.shape)}"
+        )
 
-    batch_size = teacher_logits.size(0)
-    if batch_size <= 1:
-        return torch.ones(batch_size, device=teacher_logits.device, dtype=teacher_logits.dtype)
+    same_id_mask = anchor_labels.unsqueeze(1).eq(candidate_labels.unsqueeze(0))
+    positive_counts = same_id_mask.sum(dim=1)
+    if not torch.all(positive_counts == 1):
+        bad_rows = torch.nonzero(positive_counts != 1, as_tuple=False).flatten().tolist()
+        preview = bad_rows[:10]
+        raise RuntimeError(
+            "BRD requires exactly one positive candidate per anchor. "
+            f"Invalid rows={preview}, positive_counts={positive_counts[preview].tolist()}. "
+            "Check that the global Sample4Geo batch contains unique PIDs."
+        )
 
-    positive = teacher_logits.diag()
-    eye = torch.eye(batch_size, device=teacher_logits.device, dtype=torch.bool)
-    hardest_negative = teacher_logits.masked_fill(eye, -torch.inf).max(dim=1).values
-    tau = max(float(tau), 1e-6)
-    return torch.sigmoid((hardest_negative - positive + float(margin)) / tau).detach()
+    positive_indices = same_id_mask.to(torch.long).argmax(dim=1)
+    if expect_diagonal:
+        expected = torch.arange(
+            anchor_labels.size(0),
+            device=anchor_labels.device,
+            dtype=positive_indices.dtype,
+        )
+        if not torch.equal(positive_indices, expected):
+            raise RuntimeError(
+                "BRD global positive indices are not diagonal after paired all_gather: "
+                f"got={positive_indices.tolist()} expected={expected.tolist()}"
+            )
+
+    negative_mask = ~same_id_mask
+    return positive_indices, negative_mask
 
 
-def boundary_risk_pairwise_ranking_loss(student_logits, teacher_logits, args):
+def select_teacher_topk_negative_mask(teacher_logits, negative_mask, topk):
+    if teacher_logits.shape != negative_mask.shape:
+        raise ValueError(
+            "teacher logits/negative mask shape mismatch: "
+            f"logits={tuple(teacher_logits.shape)} mask={tuple(negative_mask.shape)}"
+        )
+
+    negative_counts = negative_mask.sum(dim=1)
+    if not torch.all(negative_counts > 0):
+        return torch.zeros_like(negative_mask)
+    if int(topk) <= 0:
+        return negative_mask.clone()
+
+    selected_k = min(int(topk), int(negative_counts.min().item()))
+    masked_teacher = teacher_logits.masked_fill(~negative_mask, -torch.inf)
+    topk_indices = torch.topk(
+        masked_teacher,
+        k=selected_k,
+        dim=1,
+        largest=True,
+    ).indices
+    topk_mask = torch.zeros_like(negative_mask)
+    topk_mask.scatter_(1, topk_indices, True)
+    return topk_mask & negative_mask
+
+
+def _masked_mean(values, mask):
+    count = mask.sum()
+    if count.item() <= 0:
+        return values.new_zeros(())
+    return values.masked_select(mask).mean()
+
+
+def _zero_brd_direction_stats(reference):
+    zero = reference.new_zeros(())
+    return {
+        "teacher_pos_sim_mean": zero,
+        "teacher_topk_neg_sim_mean": zero,
+        "teacher_margin_mean": zero,
+        "teacher_margin_min": zero,
+        "teacher_wrong_neg_ratio": zero,
+        "student_pos_sim_mean": zero,
+        "student_topk_neg_sim_mean": zero,
+        "student_violation_ratio": zero,
+        "valid_neg_count": zero,
+        "risk_weight_sum": zero,
+        "risk_weight_mean": zero,
+        "risk_weight_max": zero,
+    }
+
+
+def boundary_risk_pairwise_ranking_loss(
+    student_logits,
+    teacher_logits,
+    anchor_labels,
+    candidate_labels,
+    args,
+):
     if student_logits.shape != teacher_logits.shape:
         raise ValueError(
             "BRD student/teacher logits shape mismatch: "
@@ -236,49 +313,109 @@ def boundary_risk_pairwise_ranking_loss(student_logits, teacher_logits, args):
     if student_logits.ndim != 2 or student_logits.size(0) != student_logits.size(1):
         raise ValueError(f"BRD expects square cross-view logits, got {tuple(student_logits.shape)}")
 
-    batch_size = student_logits.size(0)
-    if batch_size <= 1:
+    num_anchors = student_logits.size(0)
+    if num_anchors <= 1:
         zero = student_logits.sum() * 0.0
-        return zero, torch.zeros((), device=student_logits.device, dtype=student_logits.dtype)
+        return zero, _zero_brd_direction_stats(student_logits)
 
     teacher_logits = teacher_logits.detach()
     device = student_logits.device
-    eye = torch.eye(batch_size, device=device, dtype=torch.bool)
+    anchor_labels = anchor_labels.to(device=device)
+    candidate_labels = candidate_labels.to(device=device)
+    positive_indices, negative_mask = resolve_brd_pair_structure(
+        anchor_labels,
+        candidate_labels,
+        expect_diagonal=True,
+    )
+    row_indices = torch.arange(num_anchors, device=device)
 
-    teacher_pos = teacher_logits.diag().unsqueeze(1)
-    teacher_risk_score = (teacher_logits - teacher_pos + float(args.brd_risk_margin)) / max(float(args.brd_risk_tau), 1e-6)
-    risk_weights = torch.sigmoid(teacher_risk_score).masked_fill(eye, 0.0).detach()
+    teacher_pos_vector = teacher_logits[row_indices, positive_indices]
+    teacher_pos = teacher_pos_vector.unsqueeze(1)
+    teacher_risk_score = (
+        teacher_logits - teacher_pos + float(args.brd_risk_margin)
+    ) / max(float(args.brd_risk_tau), 1e-6)
+    raw_risk_weights = torch.sigmoid(teacher_risk_score).detach()
 
-    topk = int(getattr(args, "brd_topk", 4))
-    if topk > 0:
-        topk = min(topk, batch_size - 1)
-        masked_teacher = teacher_logits.masked_fill(eye, -torch.inf)
-        _, topk_indices = torch.topk(masked_teacher, k=topk, dim=1, largest=True)
-        topk_mask = torch.zeros_like(risk_weights, dtype=torch.bool)
-        topk_mask.scatter_(1, topk_indices, True)
-        risk_weights = risk_weights.masked_fill(~topk_mask, 0.0)
+    topk_mask = select_teacher_topk_negative_mask(
+        teacher_logits,
+        negative_mask,
+        topk=int(getattr(args, "brd_topk", 4)),
+    )
 
     threshold = float(getattr(args, "brd_risk_threshold", 0.0))
-    if threshold > 0:
-        risk_weights = risk_weights.masked_fill(risk_weights < threshold, 0.0)
+    valid_neg_mask = topk_mask
+    if threshold > 0.0:
+        valid_neg_mask = valid_neg_mask & (raw_risk_weights >= threshold)
+    risk_weights = raw_risk_weights.masked_fill(~valid_neg_mask, 0.0)
 
-    student_pos = student_logits.diag().unsqueeze(1)
+    student_pos_vector = student_logits[row_indices, positive_indices]
+    student_pos = student_pos_vector.unsqueeze(1)
     ranking_margin = float(getattr(args, "brd_pair_margin", 0.05))
     temperature = max(float(getattr(args, "brd_temperature", 0.07)), 1e-6)
     pairwise_violation = (student_logits - student_pos + ranking_margin) / temperature
-    pairwise_loss = F.softplus(pairwise_violation).masked_fill(eye, 0.0)
+    pairwise_loss = F.softplus(pairwise_violation).masked_fill(~valid_neg_mask, 0.0)
 
     weight_sum = risk_weights.sum()
+    valid_neg_count = valid_neg_mask.sum()
+    topk_count = topk_mask.sum()
+
+    teacher_margin = teacher_pos - teacher_logits
+    stats = {
+        "teacher_pos_sim_mean": teacher_pos_vector.mean().detach(),
+        "teacher_topk_neg_sim_mean": _masked_mean(
+            teacher_logits,
+            topk_mask,
+        ).detach(),
+        "teacher_margin_mean": _masked_mean(
+            teacher_margin,
+            topk_mask,
+        ).detach(),
+        "teacher_margin_min": (
+            teacher_margin.masked_select(topk_mask).min().detach()
+            if topk_count.item() > 0
+            else teacher_logits.new_zeros(())
+        ),
+        "teacher_wrong_neg_ratio": _masked_mean(
+            (teacher_logits >= teacher_pos).to(teacher_logits.dtype),
+            topk_mask,
+        ).detach(),
+        "student_pos_sim_mean": student_pos_vector.mean().detach(),
+        "student_topk_neg_sim_mean": _masked_mean(
+            student_logits,
+            topk_mask,
+        ).detach(),
+        "student_violation_ratio": _masked_mean(
+            (student_logits - student_pos + ranking_margin > 0).to(student_logits.dtype),
+            valid_neg_mask,
+        ).detach(),
+        "valid_neg_count": valid_neg_count.to(student_logits.dtype).detach(),
+        "risk_weight_sum": weight_sum.detach(),
+        "risk_weight_mean": _masked_mean(
+            raw_risk_weights,
+            valid_neg_mask,
+        ).detach(),
+        "risk_weight_max": (
+            raw_risk_weights.masked_select(valid_neg_mask).max().detach()
+            if valid_neg_count.item() > 0
+            else teacher_logits.new_zeros(())
+        ),
+    }
+
     if weight_sum.item() <= 0:
         zero = student_logits.sum() * 0.0
-        return zero, torch.zeros((), device=device, dtype=student_logits.dtype)
+        return zero, stats
 
     loss = (pairwise_loss * risk_weights).sum() / weight_sum.clamp_min(1e-6)
-    mean_risk = risk_weights.sum(dim=1).div((risk_weights > 0).sum(dim=1).clamp_min(1)).mean()
-    return loss, mean_risk.detach()
+    return loss, stats
 
 
-def compute_brd_loss(student_features, teacher_features, pair_batch_size, args):
+def compute_brd_loss(
+    student_features,
+    teacher_features,
+    pair_batch_size,
+    args,
+    pair_labels=None,
+):
     student_features = F.normalize(student_features.float(), p=2, dim=1, eps=1e-6)
     teacher_features = F.normalize(teacher_features.detach().float(), p=2, dim=1, eps=1e-6)
 
@@ -290,14 +427,66 @@ def compute_brd_loss(student_features, teacher_features, pair_batch_size, args):
     student_logits = student_drone @ student_satellite.t()
     teacher_logits = teacher_drone @ teacher_satellite.t()
 
-    loss_d2s, risk_d2s = boundary_risk_pairwise_ranking_loss(student_logits, teacher_logits, args)
-    loss_s2d, risk_s2d = boundary_risk_pairwise_ranking_loss(student_logits.t(), teacher_logits.t(), args)
+    if pair_labels is None:
+        pair_labels = torch.arange(
+            pair_batch_size,
+            device=student_features.device,
+            dtype=torch.long,
+        )
+    else:
+        pair_labels = pair_labels.to(
+            device=student_features.device,
+            dtype=torch.long,
+        )
+    if pair_labels.numel() != pair_batch_size:
+        raise ValueError(
+            f"Expected {pair_batch_size} global pair labels, got {pair_labels.numel()}"
+        )
+
+    loss_d2s, stats_d2s = boundary_risk_pairwise_ranking_loss(
+        student_logits,
+        teacher_logits,
+        pair_labels,
+        pair_labels,
+        args,
+    )
+    loss_s2d, stats_s2d = boundary_risk_pairwise_ranking_loss(
+        student_logits.t(),
+        teacher_logits.t(),
+        pair_labels,
+        pair_labels,
+        args,
+    )
     loss = 0.5 * (loss_d2s + loss_s2d)
+
+    total_valid_count = (
+        stats_d2s["valid_neg_count"] + stats_s2d["valid_neg_count"]
+    )
+    total_risk_sum = (
+        stats_d2s["risk_weight_sum"] + stats_s2d["risk_weight_sum"]
+    )
+    risk_weight_mean = (
+        total_risk_sum / total_valid_count.clamp_min(1.0)
+    )
     stats = {
         "loss_brd_d2s": loss_d2s.detach(),
         "loss_brd_s2d": loss_s2d.detach(),
-        "brd_risk_d2s": risk_d2s.detach(),
-        "brd_risk_s2d": risk_s2d.detach(),
+        "brd_risk_d2s": stats_d2s["risk_weight_mean"],
+        "brd_risk_s2d": stats_s2d["risk_weight_mean"],
+        "teacher_d2s_pos_sim_mean": stats_d2s["teacher_pos_sim_mean"],
+        "teacher_d2s_topk_neg_sim_mean": stats_d2s["teacher_topk_neg_sim_mean"],
+        "teacher_d2s_margin_mean": stats_d2s["teacher_margin_mean"],
+        "teacher_d2s_margin_min": stats_d2s["teacher_margin_min"],
+        "teacher_wrong_neg_ratio": stats_d2s["teacher_wrong_neg_ratio"],
+        "student_d2s_pos_sim_mean": stats_d2s["student_pos_sim_mean"],
+        "student_d2s_topk_neg_sim_mean": stats_d2s["student_topk_neg_sim_mean"],
+        "student_violation_ratio": stats_d2s["student_violation_ratio"],
+        "brd_valid_neg_count": total_valid_count.detach(),
+        "risk_weight_mean": risk_weight_mean.detach(),
+        "risk_weight_max": torch.maximum(
+            stats_d2s["risk_weight_max"],
+            stats_s2d["risk_weight_max"],
+        ).detach(),
     }
     return loss, stats
 
@@ -568,6 +757,101 @@ def model_input_dtype(model):
     return torch.float32
 
 
+BRD_DIAGNOSTIC_KEYS = (
+    "teacher_d2s_pos_sim_mean",
+    "teacher_d2s_topk_neg_sim_mean",
+    "teacher_d2s_margin_mean",
+    "teacher_d2s_margin_min",
+    "teacher_wrong_neg_ratio",
+    "student_d2s_pos_sim_mean",
+    "student_d2s_topk_neg_sim_mean",
+    "student_violation_ratio",
+    "brd_valid_neg_count",
+    "risk_weight_mean",
+    "risk_weight_max",
+)
+
+
+def make_zero_brd_stats(reference):
+    zero = reference.new_zeros(())
+    stats = {
+        "loss_brd_d2s": zero.detach(),
+        "loss_brd_s2d": zero.detach(),
+        "brd_risk_d2s": zero.detach(),
+        "brd_risk_s2d": zero.detach(),
+    }
+    stats.update({key: zero.detach() for key in BRD_DIAGNOSTIC_KEYS})
+    return stats
+
+
+def get_current_brd_weight(args):
+    # Kept as a function so a future schedule has one authoritative hook.
+    return float(getattr(args, "brd_weight", 0.0))
+
+
+def create_brd_log_meters():
+    keys = (
+        "brd_raw_loss",
+        "brd_weighted_loss",
+        *BRD_DIAGNOSTIC_KEYS,
+    )
+    return {key: AverageMeter() for key in keys}
+
+
+def update_brd_log_meters(meters, batch_losses, n):
+    meters["brd_raw_loss"].update(batch_losses["brd_raw_loss"].item(), n)
+    meters["brd_weighted_loss"].update(
+        batch_losses["brd_weighted_loss"].item(),
+        n,
+    )
+    for key in BRD_DIAGNOSTIC_KEYS:
+        meters[key].update(batch_losses["brd_stats"][key].item(), n)
+
+
+def format_brd_diagnostic_log(meters, current_brd_weight):
+    return (
+        f"brd_raw_loss {meters['brd_raw_loss'].val:.4f} "
+        f"({meters['brd_raw_loss'].avg:.4f}) | "
+        f"brd_weighted_loss {meters['brd_weighted_loss'].val:.4f} "
+        f"({meters['brd_weighted_loss'].avg:.4f}) | "
+        f"current_brd_weight {current_brd_weight:.6f} | "
+        f"teacher_d2s_pos_sim_mean {meters['teacher_d2s_pos_sim_mean'].val:.4f} | "
+        f"teacher_d2s_topk_neg_sim_mean "
+        f"{meters['teacher_d2s_topk_neg_sim_mean'].val:.4f} | "
+        f"teacher_d2s_margin_mean {meters['teacher_d2s_margin_mean'].val:.4f} | "
+        f"teacher_d2s_margin_min {meters['teacher_d2s_margin_min'].val:.4f} | "
+        f"teacher_wrong_neg_ratio {meters['teacher_wrong_neg_ratio'].val:.4f} | "
+        f"student_d2s_pos_sim_mean {meters['student_d2s_pos_sim_mean'].val:.4f} | "
+        f"student_d2s_topk_neg_sim_mean "
+        f"{meters['student_d2s_topk_neg_sim_mean'].val:.4f} | "
+        f"student_violation_ratio {meters['student_violation_ratio'].val:.4f} | "
+        f"brd_valid_neg_count {meters['brd_valid_neg_count'].val:.0f} | "
+        f"risk_weight_mean {meters['risk_weight_mean'].val:.4f} | "
+        f"risk_weight_max {meters['risk_weight_max'].val:.4f} | "
+    )
+
+
+def format_brd_epoch_log(stats):
+    return (
+        f"brd_raw_loss={stats['brd_raw_loss']:.4f} | "
+        f"brd_weighted_loss={stats['brd_weighted_loss']:.4f} | "
+        f"current_brd_weight={stats['current_brd_weight']:.6f} | "
+        f"teacher_d2s_pos_sim_mean={stats['teacher_d2s_pos_sim_mean']:.4f} | "
+        f"teacher_d2s_topk_neg_sim_mean="
+        f"{stats['teacher_d2s_topk_neg_sim_mean']:.4f} | "
+        f"teacher_d2s_margin_mean={stats['teacher_d2s_margin_mean']:.4f} | "
+        f"teacher_d2s_margin_min={stats['teacher_d2s_margin_min']:.4f} | "
+        f"teacher_wrong_neg_ratio={stats['teacher_wrong_neg_ratio']:.4f} | "
+        f"student_d2s_pos_sim_mean={stats['student_d2s_pos_sim_mean']:.4f} | "
+        f"student_d2s_topk_neg_sim_mean="
+        f"{stats['student_d2s_topk_neg_sim_mean']:.4f} | "
+        f"student_violation_ratio={stats['student_violation_ratio']:.4f} | "
+        f"brd_valid_neg_count={stats['brd_valid_neg_count']:.2f} | "
+        f"risk_weight_mean={stats['risk_weight_mean']:.4f} | "
+        f"risk_weight_max={stats['risk_weight_max']:.4f} | "
+    )
+
+
 def compute_student_batch_losses(
     model,
     images,
@@ -575,6 +859,7 @@ def compute_student_batch_losses(
     criterion,
     args,
     teacher_features=None,
+    pair_labels=None,
     return_local_debug=False,
 ):
     if args.use_local_align:
@@ -631,6 +916,21 @@ def compute_student_batch_losses(
         fmap_sat = None
         loss = main_loss
 
+    global_pair_labels = None
+    if pair_labels is not None:
+        if pair_labels.ndim != 1 or pair_labels.numel() != pair_batch_size:
+            raise ValueError(
+                f"Expected local pair labels [{pair_batch_size}], got "
+                f"{tuple(pair_labels.shape)}"
+            )
+        global_pair_labels = gather_tensor_without_grad(pair_labels)
+        if global_pair_labels.numel() != global_pair_batch_size:
+            raise RuntimeError(
+                "Global label gather does not match global pair batch: "
+                f"labels={global_pair_labels.numel()} pairs={global_pair_batch_size}"
+            )
+
+    current_brd_weight = get_current_brd_weight(args)
     if teacher_features is not None:
         global_teacher_features, teacher_pair_batch_size = gather_paired_views(
             teacher_features,
@@ -647,24 +947,26 @@ def compute_student_batch_losses(
             global_teacher_features,
             global_pair_batch_size,
             args,
+            pair_labels=global_pair_labels,
         )
-        loss = loss + args.brd_weight * brd_loss
+        brd_weighted_loss = brd_loss * current_brd_weight
+        loss = loss + brd_weighted_loss
     else:
         brd_loss = main_loss.new_zeros(())
-        brd_stats = {
-            "loss_brd_d2s": brd_loss.detach(),
-            "loss_brd_s2d": brd_loss.detach(),
-            "brd_risk_d2s": brd_loss.detach(),
-            "brd_risk_s2d": brd_loss.detach(),
-        }
+        brd_weighted_loss = brd_loss
+        brd_stats = make_zero_brd_stats(brd_loss)
 
     return {
         "loss": loss,
         "main_loss": main_loss,
         "local_align_loss": local_align_loss,
         "brd_loss": brd_loss,
+        "brd_raw_loss": brd_loss,
+        "brd_weighted_loss": brd_weighted_loss,
+        "current_brd_weight": current_brd_weight,
         "brd_stats": brd_stats,
         "global_pair_batch_size": global_pair_batch_size,
+        "global_pair_labels": global_pair_labels,
         "fmap_drone": fmap_drone,
         "fmap_sat": fmap_sat,
         "local_score": local_score,
@@ -684,6 +986,7 @@ def train_one_epoch(model, train_loader, criterion, optimizer, scheduler, scaler
     loss_brd_s2d_meter = AverageMeter()
     brd_risk_d2s_meter = AverageMeter()
     brd_risk_s2d_meter = AverageMeter()
+    brd_log_meters = create_brd_log_meters()
     end = time.time()
     printed_local_align_shapes = False
 
@@ -710,6 +1013,7 @@ def train_one_epoch(model, train_loader, criterion, optimizer, scheduler, scaler
                 criterion,
                 args,
                 teacher_features=teacher_features,
+                pair_labels=labels,
                 return_local_debug=args.use_local_align and not printed_local_align_shapes,
             )
             loss = batch_losses["loss"]
@@ -764,6 +1068,7 @@ def train_one_epoch(model, train_loader, criterion, optimizer, scheduler, scaler
         loss_brd_s2d_meter.update(brd_stats["loss_brd_s2d"].item(), images.size(0))
         brd_risk_d2s_meter.update(brd_stats["brd_risk_d2s"].item(), images.size(0))
         brd_risk_s2d_meter.update(brd_stats["brd_risk_s2d"].item(), images.size(0))
+        update_brd_log_meters(brd_log_meters, batch_losses, images.size(0))
         batch_time.update(time.time() - end)
         end = time.time()
 
@@ -773,12 +1078,12 @@ def train_one_epoch(model, train_loader, criterion, optimizer, scheduler, scaler
             brd_text = ""
             if teacher_model is not None:
                 brd_text = (
-                    f"loss_brd {loss_brd_meter.val:.4f} ({loss_brd_meter.avg:.4f}) | "
+                    f"loss_brd(raw) {loss_brd_meter.val:.4f} ({loss_brd_meter.avg:.4f}) | "
                     f"loss_brd_d2s {loss_brd_d2s_meter.val:.4f} ({loss_brd_d2s_meter.avg:.4f}) | "
                     f"loss_brd_s2d {loss_brd_s2d_meter.val:.4f} ({loss_brd_s2d_meter.avg:.4f}) | "
                     f"risk_d2s {brd_risk_d2s_meter.val:.4f} ({brd_risk_d2s_meter.avg:.4f}) | "
                     f"risk_s2d {brd_risk_s2d_meter.val:.4f} ({brd_risk_s2d_meter.avg:.4f}) | "
-                    f"brd_weight {args.brd_weight:.6f} | "
+                    f"{format_brd_diagnostic_log(brd_log_meters, batch_losses['current_brd_weight'])}"
                     f"brd_topk {args.brd_topk} | "
                     f"brd_pair_margin {args.brd_pair_margin:.6f} | "
                     )
@@ -809,6 +1114,13 @@ def train_one_epoch(model, train_loader, criterion, optimizer, scheduler, scaler
         "loss_brd_s2d": loss_brd_s2d_meter.avg,
         "brd_risk_d2s": brd_risk_d2s_meter.avg,
         "brd_risk_s2d": brd_risk_s2d_meter.avg,
+        "brd_raw_loss": brd_log_meters["brd_raw_loss"].avg,
+        "brd_weighted_loss": brd_log_meters["brd_weighted_loss"].avg,
+        "current_brd_weight": get_current_brd_weight(args),
+        **{
+            key: brd_log_meters[key].avg
+            for key in BRD_DIAGNOSTIC_KEYS
+        },
     }
 
 
@@ -836,6 +1148,7 @@ def train_one_epoch_deepspeed(
         "brd_risk_d2s": AverageMeter(),
         "brd_risk_s2d": AverageMeter(),
     }
+    brd_log_meters = create_brd_log_meters()
     batch_time = AverageMeter()
     data_time = AverageMeter()
     end = time.time()
@@ -844,7 +1157,7 @@ def train_one_epoch_deepspeed(
 
     for step, batch in enumerate(train_loader):
         data_time.update(time.time() - end)
-        images, _, meta = unpack_sample4geo_batch(batch, device)
+        images, labels, meta = unpack_sample4geo_batch(batch, device)
         images = images.to(dtype=input_dtype)
         pair_batch_size = meta["pair_batch_size"]
 
@@ -860,6 +1173,7 @@ def train_one_epoch_deepspeed(
             criterion,
             args,
             teacher_features=teacher_features,
+            pair_labels=labels,
             return_local_debug=args.use_local_align and not printed_local_align_shapes,
         )
         loss = batch_losses["loss"]
@@ -894,6 +1208,7 @@ def train_one_epoch_deepspeed(
         meters["loss_brd_s2d"].update(batch_losses["brd_stats"]["loss_brd_s2d"].item(), weight)
         meters["brd_risk_d2s"].update(batch_losses["brd_stats"]["brd_risk_d2s"].item(), weight)
         meters["brd_risk_s2d"].update(batch_losses["brd_stats"]["brd_risk_s2d"].item(), weight)
+        update_brd_log_meters(brd_log_meters, batch_losses, weight)
         batch_time.update(time.time() - end)
         end = time.time()
 
@@ -903,9 +1218,10 @@ def train_one_epoch_deepspeed(
             brd_text = ""
             if teacher_model is not None:
                 brd_text = (
-                    f"loss_brd {meters['loss_brd'].val:.4f} ({meters['loss_brd'].avg:.4f}) | "
+                    f"loss_brd(raw) {meters['loss_brd'].val:.4f} ({meters['loss_brd'].avg:.4f}) | "
                     f"risk_d2s {meters['brd_risk_d2s'].val:.4f} ({meters['brd_risk_d2s'].avg:.4f}) | "
                     f"risk_s2d {meters['brd_risk_s2d'].val:.4f} ({meters['brd_risk_s2d'].avg:.4f}) | "
+                    f"{format_brd_diagnostic_log(brd_log_meters, batch_losses['current_brd_weight'])}"
                 )
             print(
                 f"Epoch [{epoch}/{args.epochs}] "
@@ -922,7 +1238,17 @@ def train_one_epoch_deepspeed(
                 f"logit_scale {logit_scale:.3f} | lr {lr:.8f}"
             )
 
-    return {name: meter.avg for name, meter in meters.items()}
+    stats = {name: meter.avg for name, meter in meters.items()}
+    stats.update({
+        "brd_raw_loss": brd_log_meters["brd_raw_loss"].avg,
+        "brd_weighted_loss": brd_log_meters["brd_weighted_loss"].avg,
+        "current_brd_weight": get_current_brd_weight(args),
+    })
+    stats.update({
+        key: brd_log_meters[key].avg
+        for key in BRD_DIAGNOSTIC_KEYS
+    })
+    return stats
 
 
 def train(model, train_loader, val_loaders, criterion, optimizer, scheduler, device, args, teacher_model=None):
@@ -959,12 +1285,12 @@ def train(model, train_loader, val_loaders, criterion, optimizer, scheduler, dev
         brd_epoch_text = ""
         if teacher_model is not None:
             brd_epoch_text = (
-                f"loss_brd={train_stats['loss_brd']:.4f} | "
+                f"loss_brd(raw)={train_stats['loss_brd']:.4f} | "
                 f"loss_brd_d2s={train_stats['loss_brd_d2s']:.4f} | "
                 f"loss_brd_s2d={train_stats['loss_brd_s2d']:.4f} | "
                 f"risk_d2s={train_stats['brd_risk_d2s']:.4f} | "
                 f"risk_s2d={train_stats['brd_risk_s2d']:.4f} | "
-                f"brd_weight={args.brd_weight:.6f} | "
+                f"{format_brd_epoch_log(train_stats)}"
                 f"brd_topk={args.brd_topk} | "
                 f"brd_pair_margin={args.brd_pair_margin:.6f} | "
             )
@@ -1100,11 +1426,12 @@ def train_deepspeed(
             brd_epoch_text = ""
             if teacher_model is not None:
                 brd_epoch_text = (
-                    f"loss_brd={train_stats['loss_brd']:.4f} | "
+                    f"loss_brd(raw)={train_stats['loss_brd']:.4f} | "
                     f"loss_brd_d2s={train_stats['loss_brd_d2s']:.4f} | "
                     f"loss_brd_s2d={train_stats['loss_brd_s2d']:.4f} | "
                     f"risk_d2s={train_stats['brd_risk_d2s']:.4f} | "
                     f"risk_s2d={train_stats['brd_risk_s2d']:.4f} | "
+                    f"{format_brd_epoch_log(train_stats)}"
                 )
             print(
                 f"[Train] Epoch {epoch}/{args.epochs} | "
