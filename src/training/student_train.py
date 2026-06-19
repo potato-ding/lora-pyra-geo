@@ -49,6 +49,17 @@ def distributed_barrier():
         dist.barrier()
 
 
+def str2bool(value):
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"invalid boolean value: {value}")
+
+
 class AverageMeter:
     def __init__(self):
         self.reset()
@@ -247,30 +258,32 @@ def resolve_brd_pair_structure(anchor_labels, candidate_labels, expect_diagonal=
     return positive_indices, negative_mask
 
 
-def select_teacher_topk_negative_mask(teacher_logits, negative_mask, topk):
-    if teacher_logits.shape != negative_mask.shape:
+def select_teacher_topk_negative_mask(teacher_scores, candidate_mask, topk):
+    if teacher_scores.shape != candidate_mask.shape:
         raise ValueError(
-            "teacher logits/negative mask shape mismatch: "
-            f"logits={tuple(teacher_logits.shape)} mask={tuple(negative_mask.shape)}"
+            "teacher scores/candidate mask shape mismatch: "
+            f"scores={tuple(teacher_scores.shape)} mask={tuple(candidate_mask.shape)}"
         )
 
-    negative_counts = negative_mask.sum(dim=1)
-    if not torch.all(negative_counts > 0):
-        return torch.zeros_like(negative_mask)
     if int(topk) <= 0:
-        return negative_mask.clone()
+        return candidate_mask.clone()
 
-    selected_k = min(int(topk), int(negative_counts.min().item()))
-    masked_teacher = teacher_logits.masked_fill(~negative_mask, -torch.inf)
+    candidate_counts = candidate_mask.sum(dim=1)
+    max_available = int(candidate_counts.max().item())
+    if max_available <= 0:
+        return torch.zeros_like(candidate_mask)
+
+    selected_k = min(int(topk), max_available)
+    masked_teacher = teacher_scores.masked_fill(~candidate_mask, -torch.inf)
     topk_indices = torch.topk(
         masked_teacher,
         k=selected_k,
         dim=1,
         largest=True,
     ).indices
-    topk_mask = torch.zeros_like(negative_mask)
+    topk_mask = torch.zeros_like(candidate_mask)
     topk_mask.scatter_(1, topk_indices, True)
-    return topk_mask & negative_mask
+    return topk_mask & candidate_mask
 
 
 def _masked_mean(values, mask):
@@ -280,6 +293,13 @@ def _masked_mean(values, mask):
     return values.masked_select(mask).mean()
 
 
+def _masked_quantile(values, mask, q):
+    selected = values.masked_select(mask)
+    if selected.numel() <= 0:
+        return values.new_zeros(())
+    return torch.quantile(selected.float(), float(q)).to(dtype=values.dtype)
+
+
 def _zero_brd_direction_stats(reference):
     zero = reference.new_zeros(())
     return {
@@ -287,6 +307,11 @@ def _zero_brd_direction_stats(reference):
         "teacher_topk_neg_sim_mean": zero,
         "teacher_margin_mean": zero,
         "teacher_margin_min": zero,
+        "teacher_margin_p10": zero,
+        "teacher_margin_p50": zero,
+        "teacher_margin_p90": zero,
+        "candidate_margin_mean": zero,
+        "candidate_margin_min": zero,
         "teacher_wrong_neg_ratio": zero,
         "student_pos_sim_mean": zero,
         "student_topk_neg_sim_mean": zero,
@@ -295,6 +320,11 @@ def _zero_brd_direction_stats(reference):
         "risk_weight_sum": zero,
         "risk_weight_mean": zero,
         "risk_weight_max": zero,
+        "boundary_candidate_count": zero,
+        "boundary_query_count": zero,
+        "boundary_query_ratio": zero,
+        "effective_query_count": zero,
+        "num_queries": zero,
     }
 
 
@@ -304,6 +334,7 @@ def boundary_risk_pairwise_ranking_loss(
     anchor_labels,
     candidate_labels,
     args,
+    student_query=None,
 ):
     if student_logits.shape != teacher_logits.shape:
         raise ValueError(
@@ -313,9 +344,10 @@ def boundary_risk_pairwise_ranking_loss(
     if student_logits.ndim != 2 or student_logits.size(0) != student_logits.size(1):
         raise ValueError(f"BRD expects square cross-view logits, got {tuple(student_logits.shape)}")
 
+    zero_reference = student_query if student_query is not None else student_logits
     num_anchors = student_logits.size(0)
     if num_anchors <= 1:
-        zero = student_logits.sum() * 0.0
+        zero = zero_reference.sum() * 0.0
         return zero, _zero_brd_direction_stats(student_logits)
 
     teacher_logits = teacher_logits.detach()
@@ -331,14 +363,33 @@ def boundary_risk_pairwise_ranking_loss(
 
     teacher_pos_vector = teacher_logits[row_indices, positive_indices]
     teacher_pos = teacher_pos_vector.unsqueeze(1)
-    teacher_risk_score = (
+    teacher_margin = teacher_pos - teacher_logits
+    boundary_delta = float(getattr(args, "brd_boundary_delta", 0.3))
+    if boundary_delta <= 0:
+        raise ValueError(
+            f"brd_boundary_delta must be > 0, got {boundary_delta}"
+        )
+    boundary_candidate_mask = (
+        negative_mask
+        & (teacher_margin > 0)
+        & (teacher_margin < boundary_delta)
+    )
+    boundary_query_mask = boundary_candidate_mask.any(dim=1)
+    skip_no_boundary = bool(getattr(args, "brd_skip_no_boundary", True))
+    teacher_risk_score_unmasked = (
         teacher_logits - teacher_pos + float(args.brd_risk_margin)
     ) / max(float(args.brd_risk_tau), 1e-6)
+    # Boundary filtering is deliberately applied before top-k. Non-candidates
+    # are hard-excluded from ranking and can never be selected.
+    teacher_risk_score = teacher_risk_score_unmasked.masked_fill(
+        ~boundary_candidate_mask,
+        -torch.inf,
+    )
     raw_risk_weights = torch.sigmoid(teacher_risk_score).detach()
 
     topk_mask = select_teacher_topk_negative_mask(
-        teacher_logits,
-        negative_mask,
+        teacher_risk_score,
+        boundary_candidate_mask,
         topk=int(getattr(args, "brd_topk", 4)),
     )
 
@@ -358,8 +409,10 @@ def boundary_risk_pairwise_ranking_loss(
     weight_sum = risk_weights.sum()
     valid_neg_count = valid_neg_mask.sum()
     topk_count = topk_mask.sum()
+    effective_query_count = valid_neg_mask.any(dim=1).sum()
+    boundary_candidate_count = boundary_candidate_mask.sum()
+    boundary_query_count = boundary_query_mask.sum()
 
-    teacher_margin = teacher_pos - teacher_logits
     stats = {
         "teacher_pos_sim_mean": teacher_pos_vector.mean().detach(),
         "teacher_topk_neg_sim_mean": _masked_mean(
@@ -373,6 +426,30 @@ def boundary_risk_pairwise_ranking_loss(
         "teacher_margin_min": (
             teacher_margin.masked_select(topk_mask).min().detach()
             if topk_count.item() > 0
+            else teacher_logits.new_zeros(())
+        ),
+        "teacher_margin_p10": _masked_quantile(
+            teacher_margin,
+            negative_mask,
+            0.10,
+        ).detach(),
+        "teacher_margin_p50": _masked_quantile(
+            teacher_margin,
+            negative_mask,
+            0.50,
+        ).detach(),
+        "teacher_margin_p90": _masked_quantile(
+            teacher_margin,
+            negative_mask,
+            0.90,
+        ).detach(),
+        "candidate_margin_mean": _masked_mean(
+            teacher_margin,
+            boundary_candidate_mask,
+        ).detach(),
+        "candidate_margin_min": (
+            teacher_margin.masked_select(boundary_candidate_mask).min().detach()
+            if boundary_candidate_count.item() > 0
             else teacher_logits.new_zeros(())
         ),
         "teacher_wrong_neg_ratio": _masked_mean(
@@ -399,10 +476,29 @@ def boundary_risk_pairwise_ranking_loss(
             if valid_neg_count.item() > 0
             else teacher_logits.new_zeros(())
         ),
+        "boundary_candidate_count": boundary_candidate_count.to(
+            student_logits.dtype
+        ).detach(),
+        "boundary_query_count": boundary_query_count.to(
+            student_logits.dtype
+        ).detach(),
+        "boundary_query_ratio": (
+            boundary_query_count.to(student_logits.dtype)
+            / max(num_anchors, 1)
+        ).detach(),
+        "effective_query_count": effective_query_count.to(
+            student_logits.dtype
+        ).detach(),
+        "num_queries": student_logits.new_tensor(float(num_anchors)).detach(),
     }
 
-    if weight_sum.item() <= 0:
-        zero = student_logits.sum() * 0.0
+    if (
+        (skip_no_boundary and effective_query_count.item() <= 0)
+        or weight_sum.item() <= 0
+    ):
+        # Keep the loss attached to the student query graph, including the
+        # all-gather autograd path used by DeepSpeed multi-GPU training.
+        zero = zero_reference.sum() * 0.0
         return zero, stats
 
     loss = (pairwise_loss * risk_weights).sum() / weight_sum.clamp_min(1e-6)
@@ -449,6 +545,7 @@ def compute_brd_loss(
         pair_labels,
         pair_labels,
         args,
+        student_query=student_drone,
     )
     loss_s2d, stats_s2d = boundary_risk_pairwise_ranking_loss(
         student_logits.t(),
@@ -456,6 +553,7 @@ def compute_brd_loss(
         pair_labels,
         pair_labels,
         args,
+        student_query=student_satellite,
     )
     loss = 0.5 * (loss_d2s + loss_s2d)
 
@@ -468,6 +566,19 @@ def compute_brd_loss(
     risk_weight_mean = (
         total_risk_sum / total_valid_count.clamp_min(1.0)
     )
+    total_boundary_candidates = (
+        stats_d2s["boundary_candidate_count"]
+        + stats_s2d["boundary_candidate_count"]
+    )
+    total_boundary_queries = (
+        stats_d2s["boundary_query_count"]
+        + stats_s2d["boundary_query_count"]
+    )
+    total_queries = stats_d2s["num_queries"] + stats_s2d["num_queries"]
+    total_effective_queries = (
+        stats_d2s["effective_query_count"]
+        + stats_s2d["effective_query_count"]
+    )
     stats = {
         "loss_brd_d2s": loss_d2s.detach(),
         "loss_brd_s2d": loss_s2d.detach(),
@@ -477,9 +588,36 @@ def compute_brd_loss(
         "teacher_d2s_topk_neg_sim_mean": stats_d2s["teacher_topk_neg_sim_mean"],
         "teacher_d2s_margin_mean": stats_d2s["teacher_margin_mean"],
         "teacher_d2s_margin_min": stats_d2s["teacher_margin_min"],
+        "teacher_d2s_margin_p10": stats_d2s["teacher_margin_p10"],
+        "teacher_d2s_margin_p50": stats_d2s["teacher_margin_p50"],
+        "teacher_d2s_margin_p90": stats_d2s["teacher_margin_p90"],
+        "teacher_s2d_margin_p10": stats_s2d["teacher_margin_p10"],
+        "teacher_s2d_margin_p50": stats_s2d["teacher_margin_p50"],
+        "teacher_s2d_margin_p90": stats_s2d["teacher_margin_p90"],
         "teacher_wrong_neg_ratio": stats_d2s["teacher_wrong_neg_ratio"],
         "student_d2s_pos_sim_mean": stats_d2s["student_pos_sim_mean"],
         "student_d2s_topk_neg_sim_mean": stats_d2s["student_topk_neg_sim_mean"],
+        "student_d2s_violation_ratio": stats_d2s["student_violation_ratio"],
+        "student_s2d_violation_ratio": stats_s2d["student_violation_ratio"],
+        "candidate_d2s_margin_mean": stats_d2s["candidate_margin_mean"],
+        "candidate_s2d_margin_mean": stats_s2d["candidate_margin_mean"],
+        "candidate_d2s_margin_min": stats_d2s["candidate_margin_min"],
+        "candidate_s2d_margin_min": stats_s2d["candidate_margin_min"],
+        "brd_d2s_boundary_candidate_count": stats_d2s[
+            "boundary_candidate_count"
+        ],
+        "brd_s2d_boundary_candidate_count": stats_s2d[
+            "boundary_candidate_count"
+        ],
+        "brd_d2s_boundary_query_ratio": stats_d2s["boundary_query_ratio"],
+        "brd_s2d_boundary_query_ratio": stats_s2d["boundary_query_ratio"],
+        "brd_d2s_effective_query_count": stats_d2s[
+            "effective_query_count"
+        ],
+        "brd_s2d_effective_query_count": stats_s2d[
+            "effective_query_count"
+        ],
+        # Compatibility aliases retained for existing result consumers.
         "student_violation_ratio": stats_d2s["student_violation_ratio"],
         "brd_valid_neg_count": total_valid_count.detach(),
         "risk_weight_mean": risk_weight_mean.detach(),
@@ -487,6 +625,11 @@ def compute_brd_loss(
             stats_d2s["risk_weight_max"],
             stats_s2d["risk_weight_max"],
         ).detach(),
+        "brd_boundary_candidate_count": total_boundary_candidates.detach(),
+        "brd_boundary_query_ratio": (
+            total_boundary_queries / total_queries.clamp_min(1.0)
+        ).detach(),
+        "brd_effective_query_count": total_effective_queries.detach(),
     }
     return loss, stats
 
@@ -762,13 +905,30 @@ BRD_DIAGNOSTIC_KEYS = (
     "teacher_d2s_topk_neg_sim_mean",
     "teacher_d2s_margin_mean",
     "teacher_d2s_margin_min",
+    "teacher_d2s_margin_p10",
+    "teacher_d2s_margin_p50",
+    "teacher_d2s_margin_p90",
+    "teacher_s2d_margin_p10",
+    "teacher_s2d_margin_p50",
+    "teacher_s2d_margin_p90",
     "teacher_wrong_neg_ratio",
     "student_d2s_pos_sim_mean",
     "student_d2s_topk_neg_sim_mean",
-    "student_violation_ratio",
+    "student_d2s_violation_ratio",
+    "student_s2d_violation_ratio",
     "brd_valid_neg_count",
     "risk_weight_mean",
     "risk_weight_max",
+    "brd_d2s_boundary_candidate_count",
+    "brd_s2d_boundary_candidate_count",
+    "brd_d2s_boundary_query_ratio",
+    "brd_s2d_boundary_query_ratio",
+    "brd_d2s_effective_query_count",
+    "brd_s2d_effective_query_count",
+    "candidate_d2s_margin_mean",
+    "candidate_s2d_margin_mean",
+    "candidate_d2s_margin_min",
+    "candidate_s2d_margin_min",
 )
 
 
@@ -820,14 +980,43 @@ def format_brd_diagnostic_log(meters, current_brd_weight):
         f"{meters['teacher_d2s_topk_neg_sim_mean'].val:.4f} | "
         f"teacher_d2s_margin_mean {meters['teacher_d2s_margin_mean'].val:.4f} | "
         f"teacher_d2s_margin_min {meters['teacher_d2s_margin_min'].val:.4f} | "
+        f"teacher_d2s_margin_p10 {meters['teacher_d2s_margin_p10'].val:.4f} | "
+        f"teacher_d2s_margin_p50 {meters['teacher_d2s_margin_p50'].val:.4f} | "
+        f"teacher_d2s_margin_p90 {meters['teacher_d2s_margin_p90'].val:.4f} | "
+        f"teacher_s2d_margin_p10 {meters['teacher_s2d_margin_p10'].val:.4f} | "
+        f"teacher_s2d_margin_p50 {meters['teacher_s2d_margin_p50'].val:.4f} | "
+        f"teacher_s2d_margin_p90 {meters['teacher_s2d_margin_p90'].val:.4f} | "
         f"teacher_wrong_neg_ratio {meters['teacher_wrong_neg_ratio'].val:.4f} | "
         f"student_d2s_pos_sim_mean {meters['student_d2s_pos_sim_mean'].val:.4f} | "
         f"student_d2s_topk_neg_sim_mean "
         f"{meters['student_d2s_topk_neg_sim_mean'].val:.4f} | "
-        f"student_violation_ratio {meters['student_violation_ratio'].val:.4f} | "
+        f"student_d2s_violation_ratio "
+        f"{meters['student_d2s_violation_ratio'].val:.4f} | "
+        f"student_s2d_violation_ratio "
+        f"{meters['student_s2d_violation_ratio'].val:.4f} | "
         f"brd_valid_neg_count {meters['brd_valid_neg_count'].val:.0f} | "
         f"risk_weight_mean {meters['risk_weight_mean'].val:.4f} | "
         f"risk_weight_max {meters['risk_weight_max'].val:.4f} | "
+        f"brd_d2s_boundary_candidate_count "
+        f"{meters['brd_d2s_boundary_candidate_count'].val:.0f} | "
+        f"brd_s2d_boundary_candidate_count "
+        f"{meters['brd_s2d_boundary_candidate_count'].val:.0f} | "
+        f"brd_d2s_boundary_query_ratio "
+        f"{meters['brd_d2s_boundary_query_ratio'].val:.4f} | "
+        f"brd_s2d_boundary_query_ratio "
+        f"{meters['brd_s2d_boundary_query_ratio'].val:.4f} | "
+        f"brd_d2s_effective_query_count "
+        f"{meters['brd_d2s_effective_query_count'].val:.0f} | "
+        f"brd_s2d_effective_query_count "
+        f"{meters['brd_s2d_effective_query_count'].val:.0f} | "
+        f"candidate_d2s_margin_mean "
+        f"{meters['candidate_d2s_margin_mean'].val:.4f} | "
+        f"candidate_s2d_margin_mean "
+        f"{meters['candidate_s2d_margin_mean'].val:.4f} | "
+        f"candidate_d2s_margin_min "
+        f"{meters['candidate_d2s_margin_min'].val:.4f} | "
+        f"candidate_s2d_margin_min "
+        f"{meters['candidate_s2d_margin_min'].val:.4f} | "
     )
 
 
@@ -841,14 +1030,39 @@ def format_brd_epoch_log(stats):
         f"{stats['teacher_d2s_topk_neg_sim_mean']:.4f} | "
         f"teacher_d2s_margin_mean={stats['teacher_d2s_margin_mean']:.4f} | "
         f"teacher_d2s_margin_min={stats['teacher_d2s_margin_min']:.4f} | "
+        f"teacher_d2s_margin_p10={stats['teacher_d2s_margin_p10']:.4f} | "
+        f"teacher_d2s_margin_p50={stats['teacher_d2s_margin_p50']:.4f} | "
+        f"teacher_d2s_margin_p90={stats['teacher_d2s_margin_p90']:.4f} | "
+        f"teacher_s2d_margin_p10={stats['teacher_s2d_margin_p10']:.4f} | "
+        f"teacher_s2d_margin_p50={stats['teacher_s2d_margin_p50']:.4f} | "
+        f"teacher_s2d_margin_p90={stats['teacher_s2d_margin_p90']:.4f} | "
         f"teacher_wrong_neg_ratio={stats['teacher_wrong_neg_ratio']:.4f} | "
         f"student_d2s_pos_sim_mean={stats['student_d2s_pos_sim_mean']:.4f} | "
         f"student_d2s_topk_neg_sim_mean="
         f"{stats['student_d2s_topk_neg_sim_mean']:.4f} | "
-        f"student_violation_ratio={stats['student_violation_ratio']:.4f} | "
+        f"student_d2s_violation_ratio="
+        f"{stats['student_d2s_violation_ratio']:.4f} | "
+        f"student_s2d_violation_ratio="
+        f"{stats['student_s2d_violation_ratio']:.4f} | "
         f"brd_valid_neg_count={stats['brd_valid_neg_count']:.2f} | "
         f"risk_weight_mean={stats['risk_weight_mean']:.4f} | "
         f"risk_weight_max={stats['risk_weight_max']:.4f} | "
+        f"brd_d2s_boundary_candidate_count="
+        f"{stats['brd_d2s_boundary_candidate_count']:.2f} | "
+        f"brd_s2d_boundary_candidate_count="
+        f"{stats['brd_s2d_boundary_candidate_count']:.2f} | "
+        f"brd_d2s_boundary_query_ratio="
+        f"{stats['brd_d2s_boundary_query_ratio']:.4f} | "
+        f"brd_s2d_boundary_query_ratio="
+        f"{stats['brd_s2d_boundary_query_ratio']:.4f} | "
+        f"brd_d2s_effective_query_count="
+        f"{stats['brd_d2s_effective_query_count']:.2f} | "
+        f"brd_s2d_effective_query_count="
+        f"{stats['brd_s2d_effective_query_count']:.2f} | "
+        f"candidate_d2s_margin_mean={stats['candidate_d2s_margin_mean']:.4f} | "
+        f"candidate_s2d_margin_mean={stats['candidate_s2d_margin_mean']:.4f} | "
+        f"candidate_d2s_margin_min={stats['candidate_d2s_margin_min']:.4f} | "
+        f"candidate_s2d_margin_min={stats['candidate_s2d_margin_min']:.4f} | "
     )
 
 
@@ -1085,6 +1299,8 @@ def train_one_epoch(model, train_loader, criterion, optimizer, scheduler, scaler
                     f"risk_s2d {brd_risk_s2d_meter.val:.4f} ({brd_risk_s2d_meter.avg:.4f}) | "
                     f"{format_brd_diagnostic_log(brd_log_meters, batch_losses['current_brd_weight'])}"
                     f"brd_topk {args.brd_topk} | "
+                    f"brd_boundary_delta {getattr(args, 'brd_boundary_delta', 0.3):.4f} | "
+                    f"brd_skip_no_boundary {getattr(args, 'brd_skip_no_boundary', True)} | "
                     f"brd_pair_margin {args.brd_pair_margin:.6f} | "
                     )
             print(
@@ -1222,6 +1438,8 @@ def train_one_epoch_deepspeed(
                     f"risk_d2s {meters['brd_risk_d2s'].val:.4f} ({meters['brd_risk_d2s'].avg:.4f}) | "
                     f"risk_s2d {meters['brd_risk_s2d'].val:.4f} ({meters['brd_risk_s2d'].avg:.4f}) | "
                     f"{format_brd_diagnostic_log(brd_log_meters, batch_losses['current_brd_weight'])}"
+                    f"brd_boundary_delta {getattr(args, 'brd_boundary_delta', 0.3):.4f} | "
+                    f"brd_skip_no_boundary {getattr(args, 'brd_skip_no_boundary', True)} | "
                 )
             print(
                 f"Epoch [{epoch}/{args.epochs}] "
@@ -1292,6 +1510,8 @@ def train(model, train_loader, val_loaders, criterion, optimizer, scheduler, dev
                 f"risk_s2d={train_stats['brd_risk_s2d']:.4f} | "
                 f"{format_brd_epoch_log(train_stats)}"
                 f"brd_topk={args.brd_topk} | "
+                f"brd_boundary_delta={getattr(args, 'brd_boundary_delta', 0.3):.4f} | "
+                f"brd_skip_no_boundary={getattr(args, 'brd_skip_no_boundary', True)} | "
                 f"brd_pair_margin={args.brd_pair_margin:.6f} | "
             )
         print(
@@ -1432,6 +1652,8 @@ def train_deepspeed(
                     f"risk_d2s={train_stats['brd_risk_d2s']:.4f} | "
                     f"risk_s2d={train_stats['brd_risk_s2d']:.4f} | "
                     f"{format_brd_epoch_log(train_stats)}"
+                    f"brd_boundary_delta={getattr(args, 'brd_boundary_delta', 0.3):.4f} | "
+                    f"brd_skip_no_boundary={getattr(args, 'brd_skip_no_boundary', True)} | "
                 )
             print(
                 f"[Train] Epoch {epoch}/{args.epochs} | "
@@ -1567,13 +1789,21 @@ def parse_args():
     parser.add_argument("--teacher_checkpoint_root", type=str, default="src/checkpoint/teacher")
     parser.add_argument("--teacher_checkpoint_name", type=str, default="best_model.pth")
     parser.add_argument("--no_teacher_checkpoint_hparams", action="store_true")
-    parser.add_argument("--brd_weight", type=float, default=1.0)
+    parser.add_argument("--brd_weight", type=float, default=0.05)
     parser.add_argument("--brd_temperature", type=float, default=0.07)
     parser.add_argument("--brd_risk_margin", type=float, default=0.0)
     parser.add_argument("--brd_risk_tau", type=float, default=0.05)
     parser.add_argument("--brd_topk", type=int, default=4)
     parser.add_argument("--brd_pair_margin", type=float, default=0.05)
     parser.add_argument("--brd_risk_threshold", type=float, default=0.0)
+    parser.add_argument("--brd_boundary_delta", type=float, default=0.3)
+    parser.add_argument(
+        "--brd_skip_no_boundary",
+        type=str2bool,
+        nargs="?",
+        const=True,
+        default=True,
+    )
 
     args = parser.parse_args()
     if args.best_metric_name != "R1_sum":

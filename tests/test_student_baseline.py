@@ -191,6 +191,8 @@ def test_brd_diagnostics_match_selected_teacher_topk():
         brd_risk_threshold = 0.0
         brd_pair_margin = 0.05
         brd_temperature = 0.07
+        brd_boundary_delta = 0.3
+        brd_skip_no_boundary = True
 
     teacher_logits = torch.tensor([
         [0.90, 0.80, 0.10],
@@ -218,27 +220,113 @@ def test_brd_diagnostics_match_selected_teacher_topk():
     )
     torch.testing.assert_close(
         stats["teacher_topk_neg_sim_mean"],
-        torch.tensor(0.80),
+        torch.tensor(0.75),
     )
     torch.testing.assert_close(
         stats["teacher_margin_mean"],
-        torch.tensor(0.10),
+        torch.tensor(0.175),
     )
     torch.testing.assert_close(
         stats["teacher_margin_min"],
-        torch.tensor(-0.05),
+        torch.tensor(0.10),
     )
     torch.testing.assert_close(
         stats["teacher_wrong_neg_ratio"],
-        torch.tensor(1.0 / 3.0),
+        torch.tensor(0.0),
     )
     torch.testing.assert_close(
         stats["student_violation_ratio"],
-        torch.tensor(2.0 / 3.0),
+        torch.tensor(0.5),
     )
-    assert stats["valid_neg_count"].item() == 3
+    # Quantiles cover every valid negative, not only boundary candidates/top-k.
+    torch.testing.assert_close(stats["teacher_margin_p10"], torch.tensor(0.025))
+    torch.testing.assert_close(stats["teacher_margin_p50"], torch.tensor(0.400))
+    torch.testing.assert_close(stats["teacher_margin_p90"], torch.tensor(0.775))
+    torch.testing.assert_close(stats["candidate_margin_mean"], torch.tensor(0.175))
+    torch.testing.assert_close(stats["candidate_margin_min"], torch.tensor(0.100))
+    assert stats["boundary_candidate_count"].item() == 2
+    assert stats["boundary_query_ratio"].item() == pytest.approx(2.0 / 3.0)
+    assert stats["effective_query_count"].item() == 2
+    assert stats["valid_neg_count"].item() == 2
     loss.backward()
     assert student_logits.grad is not None
+
+
+def test_brd_skips_queries_without_boundary_candidates_by_default():
+    class Args:
+        brd_risk_margin = 0.0
+        brd_risk_tau = 0.05
+        brd_topk = 1
+        brd_risk_threshold = 0.0
+        brd_pair_margin = 0.05
+        brd_temperature = 0.07
+        brd_boundary_delta = 0.3
+        brd_skip_no_boundary = True
+
+    teacher_logits = torch.tensor([
+        [0.95, 0.20, 0.10],
+        [0.15, 0.90, 0.25],
+        [0.20, 0.10, 0.92],
+    ])
+    student_logits = teacher_logits.clone().requires_grad_(True)
+    student_query = torch.randn(3, 4, requires_grad=True)
+    labels = torch.tensor([1, 2, 3])
+
+    loss, stats = boundary_risk_pairwise_ranking_loss(
+        student_logits,
+        teacher_logits,
+        labels,
+        labels,
+        Args,
+        student_query=student_query,
+    )
+
+    assert loss.item() == 0.0
+    assert torch.isfinite(loss)
+    assert stats["boundary_candidate_count"].item() == 0
+    assert stats["boundary_query_ratio"].item() == 0.0
+    assert stats["effective_query_count"].item() == 0
+    assert stats["valid_neg_count"].item() == 0
+    loss.backward()
+    torch.testing.assert_close(
+        student_query.grad,
+        torch.zeros_like(student_query),
+    )
+    assert student_logits.grad is None
+
+
+def test_brd_never_falls_back_to_easy_negatives():
+    class Args:
+        brd_risk_margin = 0.0
+        brd_risk_tau = 0.05
+        brd_topk = 1
+        brd_risk_threshold = 0.0
+        brd_pair_margin = 0.05
+        brd_temperature = 0.07
+        brd_boundary_delta = 0.3
+        brd_skip_no_boundary = False
+
+    teacher_logits = torch.tensor([
+        [0.95, 0.20, 0.10],
+        [0.15, 0.90, 0.25],
+        [0.20, 0.10, 0.92],
+    ])
+    student_logits = teacher_logits.clone().requires_grad_(True)
+    labels = torch.tensor([1, 2, 3])
+
+    loss, stats = boundary_risk_pairwise_ranking_loss(
+        student_logits,
+        teacher_logits,
+        labels,
+        labels,
+        Args,
+    )
+
+    assert loss.item() == 0.0
+    assert torch.isfinite(loss)
+    assert stats["boundary_candidate_count"].item() == 0
+    assert stats["effective_query_count"].item() == 0
+    assert stats["valid_neg_count"].item() == 0
 
 
 def test_brd_raw_weighted_total_and_gradient_contract():
@@ -263,6 +351,8 @@ def test_brd_raw_weighted_total_and_gradient_contract():
         brd_topk = 1
         brd_pair_margin = 0.05
         brd_risk_threshold = 0.0
+        brd_boundary_delta = 2.0
+        brd_skip_no_boundary = True
 
     student_inputs = torch.tensor([
         [1.0, 0.0, 0.0],
@@ -340,6 +430,8 @@ def test_brd_uses_global_gallery_after_gather(monkeypatch):
         brd_topk = 1
         brd_pair_margin = 0.05
         brd_risk_threshold = 0.0
+        brd_boundary_delta = 2.0
+        brd_skip_no_boundary = True
 
     features = F.normalize(torch.tensor([
         [1.0, 0.0],
@@ -411,6 +503,22 @@ def test_deepspeed_runtime_config_uses_local_pair_batch(tmp_path):
     assert config["gradient_accumulation_steps"] == 2
     assert config["train_batch_size"] == 24
     assert config["gradient_clipping"] == 1.5
+
+
+def test_brd_cli_defaults_use_boundary_filter_and_small_weight(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["student_train.py"])
+    args = student_train.parse_args()
+    assert args.brd_weight == pytest.approx(0.05)
+    assert args.brd_boundary_delta == pytest.approx(0.3)
+    assert args.brd_skip_no_boundary is True
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["student_train.py", "--brd_skip_no_boundary", "false"],
+    )
+    args = student_train.parse_args()
+    assert args.brd_skip_no_boundary is False
 
 
 def test_deepspeed_runtime_config_respects_no_amp_and_rejects_zero3(tmp_path):
@@ -508,7 +616,10 @@ def test_deepspeed_epoch_path_updates_student_without_changing_loss_definition()
     assert not torch.equal(before, engine.module.proj.weight.detach())
 
 
-def test_deepspeed_backward_really_uses_weighted_brd_term():
+def test_deepspeed_backward_really_uses_weighted_brd_term(
+    monkeypatch,
+    capsys,
+):
     class PairDataset(Dataset):
         samples = [
             (
@@ -594,6 +705,8 @@ def test_deepspeed_backward_really_uses_weighted_brd_term():
         brd_topk = 2
         brd_pair_margin = 0.05
         brd_risk_threshold = 0.0
+        brd_boundary_delta = 0.3
+        brd_skip_no_boundary = True
         print_freq = 100
         epochs = 1
 
@@ -601,6 +714,7 @@ def test_deepspeed_backward_really_uses_weighted_brd_term():
     engine = FakeDeepSpeedEngine(TinyStudent())
     teacher = TinyTeacher().eval()
     before = engine.module.proj.weight.detach().clone()
+    monkeypatch.setattr(student_train, "is_main_process", lambda: False)
 
     stats = train_one_epoch_deepspeed(
         engine,
@@ -621,3 +735,26 @@ def test_deepspeed_backward_really_uses_weighted_brd_term():
     )
     assert not torch.equal(before, engine.module.proj.weight.detach())
     assert all(param.grad is None for param in teacher.parameters())
+    for key in (
+        "brd_d2s_boundary_candidate_count",
+        "brd_s2d_boundary_candidate_count",
+        "brd_d2s_boundary_query_ratio",
+        "brd_s2d_boundary_query_ratio",
+        "brd_d2s_effective_query_count",
+        "brd_s2d_effective_query_count",
+        "student_d2s_violation_ratio",
+        "student_s2d_violation_ratio",
+        "teacher_d2s_margin_p10",
+        "teacher_d2s_margin_p50",
+        "teacher_d2s_margin_p90",
+        "teacher_s2d_margin_p10",
+        "teacher_s2d_margin_p50",
+        "teacher_s2d_margin_p90",
+        "candidate_d2s_margin_mean",
+        "candidate_s2d_margin_mean",
+        "candidate_d2s_margin_min",
+        "candidate_s2d_margin_min",
+    ):
+        assert key in stats
+        assert torch.isfinite(torch.tensor(stats[key]))
+    assert capsys.readouterr().out == ""

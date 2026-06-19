@@ -738,7 +738,46 @@ L
 5. 学生特征采用可反传 all-gather；
 6. 冻结教师特征采用无梯度 all-gather；
 7. 聚合后恢复为 `[all_drone, all_satellite]`，保证矩阵对角线仍是正样本；
-8. InfoNCE、BRD 和可选 local alignment 在全局 batch 上计算。
+8. 在教师全局相似度矩阵中，仅保留满足边界条件的 negatives；
+9. InfoNCE、BRD 和可选 local alignment 在全局 batch 上计算。
+
+教师边界候选定义：
+
+\[
+\text{margin}_t
+=
+\text{sim}_t(\text{positive})
+-
+\text{sim}_t(\text{negative})
+\]
+
+\[
+\text{candidate}
+=
+\text{negative}
+\land
+(0 < \text{margin}_t < \text{brd\_boundary\_delta})
+\]
+
+默认：
+
+```text
+brd_boundary_delta=0.3
+brd_skip_no_boundary=true
+```
+
+因此教师已经明显分开的 easy negatives 不参与 BRD；教师把错误 negative
+排在 positive 前面的负 margin 样本也不进入当前边界候选。实现顺序必须是：
+
+1. 先在完整 global gallery 上计算 `candidate_mask`；
+2. 将非 candidate 的 `risk_score` 设为 `-inf`；
+3. 再且只在 candidate 内执行 Top-K。
+
+不允许先对全部 negatives 做 Top-K 再过滤。某个 query 没有候选且
+`brd_skip_no_boundary=true` 时直接跳过，不会强行用 easy negative 补齐。
+如果某个方向没有任何 effective query，该方向返回
+`student_query.sum() * 0.0`，从而保持 device、dtype 和 student all-gather
+梯度图正确，同时避免空张量归约产生 NaN。
 
 ### 8.4 Batch size 口径
 
@@ -802,8 +841,10 @@ deepspeed --include localhost:0,1,2,3 src/training/student_train.py \
   --label_smoothing 0.1 \
   --use_brd_distill \
   --teacher_checkpoint src/checkpoint/teacher/<teacher_run>/best_model.pth \
-  --brd_weight 1.0 \
+  --brd_weight 0.05 \
   --brd_topk 4 \
+  --brd_boundary_delta 0.3 \
+  --brd_skip_no_boundary true \
   --brd_pair_margin 0.05 \
   --brd_risk_margin 0.0 \
   --brd_risk_tau 0.05 \
@@ -907,13 +948,30 @@ L_{\text{BRD-weighted}}
 | `teacher_d2s_topk_neg_sim_mean` | 教师选中 top-K 风险 negatives 的相似度均值 |
 | `teacher_d2s_margin_mean` | 教师 `positive similarity - selected negative similarity` 均值 |
 | `teacher_d2s_margin_min` | 上述 margin 最小值 |
+| `teacher_d2s_margin_p10` | D2S 完整 `neg_mask` 内 margin 的 10% 分位数 |
+| `teacher_d2s_margin_p50` | D2S 完整 `neg_mask` 内 margin 的 50% 分位数 |
+| `teacher_d2s_margin_p90` | D2S 完整 `neg_mask` 内 margin 的 90% 分位数 |
+| `teacher_s2d_margin_p10` | S2D 完整 `neg_mask` 内 margin 的 10% 分位数 |
+| `teacher_s2d_margin_p50` | S2D 完整 `neg_mask` 内 margin 的 50% 分位数 |
+| `teacher_s2d_margin_p90` | S2D 完整 `neg_mask` 内 margin 的 90% 分位数 |
 | `teacher_wrong_neg_ratio` | 教师 selected negatives 中相似度不低于 positive 的比例 |
 | `student_d2s_pos_sim_mean` | 学生 D2S 正样本相似度均值 |
 | `student_d2s_topk_neg_sim_mean` | 学生在教师选中 negatives 上的相似度均值 |
-| `student_violation_ratio` | 满足 `s_neg - s_pos + pair_margin > 0` 的有效 D2S negative 比例 |
+| `student_d2s_violation_ratio` | D2S 中满足 `s_neg - s_pos + pair_margin > 0` 的有效 negative 比例 |
+| `student_s2d_violation_ratio` | S2D 中满足 `s_neg - s_pos + pair_margin > 0` 的有效 negative 比例 |
 | `brd_valid_neg_count` | D2S 与 S2D 最终参与 BRD 的 negative 总数 |
 | `risk_weight_mean` | D2S/S2D 全部有效 negatives 的风险权重均值 |
 | `risk_weight_max` | D2S/S2D 全部有效 negatives 的最大风险权重 |
+| `brd_d2s_boundary_candidate_count` | D2S 在 Top-K 前满足边界条件的候选数 |
+| `brd_s2d_boundary_candidate_count` | S2D 在 Top-K 前满足边界条件的候选数 |
+| `brd_d2s_boundary_query_ratio` | D2S query 中至少有一个边界候选的比例 |
+| `brd_s2d_boundary_query_ratio` | S2D query 中至少有一个边界候选的比例 |
+| `brd_d2s_effective_query_count` | D2S 最终至少有一个 negative 进入损失的 query 数 |
+| `brd_s2d_effective_query_count` | S2D 最终至少有一个 negative 进入损失的 query 数 |
+| `candidate_d2s_margin_mean` | D2S 全部 boundary candidates 的教师 margin 均值 |
+| `candidate_s2d_margin_mean` | S2D 全部 boundary candidates 的教师 margin 均值 |
+| `candidate_d2s_margin_min` | D2S 全部 boundary candidates 的教师 margin 最小值 |
+| `candidate_s2d_margin_min` | S2D 全部 boundary candidates 的教师 margin 最小值 |
 
 多卡正负样本规则：
 
@@ -924,7 +982,11 @@ L_{\text{BRD-weighted}}
 4. 正常 PID 唯一采样下，`pos_index_global == arange(global_pair_batch)`；
 5. negative mask 使用 `anchor_label != candidate_label`，不是单纯依赖对角线；
 6. 如果全局 batch 出现重复 PID、缺失 positive 或 all-gather 顺序错位，训练会立即报错；
-7. `brd_topk` 在完整 global gallery 中，按教师 negative similarity 从高到低选择。对同一个 anchor，positive 是常数，因此这等价于选择教师边界 margin 最小的 negatives。
+7. 先以 `0 < margin_t < brd_boundary_delta` 过滤完整 global gallery；
+8. 非 candidate 的 `risk_score=-inf`，然后才执行 Top-K；
+9. `brd_topk` 只在过滤后的 candidates 中按教师风险分数从高到低选择；对同一个 anchor，等价于选择 boundary candidates 中 margin 最小的 negatives；
+10. 默认 `brd_skip_no_boundary=true`，没有边界候选的 query 不进入 BRD；
+11. DeepSpeed 的 step/epoch BRD 统计只由 rank0 打印，其他 rank 不重复输出。
 
 ## 9. 统一评估协议
 
@@ -1180,8 +1242,10 @@ python src/training/student_test.py \
 | `--use_local_align` | `False` | 局部对齐 |
 | `--local_align_weight` | `0.01` | 局部损失权重 |
 | `--use_brd_distill` | `False` | 启用风险蒸馏 |
-| `--brd_weight` | `1.0` | BRD 权重 |
+| `--brd_weight` | `0.05` | BRD 权重 |
 | `--brd_topk` | `4` | 每个 anchor 的高风险 negatives |
+| `--brd_boundary_delta` | `0.3` | 教师正 margin 边界候选上限 |
+| `--brd_skip_no_boundary` | `True` | 无边界候选时是否跳过 query |
 | `--brd_pair_margin` | `0.05` | 学生排序 margin |
 | `--brd_risk_margin` | `0.0` | 教师风险 margin |
 | `--brd_risk_tau` | `0.05` | 风险 sigmoid 温度 |
