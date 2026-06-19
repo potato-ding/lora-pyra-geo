@@ -12,11 +12,15 @@ if ROOT not in sys.path:
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from torch.amp import GradScaler, autocast
 
 from src.loss.blocks_infoNCE import Sample4GeoLoss
 from src.models.student_model import StudentModel
-from src.utils.gather_features_and_labels_and_views import GatherLayer
+from src.utils.gather_features_and_labels_and_views import (
+    GatherLayer,
+    concat_all_gather,
+)
 from src.utils.initdist import try_init_dist
 from src.utils.optimizer_and_scale import build_student_optimizer
 from src.utils.save_path import get_student_save_pth
@@ -170,12 +174,173 @@ def gather_paired_views(tensor, pair_batch_size, with_grad=True):
     )
 
 
+@torch.no_grad()
+def gather_paired_views_without_grad(tensor, pair_batch_size):
+    if tensor.size(0) != pair_batch_size * 2:
+        raise ValueError(
+            f"Expected paired tensor first dimension {pair_batch_size * 2}, "
+            f"got {tensor.size(0)}"
+        )
+
+    local_drone = tensor[:pair_batch_size].detach()
+    local_satellite = tensor[pair_batch_size:pair_batch_size * 2].detach()
+    if is_distributed():
+        global_drone = concat_all_gather(local_drone)
+        global_satellite = concat_all_gather(local_satellite)
+    else:
+        global_drone = local_drone
+        global_satellite = local_satellite
+
+    if global_drone.size(0) != global_satellite.size(0):
+        raise RuntimeError(
+            "Teacher paired gather produced unequal view sizes: "
+            f"drone={global_drone.size(0)} satellite={global_satellite.size(0)}"
+        )
+    return (
+        torch.cat([global_drone, global_satellite], dim=0).detach(),
+        global_drone.size(0),
+    )
+
+
+def get_current_kd_weight(args, epoch):
+    if not bool(getattr(args, "use_kd_distill", False)):
+        return 0.0
+    if int(epoch) <= int(getattr(args, "kd_warmup_epochs", 5)):
+        return 0.0
+    return float(getattr(args, "kd_weight", 0.05))
+
+
+def _off_diagonal_mean(matrix):
+    if matrix.ndim != 2 or matrix.size(0) != matrix.size(1):
+        raise ValueError(
+            f"Expected a square similarity matrix, got {tuple(matrix.shape)}"
+        )
+    if matrix.size(0) <= 1:
+        return matrix.sum() * 0.0
+    mask = ~torch.eye(
+        matrix.size(0),
+        device=matrix.device,
+        dtype=torch.bool,
+    )
+    return matrix.masked_select(mask).mean()
+
+
+def similarity_matrix_kl_loss(
+    student_features,
+    teacher_features,
+    pair_batch_size,
+    args,
+):
+    if student_features.size(0) != pair_batch_size * 2:
+        raise ValueError(
+            f"Expected {pair_batch_size * 2} student features, "
+            f"got {student_features.size(0)}"
+        )
+    if teacher_features.size(0) != pair_batch_size * 2:
+        raise ValueError(
+            f"Expected {pair_batch_size * 2} teacher features, "
+            f"got {teacher_features.size(0)}"
+        )
+    if getattr(args, "kd_type", "similarity_kl") != "similarity_kl":
+        raise ValueError(f"Unsupported kd_type: {args.kd_type}")
+
+    temperature = float(getattr(args, "kd_temperature", 0.1))
+    if temperature <= 0:
+        raise ValueError("kd_temperature must be greater than 0")
+
+    student_features = F.normalize(
+        student_features.float(),
+        p=2,
+        dim=1,
+        eps=1e-6,
+    )
+    teacher_features = F.normalize(
+        teacher_features.detach().float(),
+        p=2,
+        dim=1,
+        eps=1e-6,
+    )
+    student_drone = student_features[:pair_batch_size]
+    student_satellite = student_features[pair_batch_size:pair_batch_size * 2]
+    teacher_drone = teacher_features[:pair_batch_size]
+    teacher_satellite = teacher_features[pair_batch_size:pair_batch_size * 2]
+
+    student_sim_d2s = student_drone @ student_satellite.t()
+    teacher_sim_d2s = teacher_drone @ teacher_satellite.t()
+    student_sim_s2d = student_sim_d2s.t()
+    teacher_sim_s2d = teacher_sim_d2s.t()
+
+    teacher_logprob_d2s = F.log_softmax(
+        teacher_sim_d2s / temperature,
+        dim=1,
+    )
+    teacher_prob_d2s = teacher_logprob_d2s.exp()
+    student_logprob_d2s = F.log_softmax(
+        student_sim_d2s / temperature,
+        dim=1,
+    )
+    kd_d2s = F.kl_div(
+        student_logprob_d2s,
+        teacher_prob_d2s,
+        reduction="batchmean",
+    ) * (temperature ** 2)
+
+    teacher_logprob_s2d = F.log_softmax(
+        teacher_sim_s2d / temperature,
+        dim=1,
+    )
+    teacher_prob_s2d = teacher_logprob_s2d.exp()
+    student_logprob_s2d = F.log_softmax(
+        student_sim_s2d / temperature,
+        dim=1,
+    )
+    kd_s2d = F.kl_div(
+        student_logprob_s2d,
+        teacher_prob_s2d,
+        reduction="batchmean",
+    ) * (temperature ** 2)
+
+    kd_loss = (
+        float(getattr(args, "kd_d2s_weight", 0.7)) * kd_d2s
+        + float(getattr(args, "kd_s2d_weight", 0.3)) * kd_s2d
+    )
+    row_indices = torch.arange(pair_batch_size, device=student_features.device)
+    stats = {
+        "kd_loss": kd_loss.detach(),
+        "kd_d2s": kd_d2s.detach(),
+        "kd_s2d": kd_s2d.detach(),
+        "teacher_d2s_pos_sim_mean": (
+            teacher_sim_d2s[row_indices, row_indices].mean().detach()
+        ),
+        "teacher_d2s_neg_sim_mean": _off_diagonal_mean(
+            teacher_sim_d2s
+        ).detach(),
+        "student_d2s_pos_sim_mean": (
+            student_sim_d2s[row_indices, row_indices].mean().detach()
+        ),
+        "student_d2s_neg_sim_mean": _off_diagonal_mean(
+            student_sim_d2s
+        ).detach(),
+        "teacher_d2s_entropy": (
+            -(teacher_prob_d2s * teacher_logprob_d2s).sum(dim=1).mean()
+        ).detach(),
+        "student_d2s_entropy": (
+            -(student_logprob_d2s.exp() * student_logprob_d2s)
+            .sum(dim=1)
+            .mean()
+        ).detach(),
+    }
+    return kd_loss, stats
+
+
 def compute_student_batch_losses(
     model,
     images,
     pair_batch_size,
     criterion,
     args=None,
+    teacher_features=None,
+    epoch=1,
 ):
     local_features = model(images)
     features, global_pair_batch_size = gather_paired_views(
@@ -189,11 +354,42 @@ def compute_student_batch_losses(
         criterion,
         global_pair_batch_size,
     )
-    return {
+    losses = {
         "loss": loss_infonce,
         "main_loss": loss_infonce,
         "global_pair_batch_size": global_pair_batch_size,
     }
+    if teacher_features is None:
+        return losses
+
+    global_teacher_features, teacher_pair_batch_size = (
+        gather_paired_views_without_grad(
+            teacher_features,
+            pair_batch_size,
+        )
+    )
+    if teacher_pair_batch_size != global_pair_batch_size:
+        raise RuntimeError(
+            "Student and teacher global pair batches differ: "
+            f"student={global_pair_batch_size} teacher={teacher_pair_batch_size}"
+        )
+
+    kd_loss, kd_stats = similarity_matrix_kl_loss(
+        features,
+        global_teacher_features,
+        global_pair_batch_size,
+        args,
+    )
+    current_kd_weight = get_current_kd_weight(args, epoch)
+    kd_weighted_loss = kd_loss * current_kd_weight
+    losses.update({
+        "loss": loss_infonce + kd_weighted_loss,
+        "kd_loss": kd_loss,
+        "kd_weighted_loss": kd_weighted_loss,
+        "current_kd_weight": current_kd_weight,
+        "kd_stats": kd_stats,
+    })
+    return losses
 
 
 def save_checkpoint(model, optimizer, scheduler, epoch, save_path):
@@ -387,6 +583,133 @@ def format_optional_float(value, precision=4):
     return f"{value:.{precision}f}"
 
 
+def resolve_teacher_checkpoint_path(checkpoint_path):
+    if checkpoint_path is None:
+        raise ValueError("--use_kd_distill requires --teacher_checkpoint")
+    if os.path.isdir(checkpoint_path):
+        for filename in ("best_model.pth", "final_model.pth"):
+            candidate = os.path.join(checkpoint_path, filename)
+            if os.path.isfile(candidate):
+                return candidate
+        raise FileNotFoundError(
+            "Teacher checkpoint directory does not contain "
+            f"best_model.pth or final_model.pth: {checkpoint_path}"
+        )
+    if not os.path.isfile(checkpoint_path):
+        raise FileNotFoundError(f"Teacher checkpoint not found: {checkpoint_path}")
+    return checkpoint_path
+
+
+def resolve_teacher_dtype(precision):
+    mapping = {
+        "bf16": torch.bfloat16,
+        "fp16": torch.float16,
+        "fp32": torch.float32,
+    }
+    if precision not in mapping:
+        raise ValueError(
+            f"Unsupported teacher_precision={precision!r}; "
+            f"expected one of {sorted(mapping)}"
+        )
+    return mapping[precision]
+
+
+def build_online_teacher_model(args, device):
+    from src.models.teacher.model import TeacherModel
+    from src.training.teacher.args import build_arg_parser
+    from src.training.teacher.evaluate import (
+        load_checkpoint_hparams,
+        load_teacher_checkpoint,
+    )
+
+    checkpoint_path = resolve_teacher_checkpoint_path(args.teacher_checkpoint)
+    args.teacher_checkpoint = checkpoint_path
+    teacher_parser = build_arg_parser()
+    parser_defaults = {
+        action.dest: action.default
+        for action in teacher_parser._actions
+    }
+    teacher_args = teacher_parser.parse_args([])
+    teacher_args.checkpoint = checkpoint_path
+    teacher_args.no_checkpoint_hparams = False
+    teacher_args.device = str(device)
+    load_checkpoint_hparams(
+        teacher_args,
+        parser_defaults,
+        [],
+    )
+    teacher_args.device = str(device)
+
+    teacher = TeacherModel(teacher_args).to(device)
+    load_teacher_checkpoint(
+        teacher,
+        checkpoint_path,
+        device,
+    )
+    teacher_dtype = resolve_teacher_dtype(args.teacher_precision)
+    teacher.to(device=device, dtype=teacher_dtype)
+    teacher.eval()
+    for param in teacher.parameters():
+        param.requires_grad_(False)
+    teacher._online_kd_dtype = teacher_dtype
+
+    if is_main_process():
+        trainable = sum(
+            param.numel()
+            for param in teacher.parameters()
+            if param.requires_grad
+        )
+        print(
+            "[KDTeacher] "
+            f"checkpoint={checkpoint_path} | "
+            f"precision={args.teacher_precision} | "
+            f"micro_batch_size={args.teacher_micro_batch_size} | "
+            f"trainable_params={trainable}"
+        )
+    return teacher
+
+
+def forward_teacher_online(teacher_model, images, micro_batch_size):
+    micro_batch_size = int(micro_batch_size)
+    if micro_batch_size <= 0:
+        raise ValueError("teacher_micro_batch_size must be greater than 0")
+
+    teacher_dtype = getattr(teacher_model, "_online_kd_dtype", None)
+    if teacher_dtype is None:
+        try:
+            teacher_dtype = next(teacher_model.parameters()).dtype
+        except StopIteration:
+            teacher_dtype = images.dtype
+
+    outputs = []
+    with torch.inference_mode():
+        for start in range(0, images.size(0), micro_batch_size):
+            teacher_images = images[start:start + micro_batch_size]
+            if teacher_images.is_floating_point():
+                teacher_images = teacher_images.to(dtype=teacher_dtype)
+            teacher_output = teacher_model(teacher_images)
+            if isinstance(teacher_output, (tuple, list)):
+                teacher_output = (
+                    teacher_output[1]
+                    if len(teacher_output) > 1
+                    else teacher_output[0]
+                )
+            if teacher_output.ndim != 2:
+                raise RuntimeError(
+                    "Teacher must return [B, D] descriptors, got "
+                    f"{tuple(teacher_output.shape)}"
+                )
+            outputs.append(
+                F.normalize(
+                    teacher_output.detach().float(),
+                    p=2,
+                    dim=1,
+                    eps=1e-6,
+                )
+            )
+    return torch.cat(outputs, dim=0).detach()
+
+
 def model_input_dtype(model):
     raw_model = get_raw_model(model)
     backbone = getattr(raw_model, "backbone", None)
@@ -400,6 +723,60 @@ def model_input_dtype(model):
     return torch.float32
 
 
+KD_LOG_KEYS = (
+    "kd_loss",
+    "kd_d2s",
+    "kd_s2d",
+    "kd_weighted_loss",
+    "teacher_d2s_pos_sim_mean",
+    "teacher_d2s_neg_sim_mean",
+    "student_d2s_pos_sim_mean",
+    "student_d2s_neg_sim_mean",
+    "teacher_d2s_entropy",
+    "student_d2s_entropy",
+)
+
+
+def create_kd_log_meters():
+    return {key: AverageMeter() for key in KD_LOG_KEYS}
+
+
+def update_kd_log_meters(meters, batch_losses, n):
+    meters["kd_loss"].update(batch_losses["kd_loss"].item(), n)
+    meters["kd_weighted_loss"].update(
+        batch_losses["kd_weighted_loss"].item(),
+        n,
+    )
+    for key in KD_LOG_KEYS:
+        if key in {"kd_loss", "kd_weighted_loss"}:
+            continue
+        meters[key].update(batch_losses["kd_stats"][key].item(), n)
+
+
+def format_kd_step_log(meters, current_kd_weight):
+    return (
+        f"kd_loss {meters['kd_loss'].val:.4f} "
+        f"({meters['kd_loss'].avg:.4f}) | "
+        f"kd_d2s {meters['kd_d2s'].val:.4f} | "
+        f"kd_s2d {meters['kd_s2d'].val:.4f} | "
+        f"kd_weighted_loss {meters['kd_weighted_loss'].val:.4f} "
+        f"({meters['kd_weighted_loss'].avg:.4f}) | "
+        f"current_kd_weight {current_kd_weight:.6f} | "
+        f"teacher_d2s_pos_sim_mean "
+        f"{meters['teacher_d2s_pos_sim_mean'].val:.4f} | "
+        f"teacher_d2s_neg_sim_mean "
+        f"{meters['teacher_d2s_neg_sim_mean'].val:.4f} | "
+        f"student_d2s_pos_sim_mean "
+        f"{meters['student_d2s_pos_sim_mean'].val:.4f} | "
+        f"student_d2s_neg_sim_mean "
+        f"{meters['student_d2s_neg_sim_mean'].val:.4f} | "
+        f"teacher_d2s_entropy "
+        f"{meters['teacher_d2s_entropy'].val:.4f} | "
+        f"student_d2s_entropy "
+        f"{meters['student_d2s_entropy'].val:.4f} | "
+    )
+
+
 def train_one_epoch(
     model,
     train_loader,
@@ -410,11 +787,14 @@ def train_one_epoch(
     device,
     args,
     epoch,
+    teacher_model=None,
 ):
     model.train()
     batch_time = AverageMeter()
     data_time = AverageMeter()
-    loss_meter = AverageMeter()
+    loss_total_meter = AverageMeter()
+    loss_infonce_meter = AverageMeter()
+    kd_log_meters = create_kd_log_meters() if teacher_model is not None else None
     end = time.time()
 
     if hasattr(train_loader.batch_sampler, "set_epoch"):
@@ -426,6 +806,15 @@ def train_one_epoch(
         data_time.update(time.time() - end)
         images, _, meta = unpack_sample4geo_batch(batch, device)
         pair_batch_size = meta["pair_batch_size"]
+        teacher_features = (
+            forward_teacher_online(
+                teacher_model,
+                images,
+                args.teacher_micro_batch_size,
+            )
+            if teacher_model is not None
+            else None
+        )
 
         optimizer.zero_grad(set_to_none=True)
         with autocast(device_type="cuda", enabled=args.amp):
@@ -435,6 +824,8 @@ def train_one_epoch(
                 pair_batch_size,
                 criterion,
                 args,
+                teacher_features=teacher_features,
+                epoch=epoch,
             )
             loss = batch_losses["loss"]
 
@@ -464,11 +855,31 @@ def train_one_epoch(
 
         raw_model = get_raw_model(model)
         raw_model.logit_scale.data.clamp_(0, math.log(100))
-        loss_meter.update(loss.item(), images.size(0))
+        loss_total_meter.update(loss.item(), images.size(0))
+        loss_infonce_meter.update(
+            batch_losses["main_loss"].item(),
+            images.size(0),
+        )
+        if kd_log_meters is not None:
+            update_kd_log_meters(
+                kd_log_meters,
+                batch_losses,
+                images.size(0),
+            )
         batch_time.update(time.time() - end)
         end = time.time()
 
         if step % args.print_freq == 0 or step == len(train_loader) - 1:
+            kd_text = ""
+            if kd_log_meters is not None:
+                kd_text = (
+                    f"loss_total {loss_total_meter.val:.4f} "
+                    f"({loss_total_meter.avg:.4f}) | "
+                    f"{format_kd_step_log(
+                        kd_log_meters,
+                        batch_losses['current_kd_weight'],
+                    )}"
+                )
             print(
                 f"Epoch [{epoch}/{args.epochs}] "
                 f"Step [{step + 1}/{len(train_loader)}] | "
@@ -477,16 +888,24 @@ def train_one_epoch(
                 f"{batch_losses['global_pair_batch_size']} | "
                 f"data {data_time.val:.3f}s ({data_time.avg:.3f}s) | "
                 f"batch {batch_time.val:.3f}s ({batch_time.avg:.3f}s) | "
-                f"loss_infonce {loss_meter.val:.4f} "
-                f"({loss_meter.avg:.4f}) | "
+                f"loss_infonce {loss_infonce_meter.val:.4f} "
+                f"({loss_infonce_meter.avg:.4f}) | "
+                f"{kd_text}"
                 f"logit_scale {raw_model.logit_scale.exp().item():.3f} | "
                 f"lr {optimizer.param_groups[0]['lr']:.8f}"
             )
 
-    return {
-        "loss_total": loss_meter.avg,
-        "loss_infonce": loss_meter.avg,
+    stats = {
+        "loss_total": loss_total_meter.avg,
+        "loss_infonce": loss_infonce_meter.avg,
     }
+    if kd_log_meters is not None:
+        stats.update({
+            key: meter.avg
+            for key, meter in kd_log_meters.items()
+        })
+        stats["current_kd_weight"] = get_current_kd_weight(args, epoch)
+    return stats
 
 
 def train_one_epoch_deepspeed(
@@ -497,12 +916,15 @@ def train_one_epoch_deepspeed(
     device,
     args,
     epoch,
+    teacher_model=None,
 ):
     model_engine.train()
     if hasattr(train_loader.batch_sampler, "set_epoch"):
         train_loader.batch_sampler.set_epoch(epoch)
 
-    loss_meter = AverageMeter()
+    loss_total_meter = AverageMeter()
+    loss_infonce_meter = AverageMeter()
+    kd_log_meters = create_kd_log_meters() if teacher_model is not None else None
     batch_time = AverageMeter()
     data_time = AverageMeter()
     end = time.time()
@@ -513,6 +935,15 @@ def train_one_epoch_deepspeed(
         images, _, meta = unpack_sample4geo_batch(batch, device)
         images = images.to(dtype=input_dtype)
         pair_batch_size = meta["pair_batch_size"]
+        teacher_features = (
+            forward_teacher_online(
+                teacher_model,
+                images,
+                args.teacher_micro_batch_size,
+            )
+            if teacher_model is not None
+            else None
+        )
 
         batch_losses = compute_student_batch_losses(
             model_engine,
@@ -520,6 +951,8 @@ def train_one_epoch_deepspeed(
             pair_batch_size,
             criterion,
             args,
+            teacher_features=teacher_features,
+            epoch=epoch,
         )
         loss = batch_losses["loss"]
         model_engine.backward(loss)
@@ -530,7 +963,10 @@ def train_one_epoch_deepspeed(
             raw_model.logit_scale.data.clamp_(0, math.log(100))
 
         weight = batch_losses["global_pair_batch_size"] * 2
-        loss_meter.update(loss.item(), weight)
+        loss_total_meter.update(loss.item(), weight)
+        loss_infonce_meter.update(batch_losses["main_loss"].item(), weight)
+        if kd_log_meters is not None:
+            update_kd_log_meters(kd_log_meters, batch_losses, weight)
         batch_time.update(time.time() - end)
         end = time.time()
 
@@ -538,6 +974,16 @@ def train_one_epoch_deepspeed(
             step % args.print_freq == 0
             or step == len(train_loader) - 1
         ):
+            kd_text = ""
+            if kd_log_meters is not None:
+                kd_text = (
+                    f"loss_total {loss_total_meter.val:.4f} "
+                    f"({loss_total_meter.avg:.4f}) | "
+                    f"{format_kd_step_log(
+                        kd_log_meters,
+                        batch_losses['current_kd_weight'],
+                    )}"
+                )
             print(
                 f"Epoch [{epoch}/{args.epochs}] "
                 f"Step [{step + 1}/{len(train_loader)}] | "
@@ -546,17 +992,25 @@ def train_one_epoch_deepspeed(
                 f"{batch_losses['global_pair_batch_size']} | "
                 f"data {data_time.val:.3f}s ({data_time.avg:.3f}s) | "
                 f"batch {batch_time.val:.3f}s ({batch_time.avg:.3f}s) | "
-                f"loss_infonce {loss_meter.val:.4f} "
-                f"({loss_meter.avg:.4f}) | "
+                f"loss_infonce {loss_infonce_meter.val:.4f} "
+                f"({loss_infonce_meter.avg:.4f}) | "
+                f"{kd_text}"
                 f"logit_scale "
                 f"{get_raw_model(model_engine).logit_scale.exp().item():.3f} | "
                 f"lr {optimizer.param_groups[0]['lr']:.8f}"
             )
 
-    return {
-        "loss_total": loss_meter.avg,
-        "loss_infonce": loss_meter.avg,
+    stats = {
+        "loss_total": loss_total_meter.avg,
+        "loss_infonce": loss_infonce_meter.avg,
     }
+    if kd_log_meters is not None:
+        stats.update({
+            key: meter.avg
+            for key, meter in kd_log_meters.items()
+        })
+        stats["current_kd_weight"] = get_current_kd_weight(args, epoch)
+    return stats
 
 
 def log_validation_result(epoch, result):
@@ -609,6 +1063,7 @@ def train(
     scheduler,
     device,
     args,
+    teacher_model=None,
 ):
     os.makedirs(args.output_dir, exist_ok=True)
     scaler = GradScaler("cuda", enabled=args.amp)
@@ -638,10 +1093,24 @@ def train(
             device,
             args,
             epoch,
+            teacher_model=teacher_model,
         )
+        kd_text = ""
+        if teacher_model is not None:
+            kd_text = (
+                f" | loss_total={train_stats['loss_total']:.4f}"
+                f" | kd_loss={train_stats['kd_loss']:.4f}"
+                f" | kd_d2s={train_stats['kd_d2s']:.4f}"
+                f" | kd_s2d={train_stats['kd_s2d']:.4f}"
+                f" | kd_weighted_loss="
+                f"{train_stats['kd_weighted_loss']:.4f}"
+                f" | current_kd_weight="
+                f"{train_stats['current_kd_weight']:.6f}"
+            )
         print(
             f"[Train] Epoch {epoch}/{args.epochs} | "
             f"loss_infonce={train_stats['loss_infonce']:.4f}"
+            f"{kd_text}"
         )
 
         if args.save_last:
@@ -736,6 +1205,7 @@ def train_deepspeed(
     optimizer,
     device,
     args,
+    teacher_model=None,
 ):
     if is_main_process():
         os.makedirs(args.output_dir, exist_ok=True)
@@ -766,12 +1236,26 @@ def train_deepspeed(
             device,
             args,
             epoch,
+            teacher_model=teacher_model,
         )
         if is_main_process():
+            kd_text = ""
+            if teacher_model is not None:
+                kd_text = (
+                    f" | loss_total={train_stats['loss_total']:.4f}"
+                    f" | kd_loss={train_stats['kd_loss']:.4f}"
+                    f" | kd_d2s={train_stats['kd_d2s']:.4f}"
+                    f" | kd_s2d={train_stats['kd_s2d']:.4f}"
+                    f" | kd_weighted_loss="
+                    f"{train_stats['kd_weighted_loss']:.4f}"
+                    f" | current_kd_weight="
+                    f"{train_stats['current_kd_weight']:.6f}"
+                )
             print(
                 f"[Train] Epoch {epoch}/{args.epochs} | "
                 f"loss_infonce={train_stats['loss_infonce']:.4f} | "
                 f"world_size={get_world_size()}"
+                f"{kd_text}"
             )
 
         if args.save_last:
@@ -860,7 +1344,10 @@ def train_deepspeed(
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Train RepViT-M1.5 baseline with symmetric InfoNCE"
+        description=(
+            "Train RepViT-M1.5 with symmetric InfoNCE and optional "
+            "online similarity-matrix KD"
+        )
     )
     parser.add_argument("--train_data_dir", type=str, default="data/U1652/train")
     parser.add_argument("--val_data_dir", type=str, default="data/U1652")
@@ -909,10 +1396,43 @@ def parse_args():
         "--use_kd_distill",
         action="store_true",
         default=False,
-        help="Reserved for future ordinary similarity KD.",
+        help="Enable online similarity-matrix distillation.",
     )
+    parser.add_argument(
+        "--kd_type",
+        type=str,
+        choices=["similarity_kl"],
+        default="similarity_kl",
+    )
+    parser.add_argument("--teacher_checkpoint", type=str, default=None)
+    parser.add_argument("--kd_weight", type=float, default=0.05)
+    parser.add_argument("--kd_temperature", type=float, default=0.1)
+    parser.add_argument("--kd_warmup_epochs", type=int, default=5)
+    parser.add_argument("--kd_d2s_weight", type=float, default=0.7)
+    parser.add_argument("--kd_s2d_weight", type=float, default=0.3)
+    parser.add_argument(
+        "--teacher_precision",
+        type=str,
+        choices=["bf16", "fp16", "fp32"],
+        default="bf16",
+    )
+    parser.add_argument("--teacher_micro_batch_size", type=int, default=1)
 
     args = parser.parse_args()
+    if args.kd_weight < 0:
+        parser.error("--kd_weight must be non-negative")
+    if args.kd_temperature <= 0:
+        parser.error("--kd_temperature must be greater than 0")
+    if args.kd_warmup_epochs < 0:
+        parser.error("--kd_warmup_epochs must be non-negative")
+    if args.kd_d2s_weight < 0 or args.kd_s2d_weight < 0:
+        parser.error("KD direction weights must be non-negative")
+    if args.kd_d2s_weight + args.kd_s2d_weight <= 0:
+        parser.error("At least one KD direction weight must be positive")
+    if args.teacher_micro_batch_size <= 0:
+        parser.error("--teacher_micro_batch_size must be greater than 0")
+    if args.use_kd_distill and not args.teacher_checkpoint:
+        parser.error("--use_kd_distill requires --teacher_checkpoint")
     if args.best_metric_name != "R1_sum":
         print(
             f"[Best] overriding best_metric_name="
@@ -928,18 +1448,16 @@ def main():
     from src.dataset.datasets import create_student_train_dataset_and_loader
     from src.dataset.teacher.val_dataloaders import build_1652_val_dataloaders
 
-    if args.use_kd_distill:
-        raise NotImplementedError(
-            "Ordinary similarity KD is reserved but not implemented yet. "
-            "Run the clean baseline without --use_kd_distill."
-        )
-
     device, rank, local_rank, world_size = try_init_dist()
     args.device = str(device)
     args.local_rank = local_rank
     args.rank = rank
     args.world_size = world_size
     args.deepspeed = bool(args.deepspeed or world_size > 1)
+    if args.use_kd_distill:
+        args.teacher_checkpoint = resolve_teacher_checkpoint_path(
+            args.teacher_checkpoint
+        )
 
     if args.deepspeed and not is_distributed():
         raise RuntimeError(
@@ -1004,6 +1522,11 @@ def main():
             config=ds_config,
             dist_init_required=False,
         )
+        teacher_model = (
+            build_online_teacher_model(args, device)
+            if args.use_kd_distill
+            else None
+        )
         train_deepspeed(
             model,
             train_loader,
@@ -1012,12 +1535,18 @@ def main():
             optimizer,
             device,
             args,
+            teacher_model=teacher_model,
         )
     else:
         scheduler = build_student_scheduler(
             optimizer,
             args,
             steps_per_epoch=len(train_loader),
+        )
+        teacher_model = (
+            build_online_teacher_model(args, device)
+            if args.use_kd_distill
+            else None
         )
         train(
             model,
@@ -1028,6 +1557,7 @@ def main():
             scheduler,
             device,
             args,
+            teacher_model=teacher_model,
         )
 
 

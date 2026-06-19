@@ -18,9 +18,14 @@ import src.training.student_train as student_train
 import src.dataset.datasets as student_datasets
 from src.dataset.datasets import U1652PairDataset
 from src.training.student_train import (
+    build_online_teacher_model,
     build_deepspeed_runtime_config,
     compute_student_batch_losses,
+    forward_teacher_online,
+    gather_paired_views_without_grad,
     gather_paired_views,
+    get_current_kd_weight,
+    similarity_matrix_kl_loss,
     train_one_epoch_deepspeed,
 )
 
@@ -201,8 +206,16 @@ def test_cli_defaults_to_clean_baseline(monkeypatch):
     }
 
     assert args.use_kd_distill is False
+    assert args.kd_type == "similarity_kl"
+    assert args.teacher_checkpoint is None
+    assert args.kd_weight == pytest.approx(0.05)
+    assert args.kd_temperature == pytest.approx(0.1)
+    assert args.kd_warmup_epochs == 5
+    assert args.kd_d2s_weight == pytest.approx(0.7)
+    assert args.kd_s2d_weight == pytest.approx(0.3)
+    assert args.teacher_precision == "bf16"
+    assert args.teacher_micro_batch_size == 1
     assert args.deepspeed_config == "configs/ds_student_baseline.json"
-    assert not hasattr(args, "teacher_" + "checkpoint")
     assert not any(name.startswith("b" + "rd") for name in vars(args))
     assert destinations == {"help"}
 
@@ -212,12 +225,302 @@ def test_removed_training_flags_are_rejected(monkeypatch):
         "--use_" + "b" + "rd_distill",
         "--" + "b" + "rd_weight",
         "--use_" + "local_" + "align",
-        "--teacher_" + "checkpoint",
     ]
     for flag in removed_flags:
         monkeypatch.setattr(sys, "argv", ["student_train.py", flag])
         with pytest.raises(SystemExit):
             student_train.parse_args()
+
+
+def test_kd_requires_teacher_checkpoint(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["student_train.py", "--use_kd_distill"],
+    )
+    with pytest.raises(SystemExit):
+        student_train.parse_args()
+
+
+def test_kd_weight_warmup_contract():
+    class Args:
+        use_kd_distill = True
+        kd_warmup_epochs = 5
+        kd_weight = 0.05
+
+    assert get_current_kd_weight(Args, 1) == 0.0
+    assert get_current_kd_weight(Args, 5) == 0.0
+    assert get_current_kd_weight(Args, 6) == pytest.approx(0.05)
+
+    Args.use_kd_distill = False
+    assert get_current_kd_weight(Args, 10) == 0.0
+
+
+def test_similarity_matrix_kd_matches_explicit_kl_and_allows_dim_mismatch():
+    class Args:
+        kd_type = "similarity_kl"
+        kd_temperature = 0.2
+        kd_d2s_weight = 0.7
+        kd_s2d_weight = 0.3
+
+    student = F.normalize(torch.tensor([
+        [1.0, 0.0],
+        [0.0, 1.0],
+        [0.8, 0.2],
+        [0.3, 0.7],
+    ]), dim=1).requires_grad_(True)
+    teacher = F.normalize(torch.tensor([
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.9, 0.1, 0.2],
+        [0.2, 0.8, 0.1],
+    ]), dim=1)
+
+    loss, stats = similarity_matrix_kl_loss(
+        student,
+        teacher,
+        pair_batch_size=2,
+        args=Args,
+    )
+
+    student_sim = student[:2] @ student[2:].t()
+    teacher_sim = teacher[:2] @ teacher[2:].t()
+    teacher_prob = F.softmax(teacher_sim / Args.kd_temperature, dim=1)
+    student_logprob = F.log_softmax(
+        student_sim / Args.kd_temperature,
+        dim=1,
+    )
+    expected_d2s = F.kl_div(
+        student_logprob,
+        teacher_prob,
+        reduction="batchmean",
+    ) * (Args.kd_temperature ** 2)
+    expected_s2d = F.kl_div(
+        F.log_softmax(student_sim.t() / Args.kd_temperature, dim=1),
+        F.softmax(teacher_sim.t() / Args.kd_temperature, dim=1),
+        reduction="batchmean",
+    ) * (Args.kd_temperature ** 2)
+    expected = (
+        Args.kd_d2s_weight * expected_d2s
+        + Args.kd_s2d_weight * expected_s2d
+    )
+
+    torch.testing.assert_close(loss, expected)
+    torch.testing.assert_close(stats["kd_d2s"], expected_d2s)
+    torch.testing.assert_close(stats["kd_s2d"], expected_s2d)
+    loss.backward()
+    assert student.grad is not None
+    assert teacher.grad is None
+
+
+def test_kd_is_added_to_total_loss_and_teacher_features_are_detached():
+    class IdentityFeatureModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.scale = nn.Parameter(torch.tensor(1.0))
+            self.logit_scale = nn.Parameter(torch.tensor(0.0))
+
+        def forward(self, x):
+            return F.normalize(x.float() * self.scale, dim=1)
+
+    class Args:
+        use_kd_distill = True
+        kd_type = "similarity_kl"
+        kd_weight = 0.2
+        kd_temperature = 0.1
+        kd_warmup_epochs = 0
+        kd_d2s_weight = 0.7
+        kd_s2d_weight = 0.3
+
+    student_inputs = torch.tensor([
+        [1.0, 0.0],
+        [0.0, 1.0],
+        [0.8, 0.2],
+        [0.2, 0.8],
+    ])
+    teacher_features = F.normalize(torch.tensor([
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.7, 0.2, 0.1],
+        [0.1, 0.8, 0.2],
+    ]), dim=1).requires_grad_(True)
+    model = IdentityFeatureModel()
+
+    losses = compute_student_batch_losses(
+        model,
+        student_inputs,
+        pair_batch_size=2,
+        criterion=student_train.Sample4GeoLoss(label_smoothing=0.0),
+        args=Args,
+        teacher_features=teacher_features,
+        epoch=1,
+    )
+
+    torch.testing.assert_close(
+        losses["kd_weighted_loss"],
+        losses["kd_loss"] * Args.kd_weight,
+    )
+    torch.testing.assert_close(
+        losses["loss"],
+        losses["main_loss"] + losses["kd_weighted_loss"],
+    )
+    losses["loss"].backward()
+    assert model.scale.grad is not None
+    assert teacher_features.grad is None
+
+
+def test_kd_warmup_keeps_total_equal_to_baseline():
+    class Args:
+        use_kd_distill = True
+        kd_type = "similarity_kl"
+        kd_weight = 0.2
+        kd_temperature = 0.1
+        kd_warmup_epochs = 5
+        kd_d2s_weight = 0.7
+        kd_s2d_weight = 0.3
+
+    class IdentityFeatureModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.logit_scale = nn.Parameter(torch.tensor(0.0))
+
+        def forward(self, x):
+            return F.normalize(x.float(), dim=1)
+
+    features = torch.tensor([
+        [1.0, 0.0],
+        [0.0, 1.0],
+        [0.8, 0.2],
+        [0.2, 0.8],
+    ])
+    teacher = torch.randn(4, 5)
+    losses = compute_student_batch_losses(
+        IdentityFeatureModel(),
+        features,
+        2,
+        student_train.Sample4GeoLoss(label_smoothing=0.0),
+        Args,
+        teacher_features=teacher,
+        epoch=5,
+    )
+
+    assert losses["current_kd_weight"] == 0.0
+    assert losses["kd_loss"].item() >= 0.0
+    torch.testing.assert_close(losses["loss"], losses["main_loss"])
+
+
+def test_teacher_forward_uses_micro_batches_and_inference_mode():
+    class TinyTeacher(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = nn.Linear(3, 4, bias=False)
+            self.batch_sizes = []
+            self.grad_enabled = []
+            self._online_kd_dtype = torch.float32
+
+        def forward(self, x):
+            self.batch_sizes.append(x.size(0))
+            self.grad_enabled.append(torch.is_grad_enabled())
+            return self.proj(x.float())
+
+    teacher = TinyTeacher().eval()
+    images = torch.randn(5, 3, requires_grad=True)
+    features = forward_teacher_online(
+        teacher,
+        images,
+        micro_batch_size=2,
+    )
+
+    assert teacher.batch_sizes == [2, 2, 1]
+    assert teacher.grad_enabled == [False, False, False]
+    assert features.shape == (5, 4)
+    assert features.requires_grad is False
+    torch.testing.assert_close(
+        features.norm(dim=1),
+        torch.ones(5),
+        atol=1e-6,
+        rtol=1e-6,
+    )
+
+
+def test_teacher_gather_is_detached_and_preserves_view_order(monkeypatch):
+    def fake_gather(tensor):
+        return torch.cat([tensor, tensor + 10.0], dim=0)
+
+    monkeypatch.setattr(student_train, "is_distributed", lambda: True)
+    monkeypatch.setattr(student_train, "concat_all_gather", fake_gather)
+    local = torch.tensor([
+        [1.0],
+        [2.0],
+        [11.0],
+        [12.0],
+    ], requires_grad=True)
+
+    gathered, pair_batch = gather_paired_views_without_grad(local, 2)
+
+    assert pair_batch == 4
+    assert gathered.requires_grad is False
+    torch.testing.assert_close(
+        gathered,
+        torch.tensor([
+            [1.0],
+            [2.0],
+            [11.0],
+            [12.0],
+            [11.0],
+            [12.0],
+            [21.0],
+            [22.0],
+        ]),
+    )
+
+
+def test_online_teacher_loader_freezes_teacher_and_optimizer_excludes_it(
+    tmp_path,
+    monkeypatch,
+):
+    import src.models.teacher.model as teacher_model_module
+    import src.training.teacher.evaluate as teacher_evaluate
+
+    class TinyTeacher(nn.Module):
+        def __init__(self, args):
+            super().__init__()
+            self.proj = nn.Linear(3, 5)
+
+        def forward(self, x):
+            return self.proj(x.float())
+
+    checkpoint = tmp_path / "best_model.pth"
+    checkpoint.touch()
+    monkeypatch.setattr(teacher_model_module, "TeacherModel", TinyTeacher)
+    monkeypatch.setattr(
+        teacher_evaluate,
+        "load_checkpoint_hparams",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        teacher_evaluate,
+        "load_teacher_checkpoint",
+        lambda *args, **kwargs: None,
+    )
+
+    class Args:
+        teacher_checkpoint = str(checkpoint)
+        teacher_precision = "fp32"
+        teacher_micro_batch_size = 1
+
+    student = nn.Linear(3, 2)
+    optimizer = torch.optim.AdamW(student.parameters())
+    teacher = build_online_teacher_model(Args, torch.device("cpu"))
+
+    assert teacher.training is False
+    assert all(not param.requires_grad for param in teacher.parameters())
+    optimizer_param_ids = {
+        id(param)
+        for group in optimizer.param_groups
+        for param in group["params"]
+    }
+    assert all(id(param) not in optimizer_param_ids for param in teacher.parameters())
 
 
 def test_student_dataset_returns_only_baseline_pair_fields(
@@ -319,4 +622,108 @@ def test_deepspeed_epoch_updates_student_with_infonce_only(
     assert set(stats) == {"loss_total", "loss_infonce"}
     assert torch.isfinite(torch.tensor(stats["loss_infonce"]))
     assert not torch.equal(before, engine.module.proj.weight.detach())
+    assert capsys.readouterr().out == ""
+
+
+def test_deepspeed_epoch_uses_online_kd_and_keeps_teacher_frozen(
+    monkeypatch,
+    capsys,
+):
+    class PairDataset(Dataset):
+        samples = [
+            (
+                torch.tensor([[[1.0, 0.2, 0.0]]]),
+                torch.tensor([[[0.8, 0.4, 0.1]]]),
+            ),
+            (
+                torch.tensor([[[0.1, 1.0, 0.2]]]),
+                torch.tensor([[[0.3, 0.8, 0.4]]]),
+            ),
+            (
+                torch.tensor([[[0.2, 0.1, 1.0]]]),
+                torch.tensor([[[0.4, 0.2, 0.8]]]),
+            ),
+        ]
+
+        def __len__(self):
+            return len(self.samples)
+
+        def __getitem__(self, idx):
+            drone, satellite = self.samples[idx]
+            return drone, satellite, idx, f"{idx:04d}"
+
+    class TinyStudent(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = nn.Linear(3, 3, bias=False)
+            self.logit_scale = nn.Parameter(torch.tensor(0.0))
+
+        def forward(self, x):
+            return F.normalize(self.proj(x.float().flatten(1)), dim=1)
+
+    class TinyTeacher(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = nn.Linear(3, 5, bias=False)
+            self._online_kd_dtype = torch.float32
+            for param in self.parameters():
+                param.requires_grad_(False)
+
+        def forward(self, x):
+            return F.normalize(self.proj(x.float().flatten(1)), dim=1)
+
+    class FakeDeepSpeedEngine(nn.Module):
+        def __init__(self, module):
+            super().__init__()
+            self.module = module
+            self.optimizer = torch.optim.SGD(module.parameters(), lr=0.2)
+
+        def forward(self, x):
+            return self.module(x)
+
+        def backward(self, loss):
+            loss.backward()
+
+        def step(self):
+            self.optimizer.step()
+            self.optimizer.zero_grad(set_to_none=True)
+
+    class Args:
+        use_kd_distill = True
+        kd_type = "similarity_kl"
+        kd_weight = 0.2
+        kd_temperature = 0.1
+        kd_warmup_epochs = 0
+        kd_d2s_weight = 0.7
+        kd_s2d_weight = 0.3
+        teacher_micro_batch_size = 1
+        print_freq = 100
+        epochs = 1
+
+    torch.manual_seed(29)
+    engine = FakeDeepSpeedEngine(TinyStudent())
+    teacher = TinyTeacher().eval()
+    before = engine.module.proj.weight.detach().clone()
+    monkeypatch.setattr(student_train, "is_main_process", lambda: False)
+
+    stats = train_one_epoch_deepspeed(
+        engine,
+        DataLoader(PairDataset(), batch_size=3, shuffle=False),
+        student_train.Sample4GeoLoss(label_smoothing=0.0),
+        engine.optimizer,
+        torch.device("cpu"),
+        Args,
+        epoch=1,
+        teacher_model=teacher,
+    )
+
+    assert stats["kd_loss"] >= 0.0
+    assert stats["current_kd_weight"] == pytest.approx(Args.kd_weight)
+    assert stats["loss_total"] == pytest.approx(
+        stats["loss_infonce"] + stats["kd_weighted_loss"],
+        rel=1e-5,
+        abs=1e-6,
+    )
+    assert not torch.equal(before, engine.module.proj.weight.detach())
+    assert all(param.grad is None for param in teacher.parameters())
     assert capsys.readouterr().out == ""

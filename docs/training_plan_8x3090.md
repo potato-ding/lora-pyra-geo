@@ -2,8 +2,8 @@
 
 更新日期：2026-06-19
 
-本文档是当前仓库唯一维护的学生训练说明，内容以现有代码为准。当前学生训练处于
-干净 baseline 状态：
+本文档是当前仓库唯一维护的学生训练说明，内容以现有代码为准。学生训练支持纯
+baseline 和可选的在线 similarity-matrix KD：
 
 ```text
 模型：RepViT-M1.5 -> f4 -> GAP -> BN -> L2
@@ -13,7 +13,8 @@
 教师：默认不加载
 ```
 
-普通 similarity KD 只保留命令行入口，尚未实现。
+不传 `--use_kd_distill` 时，数据、学生 forward、optimizer、损失和训练结果路径与纯
+baseline 完全一致。
 
 ---
 
@@ -22,6 +23,8 @@
 | 文件 | 职责 |
 |---|---|
 | `src/training/student_train.py` | 单卡与 DeepSpeed 多卡训练入口 |
+| `src/models/teacher/model.py` | KD 使用的 DINOv3 在线教师 |
+| `src/training/teacher/evaluate.py` | 教师 checkpoint 与超参数恢复 |
 | `src/models/student_model.py` | RepViT-M1.5 学生模型 |
 | `src/models/repvit_backbone.py` | RepViT 预训练权重加载与多阶段特征提取 |
 | `src/loss/blocks_infoNCE.py` | 学生 symmetric InfoNCE |
@@ -284,6 +287,19 @@ L_{\text{total}}=L_{\text{InfoNCE}}
 0.1
 ```
 
+启用 `--use_kd_distill` 后，会额外计算第 17 节定义的跨视角相似度矩阵 KL：
+
+\[
+L_{\text{total}}
+=
+L_{\text{InfoNCE}}
++
+\lambda_{\text{KD,current}}L_{\text{KD}}
+\]
+
+师生 embedding 维度可以不同，因为 KD 只比较各自生成的 \(N\times N\) 相似度矩阵。
+代码不执行 feature MSE，也不创建 projection head。
+
 ---
 
 ## 6. DeepSpeed 多卡机制
@@ -318,6 +334,10 @@ local features
 
 不允许将学生 gather 特征 detach。
 
+KD 模式下，每个 rank 只在线 forward 自己的 local teacher batch；教师特征随后使用
+无梯度 all-gather，形成同样顺序的 `[all_drone, all_satellite]`。全局 KD 相似度矩阵
+由可微学生特征和已 detach 的教师特征计算。
+
 ### 6.3 ZeRO 支持
 
 当前支持：
@@ -346,6 +366,9 @@ DeepSpeed 的 BF16 和 FP16。
 
 DeepSpeed step 日志、epoch 日志、验证日志以及模型保存只由 rank0 执行。各 rank
 仍共同参与训练、all-gather 和分布式验证。
+
+教师不交给 `deepspeed.initialize`，不加入 student optimizer，也不会写入 student
+checkpoint。
 
 ---
 
@@ -491,7 +514,47 @@ deepspeed --include localhost:0,1,2,3,4,5,6,7 \
 
 此时单步 global gallery 为 64 pair。
 
-### 9.4 4 卡
+### 9.4 8 卡在线 similarity KD
+
+将 `<teacher_run>` 替换为真实教师目录名，不要保留尖括号：
+
+```bash
+deepspeed --include localhost:0,1,2,3,4,5,6,7 \
+  src/training/student_train.py \
+  --deepspeed \
+  --deepspeed_config configs/ds_student_baseline.json \
+  --epochs 60 \
+  --train_data_dir data/U1652/train \
+  --val_data_dir data/U1652 \
+  --batch_size 4 \
+  --val_batch_size 32 \
+  --num_workers 8 \
+  --lr 1e-4 \
+  --weight_decay 1e-4 \
+  --temperature 0.07 \
+  --label_smoothing 0.1 \
+  --use_kd_distill \
+  --kd_type similarity_kl \
+  --teacher_checkpoint src/checkpoint/teacher/<teacher_run>/best_model.pth \
+  --kd_weight 0.05 \
+  --kd_temperature 0.1 \
+  --kd_warmup_epochs 5 \
+  --kd_d2s_weight 0.7 \
+  --kd_s2d_weight 0.3 \
+  --teacher_precision bf16 \
+  --teacher_micro_batch_size 1
+```
+
+教师 checkpoint 同目录应保留训练生成的：
+
+```text
+hyperparameters.json
+```
+
+用于恢复 DINOv3 的 LoRA、full-finetune 与 fusion 结构。教师还依赖仓库中的 DINOv3
+基础预训练权重。
+
+### 9.5 4 卡
 
 ```bash
 deepspeed --include localhost:0,1,2,3 \
@@ -504,7 +567,7 @@ deepspeed --include localhost:0,1,2,3 \
   --num_workers 8
 ```
 
-### 9.5 单卡
+### 9.6 单卡
 
 ```bash
 python src/training/student_train.py \
@@ -522,7 +585,7 @@ python src/training/student_train.py \
   --val_interval 5
 ```
 
-### 9.6 指定输出目录
+### 9.7 指定输出目录
 
 默认输出到：
 
@@ -570,7 +633,16 @@ python src/training/student_train.py \
 | `--best_metric_name` | `R1_sum` | 代码会强制使用 `R1_sum` |
 | `--save_last` | `True` | 保存 last checkpoint |
 | `--no_save_last` | - | 禁止保存 last checkpoint |
-| `--use_kd_distill` | `False` | 预留入口，当前启用会报未实现错误 |
+| `--use_kd_distill` | `False` | 启用在线相似度矩阵 KD |
+| `--kd_type` | `similarity_kl` | KD 类型；当前仅支持 similarity KL |
+| `--teacher_checkpoint` | `None` | DINOv3 教师 checkpoint 文件或 run 目录 |
+| `--kd_weight` | `0.05` | KD 正式权重 |
+| `--kd_temperature` | `0.1` | 教师/学生相似度分布温度 |
+| `--kd_warmup_epochs` | `5` | 前若干 epoch 将 KD 权重设为 0 |
+| `--kd_d2s_weight` | `0.7` | D2S KL 权重 |
+| `--kd_s2d_weight` | `0.3` | S2D KL 权重 |
+| `--teacher_precision` | `bf16` | 教师计算精度：bf16/fp16/fp32 |
+| `--teacher_micro_batch_size` | `1` | 每次教师 forward 的图片数 |
 
 ---
 
@@ -600,6 +672,30 @@ batch time
 loss_infonce
 logit_scale
 learning rate
+```
+
+仅在 KD 启用时额外打印：
+
+```text
+kd_loss
+kd_d2s
+kd_s2d
+kd_weighted_loss
+current_kd_weight
+teacher_d2s_pos_sim_mean
+teacher_d2s_neg_sim_mean
+student_d2s_pos_sim_mean
+student_d2s_neg_sim_mean
+teacher_d2s_entropy
+student_d2s_entropy
+```
+
+其中：
+
+```text
+kd_loss = 0.7 × kd_d2s + 0.3 × kd_s2d
+kd_weighted_loss = current_kd_weight × kd_loss
+loss_total = loss_infonce + kd_weighted_loss
 ```
 
 ### 11.2 正常启动检查
@@ -734,13 +830,19 @@ python -m pytest -q
 当前基准：
 
 ```text
-35 passed
+44 passed
 ```
 
 ### 14.2 学生定向测试
 
 ```bash
 python -m pytest tests/test_student_baseline.py -q
+```
+
+当前学生定向基准：
+
+```text
+21 passed
 ```
 
 ### 14.3 多卡 gather 冒烟测试
@@ -785,17 +887,29 @@ python tests/check_student_intermediate_shapes.py
 python src/training/student_train.py --help
 ```
 
-### 15.2 启用 `--use_kd_distill` 后报错
+### 15.2 启用 KD 后提示缺少教师 checkpoint
 
-这是预期行为。普通 similarity KD 尚未实现，当前参数仅用于锁定后续接口名称。
-
-baseline 训练不要传：
+启用 KD 必须同时提供：
 
 ```text
---use_kd_distill
+--teacher_checkpoint <path>
 ```
 
-### 15.3 找不到 RepViT 权重
+路径可以是 `best_model.pth`/`final_model.pth`，也可以是包含这些文件的教师 run 目录。
+如果直接复制命令示例，必须将 `<teacher_run>` 替换为真实目录名；Bash 会把尖括号理解为
+重定向符号。
+
+### 15.3 教师显存不足
+
+优先保持 student batch 不变，降低：
+
+```text
+--teacher_micro_batch_size 1
+```
+
+该参数只控制教师分块 forward，不改变 KD 使用的最终 global similarity matrix。
+
+### 15.4 找不到 RepViT 权重
 
 确认文件存在：
 
@@ -803,7 +917,7 @@ baseline 训练不要传：
 ls src/models/repvit/repvit_m1_5_distill_450e.pth
 ```
 
-### 15.4 全局 batch 大于 PID 数
+### 15.5 全局 batch 大于 PID 数
 
 报错形式：
 
@@ -819,7 +933,7 @@ batch_size
 
 或减少训练 GPU 数。
 
-### 15.5 DeepSpeed 单进程启动报错
+### 15.6 DeepSpeed 单进程启动报错
 
 不要只执行：
 
@@ -834,7 +948,7 @@ deepspeed --include localhost:0,1,2,3 \
   src/training/student_train.py --deepspeed
 ```
 
-### 15.6 CUDA OOM
+### 15.7 CUDA OOM
 
 按以下顺序处理：
 
@@ -845,7 +959,7 @@ deepspeed --include localhost:0,1,2,3 \
 
 注意：增加梯度累积不能恢复被降低的单步 InfoNCE gallery 大小。
 
-### 15.7 DataLoader 很慢
+### 15.8 DataLoader 很慢
 
 依次尝试：
 
@@ -854,7 +968,7 @@ deepspeed --include localhost:0,1,2,3 \
 - 检查 CPU、内存和磁盘占用；
 - 确认 OpenCV 与 Albumentations 安装正常。
 
-### 15.8 RepViT registry warning
+### 15.9 RepViT registry warning
 
 测试或启动时可能出现：
 
@@ -897,17 +1011,129 @@ Overwriting repvit_m1_5 in registry
 
 ---
 
-## 17. 普通 similarity KD 后续约束
+## 17. 在线 similarity-matrix KD
 
-未来实现普通 similarity KD 时，应保持以下边界：
+### 17.1 教师 forward
 
-1. 只有 `--use_kd_distill` 启用时才加载教师；
-2. 教师 forward 使用 inference/no-grad；
-3. 教师特征不参与梯度；
-4. 学生特征及跨卡 gather 保留梯度；
-5. `loss_kd_raw` 与 `loss_kd_weighted` 分开记录；
-6. 总损失明确写为 `InfoNCE + kd_weight × KD`；
-7. 默认关闭 KD 时，模型、sampler、loss、日志和 checkpoint 路径必须与本文 baseline
-   完全一致。
+每个 rank 将本地输入保持为：
 
-当前代码尚未实现上述 KD，现阶段唯一可训练配置仍是纯 symmetric InfoNCE baseline。
+```text
+[local_drone_images, local_satellite_images]
+```
+
+教师使用 `teacher_micro_batch_size` 分块 forward：
+
+```text
+teacher.eval()
+torch.inference_mode()
+teacher output -> detach -> float32 -> L2 normalize
+```
+
+教师所有参数均设置：
+
+```text
+requires_grad = False
+```
+
+教师不加入 optimizer，不随 student checkpoint 保存。
+
+### 17.2 相似度矩阵
+
+设全局 student descriptor 为 \(D_s,S_s\)，教师 descriptor 为 \(D_t,S_t\)。师生维度
+可以不同：
+
+\[
+M_s^{D2S}=D_sS_s^\top
+\]
+
+\[
+M_t^{D2S}=D_tS_t^\top
+\]
+
+\[
+M_s^{S2D}=(M_s^{D2S})^\top,
+\qquad
+M_t^{S2D}=(M_t^{D2S})^\top
+\]
+
+### 17.3 KL 定义
+
+温度为 \(T_{\text{KD}}\)：
+
+\[
+P_t^{D2S}
+=
+\operatorname{softmax}
+\left(
+\frac{M_t^{D2S}}{T_{\text{KD}}}
+\right)
+\]
+
+\[
+\log P_s^{D2S}
+=
+\operatorname{logsoftmax}
+\left(
+\frac{M_s^{D2S}}{T_{\text{KD}}}
+\right)
+\]
+
+\[
+L_{\text{KD-D2S}}
+=
+T_{\text{KD}}^2
+\operatorname{KL}
+\left(
+P_t^{D2S}\Vert P_s^{D2S}
+\right)
+\]
+
+S2D 同理。总 KD：
+
+\[
+L_{\text{KD}}
+=
+\lambda_{D2S}L_{\text{KD-D2S}}
++
+\lambda_{S2D}L_{\text{KD-S2D}}
+\]
+
+默认：
+
+```text
+kd_temperature = 0.1
+kd_d2s_weight = 0.7
+kd_s2d_weight = 0.3
+```
+
+### 17.4 KD warmup
+
+\[
+\lambda_{\text{KD,current}}
+=
+\begin{cases}
+0, & epoch \le kd\_warmup\_epochs\\
+kd\_weight, & epoch > kd\_warmup\_epochs
+\end{cases}
+\]
+
+默认前 5 个 epoch 仍会在线计算和记录 KD 诊断，但 KD 不进入 backward：
+
+```text
+epoch 1..5: current_kd_weight = 0
+epoch 6..60: current_kd_weight = 0.05
+```
+
+### 17.5 Baseline 等价性
+
+当 `--use_kd_distill` 未启用时：
+
+- 不构建或加载教师；
+- dataset 与 sampler 不变；
+- student forward 不变；
+- optimizer 参数分组不变；
+- 不执行教师 forward 或教师 gather；
+- `loss_total` 严格等于原始 symmetric InfoNCE；
+- 不打印任何 KD 日志。
+
+因此默认路径仍是纯 RepViT-M1.5 baseline。
