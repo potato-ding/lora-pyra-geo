@@ -1,896 +1,749 @@
-# 8 × RTX 3090 完整训练、蒸馏与评估手册
+# RepViT-M1.5 学生 Baseline 训练手册
 
-本文档是本项目唯一维护的实验文档，覆盖：
+更新日期：2026-06-19
 
-- 教师模型 T0–T5 六组训练计划；
-- 教师的数据采样、损失、Hard Pool、LoRA 与 hybrid dual-path 软正交融合；
-- 学生 RepViT baseline；
-- DeepSpeed 多卡边界风险感知蒸馏；
-- University-1652、SUES-200、GTA-UAV 的统一评估协议；
-- checkpoint、指标、参数和排错方法。
+本文档是当前仓库唯一维护的学生训练说明，内容以现有代码为准。当前学生训练处于
+干净 baseline 状态：
 
-后续代码或实验方案变更只更新本文件。
+```text
+模型：RepViT-M1.5 -> f4 -> GAP -> BN -> L2
+损失：双向 symmetric InfoNCE
+采样：Sample4Geo paired sampling
+多卡：DeepSpeed + 可微 all-gather
+教师：默认不加载
+```
 
-## 1. 代码入口与目录
+普通 similarity KD 只保留命令行入口，尚未实现。
 
-### 1.1 主要代码
+---
 
-| 功能 | 路径 |
+## 1. 代码入口与文件职责
+
+| 文件 | 职责 |
 |---|---|
-| 教师训练入口 | `src/training/teacher_train.py` |
-| 教师训练实现 | `src/training/teacher/train.py` |
-| 教师模型 | `src/models/teacher/model.py` |
-| 学生训练与蒸馏 | `src/training/student_train.py` |
-| 学生模型 | `src/models/student_model.py` |
-| 教师测试 | `src/training/teacher_test.py` |
-| 学生测试 | `src/training/student_test.py` |
-| 训练数据集与 sampler | `src/dataset/datasets.py`、`src/dataset/teacher/datasets.py` |
-| 统一验证数据集 | `src/dataset/teacher/val_dataloaders.py` |
-| Identity loss | `src/loss/identity_losses.py` |
-| Sample4Geo InfoNCE | `src/loss/blocks_infoNCE.py` |
-| 统一指标实现 | `src/utils/train_eval_utils.py` |
-| 教师 DeepSpeed 配置 | `ds_config.json` |
-| 学生蒸馏 DeepSpeed 配置 | `configs/ds_student_distill.json` |
+| `src/training/student_train.py` | 单卡与 DeepSpeed 多卡训练入口 |
+| `src/models/student_model.py` | RepViT-M1.5 学生模型 |
+| `src/models/repvit_backbone.py` | RepViT 预训练权重加载与多阶段特征提取 |
+| `src/loss/blocks_infoNCE.py` | 学生 symmetric InfoNCE |
+| `src/dataset/datasets.py` | 学生 pair dataset 与 dataloader |
+| `src/dataset/teacher/datasets.py` | `Sample4GeoBatchSampler` 的共享实现 |
+| `src/dataset/transforms.py` | 训练与测试图像增强 |
+| `src/utils/optimizer_and_scale.py` | 学生 AdamW 参数分组 |
+| `src/utils/scheduler.py` | warmup + cosine 学习率调度 |
+| `configs/ds_student_baseline.json` | DeepSpeed baseline 配置 |
+| `src/training/student_test.py` | U1652、GTA-UAV、SUES-200 统一测试入口 |
 
-### 1.2 数据目录
+---
 
-```text
-data/U1652
-data/SUES-200/SUES-200-512x512
-data/GTA-UAV-LR/GTA-UAV-LR-baidu
-```
+## 2. 学生模型
 
-University-1652 训练目录：
+### 2.1 前向结构
 
 ```text
-data/U1652/train/satellite/<pid>/*
-data/U1652/train/drone/<pid>/*
+输入图像 [B, 3, H, W]
+  -> RepViT-M1.5 feature extractor
+  -> f4 [B, 512, h, w]
+  -> AdaptiveAvgPool2d(1)
+  -> flatten
+  -> BatchNorm1d(512)
+  -> L2 normalize
+  -> embedding [B, 512]
 ```
 
-## 2. 总体实验设计
-
-教师训练严格分为 T0–T5 六组。学生 baseline、学生蒸馏和纯测试不计入教师实验数量。
-
-| ID | 阶段 | 初始化来源 | 融合模式 | Hard Pool |
-|---|---|---|---|---:|
-| T0 | Sample4Geo + InfoNCE | DINOv3 pretrained | `none` | 否 |
-| T1 | Sample4Geo + InfoNCE | DINOv3 pretrained | `hybrid_dual_path_fusion` | 否 |
-| T2 | Identity | T0 best | `none` | 否 |
-| T3 | Identity | T1 best | `hybrid_dual_path_fusion` | 否 |
-| T4 | Identity Hard | T2 best | `none` | 是 |
-| T5 | Identity Hard | T3 best | `hybrid_dual_path_fusion` | 是 |
-
-主原则：
-
-1. T0/T1 独立训练 10 epoch，保存 Sample4Geo 最优结果。
-2. T2/T3 从对应的 Sample4Geo `best_model.pth` 重新启动优化器和调度器。
-3. T4/T5 从对应的 Identity `best_model.pth` 重新启动。
-4. 后续阶段不从上一阶段最后一个 epoch 直接续跑。
-5. 同一分支必须保持 LoRA block、full fine-tune block、local layers、`fusion_mode` 和 gate 配置一致。
-
-训练依赖：
-
-```text
-T0 ──> T2 ──> T4
-T1 ──> T3 ──> T5
-```
-
-## 3. 8 卡资源分配
-
-硬件假设：8 × RTX 3090。
-
-### 3.1 教师训练
-
-| Slot | GPU | 建议任务 |
-|---|---|---|
-| A | `0,1` | T0 → T2 |
-| B | `2,3` | T1 → T3 |
-| C | `4,5` | T4 |
-| D | `6,7` | T5 |
-
-教师每个 run 使用 2 卡，默认每卡 `batch_size=4`。
-
-### 3.2 学生训练
-
-- 学生 baseline 可单卡运行。
-- 风险感知蒸馏推荐使用 2–4 卡 DeepSpeed。
-- 教师模型在每张蒸馏卡上保留一份冻结副本。
-- 学生测试和教师纯测试默认单卡。
-
-## 4. 教师模型与训练机制
-
-### 4.1 三种训练模式
-
-| mode | 数据 | 损失 |
-|---|---|---|
-| `sample4geo` | 每个 PID 一对 satellite/drone | 双向 InfoNCE |
-| `identity` | 每个 PID 多张跨视角图像 | Cross-domain identity + same-domain triplet + weak Sample4Geo |
-| `identity_hard` | Identity batch 中加入 Hard Pool drone | 与 `identity` 相同 |
-
-推荐使用显式阶段：
-
-```text
---training_stage sample4geo
---training_stage identity
---training_stage hard_pool
-```
-
-等价旧开关：
-
-```text
-identity
-= --enable_identity_stage --stage1_end_epoch 0
-
-hard_pool
-= --enable_identity_stage --enable_hard_pool_stage
-   --stage1_end_epoch 0 --stage2_end_epoch 0
-```
-
-### 4.2 Sample4Geo 采样
-
-输出：
-
-```python
-sat_img, drone_img, label, pid
-```
-
-训练时整理为：
-
-```text
-images:    [2B, C, H, W]
-labels:    [2B]
-view_type: [2B]  # satellite=0, drone=1
-```
-
-`Sample4GeoBatchSampler` 先构建全局 batch，再切分到各 rank，保证整个跨卡 batch 内 PID 不重复。InfoNCE 中第 `i` 个 drone 和第 `i` 个 satellite 是唯一正样本，其余 PID 都是负样本。
-
-### 4.3 Identity 采样
-
-每卡每个 batch 采样：
-
-```text
-identity_ids_per_batch 个 PID
-每个 PID：
-  identity_sat_per_id 张 satellite
-  identity_drone_per_id 张 drone
-```
-
-全局 batch 内 PID 仍保持唯一。
-
-University-1652 训练集有 701 个 PID。2 卡、每卡 8 个 PID 时：
-
-```text
-ceil(701 / (8 × 2)) = 44 batches/epoch
-```
-
-### 4.4 Identity Hard 采样
-
-每个 PID 采样：
-
-```text
-identity_sat_per_id 张 satellite
-hard_drone_per_id 张 hard drone
-random_drone_per_id 张 random drone
-```
-
-Hard Pool 不足时：
-
-1. 先取已有 hard drone；
-2. 不足部分退化到随机 drone；
-3. random drone 尽量避开已选择的 hard drone；
-4. 每个 epoch 汇总 fallback 统计。
-
-`identity_hard` 与 `identity` 的损失完全相同，仅 drone 采样方式不同。
-
-### 4.5 教师损失
-
-#### Sample4Geo
+数学形式：
 
 \[
-L_{\text{S4G}}
-=\frac{1}{2}
+f_4 = \operatorname{RepViT}(x)
+\]
+
+\[
+z = \operatorname{L2Norm}
 \left(
-\operatorname{CE}(S_{D2S}, y)
-+
-\operatorname{CE}(S_{S2D}, y)
+\operatorname{BN}
+\left(
+\operatorname{GAP}(f_4)
 \right)
+\right)
+\]
+
+模型没有额外分类头、置信度头、视角适配器或局部匹配分支。
+
+### 2.2 RepViT 初始化权重
+
+默认加载：
+
+```text
+src/models/repvit/repvit_m1_5_distill_450e.pth
+```
+
+启动前检查：
+
+```bash
+ls -lh src/models/repvit/repvit_m1_5_distill_450e.pth
+```
+
+加载器会打印：
+
+```text
+matched keys
+matched feature keys
+feature load ratio
+missing keys
+unexpected keys
+```
+
+feature 权重匹配率低于 95% 时会直接报错，避免误用错误 checkpoint。
+
+### 2.3 相似度温度
+
+模型维护可学习参数 `logit_scale`：
+
+\[
+\operatorname{logit\_scale}_{0}
+=
+\log\left(\frac{1}{T}\right)
 \]
 
 默认：
 
 ```text
-L = infonce_weight × L_S4G
-triplet_weight = 0
+temperature = 0.07
+initial exp(logit_scale) ≈ 14.2857
 ```
 
-#### Identity
-
-Cross-domain identity contrast：
-
-- drone anchor 只与 satellite candidates 比较；
-- satellite anchor 只与 drone candidates 比较；
-- 支持同 PID 多正样本。
-
-Same-domain batch-hard triplet：
-
-- drone 域和 satellite 域分别计算；
-- 每个 anchor 选择 hardest positive 与 hardest negative。
-
-Weak Sample4Geo anchor：
-
-- 每个 PID 生成一个 drone anchor 和一个 satellite anchor；
-- anchor 可选 `first` 或 `mean`；
-- 对 PID anchor 计算双向 InfoNCE。
-
-总损失：
-
-\[
-L_{\text{identity}}
-=\lambda_{\text{id}}L_{\text{cross-id}}
-+\lambda_{\text{tri}}L_{\text{same-triplet}}
-+\lambda_{\text{weak}}L_{\text{weak-S4G}}
-\]
-
-默认权重：
+每次更新后，代码将 `logit_scale` 限制在：
 
 ```text
-identity_loss_weight=1.0
-same_domain_triplet_weight=0.2
-weak_sample4geo_weight=0.2
+0 <= logit_scale <= log(100)
+1 <= exp(logit_scale) <= 100
 ```
 
-### 4.6 Hard Pool 构建
+---
 
-Hard Pool 用于寻找与错误 satellite PID 边界最接近的 drone。
+## 3. 训练数据
 
-构建过程：
+### 3.1 University-1652 目录结构
 
-1. 切换到 eval；
-2. 可选应用 EMA 权重；
-3. 提取所有训练集 satellite/drone 特征；
-4. 每个 PID 计算 satellite prototype；
-5. 为每张 drone 计算 boundary risk；
-6. 每个 PID 保留 top-K drone。
+学生训练默认读取：
 
-Satellite prototype：
+```text
+data/U1652/train/
+├── satellite/
+│   ├── 0001/
+│   │   └── *.jpg
+│   ├── 0002/
+│   └── ...
+└── drone/
+    ├── 0001/
+    │   └── *.jpg
+    ├── 0002/
+    └── ...
+```
+
+验证默认读取：
+
+```text
+data/U1652/
+```
+
+### 3.2 Pair 构建规则
+
+`U1652PairDataset` 对每个 PID：
+
+1. 按文件名排序 satellite 图片；
+2. 固定取第一张 satellite；
+3. 将该 satellite 分别与 PID 下所有 drone 图片组成 pair。
+
+每个样本固定返回：
+
+```python
+(drone_tensor, satellite_tensor, label, pid)
+```
+
+不会返回图片路径或额外样本标识，也不会读取教师缓存或额外采样文件。
+
+### 3.3 图像增强
+
+训练输入统一 resize 到：
+
+```text
+img_size × img_size
+```
+
+默认 `img_size=224`，归一化参数为 ImageNet mean/std。
+
+共同增强包括：
+
+- ColorJitter；
+- 平移与缩放；
+- Hue/Saturation/Value 扰动；
+- AdvancedBlur；
+- GridDropout；
+- CoarseDropout；
+- JPEG compression；
+- 同一 pair 同步执行概率为 0.5 的水平翻转。
+
+satellite 额外执行：
+
+```text
+RandomRotate90(p=1.0)
+```
+
+drone 不执行该 90 度旋转。
+
+验证只执行 resize、normalize 和 tensor 转换。
+
+---
+
+## 4. Baseline sampler
+
+### 4.1 采样目标
+
+InfoNCE 将 batch 中非对角样本全部视为负样本，因此一个训练 batch 内不能出现重复
+PID。否则同 ID 样本会被错误地作为负样本。
+
+### 4.2 单卡
+
+单卡训练每个 epoch 调用 dataset 的 paired shuffle：
+
+- 随机打乱所有 pair；
+- 每个 batch 内 PID 唯一；
+- 只保留完整的 PID-unique batch；
+- 同一个 pair 在一个 epoch 内不重复使用。
+
+### 4.3 多卡
+
+多卡使用 `Sample4GeoBatchSampler`：
+
+1. 先构造全局 batch；
+2. 保证全局 batch 内 PID 唯一；
+3. 再按 rank 切分为每卡 local batch；
+4. 不同 rank 获得互不重叠的 pair index。
+
+必要条件：
+
+```text
+batch_size × world_size <= 训练 PID 总数
+```
+
+否则 sampler 会直接报错。
+
+---
+
+## 5. Symmetric InfoNCE
+
+设当前 global pair batch 为 \(N\)，归一化后的 drone 和 satellite 特征分别为：
 
 \[
-p_i=\operatorname{Normalize}
-\left(
-\operatorname{Mean}\{f_s:s\in i\}
-\right)
+D \in \mathbb{R}^{N\times512},
+\qquad
+S \in \mathbb{R}^{N\times512}
 \]
 
-Drone risk：
+相似度矩阵：
 
 \[
-r(d_i)
+M = \exp(\text{logit\_scale}) D S^\top
+\]
+
+正样本标签固定为矩阵对角线：
+
+\[
+y_i=i
+\]
+
+双向损失：
+
+\[
+L_{\text{D2S}}
 =
-\operatorname{MeanTopK}_{j\ne i}
-\operatorname{sim}(d_i,p_j)
--
-\operatorname{sim}(d_i,p_i)
+\operatorname{CE}(M,y)
 \]
 
-风险越高表示 drone 越接近错误 PID prototype，同时越远离正确 prototype。
+\[
+L_{\text{S2D}}
+=
+\operatorname{CE}(M^\top,y)
+\]
 
-JSON 主要结构：
+\[
+L_{\text{InfoNCE}}
+=
+\frac{L_{\text{D2S}}+L_{\text{S2D}}}{2}
+\]
+
+当前总损失严格等于：
+
+\[
+L_{\text{total}}=L_{\text{InfoNCE}}
+\]
+
+默认 label smoothing：
+
+```text
+0.1
+```
+
+---
+
+## 6. DeepSpeed 多卡机制
+
+### 6.1 特征顺序
+
+每张卡的模型输入顺序：
+
+```text
+[local_drone, local_satellite]
+```
+
+代码先拆分两个视角，再分别 all-gather，最终得到：
+
+```text
+[all_drone, all_satellite]
+```
+
+这样 global 相似度矩阵的对角线仍然是正确正样本。
+
+### 6.2 梯度
+
+学生特征使用带 autograd 的 `GatherLayer`：
+
+```text
+local features
+  -> differentiable all-gather
+  -> global gallery
+  -> symmetric InfoNCE
+  -> backward to every rank
+```
+
+不允许将学生 gather 特征 detach。
+
+### 6.3 ZeRO 支持
+
+当前支持：
+
+```text
+ZeRO stage 0
+ZeRO stage 1
+ZeRO stage 2
+```
+
+当前不支持 ZeRO stage 3，原因是 model-only checkpoint 导出需要另一套参数合并路径。
+
+### 6.4 精度设置
+
+默认 DeepSpeed 配置：
 
 ```json
-{
-  "meta": {
-    "epoch": 0,
-    "model_source": "ema",
-    "hard_pool_topk": 12,
-    "hard_pool_topneg_k": 10
-  },
-  "hard_pool": {
-    "0001": [
-      {
-        "image_path": "...",
-        "boundary_risk": 0.123,
-        "pos_sim": 0.456,
-        "topk_neg_mean": 0.579,
-        "top1_neg_pid": "0032"
-      }
-    ]
-  },
-  "id_risk": {
-    "0001": 0.118
-  }
-}
+"bf16": {"enabled": true},
+"fp16": {"enabled": false}
 ```
 
-`id_risk` 是该 PID top-3 hard samples 的平均风险。
+RTX 3090 属于 Ampere 架构，可以使用 BF16。传入 `--no_amp` 时，代码会同时关闭
+DeepSpeed 的 BF16 和 FP16。
 
-### 4.7 教师微调结构
+### 6.5 Rank 日志
 
-教师为 DINOv3，默认三段式微调：
+DeepSpeed step 日志、epoch 日志、验证日志以及模型保存只由 rank0 执行。各 rank
+仍共同参与训练、all-gather 和分布式验证。
+
+---
+
+## 7. Batch size 口径
+
+`--batch_size` 表示每张 GPU 的 pair 数，不是图片数。
 
 ```text
-底部 blocks：冻结
-中间 blocks：LoRA
-最后 4 个 blocks：full fine-tune
+local pair batch     = batch_size
+local image batch    = 2 × batch_size
+global pair batch    = batch_size × world_size
+global image batch   = 2 × batch_size × world_size
+optimizer pair batch = batch_size × world_size × grad_accum_steps
 ```
 
-默认解析：
+常用配置：
+
+| GPU 数 | 每卡 pair | 每卡图片 | 单步 global pair | 单步 global 图片 |
+|---:|---:|---:|---:|---:|
+| 1 | 8 | 16 | 8 | 16 |
+| 2 | 8 | 16 | 16 | 32 |
+| 4 | 8 | 16 | 32 | 64 |
+| 8 | 4 | 8 | 32 | 64 |
+| 8 | 8 | 16 | 64 | 128 |
+
+梯度累积只扩大 optimizer 有效 batch，不扩大单次 forward 的 InfoNCE gallery：
 
 ```text
-full_finetune_start_block = -4
-full_finetune_end_block   = 总 block 数
-lora_start_block          = min(20, full_start)
-lora_end_block            = full_start
+InfoNCE gallery size = batch_size × world_size
 ```
 
-对 40-block DINOv3，代码使用 0-based block index：
+例如：
 
 ```text
-block 0–19  ：冻结（对应第 1–20 层）
-block 20–35 ：LoRA（对应第 21–36 层）
-block 36–39 ：full fine-tune（最后 4 层）
+8 GPU × 4 pair/GPU × grad_accum_steps 2
+
+单次 gallery       = 32 pair
+optimizer 有效 batch = 64 pair
 ```
 
-Global feature 使用最终层 CLS token。Local/PYRA 固定从 block `19,27,36` 提取 patch tokens。
+---
 
-教师至少支持以下融合模式：
+## 8. 优化器与学习率
 
-| `fusion_mode` | 行为 |
-|---|---|
-| `none` | 只使用最终层 global CLS，不计算 local 分支 |
-| `soft_orthogonal` | 保留旧逻辑：先合并三层 token 得到一个 local feature，再按可学习 `lambda_orth` 消除部分 global 投影 |
-| `hybrid_dual_path_fusion` | 当前软正交方案：三层分别得到 local feature，19/27 做双路径分解，36 直接作为高层语义 residual |
+### 8.1 AdamW
 
-旧命令行参数 `--use_soft_orth_fusion` 仍兼容，并自动解析为 `fusion_mode=soft_orthogonal`。新实验应显式使用 `--fusion_mode`。
-
-#### 4.7.1 Hybrid dual-path 软正交
-
-对第 19、27、36 层分别使用共享的 local cross-attention 和 `local_proj`，得到：
-
-\[
-l_{19},l_{27},l_{36}\in\mathbb{R}^{B\times D}
-\]
-
-不得先拼接三层 token 后再生成单个 local feature。第 19、27 层使用 detached global feature 作为分解参考：
-
-\[
-u=\operatorname{Normalize}(\operatorname{detach}(g))
-\]
-
-\[
-l_{i}^{\parallel}=(l_i^\top u)u,\qquad
-l_i^{\perp}=l_i-l_i^{\parallel},\qquad i\in\{19,27\}
-\]
-
-第 36 层不做正交分解：
-
-\[
-l_{36}^{semantic}=l_{36}
-\]
-
-五个 gate 独立学习：
-
-\[
-\gamma_k=\gamma_{\max}\cdot\sigma(\gamma_{k,\mathrm{raw}})
-\]
-
-默认 `gamma_max=0.05`，raw 参数使用
-`logit(gamma_init / gamma_max)` 初始化：
-
-| Gate | 初始实际值 |
-|---|---:|
-| `gamma_19_parallel` | `0.005` |
-| `gamma_19_perp` | `0.015` |
-| `gamma_27_parallel` | `0.010` |
-| `gamma_27_perp` | `0.015` |
-| `gamma_36` | `0.010` |
-
-最终融合为：
-
-\[
-\begin{aligned}
-f=&\,g
-+\gamma_{19}^{\parallel}l_{19}^{\parallel}
-+\gamma_{19}^{\perp}l_{19}^{\perp}\\
-&+\gamma_{27}^{\parallel}l_{27}^{\parallel}
-+\gamma_{27}^{\perp}l_{27}^{\perp}
-+\gamma_{36}l_{36}
-\end{aligned}
-\]
-
-\[
-f_{\mathrm{fused}}=\operatorname{Normalize}(f)
-\]
-
-该设计保留与 global 同方向的局部信息，但给它较小初始 gate；同时以更高初始权重注入正交互补信息。第 36 层作为靠近最终层的高层语义 residual，不进行硬性分解。
-
-Hybrid 分支在后续阶段必须始终携带：
-
-```bash
---fusion_mode hybrid_dual_path_fusion \
---local_feature_layers 19,27,36 \
---gamma_max 0.05 \
---gamma_19_parallel_init 0.005 \
---gamma_19_perp_init 0.015 \
---gamma_27_parallel_init 0.010 \
---gamma_27_perp_init 0.015 \
---gamma_36_init 0.010
-```
-
-训练日志会打印：
+默认：
 
 ```text
-gamma_19_parallel, gamma_19_perp
-gamma_27_parallel, gamma_27_perp
-gamma_36
-cos(local_19, global), cos(local_27, global), cos(local_36, global)
-ratio_19_parallel, ratio_19_perp
-ratio_27_parallel, ratio_27_perp
+optimizer = AdamW
+lr = 1e-4
+weight_decay = 1e-4
+betas = (0.9, 0.999)
 ```
 
-其中 `ratio_i_parallel` 和 `ratio_i_perp` 分别为对应分量范数除以原始
-`local_i` 范数后的 batch 均值。
+参数分组：
 
-`fusion_mode` 和 gate 初始化参数会写入 `hyperparameters.json`，测试时会随 checkpoint 自动恢复。T1 → T3 → T5 必须保持相同的 hybrid 配置。旧版 `soft_orthogonal` checkpoint 不包含五个 hybrid gate，不能在默认的严格 trainable 参数检查下直接作为 hybrid 分支初始化；如需迁移，必须明确使用 `--init_checkpoint_strict_trainable false`，并把它视为新的消融实验，而不是原分支续训。
+- 权重矩阵使用 weight decay；
+- bias、BatchNorm、归一化层及一维参数不使用 weight decay。
 
-### 4.8 教师优化器
+### 8.2 Warmup + cosine
 
-| 参数组 | 学习率 | weight decay |
-|---|---:|---:|
-| LoRA decay | `lr` | `0.01` |
-| LoRA no-decay | `lr` | `0` |
-| full backbone decay | `lr × full_finetune_lr_mult` | `0.01` |
-| full backbone no-decay | `lr × full_finetune_lr_mult` | `0` |
-| local/fusion decay | `lr` | `0.01` |
-| local/fusion no-decay（含五个 hybrid gate） | `lr` | `0` |
-| logit scale | `lr × logit_scale_lr_mult` | `0` |
-
-安装 DeepSpeed CPU Adam 时使用 `DeepSpeedCPUAdam`，否则使用 AdamW。
-
-## 5. 教师 T0–T5 命令
-
-### 5.1 T0：仅 global CLS 的 Sample4Geo
-
-```bash
-deepspeed --include localhost:0,1 src/training/teacher_train.py \
-  --training_stage sample4geo \
-  --epochs 10 \
-  --device cuda \
-  --deepspeed_config ds_config.json \
-  --data_dir data/U1652 \
-  --batch_size 4 \
-  --grad_accum_steps 1 \
-  --triplet_weight 0 \
-  --infonce_weight 1.0 \
-  --fusion_mode none
-```
-
-### 5.2 T1：Hybrid dual-path 软正交 Sample4Geo
-
-```bash
-deepspeed --include localhost:2,3 src/training/teacher_train.py \
-  --training_stage sample4geo \
-  --epochs 10 \
-  --device cuda \
-  --deepspeed_config ds_config.json \
-  --data_dir data/U1652 \
-  --batch_size 4 \
-  --grad_accum_steps 1 \
-  --triplet_weight 0 \
-  --infonce_weight 1.0 \
-  --fusion_mode hybrid_dual_path_fusion \
-  --local_feature_layers 19,27,36 \
-  --gamma_max 0.05 \
-  --gamma_19_parallel_init 0.005 \
-  --gamma_19_perp_init 0.015 \
-  --gamma_27_parallel_init 0.010 \
-  --gamma_27_perp_init 0.015 \
-  --gamma_36_init 0.010
-```
-
-### 5.3 T2：T0 best → Identity
-
-```bash
-deepspeed --include localhost:0,1 src/training/teacher_train.py \
-  --training_stage identity \
-  --epochs 20 \
-  --device cuda \
-  --deepspeed_config ds_config.json \
-  --data_dir data/U1652 \
-  --batch_size 4 \
-  --grad_accum_steps 1 \
-  --init_checkpoint src/checkpoint/teacher/<T0_run>/best_model.pth \
-  --identity_ids_per_batch 8 \
-  --identity_drone_per_id 4 \
-  --identity_sat_per_id 1 \
-  --identity_loss_weight 1.0 \
-  --same_domain_triplet_weight 0.2 \
-  --weak_sample4geo_weight 0.2 \
-  --fusion_mode none
-```
-
-### 5.4 T3：T1 best → Identity
-
-```bash
-deepspeed --include localhost:2,3 src/training/teacher_train.py \
-  --training_stage identity \
-  --epochs 20 \
-  --device cuda \
-  --deepspeed_config ds_config.json \
-  --data_dir data/U1652 \
-  --batch_size 4 \
-  --grad_accum_steps 1 \
-  --init_checkpoint src/checkpoint/teacher/<T1_run>/best_model.pth \
-  --identity_ids_per_batch 8 \
-  --identity_drone_per_id 4 \
-  --identity_sat_per_id 1 \
-  --identity_loss_weight 1.0 \
-  --same_domain_triplet_weight 0.2 \
-  --weak_sample4geo_weight 0.2 \
-  --fusion_mode hybrid_dual_path_fusion \
-  --local_feature_layers 19,27,36 \
-  --gamma_max 0.05 \
-  --gamma_19_parallel_init 0.005 \
-  --gamma_19_perp_init 0.015 \
-  --gamma_27_parallel_init 0.010 \
-  --gamma_27_perp_init 0.015 \
-  --gamma_36_init 0.010
-```
-
-### 5.5 T4：T2 best → Hard Pool
-
-```bash
-deepspeed --include localhost:4,5 src/training/teacher_train.py \
-  --training_stage hard_pool \
-  --epochs 10 \
-  --device cuda \
-  --deepspeed_config ds_config.json \
-  --data_dir data/U1652 \
-  --batch_size 4 \
-  --grad_accum_steps 1 \
-  --init_checkpoint src/checkpoint/teacher/<T2_run>/best_model.pth \
-  --build_hard_pool_epoch 0 \
-  --save_hard_pool_path outputs/hard_pool_T4_epoch{epoch}.json \
-  --identity_ids_per_batch 8 \
-  --identity_sat_per_id 1 \
-  --hard_drone_per_id 2 \
-  --random_drone_per_id 2 \
-  --identity_loss_weight 1.0 \
-  --same_domain_triplet_weight 0.2 \
-  --weak_sample4geo_weight 0.2 \
-  --hard_pool_topk 12 \
-  --hard_pool_topneg_k 10 \
-  --use_ema_for_hard_pool true \
-  --fusion_mode none
-```
-
-### 5.6 T5：T3 best → Hard Pool
-
-```bash
-deepspeed --include localhost:6,7 src/training/teacher_train.py \
-  --training_stage hard_pool \
-  --epochs 10 \
-  --device cuda \
-  --deepspeed_config ds_config.json \
-  --data_dir data/U1652 \
-  --batch_size 4 \
-  --grad_accum_steps 1 \
-  --init_checkpoint src/checkpoint/teacher/<T3_run>/best_model.pth \
-  --build_hard_pool_epoch 0 \
-  --save_hard_pool_path outputs/hard_pool_T5_epoch{epoch}.json \
-  --identity_ids_per_batch 8 \
-  --identity_sat_per_id 1 \
-  --hard_drone_per_id 2 \
-  --random_drone_per_id 2 \
-  --identity_loss_weight 1.0 \
-  --same_domain_triplet_weight 0.2 \
-  --weak_sample4geo_weight 0.2 \
-  --hard_pool_topk 12 \
-  --hard_pool_topneg_k 10 \
-  --use_ema_for_hard_pool true \
-  --fusion_mode hybrid_dual_path_fusion \
-  --local_feature_layers 19,27,36 \
-  --gamma_max 0.05 \
-  --gamma_19_parallel_init 0.005 \
-  --gamma_19_perp_init 0.015 \
-  --gamma_27_parallel_init 0.010 \
-  --gamma_27_perp_init 0.015 \
-  --gamma_36_init 0.010
-```
-
-如果已有 Hard Pool，可使用：
-
-```bash
---load_hard_pool_path outputs/hard_pool_epoch0.json
-```
-
-此时不会重复构建。
-
-## 6. 教师验证与保存
-
-训练验证使用 EMA 权重。
-
-验证频率：
-
-- Sample4Geo：每个 epoch；
-- Identity：每 5 epoch，最后 10 epoch 每 2 epoch，最终 epoch 必验；
-- Hard Pool：规则同 Identity。
-
-选择指标：
+调度器按 iteration 更新：
 
 ```text
-D2S_R@1 + S2D_R@1
+warmup -> cosine decay -> base_lr × min_lr_ratio
 ```
 
-每个教师 run 保存：
+当前默认：
 
 ```text
-src/checkpoint/teacher/<run>/best_model.pth
-src/checkpoint/teacher/<run>/final_model.pth
-src/checkpoint/teacher/<run>/best_metrics.json
-src/checkpoint/teacher/<run>/hyperparameters.json
+warmup_epochs = 0.1
+min_lr_ratio = 0.01
 ```
 
-| 文件 | 用途 |
-|---|---|
-| `best_model.pth` | 主结果、后续阶段初始化、学生蒸馏 |
-| `final_model.pth` | 最后 epoch 对照 |
-| `best_metrics.json` | 最佳结果及完整验证历史 |
-| `hyperparameters.json` | 恢复模型结构与训练参数 |
+注意：`warmup_epochs=0.1` 表示 0.1 个 epoch，不是总 epoch 的 10%。
 
-## 7. 学生模型 Baseline
-
-学生为 RepViT-M1.5：
+若训练前期不稳定，可尝试：
 
 ```text
-RepViT f4 feature map
-→ global average pooling
-→ BatchNorm1d(512)
-→ L2 normalize
-→ 512-d embedding
+--warmup_epochs 1
 ```
 
-单卡 baseline：
+---
+
+## 9. 推荐启动命令
+
+### 9.1 启动前检查
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python src/training/student_train.py \
+python src/training/student_train.py --help
+ls data/U1652/train/satellite
+ls data/U1652/train/drone
+ls src/models/repvit/repvit_m1_5_distill_450e.pth
+```
+
+### 9.2 8×RTX 3090 保守配置
+
+```bash
+deepspeed --include localhost:0,1,2,3,4,5,6,7 \
+  src/training/student_train.py \
+  --deepspeed \
+  --deepspeed_config configs/ds_student_baseline.json \
   --epochs 60 \
   --train_data_dir data/U1652/train \
   --val_data_dir data/U1652 \
+  --img_size 224 \
+  --batch_size 4 \
+  --val_batch_size 32 \
+  --num_workers 8 \
+  --lr 1e-4 \
+  --weight_decay 1e-4 \
+  --warmup_epochs 0.1 \
+  --min_lr_ratio 0.01 \
+  --temperature 0.07 \
+  --label_smoothing 0.1 \
+  --grad_accum_steps 1 \
+  --print_freq 20 \
+  --val_interval 5
+```
+
+该配置的 batch 口径：
+
+```text
+local pair batch  = 4
+local image batch = 8
+global pair batch = 32
+global image batch = 64
+```
+
+### 9.3 8×RTX 3090 扩大 gallery
+
+显存允许时：
+
+```bash
+deepspeed --include localhost:0,1,2,3,4,5,6,7 \
+  src/training/student_train.py \
+  --deepspeed \
+  --deepspeed_config configs/ds_student_baseline.json \
+  --batch_size 8 \
+  --grad_accum_steps 1
+```
+
+此时单步 global gallery 为 64 pair。
+
+### 9.4 4 卡
+
+```bash
+deepspeed --include localhost:0,1,2,3 \
+  src/training/student_train.py \
+  --deepspeed \
+  --deepspeed_config configs/ds_student_baseline.json \
+  --epochs 60 \
+  --batch_size 8 \
+  --val_batch_size 32 \
+  --num_workers 8
+```
+
+### 9.5 单卡
+
+```bash
+python src/training/student_train.py \
+  --epochs 60 \
+  --train_data_dir data/U1652/train \
+  --val_data_dir data/U1652 \
+  --img_size 224 \
   --batch_size 8 \
   --val_batch_size 32 \
   --num_workers 8 \
   --lr 1e-4 \
   --weight_decay 1e-4 \
   --temperature 0.07 \
-  --label_smoothing 0.1
-```
-
-学生 baseline 使用双向 Sample4Geo InfoNCE。默认 AdamW、iteration-level warmup + cosine scheduler 和 AMP。
-
-## 8. 边界风险感知蒸馏
-
-### 8.1 蒸馏目标
-
-当前方法不是特征维度对齐或 KL 蒸馏，而是关系排序蒸馏。教师和学生特征维度可以不同。
-
-对一个跨视角相似度矩阵，教师定义负样本风险：
-
-\[
-w_{ij}
-=
-\sigma
-\left(
-\frac{t_{ij}-t_{ii}+m_r}{\tau_r}
-\right)
-\]
-
-风险越高，表示负样本越接近或超过正确匹配。
-
-学生排序损失：
-
-\[
-\ell_{ij}
-=
-\operatorname{softplus}
-\left(
-\frac{s_{ij}-s_{ii}+m_p}{T}
-\right)
-\]
-
-仅保留教师相似度最高的 top-K negatives，并用风险权重加权：
-
-\[
-L_{\text{BRD}}
-=
-\frac{1}{2}
-\left(
-L_{D2S}+L_{S2D}
-\right)
-\]
-
-总损失：
-
-\[
-L
-=L_{\text{InfoNCE}}
-+\lambda_{\text{local}}L_{\text{local}}
-+\lambda_{\text{BRD}}L_{\text{BRD}}
-\]
-
-其中 local alignment 默认关闭。
-
-### 8.2 在线教师
-
-- 每张 GPU 加载一份冻结教师；
-- 教师使用 eval + inference mode；
-- 不计算教师梯度；
-- 学生和教师处理完全相同的本地图像；
-- 教师输出只用于构造全局风险关系。
-
-### 8.3 DeepSpeed 多卡实现
-
-多卡实现保持原数据构造和损失定义不变：
-
-1. 数据仍由 `U1652PairDataset` 生成；
-2. 图像增强仍使用原学生 transforms；
-3. sampler 先构建 PID 唯一的全局 batch；
-4. 各 rank 得到互不重叠的本地分片；
-5. 学生特征采用可反传 all-gather；
-6. 冻结教师特征采用无梯度 all-gather；
-7. 聚合后恢复为 `[all_drone, all_satellite]`，保证矩阵对角线仍是正样本；
-8. 在教师全局相似度矩阵中，仅保留满足边界条件的 negatives；
-9. InfoNCE、BRD 和可选 local alignment 在全局 batch 上计算。
-
-教师边界候选定义：
-
-\[
-\text{margin}_t
-=
-\text{sim}_t(\text{positive})
--
-\text{sim}_t(\text{negative})
-\]
-
-\[
-\text{candidate}
-=
-\text{negative}
-\land
-(0 < \text{margin}_t < \text{brd\_boundary\_delta})
-\]
-
-默认：
-
-```text
-brd_boundary_delta=0.3
-brd_skip_no_boundary=true
-```
-
-因此教师已经明显分开的 easy negatives 不参与 BRD；教师把错误 negative
-排在 positive 前面的负 margin 样本也不进入当前边界候选。实现顺序必须是：
-
-1. 先在完整 global gallery 上计算 `candidate_mask`；
-2. 将非 candidate 的 `risk_score` 设为 `-inf`；
-3. 再且只在 candidate 内执行 Top-K。
-
-不允许先对全部 negatives 做 Top-K 再过滤。某个 query 没有候选且
-`brd_skip_no_boundary=true` 时直接跳过，不会强行用 easy negative 补齐。
-如果某个方向没有任何 effective query，该方向返回
-`student_query.sum() * 0.0`，从而保持 device、dtype 和 student all-gather
-梯度图正确，同时避免空张量归约产生 NaN。
-
-### 8.4 Batch size 口径
-
-`--batch_size` 表示每张 GPU 的 pair 数；一个 pair 包含一张 drone 和一张 satellite。
-
-4 卡、每卡 4 pair：
-
-```text
-local pair batch             = 4
-local image batch            = 8
-global pair batch per step   = 16
-global image batch per step  = 32
-```
-
-梯度累积：
-
-```text
-effective pair batch
-= local_pair_batch × world_size × grad_accum_steps
-```
-
-注意：`grad_accum_steps` 只扩大优化器有效 batch。每次 BRD 的负样本集合仍来自当前 step 的跨卡 global pair batch。
-
-### 8.5 DeepSpeed 配置
-
-默认文件：
-
-```text
-configs/ds_student_distill.json
-```
-
-默认：
-
-```text
-BF16
-ZeRO-1
-gradient_accumulation_steps=1
-```
-
-支持 ZeRO-0/1/2，不支持 ZeRO-3。ZeRO-3 会切分模型参数，而当前 `best_model.pth` 和 `last_model.pth` 需要直接导出完整学生权重。
-
-传入 `--no_amp` 会同时关闭 DeepSpeed BF16 和 FP16。
-
-### 8.6 推荐多卡蒸馏命令
-
-4 卡：
-
-```bash
-deepspeed --include localhost:0,1,2,3 src/training/student_train.py \
-  --deepspeed \
-  --deepspeed_config configs/ds_student_distill.json \
-  --epochs 60 \
-  --train_data_dir data/U1652/train \
-  --val_data_dir data/U1652 \
-  --batch_size 4 \
-  --val_batch_size 32 \
-  --num_workers 8 \
-  --lr 1e-4 \
-  --weight_decay 1e-4 \
-  --temperature 0.07 \
   --label_smoothing 0.1 \
-  --use_brd_distill \
-  --teacher_checkpoint src/checkpoint/teacher/<teacher_run>/best_model.pth \
-  --brd_weight 0.05 \
-  --brd_topk 4 \
-  --brd_boundary_delta 0.3 \
-  --brd_skip_no_boundary true \
-  --brd_pair_margin 0.05 \
-  --brd_risk_margin 0.0 \
-  --brd_risk_tau 0.05 \
-  --brd_temperature 0.07
+  --val_interval 5
 ```
 
-2 卡：
+### 9.6 指定输出目录
 
-```bash
-deepspeed --include localhost:0,1 src/training/student_train.py \
-  --deepspeed \
-  --batch_size 4 \
-  --use_brd_distill \
-  --teacher_checkpoint src/checkpoint/teacher/<teacher_run>/best_model.pth
-```
-
-DeepSpeed launcher 检测到 `WORLD_SIZE > 1` 时，即使没有显式传入 `--deepspeed`，也会自动进入 DeepSpeed 路径。建议仍显式添加，方便复现实验。
-
-### 8.7 显存调整
-
-按以下顺序调整：
-
-1. `--batch_size 4` 降到 `2`；
-2. `--brd_topk 4` 降到 `2`；
-3. 降低 `--val_batch_size`；
-4. 使用 `--grad_accum_steps` 恢复有效优化 batch。
-
-不要只依靠梯度累积扩大 BRD negatives；BRD negatives 数量由单步 global pair batch 决定。
-
-### 8.8 学生保存内容
+默认输出到：
 
 ```text
-src/checkpoint/student/<run>/best_model.pth
-src/checkpoint/student/<run>/last_model.pth
-src/checkpoint/student/<run>/best_metrics.json
-src/checkpoint/student/<run>/training_record.txt
-src/checkpoint/student/<run>/deepspeed/last/
+src/checkpoint/student/<YYYYMMDD_HHMMSS>/
 ```
 
-- `best_model.pth`、`last_model.pth` 可由 `student_test.py` 直接加载；
-- `deepspeed/last/` 保存优化器、scheduler 和 ZeRO 状态；
-- 多卡验证仍以 `D2S_R@1 + S2D_R@1` 选择 best。
+也可以显式指定：
 
-### 8.9 分布式通信检查
+```bash
+python src/training/student_train.py \
+  --output_dir src/checkpoint/student/baseline_seed0
+```
 
-Linux 环境：
+---
+
+## 10. 参数表
+
+| 参数 | 默认值 | 含义 |
+|---|---:|---|
+| `--train_data_dir` | `data/U1652/train` | 训练集目录 |
+| `--val_data_dir` | `data/U1652` | U1652 验证集目录 |
+| `--output_root` | `src/checkpoint/student` | 自动创建 run 目录的根目录 |
+| `--output_dir` | `None` | 显式输出目录 |
+| `--deepspeed` | `False` | 启用 DeepSpeed；多进程启动时也会自动进入该路径 |
+| `--deepspeed_config` | `configs/ds_student_baseline.json` | DeepSpeed 配置 |
+| `--grad_accum_steps` | `1` | 梯度累积步数 |
+| `--seed` | `0` | 每个 rank 使用 `seed + rank` |
+| `--epochs` | `60` | 训练 epoch 数 |
+| `--img_size` | `224` | 输入高宽 |
+| `--batch_size` | `8` | 每卡 pair 数 |
+| `--val_batch_size` | `32` | 验证图片 batch |
+| `--num_workers` | `8` | dataloader worker 数 |
+| `--lr` | `1e-4` | AdamW 基础学习率 |
+| `--weight_decay` | `1e-4` | 权重衰减 |
+| `--warmup_epochs` | `0.1` | warmup epoch 数 |
+| `--min_lr_ratio` | `0.01` | 最终学习率与基础学习率比例 |
+| `--temperature` | `0.07` | `logit_scale` 初始化温度 |
+| `--label_smoothing` | `0.1` | InfoNCE 交叉熵 smoothing |
+| `--amp` | `True` | 单卡 AMP；DeepSpeed 精度由 runtime config 同步控制 |
+| `--no_amp` | - | 关闭 AMP/BF16/FP16 |
+| `--grad_clip` | `0.0` | 梯度裁剪；0 表示关闭 |
+| `--print_freq` | `20` | step 日志间隔 |
+| `--val_interval` | `5` | 验证间隔；最后一个 epoch 总会验证 |
+| `--best_metric_name` | `R1_sum` | 代码会强制使用 `R1_sum` |
+| `--save_last` | `True` | 保存 last checkpoint |
+| `--no_save_last` | - | 禁止保存 last checkpoint |
+| `--use_kd_distill` | `False` | 预留入口，当前启用会报未实现错误 |
+
+---
+
+## 11. 日志说明
+
+### 11.1 Step 日志
+
+单卡：
+
+```text
+pair_batch
+global_pair_batch
+data time
+batch time
+loss_infonce
+logit_scale
+learning rate
+```
+
+DeepSpeed：
+
+```text
+local_pair_batch
+global_pair_batch
+data time
+batch time
+loss_infonce
+logit_scale
+learning rate
+```
+
+### 11.2 正常启动检查
+
+建议确认启动日志包含：
+
+```text
+[RepViTBackbone] matched feature keys: ... (>=95%)
+[Params] total=... | trainable=... | frozen=...
+[Optimizer] student ...
+[Scheduler] ...
+[DeepSpeedBatch] ...
+```
+
+并确认：
+
+```text
+global_pair_batch = local_pair_batch × world_size
+```
+
+---
+
+## 12. 验证与 checkpoint
+
+### 12.1 验证方向
+
+```text
+D2S: query_drone -> gallery_satellite
+S2D: query_satellite -> gallery_drone
+```
+
+每个方向记录：
+
+```text
+R@1
+R@5
+R@10
+mAP
+```
+
+best 选择指标：
+
+\[
+\text{R1\_sum}
+=
+\text{D2S R@1}
++
+\text{S2D R@1}
+\]
+
+### 12.2 输出文件
+
+```text
+<run_dir>/
+├── best_model.pth
+├── last_model.pth
+├── best_metrics.json
+├── training_record.txt
+└── deepspeed/
+    └── last/
+```
+
+说明：
+
+- `best_model.pth`：验证指标最优权重；
+- `last_model.pth`：最后保存的训练状态或模型权重；
+- `best_metrics.json`：best 指标与验证历史；
+- `training_record.txt`：命令行、参数、最后验证结果；
+- `deepspeed/last/`：DeepSpeed optimizer、scheduler 与恢复状态。
+
+单卡 checkpoint 包含 model、optimizer、scheduler；DeepSpeed 导出的
+`best_model.pth`/`last_model.pth` 是便于测试的 model-only checkpoint。
+
+---
+
+## 13. 模型测试
+
+### 13.1 University-1652
+
+`--checkpoint` 可以传 run 目录，也可以直接传 `.pth` 文件。传目录时优先加载
+`best_model.pth`。
+
+```bash
+python src/training/student_test.py \
+  --checkpoint src/checkpoint/student/<run_dir> \
+  --dataset 1652 \
+  --data_dir data/U1652 \
+  --batch_size 32 \
+  --img_size 224 \
+  --num_workers 8
+```
+
+### 13.2 GTA-UAV
+
+```bash
+python src/training/student_test.py \
+  --checkpoint src/checkpoint/student/<run_dir> \
+  --dataset GTA-UAV \
+  --data_dir data/GTA-UAV-LR/GTA-UAV-LR-baidu \
+  --gta_split cross-area \
+  --gta_query_mode both \
+  --batch_size 32
+```
+
+### 13.3 SUES-200
+
+```bash
+python src/training/student_test.py \
+  --checkpoint src/checkpoint/student/<run_dir> \
+  --dataset SUES-200 \
+  --data_dir data/SUES-200/SUES-200-512x512 \
+  --sues_height all \
+  --batch_size 32
+```
+
+默认结果保存到 checkpoint 同目录：
+
+```text
+student_test_results.json
+```
+
+---
+
+## 14. 测试与代码审计
+
+### 14.1 完整测试
+
+```bash
+python -m pytest -q
+```
+
+当前基准：
+
+```text
+35 passed
+```
+
+### 14.2 学生定向测试
+
+```bash
+python -m pytest tests/test_student_baseline.py -q
+```
+
+### 14.3 多卡 gather 冒烟测试
 
 ```bash
 torchrun --standalone --nproc_per_node=2 \
@@ -903,473 +756,158 @@ torchrun --standalone --nproc_per_node=2 \
 student distributed paired gather smoke test passed
 ```
 
-### 8.10 BRD 日志与审计口径
+该测试同时检查：
 
-当前日志中的旧字段：
+- global 排列为 `[all_drone, all_satellite]`；
+- global pair batch 正确；
+- gather 后梯度能回传到每个 rank。
 
-```text
-loss_brd(raw)
+### 14.4 中间特征检查
+
+```bash
+python tests/check_student_intermediate_shapes.py
 ```
 
-明确表示未乘权重的双向 BRD raw loss。训练实际使用：
+检查 `f4` 通道数与最终 512 维 descriptor。
 
-\[
-L_{\text{BRD-weighted}}
-=
-\text{current\_brd\_weight}
-\times
-L_{\text{BRD-raw}}
-\]
+---
 
-默认未启用 local alignment 时：
+## 15. 常见问题
 
-\[
-L_{\text{total}}
-=
-L_{\text{InfoNCE}}
-+
-L_{\text{BRD-weighted}}
-\]
+### 15.1 `unrecognized arguments`
 
-启用 local alignment 时还会额外加：
+当前训练入口只接受参数表中的参数。历史实验参数已不属于当前 baseline，继续传入会被
+`argparse` 拒绝。
 
-\[
-\text{local\_align\_weight}\times L_{\text{local}}
-\]
+先执行：
 
-每个训练日志会打印：
+```bash
+python src/training/student_train.py --help
+```
 
-| 字段 | 含义 |
+### 15.2 启用 `--use_kd_distill` 后报错
+
+这是预期行为。普通 similarity KD 尚未实现，当前参数仅用于锁定后续接口名称。
+
+baseline 训练不要传：
+
+```text
+--use_kd_distill
+```
+
+### 15.3 找不到 RepViT 权重
+
+确认文件存在：
+
+```bash
+ls src/models/repvit/repvit_m1_5_distill_450e.pth
+```
+
+### 15.4 全局 batch 大于 PID 数
+
+报错形式：
+
+```text
+global_batch_size is larger than PID count
+```
+
+降低：
+
+```text
+batch_size
+```
+
+或减少训练 GPU 数。
+
+### 15.5 DeepSpeed 单进程启动报错
+
+不要只执行：
+
+```bash
+python src/training/student_train.py --deepspeed
+```
+
+应使用 DeepSpeed launcher：
+
+```bash
+deepspeed --include localhost:0,1,2,3 \
+  src/training/student_train.py --deepspeed
+```
+
+### 15.6 CUDA OOM
+
+按以下顺序处理：
+
+1. 降低 `--batch_size`；
+2. 降低 `--val_batch_size`；
+3. 增加 `--grad_accum_steps` 恢复 optimizer 有效 batch；
+4. 必要时降低 `--img_size`。
+
+注意：增加梯度累积不能恢复被降低的单步 InfoNCE gallery 大小。
+
+### 15.7 DataLoader 很慢
+
+依次尝试：
+
+- 检查数据是否位于机械硬盘或网络盘；
+- 调整 `--num_workers`；
+- 检查 CPU、内存和磁盘占用；
+- 确认 OpenCV 与 Albumentations 安装正常。
+
+### 15.8 RepViT registry warning
+
+测试或启动时可能出现：
+
+```text
+Overwriting repvit_m1_5 in registry
+```
+
+这是当前模型注册模块重复注册名称的 warning，不会中断训练。真正需要关注的是后续是否
+出现 traceback、权重加载率不足或 CUDA 错误。
+
+---
+
+## 16. 实验记录建议
+
+每次训练至少记录：
+
+| 项目 | 示例 |
 |---|---|
-| `brd_raw_loss` | D2S/S2D 平均后的未加权 BRD |
-| `brd_weighted_loss` | `current_brd_weight × brd_raw_loss` |
-| `current_brd_weight` | 当前实际进入总损失的 BRD 权重；目前等于 `--brd_weight` |
-| `teacher_d2s_pos_sim_mean` | 教师 D2S 正样本相似度均值 |
-| `teacher_d2s_topk_neg_sim_mean` | 教师选中 top-K 风险 negatives 的相似度均值 |
-| `teacher_d2s_margin_mean` | 教师 `positive similarity - selected negative similarity` 均值 |
-| `teacher_d2s_margin_min` | 上述 margin 最小值 |
-| `teacher_d2s_margin_p10` | D2S 完整 `neg_mask` 内 margin 的 10% 分位数 |
-| `teacher_d2s_margin_p50` | D2S 完整 `neg_mask` 内 margin 的 50% 分位数 |
-| `teacher_d2s_margin_p90` | D2S 完整 `neg_mask` 内 margin 的 90% 分位数 |
-| `teacher_s2d_margin_p10` | S2D 完整 `neg_mask` 内 margin 的 10% 分位数 |
-| `teacher_s2d_margin_p50` | S2D 完整 `neg_mask` 内 margin 的 50% 分位数 |
-| `teacher_s2d_margin_p90` | S2D 完整 `neg_mask` 内 margin 的 90% 分位数 |
-| `teacher_wrong_neg_ratio` | 教师 selected negatives 中相似度不低于 positive 的比例 |
-| `student_d2s_pos_sim_mean` | 学生 D2S 正样本相似度均值 |
-| `student_d2s_topk_neg_sim_mean` | 学生在教师选中 negatives 上的相似度均值 |
-| `student_d2s_violation_ratio` | D2S 中满足 `s_neg - s_pos + pair_margin > 0` 的有效 negative 比例 |
-| `student_s2d_violation_ratio` | S2D 中满足 `s_neg - s_pos + pair_margin > 0` 的有效 negative 比例 |
-| `brd_valid_neg_count` | D2S 与 S2D 最终参与 BRD 的 negative 总数 |
-| `risk_weight_mean` | D2S/S2D 全部有效 negatives 的风险权重均值 |
-| `risk_weight_max` | D2S/S2D 全部有效 negatives 的最大风险权重 |
-| `brd_d2s_boundary_candidate_count` | D2S 在 Top-K 前满足边界条件的候选数 |
-| `brd_s2d_boundary_candidate_count` | S2D 在 Top-K 前满足边界条件的候选数 |
-| `brd_d2s_boundary_query_ratio` | D2S query 中至少有一个边界候选的比例 |
-| `brd_s2d_boundary_query_ratio` | S2D query 中至少有一个边界候选的比例 |
-| `brd_d2s_effective_query_count` | D2S 最终至少有一个 negative 进入损失的 query 数 |
-| `brd_s2d_effective_query_count` | S2D 最终至少有一个 negative 进入损失的 query 数 |
-| `candidate_d2s_margin_mean` | D2S 全部 boundary candidates 的教师 margin 均值 |
-| `candidate_s2d_margin_mean` | S2D 全部 boundary candidates 的教师 margin 均值 |
-| `candidate_d2s_margin_min` | D2S 全部 boundary candidates 的教师 margin 最小值 |
-| `candidate_s2d_margin_min` | S2D 全部 boundary candidates 的教师 margin 最小值 |
+| run 名称 | `baseline_8x3090_b4_seed0` |
+| 日期 | `2026-06-19` |
+| GPU | `8×RTX 3090` |
+| global pair batch | `32` |
+| optimizer pair batch | `32` |
+| 分辨率 | `224` |
+| epochs | `60` |
+| lr | `1e-4` |
+| warmup | `0.1 epoch` |
+| temperature | `0.07` |
+| label smoothing | `0.1` |
+| best epoch | 训练后填写 |
+| D2S R@1/mAP | 训练后填写 |
+| S2D R@1/mAP | 训练后填写 |
+| R1_sum | 训练后填写 |
 
-多卡正负样本规则：
-
-1. 先分别 all-gather drone 和 satellite，形成
-   `[all_drone, all_satellite]`；
-2. 同步 all-gather pair labels；
-3. D2S 和 S2D 都通过全局 label 匹配得到 `pos_index_global`；
-4. 正常 PID 唯一采样下，`pos_index_global == arange(global_pair_batch)`；
-5. negative mask 使用 `anchor_label != candidate_label`，不是单纯依赖对角线；
-6. 如果全局 batch 出现重复 PID、缺失 positive 或 all-gather 顺序错位，训练会立即报错；
-7. 先以 `0 < margin_t < brd_boundary_delta` 过滤完整 global gallery；
-8. 非 candidate 的 `risk_score=-inf`，然后才执行 Top-K；
-9. `brd_topk` 只在过滤后的 candidates 中按教师风险分数从高到低选择；对同一个 anchor，等价于选择 boundary candidates 中 margin 最小的 negatives；
-10. 默认 `brd_skip_no_boundary=true`，没有边界候选的 query 不进入 BRD；
-11. DeepSpeed 的 step/epoch BRD 统计只由 rank0 打印，其他 rank 不重复输出。
-
-## 9. 统一评估协议
-
-教师和学生使用相同的数据构建与指标函数，区别仅在特征提取模型。
-
-### 9.1 University-1652
-
-方向：
-
-```text
-D2S：query_drone → gallery_satellite
-S2D：query_satellite → gallery_drone
-```
-
-指标：
-
-```text
-R@1, R@5, R@10, mAP
-```
-
-训练阶段 best 指标：
-
-```text
-D2S_R@1 + S2D_R@1
-```
-
-教师训练验证和学生 DeepSpeed 蒸馏验证均为多卡；纯测试默认单卡。
-
-### 9.2 SUES-200
-
-默认评估高度：
-
-```text
-150, 200, 250, 300
-```
-
-每个高度都评估 D2S 和 S2D。
-
-指标：
-
-```text
-R@1
-R@5
-R@10
-R@top1
-AP
-```
-
-其中：
-
-```text
-top1 = ceil(0.01 × gallery_size)
-```
-
-水平翻转 TTA 默认关闭。只有额外消融时传：
+建议输出目录使用可读名称：
 
 ```bash
---sues_horizontal_flip
+--output_dir src/checkpoint/student/baseline_8x3090_b4_seed0
 ```
 
-主结果不要混用 TTA 与非 TTA。
+---
 
-### 9.3 GTA-UAV
+## 17. 普通 similarity KD 后续约束
 
-Split：
+未来实现普通 similarity KD 时，应保持以下边界：
 
-```text
-cross-area
-same-area
-```
+1. 只有 `--use_kd_distill` 启用时才加载教师；
+2. 教师 forward 使用 inference/no-grad；
+3. 教师特征不参与梯度；
+4. 学生特征及跨卡 gather 保留梯度；
+5. `loss_kd_raw` 与 `loss_kd_weighted` 分开记录；
+6. 总损失明确写为 `InfoNCE + kd_weight × KD`；
+7. 默认关闭 KD 时，模型、sampler、loss、日志和 checkpoint 路径必须与本文 baseline
+   完全一致。
 
-方向：
-
-```text
-D2S
-S2D
-both
-```
-
-默认 `D2S`，与论文主协议一致。
-
-主指标：
-
-```text
-R@1
-R@5
-AP
-SDM@3
-DIS@1
-```
-
-`R@1`、`R@5`、`AP`、`SDM@3` 为百分制；`DIS@1` 为 top-1 坐标距离。
-
-Satellite tile 坐标从 `zoom_offset_x_y` 文件名解析，当前常量：
-
-```text
-GTA_SATE_LENGTH=24576
-GTA_TILE_LENGTH=512
-```
-
-除非单独做补充实验，论文主结果只报告 D2S。
-
-## 10. 教师纯测试
-
-`--checkpoint` 可以传：
-
-```text
-教师 run 目录
-best_model.pth
-final_model.pth
-```
-
-传目录时优先选择 `best_model.pth`，不存在时才使用 `final_model.pth`。
-
-测试脚本会自动读取同目录的 `hyperparameters.json` 恢复 LoRA、full fine-tune、local fusion 和 soft orth 设置。正常测试不要添加 `--no_checkpoint_hparams`。
-
-### 10.1 University-1652
-
-```bash
-python src/training/teacher_test.py \
-  --checkpoint src/checkpoint/teacher/<teacher_run> \
-  --dataset 1652 \
-  --data_dir data/U1652 \
-  --batch_size 32
-```
-
-### 10.2 GTA-UAV
-
-```bash
-python src/training/teacher_test.py \
-  --checkpoint src/checkpoint/teacher/<teacher_run> \
-  --dataset GTA-UAV \
-  --data_dir data/GTA-UAV-LR/GTA-UAV-LR-baidu \
-  --gta_split cross-area \
-  --gta_query_mode D2S \
-  --batch_size 32
-```
-
-### 10.3 SUES-200
-
-```bash
-python src/training/teacher_test.py \
-  --checkpoint src/checkpoint/teacher/<teacher_run> \
-  --dataset SUES-200 \
-  --data_dir data/SUES-200/SUES-200-512x512 \
-  --sues_height all \
-  --batch_size 32
-```
-
-默认输出：
-
-```text
-<teacher_run>/teacher_test_results.json
-```
-
-比较 best/final 时必须指定不同 `--output_json`，避免覆盖。
-
-## 11. 学生纯测试
-
-`--checkpoint` 可以传 student run 目录、`best_model.pth` 或 `last_model.pth`。传目录时优先 best。
-
-### 11.1 University-1652
-
-```bash
-python src/training/student_test.py \
-  --checkpoint src/checkpoint/student/<student_run> \
-  --dataset 1652 \
-  --data_dir data/U1652 \
-  --batch_size 32
-```
-
-### 11.2 GTA-UAV
-
-```bash
-python src/training/student_test.py \
-  --checkpoint src/checkpoint/student/<student_run> \
-  --dataset GTA-UAV \
-  --data_dir data/GTA-UAV-LR/GTA-UAV-LR-baidu \
-  --gta_split cross-area \
-  --gta_query_mode D2S \
-  --batch_size 32
-```
-
-### 11.3 SUES-200
-
-```bash
-python src/training/student_test.py \
-  --checkpoint src/checkpoint/student/<student_run> \
-  --dataset SUES-200 \
-  --data_dir data/SUES-200/SUES-200-512x512 \
-  --sues_height all \
-  --batch_size 32
-```
-
-默认输出：
-
-```text
-<student_run>/student_test_results.json
-```
-
-## 12. 关键参数表
-
-### 12.1 教师参数
-
-| 参数 | 默认值 | 说明 |
-|---|---:|---|
-| `--epochs` | `22` | 当前 run epoch |
-| `--batch_size` | `4` | Sample4Geo 每卡 pair 数 |
-| `--val_batch_size` | `32` | 验证 batch |
-| `--grad_accum_steps` | `1` | 梯度累积 |
-| `--lr` | `1e-4` | 主学习率 |
-| `--warmup_ratio` | `0.05` | warmup 比例 |
-| `--ema_decay` | `0.999` | EMA |
-| `--identity_ids_per_batch` | `8` | Identity 每卡 PID 数 |
-| `--identity_drone_per_id` | `4` | Identity 每 PID drone |
-| `--identity_sat_per_id` | `1` | 每 PID satellite |
-| `--hard_drone_per_id` | `2` | Hard Pool drone |
-| `--random_drone_per_id` | `2` | 随机 drone |
-| `--hard_pool_topk` | `12` | 每 PID 保留 hard drone |
-| `--hard_pool_topneg_k` | `10` | 风险计算 negative prototype 数 |
-| `--lora_rank` | `8` | LoRA rank |
-| `--lora_alpha` | `16` | LoRA alpha |
-| `--lora_dropout` | `0.1` | LoRA dropout |
-| `--full_finetune_lr_mult` | `0.1` | full backbone LR 倍率 |
-| `--local_feature_layers` | `19,27,36` | local token 层 |
-| `--fusion_mode` | `None`（解析为 `none`） | `none`、`soft_orthogonal` 或 `hybrid_dual_path_fusion` |
-| `--gamma_max` | `0.05` | Hybrid gate 的最大值 |
-| `--gamma_19_parallel_init` | `0.005` | 第 19 层平行分量 gate 初值 |
-| `--gamma_19_perp_init` | `0.015` | 第 19 层正交分量 gate 初值 |
-| `--gamma_27_parallel_init` | `0.010` | 第 27 层平行分量 gate 初值 |
-| `--gamma_27_perp_init` | `0.015` | 第 27 层正交分量 gate 初值 |
-| `--gamma_36_init` | `0.010` | 第 36 层语义 residual gate 初值 |
-| `--soft_orth_lambda_init` | `0.8` | 旧 `soft_orthogonal` 模式的投影消除比例初值 |
-| `--soft_orth_detach_global` | `true` | 旧 `soft_orthogonal` 模式是否 detach global 参考 |
-| `--identity_loss_weight` | `1.0` | Cross-ID loss |
-| `--same_domain_triplet_weight` | `0.2` | Same-domain triplet |
-| `--weak_sample4geo_weight` | `0.2` | Weak S4G |
-
-### 12.2 学生与蒸馏参数
-
-| 参数 | 默认值 | 说明 |
-|---|---:|---|
-| `--epochs` | `60` | 训练 epoch |
-| `--batch_size` | `8` | 每卡 pair 数 |
-| `--val_batch_size` | `32` | 验证 batch |
-| `--deepspeed_config` | `configs/ds_student_distill.json` | DS 配置 |
-| `--grad_accum_steps` | `1` | 梯度累积 |
-| `--lr` | `1e-4` | AdamW 学习率 |
-| `--weight_decay` | `1e-4` | weight decay |
-| `--temperature` | `0.07` | InfoNCE 初始温度 |
-| `--label_smoothing` | `0.1` | InfoNCE smoothing |
-| `--val_interval` | `5` | 验证间隔 |
-| `--use_local_align` | `False` | 局部对齐 |
-| `--local_align_weight` | `0.01` | 局部损失权重 |
-| `--use_brd_distill` | `False` | 启用风险蒸馏 |
-| `--brd_weight` | `0.05` | BRD 权重 |
-| `--brd_topk` | `4` | 每个 anchor 的高风险 negatives |
-| `--brd_boundary_delta` | `0.3` | 教师正 margin 边界候选上限 |
-| `--brd_skip_no_boundary` | `True` | 无边界候选时是否跳过 query |
-| `--brd_pair_margin` | `0.05` | 学生排序 margin |
-| `--brd_risk_margin` | `0.0` | 教师风险 margin |
-| `--brd_risk_tau` | `0.05` | 风险 sigmoid 温度 |
-| `--brd_temperature` | `0.07` | 学生排序温度 |
-| `--brd_risk_threshold` | `0.0` | 风险权重阈值 |
-
-## 13. 实验记录模板
-
-### 13.1 教师
-
-| ID | run | best checkpoint | best metrics | 备注 |
-|---|---|---|---|---|
-| T0 |  | `src/checkpoint/teacher/<run>/best_model.pth` | `best_metrics.json` | global-only S4G |
-| T1 |  | `src/checkpoint/teacher/<run>/best_model.pth` | `best_metrics.json` | hybrid dual-path S4G |
-| T2 |  | `src/checkpoint/teacher/<run>/best_model.pth` | `best_metrics.json` | T0 → identity |
-| T3 |  | `src/checkpoint/teacher/<run>/best_model.pth` | `best_metrics.json` | T1 → identity |
-| T4 |  | `src/checkpoint/teacher/<run>/best_model.pth` | `best_metrics.json` | T2 → hard |
-| T5 |  | `src/checkpoint/teacher/<run>/best_model.pth` | `best_metrics.json` | T3 → hard |
-
-### 13.2 学生
-
-| ID | 教师 | GPU 数 | local batch | global batch | best R@1 sum | checkpoint |
-|---|---|---:|---:|---:|---:|---|
-| S0 baseline | 无 | 1 | 8 | 8 |  |  |
-| S1 BRD | T5/最优教师 |  |  |  |  |  |
-
-## 14. 验证与排错
-
-### 14.1 全部测试
-
-```bash
-python -m pytest -q
-```
-
-### 14.2 编译检查
-
-```bash
-python -m py_compile \
-  src/training/teacher_train.py \
-  src/training/student_train.py \
-  src/dataset/datasets.py \
-  src/loss/identity_losses.py
-```
-
-### 14.3 常见问题
-
-1. `identity_hard` 报 Hard Pool 缺失：
-
-```text
-使用 --load_hard_pool_path
-或确保训练前构建 Hard Pool
-```
-
-2. 教师 checkpoint missing/incompatible：
-
-```text
-检查同目录 hyperparameters.json
-检查 fusion_mode、hybrid gate 配置、local layers、LoRA/full block 是否一致
-```
-
-3. 学生多卡显存不足：
-
-```text
-先降 local batch，再降 brd_topk，最后降 val batch
-```
-
-4. DeepSpeed 学生训练拒绝 ZeRO-3：
-
-```text
-改用 ZeRO-1 或 ZeRO-2
-```
-
-5. BRD negatives 太少：
-
-```text
-增加 GPU 数或每卡 batch
-梯度累积不会增加单步 BRD negative 数量
-```
-
-6. SUES/GTA 主结果不一致：
-
-```text
-SUES 主结果关闭 horizontal flip
-GTA 主结果使用 cross-area + D2S
-```
-
-7. 教师测试 dtype mismatch：
-
-```text
-使用当前 teacher_test.py
-它会按照 backbone dtype 转换输入
-```
-
-## 15. 最终论文口径
-
-建议教师消融：
-
-```text
-Global-only：T0 → T2 → T4
-Hybrid dual-path 软正交：T1 → T3 → T5
-```
-
-建议学生对比：
-
-```text
-RepViT baseline
-RepViT + BRD（最优教师）
-RepViT + BRD + local alignment（可选消融）
-```
-
-主 checkpoint 统一使用 `best_model.pth`。主 University-1652 选择指标统一使用：
-
-```text
-D2S_R@1 + S2D_R@1
-```
-
-GTA-UAV 主结果统一使用：
-
-```text
-cross-area + D2S
-```
-
-SUES-200 主结果统一使用：
-
-```text
-150/200/250/300 全高度、D2S/S2D、关闭水平翻转 TTA
-```
+当前代码尚未实现上述 KD，现阶段唯一可训练配置仍是纯 symmetric InfoNCE baseline。

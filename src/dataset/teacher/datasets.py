@@ -242,7 +242,7 @@ class IdentityU1652Dataset(Dataset):
 
     Each item is one PID and contains multiple satellite/drone images. The
     DataLoader collate function flattens sampled identities into an image batch
-    with labels, view types, pids, and image paths.
+    with labels, view types, and pids.
     """
     VIEW_SATELLITE = 0
     VIEW_DRONE = 1
@@ -256,14 +256,12 @@ class IdentityU1652Dataset(Dataset):
         sat_per_id=1,
         seed=0,
         sampling_mode="identity",
-        hard_drone_per_id=0,
-        random_drone_per_id=None,
     ):
         if drone_per_id <= 0:
             raise ValueError("drone_per_id must be greater than 0")
         if sat_per_id <= 0:
             raise ValueError("sat_per_id must be greater than 0")
-        if sampling_mode not in {"identity", "identity_hard"}:
+        if sampling_mode != "identity":
             raise ValueError(f"unsupported identity sampling_mode: {sampling_mode}")
 
         self.data_dir = data_dir
@@ -274,12 +272,6 @@ class IdentityU1652Dataset(Dataset):
         self.seed = seed
         self.epoch = 0
         self.sampling_mode = sampling_mode
-        self.hard_drone_per_id = int(hard_drone_per_id)
-        self.random_drone_per_id = (
-            self.drone_per_id if random_drone_per_id is None else int(random_drone_per_id)
-        )
-        self.hard_pool = {}
-        self.hard_pool_paths = {}
 
         self.satellite_dir = os.path.join(self.data_dir, "satellite")
         self.drone_dir = os.path.join(self.data_dir, "drone")
@@ -300,21 +292,6 @@ class IdentityU1652Dataset(Dataset):
                 "drone": self.drone_dict[pid],
                 "label": self.pid_to_label[pid],
             }
-
-    def set_hard_pool(self, hard_pool):
-        self.hard_pool = hard_pool or {}
-        self.hard_pool_paths = {}
-        for pid, samples in self.hard_pool.items():
-            paths = [
-                sample if isinstance(sample, str) else sample.get("image_path")
-                for sample in samples
-                if isinstance(sample, str) or (isinstance(sample, dict) and sample.get("image_path"))
-            ]
-            if paths:
-                self.hard_pool_paths[str(pid)] = paths
-
-    def has_hard_pool(self):
-        return bool(self.hard_pool_paths)
 
     def set_epoch(self, epoch):
         self.epoch = epoch
@@ -344,54 +321,6 @@ class IdentityU1652Dataset(Dataset):
             return rng.sample(paths, count)
         return rng.choices(paths, k=count)
 
-    @staticmethod
-    def _empty_hard_sampling_stats():
-        return {
-            "hard_requested": 0,
-            "hard_from_pool": 0,
-            "hard_fallback": 0,
-            "missing_hard_pool_ids": 0,
-            "short_hard_pool_ids": 0,
-            "random_requested": 0,
-        }
-
-    def _sample_drone_paths(self, pid, data, rng):
-        stats = self._empty_hard_sampling_stats()
-        if self.sampling_mode != "identity_hard":
-            return self._sample_paths(data["drone"], self.drone_per_id, rng), stats
-
-        hard_count = max(0, int(self.hard_drone_per_id))
-        random_count = max(0, int(self.random_drone_per_id))
-        stats["hard_requested"] = hard_count
-        stats["random_requested"] = random_count
-
-        hard_candidates = list(self.hard_pool_paths.get(str(pid), []))
-        hard_paths = []
-        if hard_count > 0:
-            if not hard_candidates:
-                stats["missing_hard_pool_ids"] = 1
-            elif len(hard_candidates) >= hard_count:
-                hard_paths = rng.sample(hard_candidates, hard_count)
-            else:
-                hard_paths = list(hard_candidates)
-                stats["short_hard_pool_ids"] = 1
-
-            stats["hard_from_pool"] = len(hard_paths)
-            fallback_count = hard_count - len(hard_paths)
-            stats["hard_fallback"] = fallback_count
-            if fallback_count > 0:
-                fallback_pool = [path for path in data["drone"] if path not in set(hard_paths)]
-                if not fallback_pool:
-                    fallback_pool = data["drone"]
-                hard_paths.extend(self._sample_paths(fallback_pool, fallback_count, rng))
-
-        selected_hard_paths = set(hard_paths)
-        random_pool = [path for path in data["drone"] if path not in selected_hard_paths]
-        if not random_pool:
-            random_pool = data["drone"]
-        random_paths = self._sample_paths(random_pool, random_count, rng) if random_count > 0 else []
-        return hard_paths + random_paths, stats
-
     def __getitem__(self, idx):
         pid = self.pids[idx]
         data = self.data_dict[pid]
@@ -399,13 +328,12 @@ class IdentityU1652Dataset(Dataset):
         rng = self._make_rng(pid)
 
         sat_paths = self._sample_paths(data["satellite"], self.sat_per_id, rng)
-        drone_paths, hard_sampling_stats = self._sample_drone_paths(pid, data, rng)
+        drone_paths = self._sample_paths(data["drone"], self.drone_per_id, rng)
 
         images = []
         labels = []
         view_types = []
         pids = []
-        image_paths = []
 
         for path in sat_paths:
             img = self._read_rgb(path)
@@ -415,7 +343,6 @@ class IdentityU1652Dataset(Dataset):
             labels.append(label)
             view_types.append(self.VIEW_SATELLITE)
             pids.append(pid)
-            image_paths.append(path)
 
         for path in drone_paths:
             img = self._read_rgb(path)
@@ -425,25 +352,19 @@ class IdentityU1652Dataset(Dataset):
             labels.append(label)
             view_types.append(self.VIEW_DRONE)
             pids.append(pid)
-            image_paths.append(path)
 
         return {
             "images": torch.stack(images, dim=0),
             "labels": torch.tensor(labels, dtype=torch.long),
             "view_type": torch.tensor(view_types, dtype=torch.long),
             "pids": pids,
-            "image_path": image_paths,
-            "image_paths": image_paths,
-            "hard_sampling_stats": hard_sampling_stats,
         }
 
     def __repr__(self):
         return (
             f"{self.__class__.__name__}(mode={self.sampling_mode}, pids={len(self.pids)}, "
             f"sat_per_id={self.sat_per_id}, drone_per_id={self.drone_per_id}, "
-            f"hard_drone_per_id={self.hard_drone_per_id}, "
-            f"random_drone_per_id={self.random_drone_per_id}, "
-            f"hard_pool_ids={len(self.hard_pool_paths)})"
+            f"seed={self.seed})"
         )
 
 
@@ -452,20 +373,11 @@ def collate_identity_u1652_batch(batch):
     labels = torch.cat([item["labels"] for item in batch], dim=0)
     view_type = torch.cat([item["view_type"] for item in batch], dim=0)
     pids = [pid for item in batch for pid in item["pids"]]
-    image_paths = [path for item in batch for path in item["image_paths"]]
-    hard_sampling_stats = {}
-    for item in batch:
-        for key, value in item.get("hard_sampling_stats", {}).items():
-            hard_sampling_stats[key] = hard_sampling_stats.get(key, 0) + int(value)
-
     return {
         "images": images,
         "labels": labels,
         "view_type": view_type,
         "pids": pids,
-        "image_path": image_paths,
-        "image_paths": image_paths,
-        "hard_sampling_stats": hard_sampling_stats,
     }
 
 
@@ -595,14 +507,9 @@ def create_identity_1652_train_dataset(args, sampling_mode="identity"):
         std=[0.229, 0.224, 0.225],
     )
 
-    if sampling_mode == "identity_hard":
-        hard_drone_per_id = int(getattr(args, "hard_drone_per_id", 2))
-        random_drone_per_id = int(getattr(args, "random_drone_per_id", 2))
-        drone_per_id = hard_drone_per_id + random_drone_per_id
-    else:
-        hard_drone_per_id = 0
-        random_drone_per_id = int(getattr(args, "identity_drone_per_id", 4))
-        drone_per_id = random_drone_per_id
+    if sampling_mode != "identity":
+        raise ValueError(f"unsupported identity sampling_mode: {sampling_mode}")
+    drone_per_id = int(getattr(args, "identity_drone_per_id", 4))
 
     train_dataset = IdentityU1652Dataset(
         data_dir=os.path.join(args.data_dir, "train"),
@@ -612,8 +519,6 @@ def create_identity_1652_train_dataset(args, sampling_mode="identity"):
         sat_per_id=getattr(args, "identity_sat_per_id", 1),
         seed=getattr(args, "seed", 0),
         sampling_mode=sampling_mode,
-        hard_drone_per_id=hard_drone_per_id,
-        random_drone_per_id=random_drone_per_id,
     )
     train_sampler = IdentityBatchSampler(
         train_dataset,
@@ -643,12 +548,6 @@ def create_1652_teacher_train_dataloaders(args):
         datasets["identity"], samplers["identity"], loaders["identity"] = create_identity_1652_train_dataset(
             args,
             sampling_mode="identity",
-        )
-
-    if getattr(args, "enable_identity_stage", False) and getattr(args, "enable_hard_pool_stage", False):
-        datasets["identity_hard"], samplers["identity_hard"], loaders["identity_hard"] = create_identity_1652_train_dataset(
-            args,
-            sampling_mode="identity_hard",
         )
 
     return datasets, samplers, loaders

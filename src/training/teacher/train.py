@@ -262,7 +262,7 @@ def get_training_mode_desc(dataset, args):
             f"{len(getattr(dataset, 'pairs', []))} sat-drone pairs, "
             "unique PID per global batch"
         )
-    if mode in {"identity", "identity_hard"}:
+    if mode == "identity":
         return mode, (
             f"{len(getattr(dataset, 'pids', []))} identities, "
             f"sat_per_id={getattr(dataset, 'sat_per_id', 'unknown')}, "
@@ -276,11 +276,7 @@ def get_training_mode(epoch, args):
         return "sample4geo"
     if epoch <= args.stage1_end_epoch:
         return "sample4geo"
-    if not args.enable_hard_pool_stage:
-        return "identity"
-    if epoch <= args.stage2_end_epoch:
-        return "identity"
-    return "identity_hard"
+    return "identity"
 
 
 def select_epoch_dataloader(train_loaders, epoch, args):
@@ -290,8 +286,6 @@ def select_epoch_dataloader(train_loaders, epoch, args):
 
     if requested_mode in train_loaders:
         return train_loaders[requested_mode], requested_mode, requested_mode
-    if requested_mode == "identity_hard" and "identity" in train_loaders:
-        return train_loaders["identity"], requested_mode, "identity"
     return train_loaders["sample4geo"], requested_mode, "sample4geo"
 
 
@@ -442,23 +436,10 @@ def validate_identity_training_args(args):
         "identity_ids_per_batch",
         "identity_drone_per_id",
         "identity_sat_per_id",
-        "hard_drone_per_id",
-        "random_drone_per_id",
     ]
     for name in positive_int_args:
         if getattr(args, name) <= 0:
             raise ValueError(f"{name} 必须大于 0")
-    hard_pool_positive_int_args = [
-        "hard_pool_topk",
-        "hard_pool_topneg_k",
-    ]
-    for name in hard_pool_positive_int_args:
-        if getattr(args, name) <= 0:
-            raise ValueError(f"{name} 必须大于 0")
-    if args.enable_hard_pool_stage and not args.enable_identity_stage:
-        raise ValueError("enable_hard_pool_stage 需要同时启用 enable_identity_stage")
-
-
 def normalize_explicit_training_stage(args):
     stage = getattr(args, "training_stage", "auto")
     if stage in (None, "auto"):
@@ -466,7 +447,6 @@ def normalize_explicit_training_stage(args):
 
     if stage == "sample4geo":
         args.enable_identity_stage = False
-        args.enable_hard_pool_stage = False
         return
 
     if not getattr(args, "init_checkpoint", None):
@@ -474,17 +454,7 @@ def normalize_explicit_training_stage(args):
 
     if stage == "identity":
         args.enable_identity_stage = True
-        args.enable_hard_pool_stage = False
         args.stage1_end_epoch = 0
-        return
-
-    if stage == "hard_pool":
-        args.enable_identity_stage = True
-        args.enable_hard_pool_stage = True
-        args.stage1_end_epoch = 0
-        args.stage2_end_epoch = 0
-        if not getattr(args, "load_hard_pool_path", None):
-            args.build_hard_pool_before_train = True
         return
 
     raise ValueError(f"unsupported training_stage: {stage}")
@@ -500,12 +470,6 @@ def should_run_validation(cur_epoch, args):
 
     if mode == "identity":
         stage_start = int(getattr(args, "stage1_end_epoch", 10)) + 1
-        if getattr(args, "enable_hard_pool_stage", False):
-            stage_end = min(int(getattr(args, "stage2_end_epoch", args.epochs)), args.epochs)
-        else:
-            stage_end = args.epochs
-    elif mode == "identity_hard":
-        stage_start = int(getattr(args, "stage2_end_epoch", 30)) + 1
         stage_end = args.epochs
     else:
         return cur_epoch % 5 == 0
@@ -568,6 +532,9 @@ def clear_memory_cache():
         torch.cuda.empty_cache()
 
 
+# Deprecated, isolated teacher-sampling helpers.
+# No command-line option, dataset factory, or training-loop path references
+# this block. It remains temporarily for old checkpoint tooling compatibility.
 class HardPoolImageDataset(Dataset):
     def __init__(self, samples, transform):
         self.samples = samples
@@ -1082,7 +1049,7 @@ def unpack_training_batch(batch, training_mode, device):
         }
         return imgs, labels, views, meta
 
-    if training_mode in {"identity", "identity_hard"}:
+    if training_mode == "identity":
         imgs = batch["images"].to(device).to(torch.bfloat16)
         labels = batch["labels"].to(device)
         views = batch["view_type"].to(device)
@@ -1136,26 +1103,9 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
     best_metrics = None
     validation_history = []
     train_loaders = dataloader
-    hard_pool_loaded = load_initial_hard_pool_if_needed(args, train_loaders)
-    hard_pool_loaded = build_initial_hard_pool_if_needed(
-        model_engine,
-        ema,
-        train_loaders,
-        args,
-        amp_device,
-        hard_pool_loaded,
-    )
     for epoch in range(1, args.epochs + 1):
         stage_mode = get_training_mode(epoch, args)
         epoch_dataloader, _, effective_mode = select_epoch_dataloader(train_loaders, epoch, args)
-        ensure_identity_hard_ready(
-            epoch,
-            stage_mode,
-            effective_mode,
-            epoch_dataloader,
-            args,
-            hard_pool_loaded,
-        )
         set_epoch_on_dataloader(epoch_dataloader, epoch)
         model_engine.train()
         mode_name, mode_desc = get_training_mode_desc(epoch_dataloader.dataset, args)
@@ -1178,8 +1128,6 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
         )
         loss_sums = {key: 0.0 for key in loss_log_keys}
         loss_counts = {key: 0 for key in loss_log_keys}
-        hard_sampling_sums = new_hard_sampling_stats()
-
         if is_main_process():
             fallback_note = " | fallback_to_sample4geo=True" if stage_mode != effective_mode else ""
             print(
@@ -1190,15 +1138,6 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                 f"[Sampler] Epoch {epoch}/{args.epochs} | "
                 f"mode={effective_mode} | {get_sampler_debug_desc(epoch_dataloader)}"
             )
-            if effective_mode == "identity_hard":
-                print(
-                    f"[HardSampler] Epoch {epoch}/{args.epochs} | "
-                    f"mode=identity_hard | "
-                    f"hard_drone_per_id={getattr(args, 'hard_drone_per_id', 0)} | "
-                    f"random_drone_per_id={getattr(args, 'random_drone_per_id', 0)} | "
-                    f"hard_pool_loaded={dataloader_has_hard_pool(epoch_dataloader)} | "
-                    f"hard_pool_ids={get_hard_pool_id_count(epoch_dataloader)}"
-                )
             fusion_values = get_model_debug_values(model_engine)
             print(
                 f"[Fusion] Epoch {epoch}/{args.epochs} | "
@@ -1223,11 +1162,6 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
 
         for batch_idx, batch in enumerate(epoch_dataloader):
             imgs, labels, views, batch_meta = unpack_training_batch(batch, effective_mode, amp_device)
-            if effective_mode == "identity_hard":
-                update_hard_sampling_stats(
-                    hard_sampling_sums,
-                    batch_meta.get("hard_sampling_stats", {}),
-                )
             
             # 4. 前向传播：训练时 TeacherModel 返回 (deep, fused, local)，loss 使用 fused。
             final_feats = model_engine(imgs)
@@ -1262,7 +1196,7 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                     total_infonce_loss = args.infonce_weight * infonce_loss
                     loss_terms.append(total_infonce_loss)
                     loss_values["infonce"] = total_infonce_loss.item()
-            elif effective_mode in {"identity", "identity_hard"}:
+            elif effective_mode == "identity":
                 if is_main_process() and batch_idx == 0:
                     print(
                         f"[TrainMode] {effective_mode} loss batch | "
@@ -1352,12 +1286,6 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                         f"batch {step}/{num_batches} | {hybrid_runtime}"
                     )
 
-        reduced_hard_sampling_sums = (
-            reduce_hard_sampling_stats(hard_sampling_sums, amp_device)
-            if effective_mode == "identity_hard"
-            else hard_sampling_sums
-        )
-
         if is_main_process():
             elapsed_min = (time.time() - epoch_start_time) / 60.0
             avg_parts = []
@@ -1369,11 +1297,6 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                 f"[Train] Epoch {epoch}/{args.epochs} done | mode={mode_name} | "
                 f"updates={loss_counts['total']} | {avg_text} | time={elapsed_min:.1f}m"
             )
-            if effective_mode == "identity_hard":
-                print(
-                    f"[HardSampler] Epoch {epoch}/{args.epochs} done | "
-                    f"{format_hard_sampler_epoch_summary(reduced_hard_sampling_sums)}"
-                )
         cur_epoch = epoch
         if val_loaders is not None and should_run_validation(cur_epoch, args):
             if is_main_process():
@@ -1453,16 +1376,6 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                         f"[Checkpoint] Saved final_model.pth | epoch={cur_epoch} | "
                         f"D2S_R@1={d2s_r1:.2f} | S2D_R@1={s2d_r1:.2f} | R@1_sum={r1_sum:.2f}"
                     )
-
-        if should_build_hard_pool(cur_epoch, args, hard_pool_loaded):
-            hard_pool_loaded = build_save_and_apply_hard_pool(
-                model_engine,
-                ema,
-                train_loaders,
-                args,
-                cur_epoch,
-                amp_device,
-            )
 
         # 7. 分布式同步：让所有显卡等 Rank 0 写完再进下一个 Epoch
         if dist.is_initialized():

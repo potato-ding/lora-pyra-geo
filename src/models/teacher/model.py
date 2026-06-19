@@ -418,7 +418,7 @@ class TeacherModel(nn.Module):
             return "LoRA region"
         if layer_idx < lora_start:
             if layer_idx == lora_start - 1:
-                return "frozen boundary / frozen region"
+                return "frozen block range / frozen region"
             return "frozen region"
         return "frozen gap region"
 
