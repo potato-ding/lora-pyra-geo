@@ -24,8 +24,8 @@ from src.training.student_train import (
     forward_teacher_online,
     gather_paired_views_without_grad,
     gather_paired_views,
-    get_current_kd_weight,
-    similarity_matrix_kl_loss,
+    plain_feature_distillation_loss,
+    plain_similarity_distillation_loss,
     train_one_epoch_deepspeed,
 )
 
@@ -205,14 +205,15 @@ def test_cli_defaults_to_clean_baseline(monkeypatch):
         for action in student_train.argparse.ArgumentParser()._actions
     }
 
-    assert args.use_kd_distill is False
-    assert args.kd_type == "similarity_kl"
-    assert args.teacher_checkpoint is None
-    assert args.kd_weight == pytest.approx(0.05)
+    assert args.distill is False
+    assert args.distill_type == "plain"
+    assert args.teacher_ckpt is None
+    assert args.teacher_arch == "dinov3_vit7b16"
+    assert args.teacher_dim == 4096
+    assert args.student_dim == 512
+    assert args.kd_feat_weight == pytest.approx(0.05)
+    assert args.kd_sim_weight == pytest.approx(0.05)
     assert args.kd_temperature == pytest.approx(0.1)
-    assert args.kd_warmup_epochs == 5
-    assert args.kd_d2s_weight == pytest.approx(0.7)
-    assert args.kd_s2d_weight == pytest.approx(0.3)
     assert args.teacher_precision == "bf16"
     assert args.teacher_micro_batch_size == 1
     assert args.deepspeed_config == "configs/ds_student_baseline.json"
@@ -225,6 +226,9 @@ def test_removed_training_flags_are_rejected(monkeypatch):
         "--use_" + "b" + "rd_distill",
         "--" + "b" + "rd_weight",
         "--use_" + "local_" + "align",
+        "--use_kd_distill",
+        "--teacher_checkpoint",
+        "--kd_weight",
     ]
     for flag in removed_flags:
         monkeypatch.setattr(sys, "argv", ["student_train.py", flag])
@@ -232,37 +236,37 @@ def test_removed_training_flags_are_rejected(monkeypatch):
             student_train.parse_args()
 
 
-def test_kd_requires_teacher_checkpoint(monkeypatch):
+def test_plain_distillation_requires_teacher_checkpoint(monkeypatch):
     monkeypatch.setattr(
         sys,
         "argv",
-        ["student_train.py", "--use_kd_distill"],
+        ["student_train.py", "--distill", "true"],
     )
     with pytest.raises(SystemExit):
         student_train.parse_args()
 
 
-def test_kd_weight_warmup_contract():
-    class Args:
-        use_kd_distill = True
-        kd_warmup_epochs = 5
-        kd_weight = 0.05
+def test_plain_distillation_projection_is_optional_and_trainable():
+    baseline = StudentModel(ckpt_path=None)
+    distilled = StudentModel(
+        ckpt_path=None,
+        distill_teacher_dim=7,
+    )
 
-    assert get_current_kd_weight(Args, 1) == 0.0
-    assert get_current_kd_weight(Args, 5) == 0.0
-    assert get_current_kd_weight(Args, 6) == pytest.approx(0.05)
+    assert not hasattr(baseline, "distill_projection")
+    assert distilled.distill_projection.in_features == 512
+    assert distilled.distill_projection.out_features == 7
+    optimizer = student_train.build_student_optimizer(distilled)
+    optimizer_ids = {
+        id(param)
+        for group in optimizer.param_groups
+        for param in group["params"]
+    }
+    assert id(distilled.distill_projection.weight) in optimizer_ids
 
-    Args.use_kd_distill = False
-    assert get_current_kd_weight(Args, 10) == 0.0
 
-
-def test_similarity_matrix_kd_matches_explicit_kl_and_allows_dim_mismatch():
-    class Args:
-        kd_type = "similarity_kl"
-        kd_temperature = 0.2
-        kd_d2s_weight = 0.7
-        kd_s2d_weight = 0.3
-
+def test_plain_similarity_kd_matches_full_matrix_bidirectional_kl():
+    temperature = 0.2
     student = F.normalize(torch.tensor([
         [1.0, 0.0],
         [0.0, 1.0],
@@ -276,44 +280,53 @@ def test_similarity_matrix_kd_matches_explicit_kl_and_allows_dim_mismatch():
         [0.2, 0.8, 0.1],
     ]), dim=1)
 
-    loss, stats = similarity_matrix_kl_loss(
+    loss, stats = plain_similarity_distillation_loss(
         student,
         teacher,
         pair_batch_size=2,
-        args=Args,
+        temperature=temperature,
     )
 
     student_sim = student[:2] @ student[2:].t()
     teacher_sim = teacher[:2] @ teacher[2:].t()
-    teacher_prob = F.softmax(teacher_sim / Args.kd_temperature, dim=1)
+    teacher_prob = F.softmax(teacher_sim / temperature, dim=1)
     student_logprob = F.log_softmax(
-        student_sim / Args.kd_temperature,
+        student_sim / temperature,
         dim=1,
     )
     expected_d2s = F.kl_div(
         student_logprob,
         teacher_prob,
         reduction="batchmean",
-    ) * (Args.kd_temperature ** 2)
+    ) * (temperature ** 2)
     expected_s2d = F.kl_div(
-        F.log_softmax(student_sim.t() / Args.kd_temperature, dim=1),
-        F.softmax(teacher_sim.t() / Args.kd_temperature, dim=1),
+        F.log_softmax(student_sim.t() / temperature, dim=1),
+        F.softmax(teacher_sim.t() / temperature, dim=1),
         reduction="batchmean",
-    ) * (Args.kd_temperature ** 2)
-    expected = (
-        Args.kd_d2s_weight * expected_d2s
-        + Args.kd_s2d_weight * expected_s2d
-    )
+    ) * (temperature ** 2)
+    expected = 0.5 * (expected_d2s + expected_s2d)
 
     torch.testing.assert_close(loss, expected)
-    torch.testing.assert_close(stats["kd_d2s"], expected_d2s)
-    torch.testing.assert_close(stats["kd_s2d"], expected_s2d)
+    torch.testing.assert_close(stats["teacher_sim_mean"], teacher_sim.mean())
+    torch.testing.assert_close(stats["student_sim_mean"], student_sim.mean())
     loss.backward()
     assert student.grad is not None
     assert teacher.grad is None
 
 
-def test_kd_is_added_to_total_loss_and_teacher_features_are_detached():
+def test_plain_feature_kd_uses_all_features_and_detaches_teacher():
+    student = torch.randn(6, 5, requires_grad=True)
+    teacher = torch.randn(6, 5, requires_grad=True)
+    loss, stats = plain_feature_distillation_loss(student, teacher)
+
+    loss.backward()
+    assert student.grad is not None
+    assert teacher.grad is None
+    assert stats["student_feat_norm_mean"].item() == pytest.approx(1.0)
+    assert stats["teacher_feat_norm_mean"].item() == pytest.approx(1.0)
+
+
+def test_plain_kd_is_added_to_total_loss_and_teacher_features_are_detached():
     class IdentityFeatureModel(nn.Module):
         def __init__(self):
             super().__init__()
@@ -324,13 +337,11 @@ def test_kd_is_added_to_total_loss_and_teacher_features_are_detached():
             return F.normalize(x.float() * self.scale, dim=1)
 
     class Args:
-        use_kd_distill = True
-        kd_type = "similarity_kl"
-        kd_weight = 0.2
+        distill = True
+        distill_type = "plain"
+        kd_feat_weight = 0.2
+        kd_sim_weight = 0.3
         kd_temperature = 0.1
-        kd_warmup_epochs = 0
-        kd_d2s_weight = 0.7
-        kd_s2d_weight = 0.3
 
     student_inputs = torch.tensor([
         [1.0, 0.0],
@@ -339,10 +350,10 @@ def test_kd_is_added_to_total_loss_and_teacher_features_are_detached():
         [0.2, 0.8],
     ])
     teacher_features = F.normalize(torch.tensor([
-        [1.0, 0.0, 0.0],
-        [0.0, 1.0, 0.0],
-        [0.7, 0.2, 0.1],
-        [0.1, 0.8, 0.2],
+        [1.0, 0.0],
+        [0.0, 1.0],
+        [0.7, 0.2],
+        [0.1, 0.8],
     ]), dim=1).requires_grad_(True)
     model = IdentityFeatureModel()
 
@@ -353,31 +364,28 @@ def test_kd_is_added_to_total_loss_and_teacher_features_are_detached():
         criterion=student_train.Sample4GeoLoss(label_smoothing=0.0),
         args=Args,
         teacher_features=teacher_features,
-        epoch=1,
     )
 
     torch.testing.assert_close(
-        losses["kd_weighted_loss"],
-        losses["kd_loss"] * Args.kd_weight,
-    )
-    torch.testing.assert_close(
         losses["loss"],
-        losses["main_loss"] + losses["kd_weighted_loss"],
+        (
+            losses["loss_retrieval"]
+            + Args.kd_feat_weight * losses["loss_kd_feat"]
+            + Args.kd_sim_weight * losses["loss_kd_sim"]
+        ),
     )
     losses["loss"].backward()
     assert model.scale.grad is not None
     assert teacher_features.grad is None
 
 
-def test_kd_warmup_keeps_total_equal_to_baseline():
+def test_zero_feature_kd_weight_allows_teacher_student_dim_mismatch():
     class Args:
-        use_kd_distill = True
-        kd_type = "similarity_kl"
-        kd_weight = 0.2
+        distill = True
+        distill_type = "plain"
+        kd_feat_weight = 0.0
+        kd_sim_weight = 0.2
         kd_temperature = 0.1
-        kd_warmup_epochs = 5
-        kd_d2s_weight = 0.7
-        kd_s2d_weight = 0.3
 
     class IdentityFeatureModel(nn.Module):
         def __init__(self):
@@ -401,12 +409,14 @@ def test_kd_warmup_keeps_total_equal_to_baseline():
         student_train.Sample4GeoLoss(label_smoothing=0.0),
         Args,
         teacher_features=teacher,
-        epoch=5,
     )
 
-    assert losses["current_kd_weight"] == 0.0
-    assert losses["kd_loss"].item() >= 0.0
-    torch.testing.assert_close(losses["loss"], losses["main_loss"])
+    assert losses["loss_kd_feat"].item() == 0.0
+    assert losses["loss_kd_sim"].item() >= 0.0
+    torch.testing.assert_close(
+        losses["loss"],
+        losses["main_loss"] + Args.kd_sim_weight * losses["loss_kd_sim"],
+    )
 
 
 def test_teacher_forward_uses_micro_batches_and_inference_mode():
@@ -505,7 +515,9 @@ def test_online_teacher_loader_freezes_teacher_and_optimizer_excludes_it(
     )
 
     class Args:
-        teacher_checkpoint = str(checkpoint)
+        teacher_ckpt = str(checkpoint)
+        teacher_arch = "dinov3_vit7b16"
+        teacher_dim = 5
         teacher_precision = "fp32"
         teacher_micro_batch_size = 1
 
@@ -619,8 +631,8 @@ def test_deepspeed_epoch_updates_student_with_infonce_only(
         epoch=1,
     )
 
-    assert set(stats) == {"loss_total", "loss_infonce"}
-    assert torch.isfinite(torch.tensor(stats["loss_infonce"]))
+    assert set(stats) == {"total_loss", "loss_retrieval"}
+    assert torch.isfinite(torch.tensor(stats["loss_retrieval"]))
     assert not torch.equal(before, engine.module.proj.weight.detach())
     assert capsys.readouterr().out == ""
 
@@ -656,10 +668,14 @@ def test_deepspeed_epoch_uses_online_kd_and_keeps_teacher_frozen(
         def __init__(self):
             super().__init__()
             self.proj = nn.Linear(3, 3, bias=False)
+            self.distill_projection = nn.Linear(3, 5, bias=False)
             self.logit_scale = nn.Parameter(torch.tensor(0.0))
 
         def forward(self, x):
             return F.normalize(self.proj(x.float().flatten(1)), dim=1)
+
+        def project_for_distillation(self, embedding):
+            return self.distill_projection(embedding)
 
     class TinyTeacher(nn.Module):
         def __init__(self):
@@ -689,13 +705,11 @@ def test_deepspeed_epoch_uses_online_kd_and_keeps_teacher_frozen(
             self.optimizer.zero_grad(set_to_none=True)
 
     class Args:
-        use_kd_distill = True
-        kd_type = "similarity_kl"
-        kd_weight = 0.2
+        distill = True
+        distill_type = "plain"
+        kd_feat_weight = 0.2
+        kd_sim_weight = 0.3
         kd_temperature = 0.1
-        kd_warmup_epochs = 0
-        kd_d2s_weight = 0.7
-        kd_s2d_weight = 0.3
         teacher_micro_batch_size = 1
         print_freq = 100
         epochs = 1
@@ -717,10 +731,16 @@ def test_deepspeed_epoch_uses_online_kd_and_keeps_teacher_frozen(
         teacher_model=teacher,
     )
 
-    assert stats["kd_loss"] >= 0.0
-    assert stats["current_kd_weight"] == pytest.approx(Args.kd_weight)
-    assert stats["loss_total"] == pytest.approx(
-        stats["loss_infonce"] + stats["kd_weighted_loss"],
+    assert stats["loss_kd_feat"] >= 0.0
+    assert stats["loss_kd_sim"] >= 0.0
+    assert stats["kd_feat_weight"] == pytest.approx(Args.kd_feat_weight)
+    assert stats["kd_sim_weight"] == pytest.approx(Args.kd_sim_weight)
+    assert stats["total_loss"] == pytest.approx(
+        (
+            stats["loss_retrieval"]
+            + Args.kd_feat_weight * stats["loss_kd_feat"]
+            + Args.kd_sim_weight * stats["loss_kd_sim"]
+        ),
         rel=1e-5,
         abs=1e-6,
     )
