@@ -888,7 +888,10 @@ def train_one_epoch(
         batch_time.update(time.time() - end)
         end = time.time()
 
-        if step % args.print_freq == 0 or step == len(train_loader) - 1:
+        if (
+            (step + 1) % args.print_freq == 0
+            or step == len(train_loader) - 1
+        ):
             kd_text = ""
             if kd_log_meters is not None:
                 kd_step_log = format_kd_step_log(
@@ -992,7 +995,7 @@ def train_one_epoch_deepspeed(
         end = time.time()
 
         if is_main_process() and (
-            step % args.print_freq == 0
+            (step + 1) % args.print_freq == 0
             or step == len(train_loader) - 1
         ):
             kd_text = ""
@@ -1348,7 +1351,7 @@ def parse_args():
     parser.add_argument("--amp", dest="amp", action="store_true", default=True)
     parser.add_argument("--no_amp", dest="amp", action="store_false")
     parser.add_argument("--grad_clip", type=float, default=0.0)
-    parser.add_argument("--print_freq", type=int, default=20)
+    parser.add_argument("--print_freq", type=int, default=200)
     parser.add_argument("--val_interval", type=int, default=5)
     parser.add_argument("--best_metric_name", type=str, default="R1_sum")
     parser.add_argument(
@@ -1399,6 +1402,8 @@ def parse_args():
     args = parser.parse_args()
     if args.kd_feat_weight < 0 or args.kd_sim_weight < 0:
         parser.error("--kd_feat_weight and --kd_sim_weight must be non-negative")
+    if args.print_freq <= 0:
+        parser.error("--print_freq must be greater than 0")
     if args.distill and args.kd_feat_weight + args.kd_sim_weight <= 0:
         parser.error(
             "Plain distillation requires at least one positive KD weight"

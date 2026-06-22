@@ -231,6 +231,7 @@ def test_cli_defaults_to_clean_baseline(monkeypatch):
     assert args.teacher_precision == "bf16"
     assert args.teacher_micro_batch_size == 1
     assert args.deepspeed_config == "configs/ds_student_baseline.json"
+    assert args.print_freq == 200
     assert not any(name.startswith("b" + "rd") for name in vars(args))
     assert destinations == {"help"}
 
