@@ -28,6 +28,7 @@ from src.training.student_train import (
     plain_similarity_distillation_loss,
     train_one_epoch_deepspeed,
 )
+from src.utils.rank_logging import rank0_print
 
 
 def test_student_forward_outputs_normalized_f4_embedding():
@@ -45,6 +46,19 @@ def test_student_forward_outputs_normalized_f4_embedding():
         atol=1e-5,
         rtol=1e-5,
     )
+
+
+def test_rank0_print_uses_launcher_rank_before_dist_init(
+    monkeypatch,
+    capsys,
+):
+    monkeypatch.setenv("RANK", "1")
+    rank0_print("hidden")
+    assert capsys.readouterr().out == ""
+
+    monkeypatch.setenv("RANK", "0")
+    rank0_print("visible")
+    assert capsys.readouterr().out.strip() == "visible"
 
 
 def test_student_has_only_backbone_neck_and_logit_scale():
@@ -533,6 +547,41 @@ def test_online_teacher_loader_freezes_teacher_and_optimizer_excludes_it(
         for param in group["params"]
     }
     assert all(id(param) not in optimizer_param_ids for param in teacher.parameters())
+
+
+def test_teacher_delta_log_distinguishes_missing_nontrainable_keys(
+    tmp_path,
+    capsys,
+):
+    from src.training.teacher.evaluate import load_teacher_checkpoint
+
+    class TinyTeacher(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.trainable = nn.Parameter(torch.tensor([0.0]))
+            self.frozen = nn.Parameter(
+                torch.tensor([2.0]),
+                requires_grad=False,
+            )
+
+    checkpoint = tmp_path / "teacher_delta.pth"
+    torch.save({"trainable": torch.tensor([3.0])}, checkpoint)
+    teacher = TinyTeacher()
+
+    load_teacher_checkpoint(
+        teacher,
+        str(checkpoint),
+        torch.device("cpu"),
+    )
+
+    output = capsys.readouterr().out
+    assert "[TeacherDelta]" in output
+    assert "trainable_covered=1/1" in output
+    assert "missing_nontrainable=1" in output
+    assert "coverage OK" in output
+    assert "missing_total" not in output
+    torch.testing.assert_close(teacher.trainable, torch.tensor([3.0]))
+    torch.testing.assert_close(teacher.frozen, torch.tensor([2.0]))
 
 
 def test_student_dataset_returns_only_baseline_pair_fields(

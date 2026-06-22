@@ -24,6 +24,7 @@ from src.utils.gather_features_and_labels_and_views import (
 from src.utils.initdist import try_init_dist
 from src.utils.optimizer_and_scale import build_student_optimizer
 from src.utils.save_path import get_student_save_pth
+from src.utils.validation_results import save_validation_results
 from src.utils.scheduler import build_student_scheduler
 from src.utils.train_eval_utils import getdist_1652_val_and_get_recall
 
@@ -628,6 +629,8 @@ def build_student_best_metrics_payload(best_metrics, validation_history):
 
 
 def print_trainable_parameter_summary(model):
+    if not is_main_process():
+        return
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(
@@ -1226,6 +1229,7 @@ def train(
                 best_metrics,
                 validation_history,
             )
+            save_validation_results(args.output_dir, validation_history)
             if is_best:
                 save_checkpoint(
                     model,
@@ -1370,6 +1374,8 @@ def train_deepspeed(
                 best_metrics,
                 validation_history,
             )
+            if is_main_process():
+                save_validation_results(args.output_dir, validation_history)
             if is_best:
                 save_model_only_checkpoint(
                     model_engine,

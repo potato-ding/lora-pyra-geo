@@ -2,6 +2,8 @@
 
 import torch
 
+from src.utils.rank_logging import rank0_print
+
 
 def build_optimizer_and_scale(*args, **kwargs):
     from src.utils.teacher.optimizer import build_optimizer_and_scale as _build_optimizer_and_scale
@@ -53,9 +55,12 @@ def build_student_optimizer(
 
     optimizer = torch.optim.AdamW(param_groups, betas=betas)
 
-    print("[Optimizer] student decay params   :", len(decay))
-    print("[Optimizer] student no_decay params:", len(no_decay))
-    print(f"[Optimizer] student lr={lr:g} | weight_decay={weight_decay:g} | optimizer=AdamW")
+    rank0_print("[Optimizer] student decay params   :", len(decay))
+    rank0_print("[Optimizer] student no_decay params:", len(no_decay))
+    rank0_print(
+        f"[Optimizer] student lr={lr:g} | "
+        f"weight_decay={weight_decay:g} | optimizer=AdamW"
+    )
 
     return optimizer
 

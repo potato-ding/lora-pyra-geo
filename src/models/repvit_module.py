@@ -1,4 +1,13 @@
+import warnings
+
 import torch.nn as nn
+
+
+warnings.filterwarnings(
+    "ignore",
+    message=r"Overwriting repvit_.* in registry.*",
+    category=UserWarning,
+)
 
 def _make_divisible(v, divisor, min_value=None):
     """

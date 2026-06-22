@@ -1,5 +1,4 @@
 import os
-from datetime import datetime
 # 用于根据args返回路径
 
 def _fmt_weight(value):
@@ -28,13 +27,6 @@ def _teacher_tuning_tag(args):
 
 
 def get_save_pth(args):
-    run_timestamp = getattr(args, 'run_timestamp', None)
-    if run_timestamp:
-        return os.path.join(
-            getattr(args, 'output_root', 'src/checkpoint/teacher'),
-            run_timestamp
-        )
-
     save_dir = os.path.join(
         getattr(args, 'output_root', 'src/checkpoint/teacher'),
         'dinov3' +
@@ -44,7 +36,4 @@ def get_save_pth(args):
     return save_dir
 
 def get_student_save_pth(args):
-    date_name = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_root = getattr(args, "output_root", "src/checkpoint/student")
-    save_dir = os.path.join(output_root, date_name)
-    return save_dir
+    return getattr(args, "output_root", "src/checkpoint/student")

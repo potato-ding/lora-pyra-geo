@@ -175,23 +175,43 @@ def load_teacher_checkpoint(model, checkpoint_path, device):
     trainable_keys = {name for name, param in model.named_parameters() if param.requires_grad}
     loaded_trainable = trainable_keys & set(mapped_state.keys())
     missing_trainable = sorted(trainable_keys - loaded_trainable)
+    missing_nontrainable = sorted(set(missing) - trainable_keys)
 
     if is_main_process():
-        print(f"[Checkpoint] loaded: {checkpoint_path}")
+        print(f"[TeacherDelta] loaded: {checkpoint_path}")
         print(
-            f"[Checkpoint] matched={len(mapped_state)} | "
-            f"trainable_matched={len(loaded_trainable)}/{len(trainable_keys)} | "
+            f"[TeacherDelta] matched={len(mapped_state)} | "
+            f"trainable_covered={len(loaded_trainable)}/{len(trainable_keys)} | "
+            f"missing_nontrainable={len(missing_nontrainable)} | "
             f"unexpected={len(unexpected) + len(load_unexpected)} | "
-            f"incompatible={len(incompatible)} | missing_total={len(missing)}"
+            f"incompatible={len(incompatible)}"
         )
+        if not missing_trainable and not incompatible:
+            print(
+                "[TeacherDelta] coverage OK: all trainable teacher parameters "
+                "were restored; missing non-trainable keys keep their "
+                "pretrained DINOv3/base initialization."
+            )
         if missing_trainable:
-            print(f"[Checkpoint][WARN] missing trainable keys examples: {missing_trainable[:5]}")
+            print(
+                "[TeacherDelta][WARN] missing trainable keys examples: "
+                f"{missing_trainable[:5]}"
+            )
         if unexpected:
-            print(f"[Checkpoint][WARN] unexpected checkpoint keys examples: {unexpected[:5]}")
+            print(
+                "[TeacherDelta][WARN] unexpected checkpoint keys examples: "
+                f"{unexpected[:5]}"
+            )
         if load_unexpected:
-            print(f"[Checkpoint][WARN] load unexpected keys examples: {load_unexpected[:5]}")
+            print(
+                "[TeacherDelta][WARN] load unexpected keys examples: "
+                f"{load_unexpected[:5]}"
+            )
         if incompatible:
-            print(f"[Checkpoint][WARN] incompatible shape examples: {incompatible[:3]}")
+            print(
+                "[TeacherDelta][WARN] incompatible shape examples: "
+                f"{incompatible[:3]}"
+            )
 
     if missing_trainable or incompatible:
         raise RuntimeError(
@@ -357,7 +377,7 @@ def parse_args():
     parser.add_argument(
         "--checkpoint",
         type=str,
-        default="src/checkpoint/teacher/2026-06-12_01-20/best_model.pth",
+        required=True,
         help="Path to a run directory, best_model.pth, or final_model.pth.",
     )
     parser.add_argument(

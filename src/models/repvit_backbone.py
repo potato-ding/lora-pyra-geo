@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 
 from src.models.repvit_module import repvit_m1_5
+from src.utils.rank_logging import rank0_print
 
 
 class RepViTBackbone(nn.Module):
@@ -85,18 +86,31 @@ class RepViTBackbone(nn.Module):
         loaded_feature_keys = [key for key in clean_state_dict if key.startswith("features.")]
         feature_load_ratio = len(loaded_feature_keys) / max(1, len(feature_keys))
 
-        print(f"[RepViTBackbone] ckpt path: {ckpt_path}")
-        print(f"[RepViTBackbone] matched keys: {len(clean_state_dict)}/{len(model_state)}")
-        print(
+        rank0_print(f"[RepViTBackbone] ckpt path: {ckpt_path}")
+        rank0_print(
+            f"[RepViTBackbone] matched keys: "
+            f"{len(clean_state_dict)}/{len(model_state)}"
+        )
+        rank0_print(
             "[RepViTBackbone] matched feature keys: "
             f"{len(loaded_feature_keys)}/{len(feature_keys)} ({feature_load_ratio:.2%})"
         )
-        print(f"[RepViTBackbone] missing keys after load: {len(msg.missing_keys)}")
-        print(f"[RepViTBackbone] unexpected keys after load: {len(msg.unexpected_keys)}")
+        rank0_print(
+            f"[RepViTBackbone] missing keys after load: {len(msg.missing_keys)}"
+        )
+        rank0_print(
+            "[RepViTBackbone] unexpected keys after load: "
+            f"{len(msg.unexpected_keys)}"
+        )
         if skipped_shape:
-            print(f"[RepViTBackbone] skipped shape-mismatch keys: {len(skipped_shape)}")
+            rank0_print(
+                "[RepViTBackbone] skipped shape-mismatch keys: "
+                f"{len(skipped_shape)}"
+            )
             for key, ckpt_shape, model_shape in skipped_shape[:5]:
-                print(f"  - {key}: ckpt={ckpt_shape}, model={model_shape}")
+                rank0_print(
+                    f"  - {key}: ckpt={ckpt_shape}, model={model_shape}"
+                )
 
         if feature_load_ratio < min_feature_load_ratio:
             raise RuntimeError(

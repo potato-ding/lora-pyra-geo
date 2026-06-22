@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from src.models.repvit_backbone import RepViTBackbone
+from src.utils.rank_logging import rank0_print
 
 
 class StudentModel(nn.Module):
@@ -32,13 +33,13 @@ class StudentModel(nn.Module):
         self._print_config()
 
     def _print_config(self):
-        print("StudentModel config:")
-        print("  architecture: RepViT-M1.5 backbone only")
-        print("  neck: BatchNorm1d(512)")
-        print("  pooling: global average pooling")
-        print("  output: L2-normalized 512-d feature")
+        rank0_print("StudentModel config:")
+        rank0_print("  architecture: RepViT-M1.5 backbone only")
+        rank0_print("  neck: BatchNorm1d(512)")
+        rank0_print("  pooling: global average pooling")
+        rank0_print("  output: L2-normalized 512-d feature")
         if hasattr(self, "distill_projection"):
-            print(
+            rank0_print(
                 "  plain KD projection: "
                 f"Linear(512, {self.distill_projection.out_features}, bias=False)"
             )

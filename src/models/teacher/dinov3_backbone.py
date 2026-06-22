@@ -5,6 +5,8 @@ import sys, os
 import inspect
 from torch.nn.attention import sdpa_kernel, SDPBackend
 
+from src.utils.rank_logging import rank0_print
+
 
 def _safe_torch_load(path, map_location):
 	load_kwargs = {"map_location": map_location}
@@ -42,7 +44,7 @@ class DINOv3Backbone(nn.Module):
 		from dinov3_main.dinov3.hub.backbones import dinov3_vit7b16
 		# 使用 pretrained=False，从本地权重加载
 		model = dinov3_vit7b16(pretrained=False)
-		print(f"Loading checkpoint from: {self.ckpt_path}")
+		rank0_print(f"[DINOv3Base] loading checkpoint: {self.ckpt_path}")
 		checkpoint = _safe_torch_load(self.ckpt_path, map_location='cpu')
 		# 扒出真正的权重字典
 		if 'model' in checkpoint:

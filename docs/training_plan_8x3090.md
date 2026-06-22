@@ -325,6 +325,9 @@ ZeRO stage 2
 不支持 ZeRO stage 3 的 model-only 导出路径。
 
 DeepSpeed step、epoch、验证和 plain KD 日志只由 rank 0 打印。
+模型结构、DINOv3/RepViT 权重加载、optimizer 和 scheduler 的启动日志同样只由
+rank 0 打印。每个 rank 仍会独立构造本地 student/teacher，这是分布式训练的正常行为，
+只是非 rank0 不再重复输出。
 
 ---
 
@@ -433,6 +436,24 @@ student_sim_mean
 
 不打印 teacher margin、boundary anchor ratio、boundary negative count、risk weight 或
 violation ratio。
+
+Teacher checkpoint 是可训练参数增量文件。启动时会看到类似：
+
+```text
+[TeacherDelta] matched=125 | trainable_covered=125/125 |
+missing_nontrainable=566 | unexpected=0 | incompatible=0
+[TeacherDelta] coverage OK: all trainable teacher parameters were restored;
+missing non-trainable keys keep their pretrained DINOv3/base initialization.
+```
+
+这里 `missing_nontrainable` 不是权重加载失败。它表示这些冻结参数不在增量 checkpoint
+中，继续使用此前已经严格加载的官方 DINOv3 基座权重。真正需要关注的是：
+
+```text
+trainable_covered 必须完整
+unexpected 必须为 0
+incompatible 必须为 0
+```
 
 ---
 

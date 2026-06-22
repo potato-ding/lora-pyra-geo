@@ -9,7 +9,6 @@ import torch
 import math
 import torch.nn.functional as F
 import torch.distributed as dist
-from datetime import datetime
 import gc
 import inspect
 import json
@@ -32,6 +31,7 @@ from src.training.teacher.args import parse_args
 from src.utils.teacher.optimizer import build_optimizer_and_scale
 from src.utils.teacher.scheduler import get_scheduler
 from src.utils.save_path import get_save_pth
+from src.utils.validation_results import save_validation_results
 if 'OMP_NUM_THREADS' not in os.environ:
     os.environ['OMP_NUM_THREADS'] = '4'
 
@@ -91,20 +91,6 @@ def is_main_process():
     return not dist.is_available() or not dist.is_initialized() or dist.get_rank() == 0
 
 
-def init_run_timestamp(args):
-    timestamp = getattr(args, "run_timestamp", None)
-    if timestamp is None:
-        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M") if is_main_process() else None
-
-    if dist.is_available() and dist.is_initialized():
-        obj = [timestamp]
-        dist.broadcast_object_list(obj, src=0)
-        timestamp = obj[0]
-
-    args.run_timestamp = timestamp
-    return timestamp
-
-
 def _json_safe_value(value):
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
@@ -121,7 +107,6 @@ def save_hyperparameters(save_dir, args):
         for key, value in sorted(vars(args).items())
     }
     payload = {
-        "run_timestamp": getattr(args, "run_timestamp", None),
         "save_dir": save_dir,
         "command": " ".join(sys.argv),
         "hyperparameters": hyperparameters,
@@ -182,23 +167,43 @@ def load_teacher_init_checkpoint(model, checkpoint_path, device, strict_trainabl
     trainable_keys = {name for name, param in model.named_parameters() if param.requires_grad}
     loaded_trainable = trainable_keys & set(mapped_state.keys())
     missing_trainable = sorted(trainable_keys - loaded_trainable)
+    missing_nontrainable = sorted(set(missing) - trainable_keys)
 
     if is_main_process():
-        print(f"[InitCheckpoint] loaded: {checkpoint_path}")
+        print(f"[TeacherInitDelta] loaded: {checkpoint_path}")
         print(
-            f"[InitCheckpoint] matched={len(mapped_state)} | "
-            f"trainable_matched={len(loaded_trainable)}/{len(trainable_keys)} | "
+            f"[TeacherInitDelta] matched={len(mapped_state)} | "
+            f"trainable_covered={len(loaded_trainable)}/{len(trainable_keys)} | "
+            f"missing_nontrainable={len(missing_nontrainable)} | "
             f"unexpected={len(unexpected) + len(load_unexpected)} | "
-            f"incompatible={len(incompatible)} | missing_total={len(missing)}"
+            f"incompatible={len(incompatible)}"
         )
+        if not missing_trainable and not incompatible:
+            print(
+                "[TeacherInitDelta] coverage OK: all trainable teacher "
+                "parameters were restored; missing non-trainable keys keep "
+                "their pretrained DINOv3/base initialization."
+            )
         if missing_trainable:
-            print(f"[InitCheckpoint][WARN] missing trainable keys examples: {missing_trainable[:5]}")
+            print(
+                "[TeacherInitDelta][WARN] missing trainable keys examples: "
+                f"{missing_trainable[:5]}"
+            )
         if unexpected:
-            print(f"[InitCheckpoint][WARN] unexpected checkpoint keys examples: {unexpected[:5]}")
+            print(
+                "[TeacherInitDelta][WARN] unexpected checkpoint keys examples: "
+                f"{unexpected[:5]}"
+            )
         if load_unexpected:
-            print(f"[InitCheckpoint][WARN] load unexpected keys examples: {load_unexpected[:5]}")
+            print(
+                "[TeacherInitDelta][WARN] load unexpected keys examples: "
+                f"{load_unexpected[:5]}"
+            )
         if incompatible:
-            print(f"[InitCheckpoint][WARN] incompatible examples: {incompatible[:3]}")
+            print(
+                "[TeacherInitDelta][WARN] incompatible examples: "
+                f"{incompatible[:3]}"
+            )
 
     if strict_trainable and (missing_trainable or incompatible):
         raise RuntimeError(
@@ -1088,7 +1093,6 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
     print_teacher_feature_fusion_config(model_engine)
     # 开始训练循环
     # 构建保存目录名
-    init_run_timestamp(args)
     save_dir = get_save_pth(args)
     if is_main_process():
         os.makedirs(save_dir, exist_ok=True)
@@ -1344,6 +1348,7 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                 history_record = dict(current_metrics)
                 history_record["is_best"] = is_best
                 validation_history.append(history_record)
+                save_validation_results(save_dir, validation_history)
 
                 if is_best:
                     best_r1_sum = r1_sum

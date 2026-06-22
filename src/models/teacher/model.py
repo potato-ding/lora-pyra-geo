@@ -7,6 +7,7 @@ import torch.nn.functional as F
 
 from src.models.teacher.dinov3_backbone import DINOv3Backbone
 from src.models.teacher.peft_lora import LoRAInject
+from src.utils.rank_logging import rank0_print
 from src.utils.smart_checkpoint import SmartCheckpointWrapper
 
 
@@ -304,7 +305,7 @@ class TeacherModel(nn.Module):
         args.resolved_full_finetune_start_block = self.full_finetune_range[0]
         args.resolved_full_finetune_end_block = self.full_finetune_range[1]
 
-        print(
+        rank0_print(
             f"[TeacherTune] blocks={num_blocks} | "
             f"lora={self.lora_range} | full_finetune={self.full_finetune_range}"
         )

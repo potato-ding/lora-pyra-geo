@@ -7,6 +7,8 @@ import math
 
 from torch.optim.lr_scheduler import LambdaLR
 
+from src.utils.rank_logging import rank0_print
+
 
 def get_scheduler(*args, **kwargs):
     from src.utils.teacher.scheduler import get_scheduler as _get_scheduler
@@ -65,13 +67,13 @@ def build_student_scheduler(optimizer, args, steps_per_epoch=None):
 
     scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
 
-    print(f"[Scheduler] total_epochs   : {total_epochs}")
-    print(f"[Scheduler] warmup_epochs  : {warmup_epochs}")
-    print(f"[Scheduler] min_lr_ratio   : {min_lr_ratio}")
+    rank0_print(f"[Scheduler] total_epochs   : {total_epochs}")
+    rank0_print(f"[Scheduler] warmup_epochs  : {warmup_epochs}")
+    rank0_print(f"[Scheduler] min_lr_ratio   : {min_lr_ratio}")
     if steps_per_epoch is not None:
-        print(f"[Scheduler] steps/epoch    : {steps_per_epoch}")
-        print(f"[Scheduler] total_steps    : {total_steps}")
-        print(f"[Scheduler] warmup_steps   : {warmup_steps}")
+        rank0_print(f"[Scheduler] steps/epoch    : {steps_per_epoch}")
+        rank0_print(f"[Scheduler] total_steps    : {total_steps}")
+        rank0_print(f"[Scheduler] warmup_steps   : {warmup_steps}")
 
     return scheduler
 
