@@ -796,3 +796,120 @@ def test_deepspeed_epoch_uses_online_kd_and_keeps_teacher_frozen(
     assert not torch.equal(before, engine.module.proj.weight.detach())
     assert all(param.grad is None for param in teacher.parameters())
     assert capsys.readouterr().out == ""
+
+
+def _validation_result():
+    return {
+        "D2S_R1": 60.0,
+        "D2S_R5": 80.0,
+        "D2S_R10": 90.0,
+        "D2S_mAP": 70.0,
+        "S2D_R1": 40.0,
+        "S2D_R5": 65.0,
+        "S2D_R10": 75.0,
+        "S2D_mAP": 50.0,
+        "R1_sum": 100.0,
+        "avg_R1": 50.0,
+        "avg_mAP": 60.0,
+    }
+
+
+def _artifact_args(output_dir):
+    return type("Args", (), {
+        "output_dir": str(output_dir),
+        "epochs": 1,
+        "amp": False,
+        "save_last": True,
+        "val_interval": 1,
+    })()
+
+
+def test_single_gpu_training_writes_only_requested_student_artifacts(
+    tmp_path,
+    monkeypatch,
+):
+    model = nn.Linear(2, 2)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        lr_lambda=lambda _: 1.0,
+    )
+    monkeypatch.setattr(
+        student_train,
+        "train_one_epoch",
+        lambda *args, **kwargs: {
+            "loss_retrieval": 1.0,
+            "total_loss": 1.0,
+        },
+    )
+    monkeypatch.setattr(
+        student_train,
+        "validate_u1652",
+        lambda *args, **kwargs: _validation_result(),
+    )
+
+    student_train.train(
+        model,
+        train_loader=[],
+        val_loaders={},
+        criterion=None,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        device=torch.device("cpu"),
+        args=_artifact_args(tmp_path),
+    )
+
+    assert {path.name for path in tmp_path.iterdir()} == {
+        "best_model.pth",
+        "last_model.pth",
+        "best_metrics.json",
+    }
+    metrics = json.loads(
+        (tmp_path / "best_metrics.json").read_text(encoding="utf-8")
+    )
+    assert len(metrics["validation_history"]) == 1
+    assert metrics["validation_history"][0]["epoch"] == 1
+
+
+def test_deepspeed_training_writes_only_requested_student_artifacts(
+    tmp_path,
+    monkeypatch,
+):
+    class FakeEngine(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.module = nn.Linear(2, 2)
+
+        def save_checkpoint(self, *args, **kwargs):
+            raise AssertionError("DeepSpeed state directories must not be saved")
+
+    engine = FakeEngine()
+    monkeypatch.setattr(
+        student_train,
+        "train_one_epoch_deepspeed",
+        lambda *args, **kwargs: {
+            "loss_retrieval": 1.0,
+            "total_loss": 1.0,
+        },
+    )
+    monkeypatch.setattr(
+        student_train,
+        "validate_u1652",
+        lambda *args, **kwargs: _validation_result(),
+    )
+
+    student_train.train_deepspeed(
+        engine,
+        train_loader=[],
+        val_loaders={},
+        criterion=None,
+        optimizer=None,
+        device=torch.device("cpu"),
+        args=_artifact_args(tmp_path),
+    )
+
+    assert {path.name for path in tmp_path.iterdir()} == {
+        "best_model.pth",
+        "last_model.pth",
+        "best_metrics.json",
+    }

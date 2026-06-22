@@ -2,7 +2,6 @@ import argparse
 import json
 import math
 import os
-import shlex
 import sys
 import time
 
@@ -24,7 +23,6 @@ from src.utils.gather_features_and_labels_and_views import (
 from src.utils.initdist import try_init_dist
 from src.utils.optimizer_and_scale import build_student_optimizer
 from src.utils.save_path import get_student_save_pth
-from src.utils.validation_results import save_validation_results
 from src.utils.scheduler import build_student_scheduler
 from src.utils.train_eval_utils import getdist_1652_val_and_get_recall
 
@@ -454,20 +452,6 @@ def compute_student_batch_losses(
     return losses
 
 
-def save_checkpoint(model, optimizer, scheduler, epoch, save_path):
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    torch.save(
-        {
-            "epoch": epoch,
-            "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "scheduler": scheduler.state_dict() if scheduler is not None else None,
-        },
-        save_path,
-    )
-    print(f"[Checkpoint] saved to: {save_path}")
-
-
 def save_model_only_checkpoint(model, epoch, save_path):
     if not is_main_process():
         return
@@ -532,54 +516,6 @@ def print_deepspeed_batch_config(config):
         f"local_images={local_pair_batch * 2} | "
         f"global_images_per_step={global_pair_batch * 2}"
     )
-
-
-def write_training_record(
-    args,
-    status,
-    best_epoch=None,
-    best_metric=None,
-    best_result=None,
-    last_epoch=None,
-    last_result=None,
-):
-    os.makedirs(args.output_dir, exist_ok=True)
-    record_path = os.path.join(args.output_dir, "training_record.txt")
-    command_line = getattr(
-        args,
-        "command_line",
-        " ".join(shlex.quote(x) for x in sys.argv),
-    )
-    lines = [
-        "Sample4Geo RepViT Student Training Record",
-        "=========================================",
-        "",
-        f"status: {status}",
-        f"output_dir: {args.output_dir}",
-        "",
-        "Command",
-        "-------",
-        command_line,
-        "",
-        "Best Result",
-        "-----------",
-        f"best_metric_name: {args.best_metric_name}",
-        f"best_epoch: {best_epoch if best_epoch is not None else 'N/A'}",
-        f"best_metric: {best_metric if best_metric is not None else 'N/A'}",
-        json.dumps(best_result or {}, ensure_ascii=False, indent=2),
-        "",
-        "Last Validation",
-        "---------------",
-        f"last_epoch: {last_epoch if last_epoch is not None else 'N/A'}",
-        json.dumps(last_result or {}, ensure_ascii=False, indent=2),
-        "",
-        "Args",
-        "----",
-        json.dumps(vars(args), ensure_ascii=False, indent=2, sort_keys=True),
-        "",
-    ]
-    with open(record_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines))
 
 
 def save_metrics_json(save_dir, filename, payload):
@@ -1160,10 +1096,6 @@ def train(
     best_result = None
     best_metrics = None
     validation_history = []
-    last_epoch = None
-    last_result = None
-
-    write_training_record(args, status="training")
     save_metrics_json(
         args.output_dir,
         "best_metrics.json",
@@ -1199,10 +1131,8 @@ def train(
         )
 
         if args.save_last:
-            save_checkpoint(
+            save_model_only_checkpoint(
                 model,
-                optimizer,
-                scheduler,
                 epoch,
                 os.path.join(args.output_dir, "last_model.pth"),
             )
@@ -1211,8 +1141,6 @@ def train(
             epoch % args.val_interval == 0 or epoch == args.epochs
         ):
             result = validate_u1652(model, val_loaders)
-            last_epoch = epoch
-            last_result = result
             log_validation_result(epoch, result)
             (
                 is_best,
@@ -1229,12 +1157,9 @@ def train(
                 best_metrics,
                 validation_history,
             )
-            save_validation_results(args.output_dir, validation_history)
             if is_best:
-                save_checkpoint(
+                save_model_only_checkpoint(
                     model,
-                    optimizer,
-                    scheduler,
                     epoch,
                     os.path.join(args.output_dir, "best_model.pth"),
                 )
@@ -1254,25 +1179,7 @@ def train(
                 f"best_R1_sum="
                 f"{format_optional_float((best_result or {}).get('R1_sum'), 6)}"
             )
-            write_training_record(
-                args,
-                status="training",
-                best_epoch=best_epoch,
-                best_metric=best_metric if best_epoch is not None else None,
-                best_result=best_result,
-                last_epoch=last_epoch,
-                last_result=last_result,
-            )
 
-    write_training_record(
-        args,
-        status="finished",
-        best_epoch=best_epoch,
-        best_metric=best_metric if best_epoch is not None else None,
-        best_result=best_result,
-        last_epoch=last_epoch,
-        last_result=last_result,
-    )
     save_metrics_json(
         args.output_dir,
         "best_metrics.json",
@@ -1295,7 +1202,6 @@ def train_deepspeed(
 ):
     if is_main_process():
         os.makedirs(args.output_dir, exist_ok=True)
-        write_training_record(args, status="training")
     distributed_barrier()
 
     best_metric = -1.0
@@ -1303,9 +1209,6 @@ def train_deepspeed(
     best_result = None
     best_metrics = None
     validation_history = []
-    last_epoch = None
-    last_result = None
-
     if is_main_process():
         save_metrics_json(
             args.output_dir,
@@ -1342,11 +1245,6 @@ def train_deepspeed(
             )
 
         if args.save_last:
-            model_engine.save_checkpoint(
-                os.path.join(args.output_dir, "deepspeed"),
-                tag="last",
-                client_state={"epoch": epoch},
-            )
             save_model_only_checkpoint(
                 model_engine,
                 epoch,
@@ -1357,8 +1255,6 @@ def train_deepspeed(
             epoch % args.val_interval == 0 or epoch == args.epochs
         ):
             result = validate_u1652(model_engine, val_loaders)
-            last_epoch = epoch
-            last_result = result
             (
                 is_best,
                 best_metric,
@@ -1374,8 +1270,6 @@ def train_deepspeed(
                 best_metrics,
                 validation_history,
             )
-            if is_main_process():
-                save_validation_results(args.output_dir, validation_history)
             if is_best:
                 save_model_only_checkpoint(
                     model_engine,
@@ -1393,29 +1287,9 @@ def train_deepspeed(
                         validation_history,
                     ),
                 )
-                write_training_record(
-                    args,
-                    status="training",
-                    best_epoch=best_epoch,
-                    best_metric=(
-                        best_metric if best_epoch is not None else None
-                    ),
-                    best_result=best_result,
-                    last_epoch=last_epoch,
-                    last_result=last_result,
-                )
         distributed_barrier()
 
     if is_main_process():
-        write_training_record(
-            args,
-            status="finished",
-            best_epoch=best_epoch,
-            best_metric=best_metric if best_epoch is not None else None,
-            best_result=best_result,
-            last_epoch=last_epoch,
-            last_result=last_result,
-        )
         save_metrics_json(
             args.output_dir,
             "best_metrics.json",
@@ -1548,7 +1422,6 @@ def parse_args():
             f"{args.best_metric_name!r} to 'R1_sum'"
         )
         args.best_metric_name = "R1_sum"
-    args.command_line = " ".join(shlex.quote(x) for x in sys.argv)
     return args
 
 
@@ -1584,7 +1457,6 @@ def main():
 
     if is_main_process():
         print(f"[Output] checkpoints will be saved to: {args.output_dir}")
-        write_training_record(args, status="initialized")
     distributed_barrier()
 
     torch.manual_seed(args.seed + rank)
