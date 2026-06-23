@@ -54,7 +54,7 @@ def build_arg_parser():
     parser.add_argument('--data_dir', type=str, default='data/U1652', help='数据集路径')
     parser.add_argument('--seed', type=int, default=0, help='Sample4Geo batch sampler 随机种子')
     parser.add_argument('--prob_flip', type=float, default=0.5, help='Sample4Geo pair-level horizontal flip probability')
-    parser.add_argument('--log_interval', type=int, default=20, help='训练日志打印间隔，按 batch 计')
+    parser.add_argument('--log_interval', type=int, default=200, help='训练日志打印间隔，按 batch 计')
     parser.add_argument('--num_workers', type=int, default=4, help='数据加载器的工作进程数')
     parser.add_argument('--lora_start_block', type=int, default=None, help='LoRA 起始 transformer block，默认 20')
     parser.add_argument('--lora_end_block', type=int, default=None, help='LoRA 结束 transformer block（左闭右开），默认等于 full_finetune_start_block')
