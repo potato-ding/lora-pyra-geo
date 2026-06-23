@@ -13,19 +13,20 @@ from src.utils.smart_checkpoint import SmartCheckpointWrapper
 
 _MODEL_DIR = Path(__file__).resolve().parents[1]
 repo_dir = str(_MODEL_DIR)
-ckpt_path = str(_MODEL_DIR / "dinov3-pth" / "dinov3_vit7b16_pretrain_lvd1689m-a955f4ea.pth")
+ckpt_path = str(
+    _MODEL_DIR
+    / "dinov3-pth"
+    / "dinov3_vit7b16_pretrain_lvd1689m-a955f4ea.pth"
+)
 
 FUSION_MODE_NONE = "none"
-FUSION_MODE_LOCAL = "local"
-FUSION_MODE_SOFT_ORTHOGONAL = "soft_orthogonal"
-FUSION_MODE_HYBRID_DUAL_PATH = "hybrid_dual_path_fusion"
+FUSION_MODE_LAYERWISE_SOFT_ORTH = "layerwise_soft_orth"
 SUPPORTED_FUSION_MODES = {
     FUSION_MODE_NONE,
-    FUSION_MODE_LOCAL,
-    FUSION_MODE_SOFT_ORTHOGONAL,
-    FUSION_MODE_HYBRID_DUAL_PATH,
+    FUSION_MODE_LAYERWISE_SOFT_ORTH,
 }
-HYBRID_LOCAL_LAYERS = [19, 27, 36]
+DEFAULT_DETAIL_LAYERS = [19, 27]
+DEFAULT_SEMANTIC_LAYER = 36
 
 
 def _resolve_block_index(value, num_blocks, name, default=None):
@@ -39,7 +40,9 @@ def _resolve_block_index(value, num_blocks, name, default=None):
         idx = num_blocks + idx
 
     if idx < 0 or idx > num_blocks:
-        raise ValueError(f"{name}={value} resolves to {idx}, expected range [0, {num_blocks}]")
+        raise ValueError(
+            f"{name}={value} resolves to {idx}, expected range [0, {num_blocks}]"
+        )
     return idx
 
 
@@ -66,7 +69,9 @@ def resolve_teacher_tuning_ranges(args, num_blocks):
         default=None,
     )
     if full_start > full_end:
-        raise ValueError(f"invalid full_finetune range: start={full_start}, end={full_end}")
+        raise ValueError(
+            f"invalid full_finetune range: start={full_start}, end={full_end}"
+        )
 
     default_lora_start = min(20, full_start)
     lora_start = _resolve_block_index(
@@ -86,7 +91,6 @@ def resolve_teacher_tuning_ranges(args, num_blocks):
 
     lora_range = (lora_start, lora_end)
     full_range = (full_start, full_end)
-
     if _range_overlaps(lora_range, full_range):
         raise ValueError(
             f"LoRA range {lora_range} overlaps full_finetune range {full_range}; "
@@ -121,120 +125,87 @@ def _as_bool(value):
     raise ValueError(f"cannot parse boolean value: {value!r}")
 
 
-def parse_local_feature_layers(value, default="19,27,36"):
+def parse_detail_layers(value):
     if value is None:
-        value = default
-
+        return list(DEFAULT_DETAIL_LAYERS)
     if isinstance(value, str):
         parts = [item.strip() for item in value.split(",") if item.strip()]
     elif isinstance(value, int):
         parts = [value]
     else:
         parts = list(value)
-
-    if not parts:
-        raise ValueError("local_feature_layers cannot be empty")
-
     try:
         layers = [int(item) for item in parts]
     except (TypeError, ValueError) as exc:
-        raise ValueError(f"invalid local_feature_layers={value!r}; expected comma-separated integers") from exc
-
-    if len(set(layers)) != len(layers):
-        raise ValueError(f"local_feature_layers contains duplicate indices: {layers}")
-
-    return layers
-
-
-def validate_local_feature_layers(layers, num_blocks):
-    invalid = [idx for idx in layers if idx < 0 or idx >= num_blocks]
-    if invalid:
         raise ValueError(
-            f"local_feature_layers has invalid 0-based block indices {invalid}; "
-            f"valid range is [0, {num_blocks - 1}]"
+            f"invalid detail_layers={value!r}; expected two integer block indices"
+        ) from exc
+    if len(layers) != 2:
+        raise ValueError(f"detail_layers must contain exactly two layers, got {layers}")
+    if layers != DEFAULT_DETAIL_LAYERS:
+        raise ValueError(
+            "the current layerwise_soft_orth architecture requires "
+            f"detail_layers={DEFAULT_DETAIL_LAYERS}, got {layers}"
         )
     return layers
 
 
-def _clamp_lambda_init(value):
-    value = float(value)
-    if not math.isfinite(value):
-        raise ValueError(f"soft_orth_lambda_init must be finite, got {value}")
-    return min(max(value, 1e-4), 1.0 - 1e-4)
+def validate_layerwise_layers(detail_layers, semantic_layer, num_blocks):
+    semantic_layer = int(semantic_layer)
+    all_layers = list(detail_layers) + [semantic_layer]
+    invalid = [idx for idx in all_layers if idx < 0 or idx >= num_blocks]
+    if invalid:
+        raise ValueError(
+            f"layerwise fusion has invalid 0-based block indices {invalid}; "
+            f"valid range is [0, {num_blocks - 1}]"
+        )
+    if semantic_layer != DEFAULT_SEMANTIC_LAYER:
+        raise ValueError(
+            "the current layerwise_soft_orth architecture requires "
+            f"semantic_layer={DEFAULT_SEMANTIC_LAYER}, got {semantic_layer}"
+        )
+    if len(set(all_layers)) != len(all_layers):
+        raise ValueError(
+            f"detail_layers and semantic_layer must be distinct, got {all_layers}"
+        )
+    return list(detail_layers), semantic_layer
 
 
 def resolve_fusion_mode(args):
-    fusion_mode = getattr(args, "fusion_mode", None)
-    if fusion_mode is None or str(fusion_mode).strip() == "":
-        if _as_bool(getattr(args, "use_soft_orth_fusion", False)):
-            return FUSION_MODE_SOFT_ORTHOGONAL
-        if _as_bool(getattr(args, "use_local_fusion", False)):
-            return FUSION_MODE_LOCAL
-        return FUSION_MODE_NONE
-
-    fusion_mode = str(fusion_mode).strip().lower()
+    fusion_mode = str(getattr(args, "fusion_mode", FUSION_MODE_NONE) or "").strip().lower()
+    if not fusion_mode:
+        fusion_mode = FUSION_MODE_NONE
     if fusion_mode not in SUPPORTED_FUSION_MODES:
         raise ValueError(
             f"unsupported fusion_mode={fusion_mode!r}; "
-            f"expected one of {sorted(SUPPORTED_FUSION_MODES)}"
+            f"expected one of {sorted(SUPPORTED_FUSION_MODES)}. "
+            "Legacy teacher fusion modes have been removed."
         )
     return fusion_mode
 
 
-def _gate_raw_from_init(init_value, gamma_max, name):
+def _probability_raw_from_init(value, name):
+    value = float(value)
+    if not math.isfinite(value) or not 0.0 < value < 1.0:
+        raise ValueError(f"{name} must be finite and satisfy 0 < value < 1, got {value}")
+    return torch.logit(torch.tensor(value, dtype=torch.float32))
+
+
+def _bounded_raw_from_init(init_value, max_value, init_name, max_name):
     init_value = float(init_value)
-    gamma_max = float(gamma_max)
-    if not math.isfinite(gamma_max) or gamma_max <= 0:
-        raise ValueError(f"gamma_max must be finite and > 0, got {gamma_max}")
-    if not math.isfinite(init_value) or not 0 < init_value < gamma_max:
+    max_value = float(max_value)
+    if not math.isfinite(max_value) or max_value <= 0:
+        raise ValueError(f"{max_name} must be finite and > 0, got {max_value}")
+    if not math.isfinite(init_value) or not 0 < init_value < max_value:
         raise ValueError(
-            f"{name} must be finite and satisfy 0 < init < gamma_max; "
-            f"got init={init_value}, gamma_max={gamma_max}"
+            f"{init_name} must be finite and satisfy 0 < init < {max_name}; "
+            f"got init={init_value}, {max_name}={max_value}"
         )
-    return torch.logit(torch.tensor(init_value / gamma_max, dtype=torch.float32))
-
-
-def decompose_local_feature(global_feat, local_feat, detach_global=True, eps=1e-6):
-    if global_feat.shape != local_feat.shape:
-        raise RuntimeError(
-            f"dual-path fusion expects matching shapes, "
-            f"got global_feat={tuple(global_feat.shape)} and local_feat={tuple(local_feat.shape)}"
-        )
-    if global_feat.ndim != 2:
-        raise RuntimeError(f"dual-path fusion expects [B, D] features, got {tuple(global_feat.shape)}")
-
-    orth_ref = global_feat.detach() if detach_global else global_feat
-    unit_global = F.normalize(orth_ref, p=2, dim=-1, eps=eps)
-    local_parallel = (local_feat * unit_global).sum(dim=-1, keepdim=True) * unit_global
-    local_perp = local_feat - local_parallel
-    return local_parallel, local_perp
-
-
-def apply_soft_orthogonal_local_fusion(
-    global_feat,
-    local_feat,
-    lambda_orth_raw,
-    detach_global=True,
-    eps=1e-6,
-):
-    if global_feat.shape != local_feat.shape:
-        raise RuntimeError(
-            f"soft orthogonal fusion expects matching shapes, "
-            f"got global_feat={tuple(global_feat.shape)} and local_feat={tuple(local_feat.shape)}"
-        )
-    if global_feat.ndim != 2:
-        raise RuntimeError(f"soft orthogonal fusion expects [B, D] features, got {tuple(global_feat.shape)}")
-
-    orth_ref = global_feat.detach() if detach_global else global_feat
-    ref_global = F.normalize(orth_ref, p=2, dim=-1, eps=eps)
-    proj = (local_feat * ref_global).sum(dim=-1, keepdim=True) * ref_global
-    lambda_orth = torch.sigmoid(lambda_orth_raw).to(dtype=local_feat.dtype, device=local_feat.device)
-    local_soft = local_feat - lambda_orth * proj
-    return local_soft, lambda_orth
+    return torch.logit(torch.tensor(init_value / max_value, dtype=torch.float32))
 
 
 class PYRALocalCrossAttention(nn.Module):
-    """Parameter-light local cross-attention over selected patch-token layers."""
+    """Independent parameter-light pooling module for one transformer layer."""
 
     def __init__(self, dim):
         super().__init__()
@@ -249,18 +220,22 @@ class PYRALocalCrossAttention(nn.Module):
     def _norm_with_module_dtype(norm, x):
         return norm(x.to(dtype=norm.weight.dtype))
 
-    def forward(self, local_tokens):
-        if local_tokens.ndim != 3:
-            raise RuntimeError(f"local_tokens must be [B, N, D], got {tuple(local_tokens.shape)}")
-        if local_tokens.size(-1) != self.dim:
+    def forward(self, layer_tokens):
+        if layer_tokens.ndim != 3:
             raise RuntimeError(
-                f"local token dim mismatch: got {local_tokens.size(-1)}, expected {self.dim}"
+                f"layer_tokens must be [B, N, D], got {tuple(layer_tokens.shape)}"
+            )
+        if layer_tokens.size(-1) != self.dim:
+            raise RuntimeError(
+                f"local token dim mismatch: got {layer_tokens.size(-1)}, expected {self.dim}"
             )
 
-        tokens = self._norm_with_module_dtype(self.token_norm, local_tokens)
-        query = self.query.to(device=tokens.device, dtype=tokens.dtype).expand(tokens.size(0), -1, -1)
+        tokens = self._norm_with_module_dtype(self.token_norm, layer_tokens)
+        query = self.query.to(
+            device=tokens.device,
+            dtype=tokens.dtype,
+        ).expand(tokens.size(0), -1, -1)
         query = self._norm_with_module_dtype(self.query_norm, query)
-
         attn_logits = torch.matmul(query, tokens.transpose(-1, -2)) / math.sqrt(self.dim)
         attn_weights = torch.softmax(attn_logits.float(), dim=-1).to(dtype=tokens.dtype)
         attended = torch.matmul(attn_weights, tokens).squeeze(1)
@@ -268,10 +243,7 @@ class PYRALocalCrossAttention(nn.Module):
 
 
 class TeacherModel(nn.Module):
-    """
-    DINOv3 teacher with the existing three-stage tuning plan:
-    frozen bottom blocks, LoRA middle blocks, and full fine-tuning on the last blocks.
-    """
+    """DINOv3 teacher with baseline and layer-wise soft-orthogonal descriptors."""
 
     def __init__(self, args):
         super().__init__()
@@ -284,19 +256,21 @@ class TeacherModel(nn.Module):
             device=self.device,
             dtype="bfloat16",
         )
-
         for param in self.backbone.parameters():
             param.requires_grad = False
 
         dino_model = self.backbone.model
-
-        if not hasattr(dino_model, "blocks") or not isinstance(dino_model.blocks, nn.ModuleList):
-            raise AttributeError("dino_model.blocks was not found; please check the DINOv3 model structure")
+        if not hasattr(dino_model, "blocks") or not isinstance(
+            dino_model.blocks,
+            nn.ModuleList,
+        ):
+            raise AttributeError(
+                "dino_model.blocks was not found; please check the DINOv3 model structure"
+            )
 
         num_blocks = len(dino_model.blocks)
         self.num_blocks = num_blocks
         self.final_layer_index = num_blocks - 1
-
         tuning_ranges = resolve_teacher_tuning_ranges(args, num_blocks)
         self.lora_range = tuning_ranges["lora_range"]
         self.full_finetune_range = tuning_ranges["full_range"]
@@ -314,7 +288,6 @@ class TeacherModel(nn.Module):
             lora_target_names = _parse_lora_target_names(
                 getattr(args, "lora_target_names", "qkv,proj")
             )
-
             self.lora_cfg = {
                 "r": int(getattr(args, "lora_rank", 8)),
                 "alpha": int(getattr(args, "lora_alpha", 16)),
@@ -323,7 +296,6 @@ class TeacherModel(nn.Module):
                 "block_range": self.lora_range,
                 "task_type": "feature_extraction",
             }
-
             self.lora_injector = LoRAInject(dino_model, **self.lora_cfg)
             self.lora_injector.inject()
 
@@ -332,81 +304,115 @@ class TeacherModel(nn.Module):
             for param in dino_model.blocks[block_idx].parameters():
                 param.requires_grad = True
 
-        for i in range(num_blocks):
-            dino_model.blocks[i] = SmartCheckpointWrapper(dino_model.blocks[i])
+        for block_idx in range(num_blocks):
+            dino_model.blocks[block_idx] = SmartCheckpointWrapper(
+                dino_model.blocks[block_idx]
+            )
 
-        init_value = torch.log(torch.tensor(1 / 0.07, dtype=torch.float32))
-        self.logit_scale = nn.Parameter(init_value)
-
+        self.logit_scale = nn.Parameter(
+            torch.log(torch.tensor(1 / 0.07, dtype=torch.float32))
+        )
         self.fusion_mode = resolve_fusion_mode(args)
-        self.use_soft_orth_fusion = self.fusion_mode == FUSION_MODE_SOFT_ORTHOGONAL
-        self.use_local_fusion = self.fusion_mode != FUSION_MODE_NONE
         args.resolved_fusion_mode = self.fusion_mode
-        args.resolved_use_local_fusion = self.use_local_fusion
 
-        self.local_feature_layers = validate_local_feature_layers(
-            parse_local_feature_layers(getattr(args, "local_feature_layers", None)),
+        self.detail_layers, self.semantic_layer = validate_layerwise_layers(
+            parse_detail_layers(getattr(args, "detail_layers", None)),
+            getattr(args, "semantic_layer", DEFAULT_SEMANTIC_LAYER),
             num_blocks,
         )
-        if (
-            self.fusion_mode == FUSION_MODE_HYBRID_DUAL_PATH
-            and self.local_feature_layers != HYBRID_LOCAL_LAYERS
-        ):
-            raise ValueError(
-                f"{FUSION_MODE_HYBRID_DUAL_PATH} requires local_feature_layers="
-                f"{HYBRID_LOCAL_LAYERS}, got {self.local_feature_layers}"
+        args.resolved_detail_layers = list(self.detail_layers)
+        args.resolved_semantic_layer = self.semantic_layer
+        self.target_layers = (
+            [self.final_layer_index]
+            if self.fusion_mode == FUSION_MODE_NONE
+            else sorted(
+                set(
+                    self.detail_layers
+                    + [self.semantic_layer, self.final_layer_index]
+                )
             )
-        args.resolved_local_feature_layers = list(self.local_feature_layers)
-
-        if self.use_local_fusion:
-            self.target_layers = sorted(set(self.local_feature_layers + [self.final_layer_index]))
-        else:
-            self.target_layers = [self.final_layer_index]
+        )
 
         feature_dim = getattr(dino_model, "embed_dim", None)
         if feature_dim is None:
             feature_dim = getattr(dino_model, "num_features", None)
         if feature_dim is None:
-            raise AttributeError("Unable to infer DINOv3 feature dimension from embed_dim or num_features")
+            raise AttributeError(
+                "Unable to infer DINOv3 feature dimension from embed_dim or num_features"
+            )
         self.feature_dim = int(feature_dim)
-
-        self.local_cross_attn = PYRALocalCrossAttention(self.feature_dim)
-        self.local_proj = nn.Linear(self.feature_dim, self.feature_dim)
-
-        self.gamma_raw = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
-
-        self.soft_orth_detach_global = _as_bool(getattr(args, "soft_orth_detach_global", True))
-        self.soft_orth_lambda_init = _clamp_lambda_init(getattr(args, "soft_orth_lambda_init", 0.8))
-        lambda_init_value = torch.logit(torch.tensor(self.soft_orth_lambda_init, dtype=torch.float32))
-        self.lambda_orth_raw = nn.Parameter(lambda_init_value.clone().float())
-
-        self.gamma_max = float(getattr(args, "gamma_max", 0.05))
-        hybrid_gate_defaults = {
-            "gamma_19_parallel": 0.005,
-            "gamma_19_perp": 0.015,
-            "gamma_27_parallel": 0.010,
-            "gamma_27_perp": 0.015,
-            "gamma_36": 0.010,
-        }
-        self.hybrid_gate_inits = {}
-        for gate_name, default_value in hybrid_gate_defaults.items():
-            init_name = f"{gate_name}_init"
-            init_value = float(getattr(args, init_name, default_value))
-            self.hybrid_gate_inits[gate_name] = init_value
-            raw_value = _gate_raw_from_init(init_value, self.gamma_max, init_name)
-            setattr(self, f"{gate_name}_raw", nn.Parameter(raw_value.clone().float()))
-
         self._fusion_runtime_stats = {}
 
-        if not self.use_local_fusion:
-            for module in (self.local_cross_attn, self.local_proj):
-                for param in module.parameters():
-                    param.requires_grad_(False)
-        self.gamma_raw.requires_grad_(self.fusion_mode == FUSION_MODE_LOCAL or self.use_soft_orth_fusion)
-        self.lambda_orth_raw.requires_grad_(self.use_soft_orth_fusion)
-        hybrid_trainable = self.fusion_mode == FUSION_MODE_HYBRID_DUAL_PATH
-        for gate_name in hybrid_gate_defaults:
-            getattr(self, f"{gate_name}_raw").requires_grad_(hybrid_trainable)
+        if self.fusion_mode == FUSION_MODE_LAYERWISE_SOFT_ORTH:
+            self.pool19 = PYRALocalCrossAttention(self.feature_dim)
+            self.proj19 = nn.Linear(self.feature_dim, self.feature_dim)
+            self.pool27 = PYRALocalCrossAttention(self.feature_dim)
+            self.proj27 = nn.Linear(self.feature_dim, self.feature_dim)
+            self.pool36 = PYRALocalCrossAttention(self.feature_dim)
+            self.proj36 = nn.Linear(self.feature_dim, self.feature_dim)
+
+            self.soft_orth_detach_global = _as_bool(
+                getattr(args, "soft_orth_detach_global", True)
+            )
+            self.lambda19_init = float(getattr(args, "lambda19_init", 0.8))
+            self.lambda27_init = float(getattr(args, "lambda27_init", 0.8))
+            self.lambda19_raw = nn.Parameter(
+                _probability_raw_from_init(self.lambda19_init, "lambda19_init")
+            )
+            self.lambda27_raw = nn.Parameter(
+                _probability_raw_from_init(self.lambda27_init, "lambda27_init")
+            )
+
+            gate19_init = float(getattr(args, "gate19_init", 0.5))
+            gate27_init = float(getattr(args, "gate27_init", 0.5))
+            if (
+                not math.isfinite(gate19_init)
+                or not math.isfinite(gate27_init)
+                or gate19_init <= 0
+                or gate27_init <= 0
+            ):
+                raise ValueError(
+                    "gate19_init and gate27_init must be finite and > 0"
+                )
+            self.detail_gate_logits = nn.Parameter(
+                torch.log(
+                    torch.tensor(
+                        [gate19_init, gate27_init],
+                        dtype=torch.float32,
+                    )
+                )
+            )
+            self.gate36_init = float(getattr(args, "gate36_init", 0.5))
+            self.gate36_raw = nn.Parameter(
+                _probability_raw_from_init(self.gate36_init, "gate36_init")
+            )
+
+            self.gamma_detail_max = float(
+                getattr(args, "gamma_detail_max", 0.02)
+            )
+            self.gamma_sem_max = float(getattr(args, "gamma_sem_max", 0.02))
+            self.gamma_detail_init = float(
+                getattr(args, "gamma_detail_init", 0.005)
+            )
+            self.gamma_sem_init = float(
+                getattr(args, "gamma_sem_init", 0.005)
+            )
+            self.gamma_detail_raw = nn.Parameter(
+                _bounded_raw_from_init(
+                    self.gamma_detail_init,
+                    self.gamma_detail_max,
+                    "gamma_detail_init",
+                    "gamma_detail_max",
+                )
+            )
+            self.gamma_sem_raw = nn.Parameter(
+                _bounded_raw_from_init(
+                    self.gamma_sem_init,
+                    self.gamma_sem_max,
+                    "gamma_sem_init",
+                    "gamma_sem_max",
+                )
+            )
 
     def _layer_region_desc(self, layer_idx):
         lora_start, lora_end = self.lora_range
@@ -414,227 +420,265 @@ class TeacherModel(nn.Module):
         if full_start <= layer_idx < full_end:
             return "full fine-tune region"
         if lora_start <= layer_idx < lora_end:
-            if layer_idx == lora_end - 1:
-                return "LoRA late region / before full fine-tune"
             return "LoRA region"
-        if layer_idx < lora_start:
-            if layer_idx == lora_start - 1:
-                return "frozen block range / frozen region"
-            return "frozen region"
-        return "frozen gap region"
+        return "frozen region"
 
     def get_feature_fusion_config(self):
-        return {
-            "local_feature_layers": list(self.local_feature_layers),
+        config = {
+            "fusion_mode": self.fusion_mode,
+            "detail_layers": list(self.detail_layers),
+            "semantic_layer": self.semantic_layer,
             "layer_index_base": "0-based block index",
             "layer_regions": [
                 {"layer": layer_idx, "region": self._layer_region_desc(layer_idx)}
-                for layer_idx in self.local_feature_layers
+                for layer_idx in self.detail_layers + [self.semantic_layer]
             ],
-            "fusion_mode": self.fusion_mode,
-            "use_local_fusion": self.use_local_fusion,
-            "use_soft_orth_fusion": self.use_soft_orth_fusion,
-            "soft_orth_lambda_init": self.soft_orth_lambda_init,
-            "soft_orth_detach_global": self.soft_orth_detach_global,
-            "gamma_max": self.gamma_max,
-            "hybrid_gate_inits": dict(self.hybrid_gate_inits),
         }
+        if self.fusion_mode == FUSION_MODE_LAYERWISE_SOFT_ORTH:
+            config.update(
+                {
+                    "soft_orth_detach_global": self.soft_orth_detach_global,
+                    "lambda19_init": self.lambda19_init,
+                    "lambda27_init": self.lambda27_init,
+                    "gamma_detail_max": self.gamma_detail_max,
+                    "gamma_sem_max": self.gamma_sem_max,
+                    "gamma_detail_init": self.gamma_detail_init,
+                    "gamma_sem_init": self.gamma_sem_init,
+                    "gate36_init": self.gate36_init,
+                }
+            )
+        return config
 
-    def get_gamma(self):
-        return 0.05 * torch.sigmoid(self.gamma_raw)
+    def get_detail_gates(self):
+        return torch.softmax(self.detail_gate_logits.float(), dim=0)
 
-    def get_hybrid_gates(self):
-        return {
-            gate_name: self.gamma_max * torch.sigmoid(getattr(self, f"{gate_name}_raw"))
-            for gate_name in self.hybrid_gate_inits
-        }
+    def get_gate36(self):
+        return torch.sigmoid(self.gate36_raw)
+
+    def get_gamma_detail(self):
+        return self.gamma_detail_max * torch.sigmoid(self.gamma_detail_raw)
+
+    def get_gamma_sem(self):
+        return self.gamma_sem_max * torch.sigmoid(self.gamma_sem_raw)
 
     def get_fusion_runtime_values(self):
+        values = {"fusion_mode": self.fusion_mode}
+        if self.fusion_mode != FUSION_MODE_LAYERWISE_SOFT_ORTH:
+            return values
         with torch.no_grad():
-            values = {
-                "fusion_mode": self.fusion_mode,
-                "gamma": self.get_gamma().detach().float().item(),
-                "lambda_orth": torch.sigmoid(self.lambda_orth_raw).detach().float().item(),
-                "use_local_fusion": self.use_local_fusion,
-                "use_soft_orth_fusion": self.use_soft_orth_fusion,
-                "soft_orth_detach_global": self.soft_orth_detach_global,
-                "local_feature_layers": list(self.local_feature_layers),
-            }
+            detail_gates = self.get_detail_gates()
             values.update(
                 {
-                    gate_name: gate.detach().float().item()
-                    for gate_name, gate in self.get_hybrid_gates().items()
+                    "lambda19": torch.sigmoid(self.lambda19_raw).float().item(),
+                    "lambda27": torch.sigmoid(self.lambda27_raw).float().item(),
+                    "gamma_detail": self.get_gamma_detail().float().item(),
+                    "gamma_sem": self.get_gamma_sem().float().item(),
+                    "gate19": detail_gates[0].float().item(),
+                    "gate27": detail_gates[1].float().item(),
+                    "gate36": self.get_gate36().float().item(),
+                    "soft_orth_detach_global": self.soft_orth_detach_global,
+                    "detail_layers": list(self.detail_layers),
+                    "semantic_layer": self.semantic_layer,
                 }
             )
             values.update(
                 {
-                    name: (
-                        value.detach().float().item()
-                        if isinstance(value, torch.Tensor)
-                        else float(value)
-                    )
+                    name: value.detach().float().item()
                     for name, value in self._fusion_runtime_stats.items()
                 }
             )
-            return values
+        return values
 
     @staticmethod
     def _split_intermediate_output(output):
         if not isinstance(output, (tuple, list)) or len(output) != 2:
-            raise RuntimeError("DINOv3 get_intermediate_layers must return (patch_tokens, cls_token)")
+            raise RuntimeError(
+                "DINOv3 get_intermediate_layers must return "
+                "(patch_tokens, cls_token)"
+            )
         return output[0], output[1]
 
-    def _project_local_tokens(self, patch_tokens, global_feat):
-        attended_feat = self.local_cross_attn(patch_tokens)
-        local_feat = self.local_proj(
-            attended_feat.to(dtype=self.local_proj.weight.dtype)
+    @staticmethod
+    def _validate_layer_tokens(layer_idx, patch_tokens, global_feat):
+        if patch_tokens.ndim != 3:
+            raise RuntimeError(
+                f"layer {layer_idx} patch tokens must be [B, N, D], "
+                f"got {tuple(patch_tokens.shape)}"
+            )
+        if patch_tokens.size(0) != global_feat.size(0):
+            raise RuntimeError(
+                f"layer {layer_idx} batch size {patch_tokens.size(0)} "
+                f"does not match global batch size {global_feat.size(0)}"
+            )
+        if patch_tokens.size(-1) != global_feat.size(-1):
+            raise RuntimeError(
+                f"layer {layer_idx} token dim {patch_tokens.size(-1)} "
+                f"does not match global dim {global_feat.size(-1)}"
+            )
+
+    @staticmethod
+    def _project_layer(patch_tokens, pool, projection, global_feat):
+        pooled = pool(patch_tokens)
+        local_feat = projection(
+            pooled.to(dtype=projection.weight.dtype)
         ).to(dtype=global_feat.dtype)
         if local_feat.shape != global_feat.shape:
             raise RuntimeError(
-                f"local projection must match global feature shape; "
-                f"got local_feat={tuple(local_feat.shape)} and global_feat={tuple(global_feat.shape)}"
+                "layer projection must match global feature shape; "
+                f"got local_feat={tuple(local_feat.shape)} and "
+                f"global_feat={tuple(global_feat.shape)}"
             )
         return local_feat
 
     @torch.no_grad()
-    def _update_hybrid_runtime_stats(
+    def _update_layerwise_runtime_stats(
         self,
         global_feat,
-        local_by_layer,
-        local_19_parallel,
-        local_19_perp,
-        local_27_parallel,
-        local_27_perp,
+        fused_feat,
+        detail,
+        semantic36,
         eps=1e-6,
     ):
         global_ref = global_feat.detach().float()
-        stats = {}
-        for layer_idx in HYBRID_LOCAL_LAYERS:
-            local_feat = local_by_layer[layer_idx].detach().float()
-            stats[f"cos_local_{layer_idx}_global"] = (
-                F.cosine_similarity(local_feat, global_ref, dim=-1, eps=eps).mean()
-            )
-
-        for layer_idx, local_parallel, local_perp in (
-            (19, local_19_parallel, local_19_perp),
-            (27, local_27_parallel, local_27_perp),
-        ):
-            local_norm = local_by_layer[layer_idx].detach().float().norm(dim=-1).clamp_min(eps)
-            stats[f"ratio_{layer_idx}_parallel"] = (
-                local_parallel.detach().float().norm(dim=-1) / local_norm
-            ).mean()
-            stats[f"ratio_{layer_idx}_perp"] = (
-                local_perp.detach().float().norm(dim=-1) / local_norm
-            ).mean()
-        self._fusion_runtime_stats = stats
+        self._fusion_runtime_stats = {
+            "cos_global_fused": F.cosine_similarity(
+                global_ref,
+                fused_feat.detach().float(),
+                dim=-1,
+                eps=eps,
+            ).mean(),
+            "cos_global_detail": F.cosine_similarity(
+                global_ref,
+                detail.detach().float(),
+                dim=-1,
+                eps=eps,
+            ).mean(),
+            "cos_global_semantic36": F.cosine_similarity(
+                global_ref,
+                semantic36.detach().float(),
+                dim=-1,
+                eps=eps,
+            ).mean(),
+        }
 
     def forward(self, x):
-        with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.FLASH_ATTENTION):
+        with torch.nn.attention.sdpa_kernel(
+            torch.nn.attention.SDPBackend.FLASH_ATTENTION
+        ):
             features = self.backbone.model.get_intermediate_layers(
                 x,
                 n=self.target_layers,
                 return_class_token=True,
             )
-
         if len(features) != len(self.target_layers):
             raise RuntimeError(
-                f"Expected {len(self.target_layers)} intermediate outputs, got {len(features)}"
+                f"Expected {len(self.target_layers)} intermediate outputs, "
+                f"got {len(features)}"
             )
 
         feature_by_layer = {
             layer_idx: feature
             for layer_idx, feature in zip(self.target_layers, features)
         }
-
-        final_patches, final_cls = self._split_intermediate_output(
+        _, final_cls = self._split_intermediate_output(
             feature_by_layer[self.final_layer_index]
         )
-        del final_patches
-
         global_feat = final_cls.float()
         deep_feats = F.normalize(global_feat, p=2, dim=-1, eps=1e-6)
 
-        if not self.use_local_fusion:
-            if self.training:
-                return deep_feats, deep_feats, deep_feats
-            return deep_feats
+        if self.fusion_mode == FUSION_MODE_NONE:
+            return deep_feats, deep_feats, {}
 
-        local_patch_tokens = {}
-        for layer_idx in self.local_feature_layers:
-            patch_tokens, _ = self._split_intermediate_output(feature_by_layer[layer_idx])
-            if patch_tokens.ndim != 3:
-                raise RuntimeError(
-                    f"local layer {layer_idx} patch tokens must be [B, N, D], got {tuple(patch_tokens.shape)}"
-                )
-            if patch_tokens.size(0) != global_feat.size(0):
-                raise RuntimeError(
-                    f"local layer {layer_idx} batch size {patch_tokens.size(0)} "
-                    f"does not match global batch size {global_feat.size(0)}"
-                )
-            if patch_tokens.size(-1) != global_feat.size(-1):
-                raise RuntimeError(
-                    f"local layer {layer_idx} token dim {patch_tokens.size(-1)} "
-                    f"does not match global dim {global_feat.size(-1)}"
-                )
-            local_patch_tokens[layer_idx] = patch_tokens
+        layer_tokens = {}
+        for layer_idx in self.detail_layers + [self.semantic_layer]:
+            patch_tokens, _ = self._split_intermediate_output(
+                feature_by_layer[layer_idx]
+            )
+            self._validate_layer_tokens(layer_idx, patch_tokens, global_feat)
+            layer_tokens[layer_idx] = patch_tokens
 
-        if self.fusion_mode == FUSION_MODE_HYBRID_DUAL_PATH:
-            local_by_layer = {
-                layer_idx: self._project_local_tokens(local_patch_tokens[layer_idx], global_feat)
-                for layer_idx in HYBRID_LOCAL_LAYERS
-            }
-            local_19 = local_by_layer[19]
-            local_27 = local_by_layer[27]
-            local_36 = local_by_layer[36]
-            local_19_parallel, local_19_perp = decompose_local_feature(
-                global_feat, local_19, detach_global=True, eps=1e-6
-            )
-            local_27_parallel, local_27_perp = decompose_local_feature(
-                global_feat, local_27, detach_global=True, eps=1e-6
-            )
-            gates = {
-                name: value.to(dtype=global_feat.dtype, device=global_feat.device)
-                for name, value in self.get_hybrid_gates().items()
-            }
-            fused_feat = (
-                global_feat
-                + gates["gamma_19_parallel"] * local_19_parallel
-                + gates["gamma_19_perp"] * local_19_perp
-                + gates["gamma_27_parallel"] * local_27_parallel
-                + gates["gamma_27_perp"] * local_27_perp
-                + gates["gamma_36"] * local_36
-            )
-            local_feat = (local_19 + local_27 + local_36) / 3.0
-            self._update_hybrid_runtime_stats(
-                global_feat,
-                local_by_layer,
-                local_19_parallel,
-                local_19_perp,
-                local_27_parallel,
-                local_27_perp,
-            )
-        else:
-            local_tokens = torch.cat(
-                [local_patch_tokens[layer_idx] for layer_idx in self.local_feature_layers],
-                dim=1,
-            )
-            local_feat = self._project_local_tokens(local_tokens, global_feat)
-            gamma = self.get_gamma().to(dtype=global_feat.dtype, device=global_feat.device)
-            if self.use_soft_orth_fusion:
-                local_for_fusion, _ = apply_soft_orthogonal_local_fusion(
-                    global_feat,
-                    local_feat,
-                    self.lambda_orth_raw,
-                    detach_global=self.soft_orth_detach_global,
-                    eps=1e-6,
-                )
-            else:
-                local_for_fusion = local_feat
-            fused_feat = global_feat + gamma * local_for_fusion
+        local19 = self._project_layer(
+            layer_tokens[19],
+            self.pool19,
+            self.proj19,
+            global_feat,
+        )
+        local27 = self._project_layer(
+            layer_tokens[27],
+            self.pool27,
+            self.proj27,
+            global_feat,
+        )
+        local36 = self._project_layer(
+            layer_tokens[36],
+            self.pool36,
+            self.proj36,
+            global_feat,
+        )
 
+        orth_reference = (
+            global_feat.detach()
+            if self.soft_orth_detach_global
+            else global_feat
+        )
+        unit_global = F.normalize(
+            orth_reference,
+            p=2,
+            dim=-1,
+            eps=1e-6,
+        )
+        parallel19 = (
+            (local19 * unit_global).sum(dim=-1, keepdim=True) * unit_global
+        )
+        parallel27 = (
+            (local27 * unit_global).sum(dim=-1, keepdim=True) * unit_global
+        )
+        lambda19 = torch.sigmoid(self.lambda19_raw).to(
+            dtype=local19.dtype,
+            device=local19.device,
+        )
+        lambda27 = torch.sigmoid(self.lambda27_raw).to(
+            dtype=local27.dtype,
+            device=local27.device,
+        )
+        local19_soft = local19 - lambda19 * parallel19
+        local27_soft = local27 - lambda27 * parallel27
+
+        detail_gates = self.get_detail_gates().to(
+            dtype=global_feat.dtype,
+            device=global_feat.device,
+        )
+        gate36 = self.get_gate36().to(
+            dtype=global_feat.dtype,
+            device=global_feat.device,
+        )
+        detail = (
+            detail_gates[0] * local19_soft
+            + detail_gates[1] * local27_soft
+        )
+        semantic36 = gate36 * local36
+        gamma_detail = self.get_gamma_detail().to(
+            dtype=global_feat.dtype,
+            device=global_feat.device,
+        )
+        gamma_sem = self.get_gamma_sem().to(
+            dtype=global_feat.dtype,
+            device=global_feat.device,
+        )
+        fused_feat = (
+            global_feat
+            + gamma_detail * detail
+            + gamma_sem * semantic36
+        )
         fused_feats = F.normalize(fused_feat, p=2, dim=-1, eps=1e-6)
-        local_feats = F.normalize(local_feat, p=2, dim=-1, eps=1e-6)
-
-        if self.training:
-            return deep_feats, fused_feats, local_feats
-        return fused_feats
+        self._update_layerwise_runtime_stats(
+            global_feat,
+            fused_feats,
+            detail,
+            semantic36,
+        )
+        debug_info = {
+            name: value.detach()
+            for name, value in self._fusion_runtime_stats.items()
+        }
+        return deep_feats, fused_feats, debug_info

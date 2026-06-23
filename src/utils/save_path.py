@@ -26,11 +26,17 @@ def _teacher_tuning_tag(args):
     return ""
 
 
+def _teacher_fusion_tag(args):
+    mode = getattr(args, "resolved_fusion_mode", getattr(args, "fusion_mode", "none"))
+    return f"_fusion-{mode}"
+
+
 def get_save_pth(args):
     save_dir = os.path.join(
         getattr(args, 'output_root', 'src/checkpoint/teacher'),
         'dinov3' +
         _teacher_tuning_tag(args) +
+        _teacher_fusion_tag(args) +
         f"_{_loss_weight_tag(args)}"
     )
     return save_dir

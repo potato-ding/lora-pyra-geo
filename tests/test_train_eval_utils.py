@@ -68,6 +68,17 @@ class TeacherLikeDtypeModel(torch.nn.Module):
         return x.float()
 
 
+class TupleDescriptorModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.scale = torch.nn.Parameter(torch.tensor(1.0))
+
+    def forward(self, x):
+        deep = x.float() * self.scale
+        fused = torch.flip(deep, dims=[1])
+        return deep, fused, {"source": "test"}
+
+
 class FakeDist:
     class ReduceOp:
         SUM = "sum"
@@ -168,6 +179,19 @@ class ExtractFeaturesDistTest(unittest.TestCase):
         self.assertEqual(r5, 100.0)
         self.assertEqual(r10, 100.0)
         self.assertEqual(mean_ap, 100.0)
+
+    def test_deep_and_fused_descriptor_selection_both_produce_metrics(self):
+        loader = DataLoader(TinyIndexedDataset(), batch_size=2, shuffle=False)
+        for feature_name in ("deep", "fused"):
+            metrics = train_eval_utils.getdist_1652_val_and_get_recall(
+                TupleDescriptorModel(),
+                loader,
+                loader,
+                torch.device("cpu"),
+                task_name=f"test:{feature_name}",
+                feature_name=feature_name,
+            )
+            self.assertEqual(metrics, (100.0, 100.0, 100.0, 100.0))
 
     def test_gta_metrics_use_paper_subset_and_percentage_sdm(self):
         query_features = torch.tensor([[1.0, 0.0], [0.0, 1.0]], dtype=torch.float32)

@@ -23,5 +23,5 @@ def test_teacher_save_path_ignores_legacy_timestamp_folder():
     assert args.run_timestamp not in save_path
     assert save_path == os.path.join(
         args.output_root,
-        "dinov3_loss_tri0_infonce1",
+        "dinov3_fusion-none_loss_tri0_infonce1",
     )

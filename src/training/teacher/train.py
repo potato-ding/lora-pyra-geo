@@ -26,8 +26,13 @@ from src.utils.gather_features_and_labels_and_views import gather_features_and_l
 from src.utils.train_eval_utils import getdist_1652_val_and_get_recall
 from src.dataset.teacher.datasets import create_1652_teacher_train_dataloaders
 from src.dataset.teacher.val_dataloaders import build_1652_val_dataloaders
+from src.models.teacher.checkpoint_guard import (
+    reject_removed_fusion_state_dict,
+    validate_fusion_state_matches_model,
+)
 from src.models.teacher.model import TeacherModel
 from src.training.teacher.args import parse_args
+from src.training.teacher.hparams import save_hyperparameters
 from src.utils.teacher.optimizer import build_optimizer_and_scale
 from src.utils.teacher.scheduler import get_scheduler
 from src.utils.save_path import get_save_pth
@@ -101,22 +106,6 @@ def _json_safe_value(value):
     return str(value)
 
 
-def save_hyperparameters(save_dir, args):
-    hyperparameters = {
-        key: _json_safe_value(value)
-        for key, value in sorted(vars(args).items())
-    }
-    payload = {
-        "save_dir": save_dir,
-        "command": " ".join(sys.argv),
-        "hyperparameters": hyperparameters,
-    }
-
-    json_path = os.path.join(save_dir, "hyperparameters.json")
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2, ensure_ascii=False)
-
-
 def save_metrics_json(save_dir, filename, payload):
     json_path = os.path.join(save_dir, filename)
     with open(json_path, "w", encoding="utf-8") as f:
@@ -139,6 +128,8 @@ def load_teacher_init_checkpoint(model, checkpoint_path, device, strict_trainabl
 
     checkpoint = safe_torch_load(checkpoint_path, map_location="cpu")
     state_dict = checkpoint.get("state_dict", checkpoint.get("model", checkpoint))
+    reject_removed_fusion_state_dict(state_dict, checkpoint_path)
+    validate_fusion_state_matches_model(state_dict, model, checkpoint_path)
     model_state = model.state_dict()
     mapped_state = {}
     unexpected = []
@@ -334,54 +325,40 @@ def print_teacher_feature_fusion_config(model_or_engine):
 
     config = base_model.get_feature_fusion_config()
     print(
-        f"[TeacherFusion] fusion_mode = {config.get('fusion_mode', 'none')} | "
-        f"use_local_fusion = {config.get('use_local_fusion', False)} | "
-        f"use_soft_orth_fusion = {config['use_soft_orth_fusion']}"
-    )
-    print(
-        f"[TeacherFusion] local_feature_layers = {config['local_feature_layers']} "
-        f"# {config['layer_index_base']}"
+        f"[TeacherFusion] fusion_mode={config.get('fusion_mode', 'none')} | "
+        f"detail_layers={config['detail_layers']} | "
+        f"semantic_layer={config['semantic_layer']}"
     )
     for item in config["layer_regions"]:
         print(f"[TeacherFusion] layer {item['layer']}: {item['region']}")
-    print(
-        f"[TeacherFusion] use_soft_orth_fusion={config['use_soft_orth_fusion']} | "
-        f"soft_orth_lambda_init={config['soft_orth_lambda_init']:.6g} | "
-        f"soft_orth_detach_global={config['soft_orth_detach_global']}"
-    )
-    if config.get("fusion_mode") == "hybrid_dual_path_fusion":
-        gate_inits = config.get("hybrid_gate_inits", {})
+    if config.get("fusion_mode") == "layerwise_soft_orth":
         print(
-            f"[TeacherFusion] gamma_max={config.get('gamma_max', 0.05):.6f} | "
-            f"gamma_19_parallel_init={gate_inits.get('gamma_19_parallel', 0.0):.6f} | "
-            f"gamma_19_perp_init={gate_inits.get('gamma_19_perp', 0.0):.6f} | "
-            f"gamma_27_parallel_init={gate_inits.get('gamma_27_parallel', 0.0):.6f} | "
-            f"gamma_27_perp_init={gate_inits.get('gamma_27_perp', 0.0):.6f} | "
-            f"gamma_36_init={gate_inits.get('gamma_36', 0.0):.6f}"
+            f"[TeacherFusion] lambda19_init={config['lambda19_init']:.6f} | "
+            f"lambda27_init={config['lambda27_init']:.6f} | "
+            f"gamma_detail={config['gamma_detail_init']:.6f}/"
+            f"{config['gamma_detail_max']:.6f} | "
+            f"gamma_sem={config['gamma_sem_init']:.6f}/"
+            f"{config['gamma_sem_max']:.6f} | "
+            f"gate36_init={config['gate36_init']:.6f} | "
+            f"detach_global={config['soft_orth_detach_global']}"
         )
 
 
-def format_hybrid_fusion_runtime(values):
-    if values.get("fusion_mode") != "hybrid_dual_path_fusion":
+def format_layerwise_fusion_runtime(values):
+    if values.get("fusion_mode") != "layerwise_soft_orth":
         return None
-    gate_text = (
-        f"gamma_19_parallel={values.get('gamma_19_parallel', 0.0):.6f} | "
-        f"gamma_19_perp={values.get('gamma_19_perp', 0.0):.6f} | "
-        f"gamma_27_parallel={values.get('gamma_27_parallel', 0.0):.6f} | "
-        f"gamma_27_perp={values.get('gamma_27_perp', 0.0):.6f} | "
-        f"gamma_36={values.get('gamma_36', 0.0):.6f}"
-    )
-    if "cos_local_19_global" not in values:
-        return gate_text
     return (
-        f"{gate_text} | "
-        f"cos(local_19,global)={values.get('cos_local_19_global', float('nan')):.4f} | "
-        f"cos(local_27,global)={values.get('cos_local_27_global', float('nan')):.4f} | "
-        f"cos(local_36,global)={values.get('cos_local_36_global', float('nan')):.4f} | "
-        f"ratio_19_parallel={values.get('ratio_19_parallel', float('nan')):.4f} | "
-        f"ratio_19_perp={values.get('ratio_19_perp', float('nan')):.4f} | "
-        f"ratio_27_parallel={values.get('ratio_27_parallel', float('nan')):.4f} | "
-        f"ratio_27_perp={values.get('ratio_27_perp', float('nan')):.4f}"
+        f"lambda19={values.get('lambda19', float('nan')):.6f} | "
+        f"lambda27={values.get('lambda27', float('nan')):.6f} | "
+        f"gamma_detail={values.get('gamma_detail', float('nan')):.6f} | "
+        f"gamma_sem={values.get('gamma_sem', float('nan')):.6f} | "
+        f"gate19={values.get('gate19', float('nan')):.6f} | "
+        f"gate27={values.get('gate27', float('nan')):.6f} | "
+        f"gate36={values.get('gate36', float('nan')):.6f} | "
+        f"cos_global_fused={values.get('cos_global_fused', float('nan')):.4f} | "
+        f"cos_global_detail={values.get('cos_global_detail', float('nan')):.4f} | "
+        f"cos_global_semantic36="
+        f"{values.get('cos_global_semantic36', float('nan')):.4f}"
     )
 
 
@@ -1145,17 +1122,14 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
             fusion_values = get_model_debug_values(model_engine)
             print(
                 f"[Fusion] Epoch {epoch}/{args.epochs} | "
-                f"fusion_mode={fusion_values.get('fusion_mode', 'none')} | "
-                f"gamma={fusion_values.get('gamma', 0.0):.6f} | "
-                f"lambda_orth={fusion_values.get('lambda_orth', 0.0):.6f} | "
-                f"use_local_fusion={fusion_values.get('use_local_fusion', False)} | "
-                f"use_soft_orth_fusion={fusion_values.get('use_soft_orth_fusion', False)} | "
-                f"soft_orth_detach_global={fusion_values.get('soft_orth_detach_global', True)} | "
-                f"local_feature_layers={fusion_values.get('local_feature_layers', [])}"
+                f"fusion_mode={fusion_values.get('fusion_mode', 'none')}"
             )
-            hybrid_runtime = format_hybrid_fusion_runtime(fusion_values)
-            if hybrid_runtime is not None:
-                print(f"[FusionHybrid] Epoch {epoch}/{args.epochs} | {hybrid_runtime}")
+            layerwise_runtime = format_layerwise_fusion_runtime(fusion_values)
+            if layerwise_runtime is not None:
+                print(
+                    f"[FusionLayerwise] Epoch {epoch}/{args.epochs} | "
+                    f"{layerwise_runtime}"
+                )
             print(
                 f"[Train] Epoch {epoch}/{args.epochs} start | "
                 f"mode={mode_name} ({mode_desc}) | "
@@ -1167,10 +1141,13 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
         for batch_idx, batch in enumerate(epoch_dataloader):
             imgs, labels, views, batch_meta = unpack_training_batch(batch, effective_mode, amp_device)
             
-            # 4. 前向传播：训练时 TeacherModel 返回 (deep, fused, local)，loss 使用 fused。
-            final_feats = model_engine(imgs)
-            if isinstance(final_feats, tuple):
-                final_feats = final_feats[1] if len(final_feats) > 1 else final_feats[0]
+            # TeacherModel returns (deep, fused, debug_info); training always uses fused.
+            model_output = model_engine(imgs)
+            if not isinstance(model_output, (tuple, list)) or len(model_output) < 2:
+                raise RuntimeError(
+                    "TeacherModel must return (deep, fused, debug_info)"
+                )
+            final_feats = model_output[1]
 
             # 跨卡特征聚合
             all_feats, all_labels, all_views = gather_features_and_labels_and_views(final_feats, labels, views)
@@ -1283,11 +1260,11 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                     f"lr={lr:.2e} | scale={debug_values.get('scale', 0.0):.3f} | "
                     f"elapsed={elapsed_min:.1f}m"
                 )
-                hybrid_runtime = format_hybrid_fusion_runtime(debug_values)
-                if hybrid_runtime is not None:
+                layerwise_runtime = format_layerwise_fusion_runtime(debug_values)
+                if layerwise_runtime is not None:
                     print(
-                        f"[FusionHybrid] Epoch {epoch}/{args.epochs} | "
-                        f"batch {step}/{num_batches} | {hybrid_runtime}"
+                        f"[FusionLayerwise] Epoch {epoch}/{args.epochs} | "
+                        f"batch {step}/{num_batches} | {layerwise_runtime}"
                     )
 
         if is_main_process():
@@ -1321,6 +1298,7 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                     g_loader_d2s,
                     amp_device,
                     task_name="D2S",
+                    feature_name="fused",
                 )
                 clear_memory_cache()
                 s2d_r1, s2d_r5, s2d_r10, s2d_map = getdist_1652_val_and_get_recall(
@@ -1329,6 +1307,7 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                     g_loader_s2d,
                     amp_device,
                     task_name="S2D",
+                    feature_name="fused",
                 )
             finally:
                 if ema_applied:

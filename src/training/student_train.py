@@ -659,6 +659,7 @@ def build_online_teacher_model(args, device):
     for param in teacher.parameters():
         param.requires_grad_(False)
     teacher._online_kd_dtype = teacher_dtype
+    teacher._online_kd_feature = "fused"
     actual_teacher_dim = getattr(teacher, "feature_dim", None)
     configured_teacher_dim = int(getattr(args, "teacher_dim", 0) or 0)
     if (
@@ -692,6 +693,8 @@ def build_online_teacher_model(args, device):
             f"feature_dim={resolved_teacher_dim or 'runtime-check'} | "
             f"precision={args.teacher_precision} | "
             f"micro_batch_size={args.teacher_micro_batch_size} | "
+            f"fusion_mode={getattr(teacher, 'fusion_mode', 'none')} | "
+            "descriptor=fused | "
             f"trainable_params={trainable}"
         )
     return teacher
@@ -717,11 +720,11 @@ def forward_teacher_online(teacher_model, images, micro_batch_size):
                 teacher_images = teacher_images.to(dtype=teacher_dtype)
             teacher_output = teacher_model(teacher_images)
             if isinstance(teacher_output, (tuple, list)):
-                teacher_output = (
-                    teacher_output[1]
-                    if len(teacher_output) > 1
-                    else teacher_output[0]
-                )
+                if len(teacher_output) < 2:
+                    raise RuntimeError(
+                        "Online teacher output does not contain a fused descriptor"
+                    )
+                teacher_output = teacher_output[1]
             if teacher_output.ndim != 2:
                 raise RuntimeError(
                     "Teacher must return [B, D] descriptors, got "

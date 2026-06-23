@@ -468,6 +468,39 @@ def test_teacher_forward_uses_micro_batches_and_inference_mode():
     )
 
 
+def test_online_teacher_forward_selects_fused_descriptor():
+    class TupleTeacher(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.anchor = nn.Parameter(torch.tensor(1.0))
+            self._online_kd_dtype = torch.float32
+
+        def forward(self, x):
+            deep = torch.zeros(x.size(0), 4)
+            fused = torch.stack(
+                [x[:, 0], x[:, 1], x[:, 2], x[:, 0] + x[:, 1]],
+                dim=1,
+            )
+            return deep, fused, {}
+
+    teacher = TupleTeacher().eval()
+    images = torch.randn(3, 3)
+    features = forward_teacher_online(teacher, images, micro_batch_size=2)
+    expected = F.normalize(
+        torch.stack(
+            [
+                images[:, 0],
+                images[:, 1],
+                images[:, 2],
+                images[:, 0] + images[:, 1],
+            ],
+            dim=1,
+        ),
+        dim=1,
+    )
+    torch.testing.assert_close(features, expected)
+
+
 def test_teacher_gather_is_detached_and_preserves_view_order(monkeypatch):
     def fake_gather(tensor):
         return torch.cat([tensor, tensor + 10.0], dim=0)
@@ -511,18 +544,32 @@ def test_online_teacher_loader_freezes_teacher_and_optimizer_excludes_it(
         def __init__(self, args):
             super().__init__()
             self.proj = nn.Linear(3, 5)
+            self.fusion_mode = args.fusion_mode
 
         def forward(self, x):
             return self.proj(x.float())
 
     checkpoint = tmp_path / "best_model.pth"
     checkpoint.touch()
-    monkeypatch.setattr(teacher_model_module, "TeacherModel", TinyTeacher)
-    monkeypatch.setattr(
-        teacher_evaluate,
-        "load_checkpoint_hparams",
-        lambda *args, **kwargs: None,
+    (tmp_path / "hyperparameters.json").write_text(
+        json.dumps(
+            {
+                "hyperparameters": {
+                    "fusion_mode": "layerwise_soft_orth",
+                    "detail_layers": [19, 27],
+                    "semantic_layer": 36,
+                    "lambda19_init": 0.8,
+                    "lambda27_init": 0.8,
+                    "gamma_detail_max": 0.02,
+                    "gamma_sem_max": 0.02,
+                    "gamma_detail_init": 0.005,
+                    "gamma_sem_init": 0.005,
+                }
+            }
+        ),
+        encoding="utf-8",
     )
+    monkeypatch.setattr(teacher_model_module, "TeacherModel", TinyTeacher)
     monkeypatch.setattr(
         teacher_evaluate,
         "load_teacher_checkpoint",
@@ -541,6 +588,7 @@ def test_online_teacher_loader_freezes_teacher_and_optimizer_excludes_it(
     teacher = build_online_teacher_model(Args, torch.device("cpu"))
 
     assert teacher.training is False
+    assert teacher.fusion_mode == "layerwise_soft_orth"
     assert all(not param.requires_grad for param in teacher.parameters())
     optimizer_param_ids = {
         id(param)

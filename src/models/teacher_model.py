@@ -4,23 +4,23 @@ The implementation lives in ``src.models.teacher.model``.
 """
 
 from src.models.teacher.model import (
+    FUSION_MODE_LAYERWISE_SOFT_ORTH,
+    FUSION_MODE_NONE,
     PYRALocalCrossAttention,
     TeacherModel,
-    apply_soft_orthogonal_local_fusion,
-    decompose_local_feature,
-    parse_local_feature_layers,
+    parse_detail_layers,
     resolve_fusion_mode,
     resolve_teacher_tuning_ranges,
-    validate_local_feature_layers,
+    validate_layerwise_layers,
 )
 
 __all__ = [
+    "FUSION_MODE_LAYERWISE_SOFT_ORTH",
+    "FUSION_MODE_NONE",
     "PYRALocalCrossAttention",
     "TeacherModel",
-    "apply_soft_orthogonal_local_fusion",
-    "decompose_local_feature",
-    "parse_local_feature_layers",
+    "parse_detail_layers",
     "resolve_fusion_mode",
     "resolve_teacher_tuning_ranges",
-    "validate_local_feature_layers",
+    "validate_layerwise_layers",
 ]

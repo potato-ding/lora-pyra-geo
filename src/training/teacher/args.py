@@ -66,18 +66,44 @@ def build_arg_parser():
     parser.add_argument('--lora_alpha', type=int, default=16, help='LoRA alpha')
     parser.add_argument('--lora_dropout', type=float, default=0.1, help='LoRA dropout')
     parser.add_argument('--lora_target_names', type=str, default='qkv,proj', help='逗号分隔的 LoRA 目标 Linear 名称')
-    parser.add_argument('--local_feature_layers', type=str, default='19,27,36', help='逗号分隔的 local/PYRA transformer block 输出 index，0-based')
-    parser.add_argument('--use_local_fusion', action='store_true', help='启用 local token 分支并与最终 CLS 特征融合')
-    parser.add_argument('--use_soft_orth_fusion', action='store_true', help='启用 learnable soft orthogonal local fusion')
-    parser.add_argument('--fusion_mode', type=str, choices=['none', 'local', 'soft_orthogonal', 'hybrid_dual_path_fusion'], default=None, help='Feature fusion mode; explicit value takes precedence over legacy fusion flags')
-    parser.add_argument('--soft_orth_lambda_init', type=float, default=0.8, help='lambda_orth 的 sigmoid 初始化值')
-    parser.add_argument('--soft_orth_detach_global', type=str2bool, nargs='?', const=True, default=True, help='soft orthogonal projection 是否使用 global_feat.detach()')
-    parser.add_argument('--gamma_max', type=float, default=0.05, help='Maximum value for hybrid dual-path gates')
-    parser.add_argument('--gamma_19_parallel_init', type=float, default=0.005)
-    parser.add_argument('--gamma_19_perp_init', type=float, default=0.015)
-    parser.add_argument('--gamma_27_parallel_init', type=float, default=0.010)
-    parser.add_argument('--gamma_27_perp_init', type=float, default=0.015)
-    parser.add_argument('--gamma_36_init', type=float, default=0.010)
+    parser.add_argument(
+        '--fusion_mode',
+        type=str,
+        choices=['none', 'layerwise_soft_orth'],
+        default='none',
+        help='Teacher descriptor mode.',
+    )
+    parser.add_argument(
+        '--detail_layers',
+        type=int,
+        nargs=2,
+        default=[19, 27],
+        metavar=('LAYER19', 'LAYER27'),
+        help='Two detail-layer block indices; the current architecture requires 19 27.',
+    )
+    parser.add_argument(
+        '--semantic_layer',
+        type=int,
+        default=36,
+        help='Semantic enhancement block index; the current architecture requires 36.',
+    )
+    parser.add_argument('--lambda19_init', type=float, default=0.8)
+    parser.add_argument('--lambda27_init', type=float, default=0.8)
+    parser.add_argument(
+        '--soft_orth_detach_global',
+        type=str2bool,
+        nargs='?',
+        const=True,
+        default=True,
+        help='Use global_feat.detach() as the layer-wise orthogonal reference.',
+    )
+    parser.add_argument('--gate19_init', type=float, default=0.5)
+    parser.add_argument('--gate27_init', type=float, default=0.5)
+    parser.add_argument('--gate36_init', type=float, default=0.5)
+    parser.add_argument('--gamma_detail_max', type=float, default=0.02)
+    parser.add_argument('--gamma_sem_max', type=float, default=0.02)
+    parser.add_argument('--gamma_detail_init', type=float, default=0.005)
+    parser.add_argument('--gamma_sem_init', type=float, default=0.005)
 
     # Loss weights. Sample4Geo-style training defaults to cross-view InfoNCE only.
     parser.add_argument('--triplet_weight', type=float, default=0.0, help='两个同域三元组损失的权重；设为 0 可关闭')

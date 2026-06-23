@@ -3,18 +3,16 @@ import sys
 import unittest
 from types import SimpleNamespace
 
-import torch
-
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from src.models.teacher_model import (
-    apply_soft_orthogonal_local_fusion,
-    parse_local_feature_layers,
+    parse_detail_layers,
+    resolve_fusion_mode,
     resolve_teacher_tuning_ranges,
-    validate_local_feature_layers,
+    validate_layerwise_layers,
 )
 
 
@@ -24,6 +22,7 @@ def make_args(**kwargs):
         "lora_end_block": None,
         "full_finetune_start_block": None,
         "full_finetune_end_block": None,
+        "fusion_mode": "none",
     }
     defaults.update(kwargs)
     return SimpleNamespace(**defaults)
@@ -32,7 +31,6 @@ def make_args(**kwargs):
 class TeacherTuningRangesTest(unittest.TestCase):
     def test_default_plan_for_dinov3_7b_40_blocks(self):
         ranges = resolve_teacher_tuning_ranges(make_args(), num_blocks=40)
-
         self.assertEqual(ranges["lora_range"], (20, 36))
         self.assertEqual(ranges["full_range"], (36, 40))
 
@@ -46,7 +44,6 @@ class TeacherTuningRangesTest(unittest.TestCase):
             ),
             num_blocks=32,
         )
-
         self.assertEqual(ranges["lora_range"], (18, 25))
         self.assertEqual(ranges["full_range"], (25, 31))
 
@@ -61,28 +58,30 @@ class TeacherTuningRangesTest(unittest.TestCase):
                 num_blocks=32,
             )
 
-    def test_parses_local_feature_layers_from_comma_string(self):
-        self.assertEqual(parse_local_feature_layers("19,27,36"), [19, 27, 36])
-        self.assertEqual(parse_local_feature_layers("15, 23, 31"), [15, 23, 31])
-
-    def test_rejects_out_of_range_local_feature_layers(self):
-        with self.assertRaises(ValueError):
-            validate_local_feature_layers([19, 27, 40], num_blocks=40)
-
-    def test_soft_orthogonal_local_fusion_removes_weighted_projection(self):
-        global_feat = torch.tensor([[2.0, 0.0]])
-        local_feat = torch.tensor([[3.0, 4.0]])
-        lambda_raw = torch.logit(torch.tensor(0.8))
-
-        local_soft, lambda_orth = apply_soft_orthogonal_local_fusion(
-            global_feat,
-            local_feat,
-            lambda_raw,
-            detach_global=True,
+    def test_layerwise_layers_are_explicit_and_validated(self):
+        self.assertEqual(parse_detail_layers([19, 27]), [19, 27])
+        detail, semantic = validate_layerwise_layers(
+            [19, 27],
+            36,
+            num_blocks=40,
         )
+        self.assertEqual(detail, [19, 27])
+        self.assertEqual(semantic, 36)
 
-        self.assertTrue(torch.allclose(lambda_orth, torch.tensor(0.8), atol=1e-6))
-        self.assertTrue(torch.allclose(local_soft, torch.tensor([[0.6, 4.0]]), atol=1e-6))
+    def test_rejects_changed_layerwise_layout(self):
+        with self.assertRaises(ValueError):
+            parse_detail_layers([18, 27])
+        with self.assertRaises(ValueError):
+            validate_layerwise_layers([19, 27], 35, num_blocks=40)
+
+    def test_only_new_fusion_modes_are_accepted(self):
+        self.assertEqual(resolve_fusion_mode(make_args()), "none")
+        self.assertEqual(
+            resolve_fusion_mode(make_args(fusion_mode="layerwise_soft_orth")),
+            "layerwise_soft_orth",
+        )
+        with self.assertRaisesRegex(ValueError, "Legacy teacher fusion modes"):
+            resolve_fusion_mode(make_args(fusion_mode="removed_mode"))
 
 
 if __name__ == "__main__":

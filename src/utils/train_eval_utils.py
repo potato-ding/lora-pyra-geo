@@ -39,8 +39,39 @@ def _model_input_dtype(model):
     return model_dtype if model_dtype is not None else torch.float32
 
 
+def select_model_descriptor(model_output, feature_name=None):
+    if torch.is_tensor(model_output):
+        return model_output
+    if not isinstance(model_output, (tuple, list)) or not model_output:
+        raise RuntimeError(
+            "model output must be a descriptor tensor or a non-empty tuple/list"
+        )
+    if feature_name in (None, "deep"):
+        descriptor = model_output[0]
+    elif feature_name == "fused":
+        if len(model_output) < 2:
+            raise RuntimeError("model output does not contain a fused descriptor")
+        descriptor = model_output[1]
+    else:
+        raise ValueError(
+            f"unsupported feature_name={feature_name!r}; expected 'deep' or 'fused'"
+        )
+    if not torch.is_tensor(descriptor):
+        raise RuntimeError(
+            f"selected {feature_name or 'default'} descriptor is not a tensor"
+        )
+    return descriptor
+
+
 @torch.no_grad()
-def extract_features_dist(model, dataloader, device, stage_name=None, horizontal_flip=False):
+def extract_features_dist(
+    model,
+    dataloader,
+    device,
+    stage_name=None,
+    horizontal_flip=False,
+    feature_name=None,
+):
     model.eval()
     local_feats, local_labels, local_coords, local_indices = [], [], [], []
     has_coords = False
@@ -65,15 +96,17 @@ def extract_features_dist(model, dataloader, device, stage_name=None, horizontal
             feats = None
             for flip_idx in range(2):
                 model_imgs = torch.flip(imgs, dims=[3]) if flip_idx == 1 else imgs
-                current_feats = model(model_imgs)
-                if isinstance(current_feats, tuple):
-                    current_feats = current_feats[0]
+                current_feats = select_model_descriptor(
+                    model(model_imgs),
+                    feature_name=feature_name,
+                )
                 feats = current_feats if feats is None else feats + current_feats
                 feats = torch.nn.functional.normalize(feats, p=2, dim=1)
         else:
-            feats = model(imgs)
-        if isinstance(feats, tuple):
-            feats = feats[0]
+            feats = select_model_descriptor(
+                model(imgs),
+                feature_name=feature_name,
+            )
 
         # 2. L2 归一化，方便后面直接点乘作为余弦相似度
         feats = torch.nn.functional.normalize(feats, p=2, dim=1)
@@ -154,7 +187,14 @@ def extract_features_dist(model, dataloader, device, stage_name=None, horizontal
     return res_feats, res_labels, res_coords
 
 @torch.no_grad()
-def getdist_1652_val_and_get_recall(model, val_query_loader, val_gallery_loader, device, task_name=None):
+def getdist_1652_val_and_get_recall(
+    model,
+    val_query_loader,
+    val_gallery_loader,
+    device,
+    task_name=None,
+    feature_name=None,
+):
     """
     University-1652 专用多卡验证函数。
 
@@ -174,8 +214,20 @@ def getdist_1652_val_and_get_recall(model, val_query_loader, val_gallery_loader,
     # 1. 提取并 all_gather query / gallery 特征
     query_stage = f"{task_name}:query" if task_name else None
     gallery_stage = f"{task_name}:gallery" if task_name else None
-    q_f, q_l, _ = extract_features_dist(model, val_query_loader, device, stage_name=query_stage)
-    g_f, g_l, _ = extract_features_dist(model, val_gallery_loader, device, stage_name=gallery_stage)
+    q_f, q_l, _ = extract_features_dist(
+        model,
+        val_query_loader,
+        device,
+        stage_name=query_stage,
+        feature_name=feature_name,
+    )
+    g_f, g_l, _ = extract_features_dist(
+        model,
+        val_gallery_loader,
+        device,
+        stage_name=gallery_stage,
+        feature_name=feature_name,
+    )
 
     # 2. 删除 DistributedSampler 为整除 world_size 补出来的重复样本
     real_num_queries = len(val_query_loader.dataset)
@@ -288,10 +340,26 @@ def getdist_1652_val_and_get_recall(model, val_query_loader, val_gallery_loader,
 
     return recall_1, recall_5, recall_10, mAP
 
-def run_val_and_get_recall(model, val_query_loader, val_gallery_loader, device):
+def run_val_and_get_recall(
+    model,
+    val_query_loader,
+    val_gallery_loader,
+    device,
+    feature_name=None,
+):
     # 1. 提取全局特征 (提取函数内部已做完 all_gather)
-    q_f, q_l, q_c = extract_features_dist(model, val_query_loader, device)
-    g_f, g_l, g_c = extract_features_dist(model, val_gallery_loader, device)
+    q_f, q_l, q_c = extract_features_dist(
+        model,
+        val_query_loader,
+        device,
+        feature_name=feature_name,
+    )
+    g_f, g_l, g_c = extract_features_dist(
+        model,
+        val_gallery_loader,
+        device,
+        feature_name=feature_name,
+    )
 
     # 剔除 Dataloader 为整除而补齐(padding)的冗余数据
     real_num_queries = len(val_query_loader.dataset)
@@ -427,9 +495,25 @@ def run_val_and_get_recall(model, val_query_loader, val_gallery_loader, device):
 
 
 @torch.no_grad()
-def run_gta_val_and_get_metrics(model, val_query_loader, val_gallery_loader, device):
-    q_f, q_l, q_c = extract_features_dist(model, val_query_loader, device)
-    g_f, g_l, g_c = extract_features_dist(model, val_gallery_loader, device)
+def run_gta_val_and_get_metrics(
+    model,
+    val_query_loader,
+    val_gallery_loader,
+    device,
+    feature_name=None,
+):
+    q_f, q_l, q_c = extract_features_dist(
+        model,
+        val_query_loader,
+        device,
+        feature_name=feature_name,
+    )
+    g_f, g_l, g_c = extract_features_dist(
+        model,
+        val_gallery_loader,
+        device,
+        feature_name=feature_name,
+    )
 
     real_num_queries = len(val_query_loader.dataset)
     real_num_gallery = len(val_gallery_loader.dataset)
@@ -526,18 +610,27 @@ def run_gta_val_and_get_metrics(model, val_query_loader, val_gallery_loader, dev
 
 
 @torch.no_grad()
-def run_sues_val_and_get_metrics(model, val_query_loader, val_gallery_loader, device, horizontal_flip=False):
+def run_sues_val_and_get_metrics(
+    model,
+    val_query_loader,
+    val_gallery_loader,
+    device,
+    horizontal_flip=False,
+    feature_name=None,
+):
     q_f, q_l, _ = extract_features_dist(
         model,
         val_query_loader,
         device,
         horizontal_flip=horizontal_flip,
+        feature_name=feature_name,
     )
     g_f, g_l, _ = extract_features_dist(
         model,
         val_gallery_loader,
         device,
         horizontal_flip=horizontal_flip,
+        feature_name=feature_name,
     )
 
     real_num_queries = len(val_query_loader.dataset)

@@ -42,10 +42,20 @@ def build_optimizer_and_scale(model, args):
         )
 
         is_fusion_param = (
-            name in {"gamma_raw", "lambda_orth_raw"}
-            or (name.startswith("gamma_") and name.endswith("_raw"))
-            or name.startswith("local_cross_attn.")
-            or name.startswith("local_proj.")
+            name in {
+                "lambda19_raw",
+                "lambda27_raw",
+                "detail_gate_logits",
+                "gate36_raw",
+                "gamma_detail_raw",
+                "gamma_sem_raw",
+            }
+            or name.startswith("pool19.")
+            or name.startswith("proj19.")
+            or name.startswith("pool27.")
+            or name.startswith("proj27.")
+            or name.startswith("pool36.")
+            or name.startswith("proj36.")
         )
 
         if "lora_" in name:
@@ -145,7 +155,7 @@ def build_optimizer_and_scale(model, args):
     print(f"[TeacherOptimizer] using {optimizer_class.__name__}")
     print(f"[TeacherOptimizer] lora lr: {args.lr:.6g}")
     print(f"[TeacherOptimizer] full_finetune lr: {full_lr:.6g} (mult={full_lr_mult:g})")
-    print(f"[TeacherOptimizer] local/fusion lr: {args.lr:.6g}")
+    print(f"[TeacherOptimizer] layerwise fusion lr: {args.lr:.6g}")
     print(f"[TeacherOptimizer] logit_scale lr: {logit_scale_lr:.6g} (mult={logit_scale_lr_mult:g})")
     return optimizer
 

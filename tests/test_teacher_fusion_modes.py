@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import os
 import sys
 import tempfile
@@ -9,6 +10,7 @@ from unittest import mock
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset
 
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -16,14 +18,15 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from src.models.teacher.model import (
-    FUSION_MODE_HYBRID_DUAL_PATH,
+    FUSION_MODE_LAYERWISE_SOFT_ORTH,
     FUSION_MODE_NONE,
-    FUSION_MODE_SOFT_ORTHOGONAL,
     TeacherModel,
-    _gate_raw_from_init,
-    apply_soft_orthogonal_local_fusion,
 )
 from src.training.teacher.evaluate import load_teacher_checkpoint
+from src.training.teacher.evaluate import load_checkpoint_hparams
+from src.training.teacher.evaluate import evaluate_dataset
+from src.training.teacher.args import build_arg_parser
+from src.training.teacher.hparams import save_hyperparameters
 
 
 OPTIMIZER_PATH = os.path.join(
@@ -74,10 +77,10 @@ class FakeBackbone(nn.Module):
         self.model = FakeIntermediateModel(dim=dim)
 
 
-class CountingLocalPool(nn.Module):
-    def __init__(self):
+class CountingLayerPool(nn.Module):
+    def __init__(self, scale):
         super().__init__()
-        self.scale = nn.Parameter(torch.tensor(1.0))
+        self.scale = nn.Parameter(torch.tensor(float(scale)))
         self.call_count = 0
 
     def forward(self, tokens):
@@ -85,8 +88,12 @@ class CountingLocalPool(nn.Module):
         return self.scale * tokens.mean(dim=1)
 
 
-def gate_raw(init_value, gamma_max=0.05):
-    return torch.logit(torch.tensor(init_value / gamma_max, dtype=torch.float32))
+class TinyTeacherEvalDataset(Dataset):
+    def __len__(self):
+        return 2
+
+    def __getitem__(self, index):
+        return torch.full((3, 8, 8), float(index)), index, index
 
 
 def make_lightweight_teacher(fusion_mode):
@@ -94,49 +101,46 @@ def make_lightweight_teacher(fusion_mode):
     nn.Module.__init__(model)
     model.backbone = FakeBackbone(dim=4)
     model.final_layer_index = 39
-    model.local_feature_layers = [19, 27, 36]
+    model.detail_layers = [19, 27]
+    model.semantic_layer = 36
     model.fusion_mode = fusion_mode
-    model.use_local_fusion = fusion_mode != FUSION_MODE_NONE
-    model.use_soft_orth_fusion = fusion_mode == FUSION_MODE_SOFT_ORTHOGONAL
     model.target_layers = (
-        [19, 27, 36, 39] if model.use_local_fusion else [39]
+        [39]
+        if fusion_mode == FUSION_MODE_NONE
+        else [19, 27, 36, 39]
     )
     model.feature_dim = 4
-    model.local_cross_attn = CountingLocalPool()
-    model.local_proj = nn.Linear(4, 4, bias=False)
-    with torch.no_grad():
-        model.local_proj.weight.copy_(torch.eye(4))
-
-    model.gamma_raw = nn.Parameter(torch.tensor(0.0))
-    model.lambda_orth_raw = nn.Parameter(torch.logit(torch.tensor(0.8)))
-    model.soft_orth_detach_global = True
-    model.soft_orth_lambda_init = 0.8
-    model.gamma_max = 0.05
-    model.hybrid_gate_inits = {
-        "gamma_19_parallel": 0.005,
-        "gamma_19_perp": 0.015,
-        "gamma_27_parallel": 0.010,
-        "gamma_27_perp": 0.015,
-        "gamma_36": 0.010,
-    }
-    for name, init_value in model.hybrid_gate_inits.items():
-        setattr(model, f"{name}_raw", nn.Parameter(gate_raw(init_value)))
     model._fusion_runtime_stats = {}
     model.logit_scale = nn.Parameter(torch.log(torch.tensor(1 / 0.07)))
 
-    model.gamma_raw.requires_grad_(
-        fusion_mode == "local" or fusion_mode == FUSION_MODE_SOFT_ORTHOGONAL
-    )
-    model.lambda_orth_raw.requires_grad_(
-        fusion_mode == FUSION_MODE_SOFT_ORTHOGONAL
-    )
-    hybrid_trainable = fusion_mode == FUSION_MODE_HYBRID_DUAL_PATH
-    for name in model.hybrid_gate_inits:
-        getattr(model, f"{name}_raw").requires_grad_(hybrid_trainable)
-    if not model.use_local_fusion:
-        for module in (model.local_cross_attn, model.local_proj):
-            for parameter in module.parameters():
-                parameter.requires_grad_(False)
+    if fusion_mode == FUSION_MODE_LAYERWISE_SOFT_ORTH:
+        model.pool19 = CountingLayerPool(1.0)
+        model.proj19 = nn.Linear(4, 4, bias=False)
+        model.pool27 = CountingLayerPool(1.5)
+        model.proj27 = nn.Linear(4, 4, bias=False)
+        model.pool36 = CountingLayerPool(2.0)
+        model.proj36 = nn.Linear(4, 4, bias=False)
+        with torch.no_grad():
+            model.proj19.weight.copy_(torch.eye(4))
+            model.proj27.weight.copy_(torch.eye(4))
+            model.proj36.weight.copy_(torch.eye(4))
+
+        model.soft_orth_detach_global = True
+        model.lambda19_init = 0.8
+        model.lambda27_init = 0.8
+        model.lambda19_raw = nn.Parameter(torch.logit(torch.tensor(0.8)))
+        model.lambda27_raw = nn.Parameter(torch.logit(torch.tensor(0.8)))
+        model.detail_gate_logits = nn.Parameter(
+            torch.log(torch.tensor([0.5, 0.5]))
+        )
+        model.gate36_init = 0.5
+        model.gate36_raw = nn.Parameter(torch.logit(torch.tensor(0.5)))
+        model.gamma_detail_max = 0.02
+        model.gamma_sem_max = 0.02
+        model.gamma_detail_init = 0.005
+        model.gamma_sem_init = 0.005
+        model.gamma_detail_raw = nn.Parameter(torch.logit(torch.tensor(0.25)))
+        model.gamma_sem_raw = nn.Parameter(torch.logit(torch.tensor(0.25)))
     return model
 
 
@@ -145,9 +149,9 @@ class TeacherFusionModesTest(unittest.TestCase):
         torch.manual_seed(7)
         self.images = torch.randn(2, 3, 8, 8)
 
-    def test_none_is_global_cls_only(self):
+    def test_none_returns_global_descriptor_for_deep_and_fused(self):
         model = make_lightweight_teacher(FUSION_MODE_NONE).train()
-        deep, fused, local = model(self.images)
+        deep, fused, debug = model(self.images)
 
         expected = F.normalize(
             model.backbone.model.final_cls.expand(self.images.size(0), -1),
@@ -155,77 +159,143 @@ class TeacherFusionModesTest(unittest.TestCase):
         )
         self.assertTrue(torch.allclose(deep, expected, atol=1e-6))
         self.assertTrue(torch.allclose(fused, expected, atol=1e-6))
-        self.assertTrue(torch.allclose(local, expected, atol=1e-6))
-        self.assertEqual(model.local_cross_attn.call_count, 0)
+        self.assertEqual(debug, {})
+        self.assertFalse(hasattr(model, "pool19"))
+        (fused * torch.tensor([1.0, -0.5, 0.25, 0.75])).sum().backward()
+        self.assertIsNotNone(model.backbone.model.final_cls.grad)
 
-    def test_soft_orthogonal_matches_legacy_combined_local_path(self):
-        model = make_lightweight_teacher(FUSION_MODE_SOFT_ORTHOGONAL).train()
-        _, fused, _ = model(self.images)
+    def test_layerwise_forward_matches_three_independent_branches(self):
+        model = make_lightweight_teacher(
+            FUSION_MODE_LAYERWISE_SOFT_ORTH
+        ).train()
+        deep, fused, debug = model(self.images)
 
         backbone = model.backbone.model
-        global_feat = backbone.final_cls.expand(self.images.size(0), -1)
-        combined_tokens = torch.cat(
-            [
-                backbone.layer_tokens[str(layer)].expand(self.images.size(0), -1, -1)
-                for layer in (19, 27, 36)
-            ],
-            dim=1,
-        )
-        local_feat = model.local_proj(
-            model.local_cross_attn.scale * combined_tokens.mean(dim=1)
-        )
-        local_soft, _ = apply_soft_orthogonal_local_fusion(
-            global_feat,
-            local_feat,
-            model.lambda_orth_raw,
-            detach_global=True,
-        )
+        batch_size = self.images.size(0)
+        global_feat = backbone.final_cls.expand(batch_size, -1)
+        unit_global = F.normalize(global_feat.detach(), dim=-1)
+
+        local19 = backbone.layer_tokens["19"].expand(
+            batch_size, -1, -1
+        ).mean(dim=1)
+        local27 = 1.5 * backbone.layer_tokens["27"].expand(
+            batch_size, -1, -1
+        ).mean(dim=1)
+        local36 = 2.0 * backbone.layer_tokens["36"].expand(
+            batch_size, -1, -1
+        ).mean(dim=1)
+        parallel19 = (local19 * unit_global).sum(
+            dim=-1, keepdim=True
+        ) * unit_global
+        parallel27 = (local27 * unit_global).sum(
+            dim=-1, keepdim=True
+        ) * unit_global
+        detail = 0.5 * (local19 - 0.8 * parallel19)
+        detail = detail + 0.5 * (local27 - 0.8 * parallel27)
+        semantic36 = 0.5 * local36
         expected = F.normalize(
-            global_feat + model.get_gamma() * local_soft,
+            global_feat + 0.005 * detail + 0.005 * semantic36,
             dim=-1,
         )
 
+        self.assertTrue(torch.allclose(deep.norm(dim=-1), torch.ones(2)))
         self.assertTrue(torch.allclose(fused, expected, atol=1e-6))
-        self.assertEqual(model.local_cross_attn.call_count, 1)
+        self.assertEqual(model.pool19.call_count, 1)
+        self.assertEqual(model.pool27.call_count, 1)
+        self.assertEqual(model.pool36.call_count, 1)
+        self.assertEqual(
+            set(debug),
+            {
+                "cos_global_fused",
+                "cos_global_detail",
+                "cos_global_semantic36",
+            },
+        )
 
-    def test_hybrid_forward_backward_and_runtime_stats(self):
-        model = make_lightweight_teacher(FUSION_MODE_HYBRID_DUAL_PATH).train()
+    def test_layerwise_backward_and_runtime_values(self):
+        model = make_lightweight_teacher(
+            FUSION_MODE_LAYERWISE_SOFT_ORTH
+        ).train()
         _, fused, _ = model(self.images)
         target = F.normalize(torch.randn_like(fused), dim=-1)
         loss = (fused - target).square().mean()
         loss.backward()
 
-        self.assertEqual(model.local_cross_attn.call_count, 3)
-        self.assertTrue(torch.allclose(fused.norm(dim=-1), torch.ones(2), atol=1e-6))
-        for name, expected_init in model.hybrid_gate_inits.items():
-            parameter = getattr(model, f"{name}_raw")
-            self.assertIsNotNone(parameter.grad)
-            self.assertTrue(torch.isfinite(parameter.grad))
-            actual_gate = model.get_hybrid_gates()[name].item()
-            self.assertAlmostEqual(actual_gate, expected_init, places=6)
+        for name in (
+            "lambda19_raw",
+            "lambda27_raw",
+            "detail_gate_logits",
+            "gate36_raw",
+            "gamma_detail_raw",
+            "gamma_sem_raw",
+        ):
+            grad = dict(model.named_parameters())[name].grad
+            self.assertIsNotNone(grad, name)
+            self.assertTrue(torch.isfinite(grad).all(), name)
 
         runtime = model.get_fusion_runtime_values()
+        self.assertAlmostEqual(runtime["lambda19"], 0.8, places=6)
+        self.assertAlmostEqual(runtime["lambda27"], 0.8, places=6)
+        self.assertAlmostEqual(runtime["gamma_detail"], 0.005, places=6)
+        self.assertAlmostEqual(runtime["gamma_sem"], 0.005, places=6)
+        self.assertAlmostEqual(
+            runtime["gate19"] + runtime["gate27"],
+            1.0,
+            places=6,
+        )
         for key in (
-            "cos_local_19_global",
-            "cos_local_27_global",
-            "cos_local_36_global",
-            "ratio_19_parallel",
-            "ratio_19_perp",
-            "ratio_27_parallel",
-            "ratio_27_perp",
+            "gate36",
+            "cos_global_fused",
+            "cos_global_detail",
+            "cos_global_semantic36",
         ):
-            self.assertIn(key, runtime)
-            self.assertTrue(torch.isfinite(torch.tensor(runtime[key])))
+            self.assertTrue(torch.isfinite(torch.tensor(runtime[key])), key)
 
-    def test_production_gate_raw_initialization(self):
-        defaults = (0.005, 0.015, 0.010, 0.015, 0.010)
-        for init_value in defaults:
-            raw = _gate_raw_from_init(init_value, 0.05, "test_gate")
-            actual = 0.05 * torch.sigmoid(raw)
-            self.assertAlmostEqual(actual.item(), init_value, places=7)
+    def test_none_and_layerwise_eval_return_selectable_descriptors(self):
+        for mode in (FUSION_MODE_NONE, FUSION_MODE_LAYERWISE_SOFT_ORTH):
+            model = make_lightweight_teacher(mode).eval()
+            with torch.no_grad():
+                deep, fused, debug = model(self.images)
+            self.assertEqual(deep.shape, (2, 4))
+            self.assertEqual(fused.shape, (2, 4))
+            self.assertTrue(
+                torch.allclose(deep.norm(dim=-1), torch.ones(2), atol=1e-6)
+            )
+            self.assertTrue(
+                torch.allclose(fused.norm(dim=-1), torch.ones(2), atol=1e-6)
+            )
+            self.assertIsInstance(debug, dict)
 
-    def test_hybrid_gates_are_in_optimizer(self):
-        model = make_lightweight_teacher(FUSION_MODE_HYBRID_DUAL_PATH)
+    def test_eval_feature_deep_and_fused_produce_d2s_and_s2d_metrics(self):
+        loader = DataLoader(
+            TinyTeacherEvalDataset(),
+            batch_size=2,
+            shuffle=False,
+        )
+        loaders = {
+            "D2S": (loader, loader),
+            "S2D": (loader, loader),
+        }
+        model = make_lightweight_teacher(
+            FUSION_MODE_LAYERWISE_SOFT_ORTH
+        ).eval()
+        for eval_feature in ("deep", "fused"):
+            results = evaluate_dataset(
+                model,
+                SimpleNamespace(eval_feature=eval_feature),
+                "1652",
+                torch.device("cpu"),
+                loaders=loaders,
+            )
+            self.assertEqual(set(results), {"D2S", "S2D"})
+            for direction in ("D2S", "S2D"):
+                self.assertEqual(
+                    set(results[direction]),
+                    {"R@1", "R@5", "R@10", "mAP"},
+                )
+
+    def test_layerwise_parameters_are_in_optimizer(self):
+        model = make_lightweight_teacher(FUSION_MODE_LAYERWISE_SOFT_ORTH)
         args = SimpleNamespace(
             lr=1e-4,
             full_finetune_lr_mult=0.1,
@@ -239,30 +309,108 @@ class TeacherFusionModesTest(unittest.TestCase):
             for group in optimizer.param_groups
             for parameter in group["params"]
         }
-        for name in model.hybrid_gate_inits:
-            self.assertIn(id(getattr(model, f"{name}_raw")), optimizer_param_ids)
+        for name in (
+            "lambda19_raw",
+            "lambda27_raw",
+            "detail_gate_logits",
+            "gate36_raw",
+            "gamma_detail_raw",
+            "gamma_sem_raw",
+        ):
+            self.assertIn(
+                id(dict(model.named_parameters())[name]),
+                optimizer_param_ids,
+            )
+        for module in (
+            model.pool19,
+            model.proj19,
+            model.pool27,
+            model.proj27,
+            model.pool36,
+            model.proj36,
+        ):
+            for parameter in module.parameters():
+                self.assertIn(id(parameter), optimizer_param_ids)
 
-    def test_hybrid_trainable_checkpoint_round_trip(self):
-        source = make_lightweight_teacher(FUSION_MODE_HYBRID_DUAL_PATH)
+    def test_layerwise_checkpoint_round_trip(self):
+        source = make_lightweight_teacher(FUSION_MODE_LAYERWISE_SOFT_ORTH)
         with torch.no_grad():
-            source.gamma_19_parallel_raw.add_(0.75)
-            source.gamma_36_raw.sub_(0.5)
+            source.lambda19_raw.add_(0.75)
+            source.gamma_sem_raw.sub_(0.5)
 
         trainable_state = {
             name: parameter.detach().clone()
             for name, parameter in source.named_parameters()
             if parameter.requires_grad
         }
-        target = make_lightweight_teacher(FUSION_MODE_HYBRID_DUAL_PATH)
+        target = make_lightweight_teacher(FUSION_MODE_LAYERWISE_SOFT_ORTH)
         with tempfile.TemporaryDirectory() as tmp_dir:
-            checkpoint_path = os.path.join(tmp_dir, "hybrid.pth")
+            checkpoint_path = os.path.join(tmp_dir, "layerwise.pth")
             torch.save(trainable_state, checkpoint_path)
-            load_teacher_checkpoint(target, checkpoint_path, torch.device("cpu"))
+            load_teacher_checkpoint(
+                target,
+                checkpoint_path,
+                torch.device("cpu"),
+            )
 
         for name, expected in trainable_state.items():
             self.assertTrue(
                 torch.allclose(dict(target.named_parameters())[name], expected)
             )
+
+    def test_removed_fusion_checkpoint_is_rejected(self):
+        target = make_lightweight_teacher(FUSION_MODE_LAYERWISE_SOFT_ORTH)
+        removed_key = "lambda" + "_orth_raw"
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            checkpoint_path = os.path.join(tmp_dir, "removed.pth")
+            torch.save({removed_key: torch.tensor(0.0)}, checkpoint_path)
+            with self.assertRaisesRegex(RuntimeError, "removed teacher fusion"):
+                load_teacher_checkpoint(
+                    target,
+                    checkpoint_path,
+                    torch.device("cpu"),
+                )
+
+    def test_new_hyperparameters_save_and_restore_without_removed_fields(self):
+        parser = build_arg_parser()
+        args = parser.parse_args(
+            [
+                "--fusion_mode",
+                "layerwise_soft_orth",
+                "--lambda19_init",
+                "0.75",
+                "--gamma_sem_init",
+                "0.01",
+            ]
+        )
+        removed_key = "soft_orth_" + "lambda_init"
+        setattr(args, removed_key, 0.2)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            save_hyperparameters(tmp_dir, args)
+            hparam_path = os.path.join(tmp_dir, "hyperparameters.json")
+            with open(hparam_path, "r", encoding="utf-8") as handle:
+                saved = json.load(handle)["hyperparameters"]
+
+            self.assertEqual(saved["fusion_mode"], "layerwise_soft_orth")
+            self.assertEqual(saved["detail_layers"], [19, 27])
+            self.assertEqual(saved["semantic_layer"], 36)
+            self.assertEqual(saved["lambda19_init"], 0.75)
+            self.assertEqual(saved["gamma_sem_init"], 0.01)
+            self.assertNotIn(removed_key, saved)
+
+            defaults = {
+                action.dest: action.default
+                for action in parser._actions
+            }
+            restored = parser.parse_args([])
+            restored.checkpoint = os.path.join(tmp_dir, "best_model.pth")
+            restored.no_checkpoint_hparams = False
+            load_checkpoint_hparams(restored, defaults, [])
+
+        self.assertEqual(restored.fusion_mode, "layerwise_soft_orth")
+        self.assertEqual(restored.lambda19_init, 0.75)
+        self.assertEqual(restored.gamma_sem_init, 0.01)
 
 
 if __name__ == "__main__":
