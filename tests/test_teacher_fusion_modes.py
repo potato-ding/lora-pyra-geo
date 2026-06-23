@@ -175,26 +175,45 @@ class TeacherFusionModesTest(unittest.TestCase):
         global_feat = backbone.final_cls.expand(batch_size, -1)
         unit_global = F.normalize(global_feat.detach(), dim=-1)
 
-        local19 = backbone.layer_tokens["19"].expand(
-            batch_size, -1, -1
-        ).mean(dim=1)
-        local27 = 1.5 * backbone.layer_tokens["27"].expand(
-            batch_size, -1, -1
-        ).mean(dim=1)
-        local36 = 2.0 * backbone.layer_tokens["36"].expand(
-            batch_size, -1, -1
-        ).mean(dim=1)
+        local19 = F.normalize(
+            backbone.layer_tokens["19"].expand(
+                batch_size, -1, -1
+            ).mean(dim=1),
+            dim=-1,
+        )
+        local27 = F.normalize(
+            1.5 * backbone.layer_tokens["27"].expand(
+                batch_size, -1, -1
+            ).mean(dim=1),
+            dim=-1,
+        )
+        local36 = F.normalize(
+            2.0 * backbone.layer_tokens["36"].expand(
+                batch_size, -1, -1
+            ).mean(dim=1),
+            dim=-1,
+        )
         parallel19 = (local19 * unit_global).sum(
             dim=-1, keepdim=True
         ) * unit_global
         parallel27 = (local27 * unit_global).sum(
             dim=-1, keepdim=True
         ) * unit_global
-        detail = 0.5 * (local19 - 0.8 * parallel19)
-        detail = detail + 0.5 * (local27 - 0.8 * parallel27)
-        semantic36 = 0.5 * local36
+        local19_soft = F.normalize(
+            local19 - 0.8 * parallel19,
+            dim=-1,
+        )
+        local27_soft = F.normalize(
+            local27 - 0.8 * parallel27,
+            dim=-1,
+        )
+        detail = F.normalize(
+            0.5 * local19_soft + 0.5 * local27_soft,
+            dim=-1,
+        )
+        semantic = F.normalize(local36, dim=-1)
         expected = F.normalize(
-            global_feat + 0.005 * detail + 0.005 * semantic36,
+            unit_global + 0.005 * detail + 0.005 * 0.5 * semantic,
             dim=-1,
         )
 
@@ -209,6 +228,14 @@ class TeacherFusionModesTest(unittest.TestCase):
                 "cos_global_fused",
                 "cos_global_detail",
                 "cos_global_semantic36",
+                "norm_global",
+                "norm_local19",
+                "norm_local27",
+                "norm_local36",
+                "norm_detail",
+                "norm_semantic",
+                "norm_gamma_detail_detail",
+                "norm_gamma_sem_semantic",
             },
         )
 
@@ -250,6 +277,38 @@ class TeacherFusionModesTest(unittest.TestCase):
             "cos_global_semantic36",
         ):
             self.assertTrue(torch.isfinite(torch.tensor(runtime[key])), key)
+        for key in (
+            "norm_global",
+            "norm_local19",
+            "norm_local27",
+            "norm_local36",
+            "norm_detail",
+            "norm_semantic",
+        ):
+            self.assertAlmostEqual(runtime[key], 1.0, places=5)
+        self.assertAlmostEqual(
+            runtime["norm_gamma_detail_detail"],
+            runtime["gamma_detail"],
+            places=6,
+        )
+        self.assertAlmostEqual(
+            runtime["norm_gamma_sem_semantic"],
+            runtime["gamma_sem"] * runtime["gate36"],
+            places=6,
+        )
+        self.assertGreater(runtime["cos_global_fused"], 0.98)
+
+    def test_layerwise_rejects_nonfinite_projection_output(self):
+        model = make_lightweight_teacher(
+            FUSION_MODE_LAYERWISE_SOFT_ORTH
+        ).train()
+        with torch.no_grad():
+            model.proj19.weight.fill_(float("inf"))
+        with self.assertRaisesRegex(
+            FloatingPointError,
+            "local19_projected contains",
+        ):
+            model(self.images)
 
     def test_none_and_layerwise_eval_return_selectable_descriptors(self):
         for mode in (FUSION_MODE_NONE, FUSION_MODE_LAYERWISE_SOFT_ORTH):

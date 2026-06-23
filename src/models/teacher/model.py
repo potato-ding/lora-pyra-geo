@@ -530,20 +530,48 @@ class TeacherModel(nn.Module):
             )
         return local_feat
 
+    @staticmethod
+    def _require_finite(name, tensor):
+        if not torch.isfinite(tensor).all():
+            nonfinite_count = int((~torch.isfinite(tensor)).sum().item())
+            raise FloatingPointError(
+                f"{name} contains {nonfinite_count} non-finite values; "
+                "refusing to continue layerwise_soft_orth fusion"
+            )
+
     @torch.no_grad()
     def _update_layerwise_runtime_stats(
         self,
-        global_feat,
-        fused_feat,
+        global_descriptor,
+        fused_descriptor,
+        local19,
+        local27,
+        local36,
         detail,
-        semantic36,
+        semantic,
+        detail_update,
+        semantic_update,
         eps=1e-6,
     ):
-        global_ref = global_feat.detach().float()
+        tensors = {
+            "global_descriptor": global_descriptor,
+            "fused_descriptor": fused_descriptor,
+            "local19": local19,
+            "local27": local27,
+            "local36": local36,
+            "detail": detail,
+            "semantic": semantic,
+            "detail_update": detail_update,
+            "semantic_update": semantic_update,
+        }
+        for name, tensor in tensors.items():
+            self._require_finite(name, tensor)
+
+        global_ref = global_descriptor.detach().float()
         self._fusion_runtime_stats = {
             "cos_global_fused": F.cosine_similarity(
                 global_ref,
-                fused_feat.detach().float(),
+                fused_descriptor.detach().float(),
                 dim=-1,
                 eps=eps,
             ).mean(),
@@ -555,10 +583,24 @@ class TeacherModel(nn.Module):
             ).mean(),
             "cos_global_semantic36": F.cosine_similarity(
                 global_ref,
-                semantic36.detach().float(),
+                semantic.detach().float(),
                 dim=-1,
                 eps=eps,
             ).mean(),
+            "norm_global": global_ref.norm(p=2, dim=-1).mean(),
+            "norm_local19": local19.detach().float().norm(p=2, dim=-1).mean(),
+            "norm_local27": local27.detach().float().norm(p=2, dim=-1).mean(),
+            "norm_local36": local36.detach().float().norm(p=2, dim=-1).mean(),
+            "norm_detail": detail.detach().float().norm(p=2, dim=-1).mean(),
+            "norm_semantic": semantic.detach().float().norm(p=2, dim=-1).mean(),
+            "norm_gamma_detail_detail": detail_update.detach()
+            .float()
+            .norm(p=2, dim=-1)
+            .mean(),
+            "norm_gamma_sem_semantic": semantic_update.detach()
+            .float()
+            .norm(p=2, dim=-1)
+            .mean(),
         }
 
     def forward(self, x):
@@ -585,6 +627,7 @@ class TeacherModel(nn.Module):
         )
         global_feat = final_cls.float()
         deep_feats = F.normalize(global_feat, p=2, dim=-1, eps=1e-6)
+        self._require_finite("deep_feats", deep_feats)
 
         if self.fusion_mode == FUSION_MODE_NONE:
             return deep_feats, deep_feats, {}
@@ -615,18 +658,22 @@ class TeacherModel(nn.Module):
             self.proj36,
             global_feat,
         )
+        self._require_finite("local19_projected", local19)
+        self._require_finite("local27_projected", local27)
+        self._require_finite("local36_projected", local36)
+        local19 = F.normalize(local19, p=2, dim=-1, eps=1e-6)
+        local27 = F.normalize(local27, p=2, dim=-1, eps=1e-6)
+        local36 = F.normalize(local36, p=2, dim=-1, eps=1e-6)
+        self._require_finite("local19", local19)
+        self._require_finite("local27", local27)
+        self._require_finite("local36", local36)
 
         orth_reference = (
-            global_feat.detach()
+            deep_feats.detach()
             if self.soft_orth_detach_global
-            else global_feat
+            else deep_feats
         )
-        unit_global = F.normalize(
-            orth_reference,
-            p=2,
-            dim=-1,
-            eps=1e-6,
-        )
+        unit_global = orth_reference
         parallel19 = (
             (local19 * unit_global).sum(dim=-1, keepdim=True) * unit_global
         )
@@ -643,39 +690,70 @@ class TeacherModel(nn.Module):
         )
         local19_soft = local19 - lambda19 * parallel19
         local27_soft = local27 - lambda27 * parallel27
+        self._require_finite("local19_soft_pre_normalize", local19_soft)
+        self._require_finite("local27_soft_pre_normalize", local27_soft)
+        local19_soft = F.normalize(
+            local19_soft,
+            p=2,
+            dim=-1,
+            eps=1e-6,
+        )
+        local27_soft = F.normalize(
+            local27_soft,
+            p=2,
+            dim=-1,
+            eps=1e-6,
+        )
+        self._require_finite("local19_soft", local19_soft)
+        self._require_finite("local27_soft", local27_soft)
 
         detail_gates = self.get_detail_gates().to(
-            dtype=global_feat.dtype,
-            device=global_feat.device,
+            dtype=deep_feats.dtype,
+            device=deep_feats.device,
         )
         gate36 = self.get_gate36().to(
-            dtype=global_feat.dtype,
-            device=global_feat.device,
+            dtype=deep_feats.dtype,
+            device=deep_feats.device,
         )
         detail = (
             detail_gates[0] * local19_soft
             + detail_gates[1] * local27_soft
         )
-        semantic36 = gate36 * local36
+        self._require_finite("detail_pre_normalize", detail)
+        detail = F.normalize(detail, p=2, dim=-1, eps=1e-6)
+        semantic = F.normalize(local36, p=2, dim=-1, eps=1e-6)
+        self._require_finite("detail", detail)
+        self._require_finite("semantic", semantic)
         gamma_detail = self.get_gamma_detail().to(
-            dtype=global_feat.dtype,
-            device=global_feat.device,
+            dtype=deep_feats.dtype,
+            device=deep_feats.device,
         )
         gamma_sem = self.get_gamma_sem().to(
-            dtype=global_feat.dtype,
-            device=global_feat.device,
+            dtype=deep_feats.dtype,
+            device=deep_feats.device,
         )
+        detail_update = gamma_detail * detail
+        semantic_update = gamma_sem * gate36 * semantic
+        self._require_finite("detail_update", detail_update)
+        self._require_finite("semantic_update", semantic_update)
         fused_feat = (
-            global_feat
-            + gamma_detail * detail
-            + gamma_sem * semantic36
+            deep_feats
+            + detail_update
+            + semantic_update
         )
+        self._require_finite("fused_feat_pre_normalize", fused_feat)
         fused_feats = F.normalize(fused_feat, p=2, dim=-1, eps=1e-6)
+        self._require_finite("fused_feats", fused_feats)
         self._update_layerwise_runtime_stats(
-            global_feat,
+            deep_feats,
             fused_feats,
+            local19,
+            local27,
+            local36,
             detail,
-            semantic36,
+            semantic,
+            detail_update,
+            semantic_update,
         )
         debug_info = {
             name: value.detach()

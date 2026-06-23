@@ -347,7 +347,7 @@ def print_teacher_feature_fusion_config(model_or_engine):
 def format_layerwise_fusion_runtime(values):
     if values.get("fusion_mode") != "layerwise_soft_orth":
         return None
-    return (
+    text = (
         f"lambda19={values.get('lambda19', float('nan')):.6f} | "
         f"lambda27={values.get('lambda27', float('nan')):.6f} | "
         f"gamma_detail={values.get('gamma_detail', float('nan')):.6f} | "
@@ -355,10 +355,38 @@ def format_layerwise_fusion_runtime(values):
         f"gate19={values.get('gate19', float('nan')):.6f} | "
         f"gate27={values.get('gate27', float('nan')):.6f} | "
         f"gate36={values.get('gate36', float('nan')):.6f} | "
-        f"cos_global_fused={values.get('cos_global_fused', float('nan')):.4f} | "
+        f"norm_global={values.get('norm_global', float('nan')):.4f} | "
+        f"norm_local19={values.get('norm_local19', float('nan')):.4f} | "
+        f"norm_local27={values.get('norm_local27', float('nan')):.4f} | "
+        f"norm_local36={values.get('norm_local36', float('nan')):.4f} | "
+        f"norm_detail={values.get('norm_detail', float('nan')):.4f} | "
+        f"norm_semantic={values.get('norm_semantic', float('nan')):.4f} | "
+        f"norm_gamma_detail_detail="
+        f"{values.get('norm_gamma_detail_detail', float('nan')):.6f} | "
+        f"norm_gamma_sem_semantic="
+        f"{values.get('norm_gamma_sem_semantic', float('nan')):.6f} | "
+        f"cos_global_fused={values.get('cos_global_fused', float('nan')):.6f} | "
         f"cos_global_detail={values.get('cos_global_detail', float('nan')):.4f} | "
         f"cos_global_semantic36="
         f"{values.get('cos_global_semantic36', float('nan')):.4f}"
+    )
+    return text
+
+
+def warn_if_fusion_rotation_is_large(values, epoch, step=None):
+    cosine = values.get("cos_global_fused")
+    if cosine is None or not math.isfinite(float(cosine)):
+        return
+    if float(cosine) >= 0.98:
+        return
+    location = f"epoch={epoch}"
+    if step is not None:
+        location += f" batch={step}"
+    print(
+        "[FusionLayerwise][WARNING] "
+        f"{location} | cos_global_fused={float(cosine):.6f} < 0.98 | "
+        "the fused descriptor is rotating too far from the global descriptor",
+        flush=True,
     )
 
 
@@ -1130,6 +1158,10 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                     f"[FusionLayerwise] Epoch {epoch}/{args.epochs} | "
                     f"{layerwise_runtime}"
                 )
+                warn_if_fusion_rotation_is_large(
+                    fusion_values,
+                    epoch=epoch,
+                )
             print(
                 f"[Train] Epoch {epoch}/{args.epochs} start | "
                 f"mode={mode_name} ({mode_desc}) | "
@@ -1265,6 +1297,11 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                     print(
                         f"[FusionLayerwise] Epoch {epoch}/{args.epochs} | "
                         f"batch {step}/{num_batches} | {layerwise_runtime}"
+                    )
+                    warn_if_fusion_rotation_is_large(
+                        debug_values,
+                        epoch=epoch,
+                        step=step,
                     )
 
         if is_main_process():
