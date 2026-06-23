@@ -587,13 +587,13 @@ def resolve_teacher_checkpoint_path(checkpoint_path):
     if checkpoint_path is None:
         raise ValueError("--distill true requires --teacher_ckpt")
     if os.path.isdir(checkpoint_path):
-        for filename in ("best_model.pth", "final_model.pth"):
+        for filename in ("best_model.pth", "last_model.pth"):
             candidate = os.path.join(checkpoint_path, filename)
             if os.path.isfile(candidate):
                 return candidate
         raise FileNotFoundError(
             "Teacher checkpoint directory does not contain "
-            f"best_model.pth or final_model.pth: {checkpoint_path}"
+            f"best_model.pth or last_model.pth: {checkpoint_path}"
         )
     if not os.path.isfile(checkpoint_path):
         raise FileNotFoundError(f"Teacher checkpoint not found: {checkpoint_path}")

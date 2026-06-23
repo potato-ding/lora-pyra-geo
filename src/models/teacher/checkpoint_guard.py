@@ -82,6 +82,6 @@ def validate_fusion_state_matches_model(state_dict, model, source):
         raise RuntimeError(
             f"{source} was saved with fusion_mode={checkpoint_mode}, but the "
             f"constructed teacher uses fusion_mode={model_mode}. Keep the new "
-            "hyperparameters.json beside the checkpoint or pass the matching "
+            "bset_metricis.json beside the checkpoint or pass the matching "
             "--fusion_mode explicitly."
         )

@@ -32,11 +32,13 @@ from src.models.teacher.checkpoint_guard import (
 )
 from src.models.teacher.model import TeacherModel
 from src.training.teacher.args import parse_args
-from src.training.teacher.hparams import save_hyperparameters
+from src.training.teacher.hparams import (
+    remove_legacy_training_artifacts,
+    save_training_record,
+)
 from src.utils.teacher.optimizer import build_optimizer_and_scale
 from src.utils.teacher.scheduler import get_scheduler
 from src.utils.save_path import get_save_pth
-from src.utils.validation_results import save_validation_results
 if 'OMP_NUM_THREADS' not in os.environ:
     os.environ['OMP_NUM_THREADS'] = '4'
 
@@ -104,12 +106,6 @@ def _json_safe_value(value):
     if isinstance(value, dict):
         return {str(key): _json_safe_value(val) for key, val in value.items()}
     return str(value)
-
-
-def save_metrics_json(save_dir, filename, payload):
-    json_path = os.path.join(save_dir, filename)
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(_json_safe_value(payload), f, indent=2, ensure_ascii=False)
 
 
 def _strip_module_prefix(key):
@@ -224,18 +220,6 @@ def build_validation_metrics(epoch, d2s_metrics, s2d_metrics):
             "mAP": s2d_map,
         },
     }
-
-
-def build_best_metrics_payload(best_metrics, validation_history):
-    payload = {
-        "epoch": best_metrics["epoch"],
-        "selection_metric": best_metrics["selection_metric"],
-        "best_R@1_sum": best_metrics["R@1_sum"],
-        "D2S": best_metrics["D2S"],
-        "S2D": best_metrics["S2D"],
-        "validation_history": validation_history,
-    }
-    return payload
 
 
 def get_current_lr(optimizer, scheduler=None):
@@ -1101,7 +1085,20 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
     save_dir = get_save_pth(args)
     if is_main_process():
         os.makedirs(save_dir, exist_ok=True)
-        save_hyperparameters(save_dir, args)
+        removed_artifacts = remove_legacy_training_artifacts(save_dir)
+        if removed_artifacts:
+            print(
+                "[Checkpoint] Removed legacy training artifacts: "
+                + ", ".join(os.path.basename(path) for path in removed_artifacts),
+                flush=True,
+            )
+        save_training_record(
+            save_dir=save_dir,
+            args=args,
+            validation_history=[],
+            best_metrics=None,
+            last_completed_epoch=0,
+        )
         print(f"[Checkpoint] Save directory: {save_dir}")
     if dist.is_available() and dist.is_initialized():
         dist.barrier()
@@ -1315,6 +1312,19 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                 f"[Train] Epoch {epoch}/{args.epochs} done | mode={mode_name} | "
                 f"updates={loss_counts['total']} | {avg_text} | time={elapsed_min:.1f}m"
             )
+            last_state = {name: value.cpu() for name, value in ema.shadow.items()}
+            torch.save(last_state, os.path.join(save_dir, "last_model.pth"))
+            save_training_record(
+                save_dir=save_dir,
+                args=args,
+                validation_history=validation_history,
+                best_metrics=best_metrics,
+                last_completed_epoch=epoch,
+            )
+            print(
+                f"[Checkpoint] Saved last_model.pth | epoch={epoch}",
+                flush=True,
+            )
         cur_epoch = epoch
         if val_loaders is not None and should_run_validation(cur_epoch, args):
             if is_main_process():
@@ -1364,7 +1374,6 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                 history_record = dict(current_metrics)
                 history_record["is_best"] = is_best
                 validation_history.append(history_record)
-                save_validation_results(save_dir, validation_history)
 
                 if is_best:
                     best_r1_sum = r1_sum
@@ -1372,14 +1381,13 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                     best_metrics = current_metrics
                     torch.save(trainable_state, os.path.join(save_dir, "best_model.pth"))
 
-                save_metrics_json(
-                    save_dir,
-                    "best_metrics.json",
-                    build_best_metrics_payload(best_metrics, validation_history),
+                save_training_record(
+                    save_dir=save_dir,
+                    args=args,
+                    validation_history=validation_history,
+                    best_metrics=best_metrics,
+                    last_completed_epoch=cur_epoch,
                 )
-
-                if cur_epoch == args.epochs:
-                    torch.save(trainable_state, os.path.join(save_dir, "final_model.pth"))
 
                 print(
                     f"[Eval] Epoch {cur_epoch}/{args.epochs} done | "
@@ -1390,11 +1398,6 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                 if is_best:
                     print(
                         f"[Checkpoint] Saved best_model.pth | epoch={cur_epoch} | "
-                        f"D2S_R@1={d2s_r1:.2f} | S2D_R@1={s2d_r1:.2f} | R@1_sum={r1_sum:.2f}"
-                    )
-                if cur_epoch == args.epochs:
-                    print(
-                        f"[Checkpoint] Saved final_model.pth | epoch={cur_epoch} | "
                         f"D2S_R@1={d2s_r1:.2f} | S2D_R@1={s2d_r1:.2f} | R@1_sum={r1_sum:.2f}"
                     )
 

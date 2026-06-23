@@ -26,7 +26,11 @@ from src.training.teacher.evaluate import load_teacher_checkpoint
 from src.training.teacher.evaluate import load_checkpoint_hparams
 from src.training.teacher.evaluate import evaluate_dataset
 from src.training.teacher.args import build_arg_parser
-from src.training.teacher.hparams import save_hyperparameters
+from src.training.teacher.hparams import (
+    TRAINING_RECORD_FILENAME,
+    remove_legacy_training_artifacts,
+    save_training_record,
+)
 
 
 OPTIMIZER_PATH = os.path.join(
@@ -430,7 +434,7 @@ class TeacherFusionModesTest(unittest.TestCase):
                     torch.device("cpu"),
                 )
 
-    def test_new_hyperparameters_save_and_restore_without_removed_fields(self):
+    def test_training_record_saves_command_metrics_and_restores_hparams(self):
         parser = build_arg_parser()
         args = parser.parse_args(
             [
@@ -446,10 +450,30 @@ class TeacherFusionModesTest(unittest.TestCase):
         setattr(args, removed_key, 0.2)
 
         with tempfile.TemporaryDirectory() as tmp_dir:
-            save_hyperparameters(tmp_dir, args)
-            hparam_path = os.path.join(tmp_dir, "hyperparameters.json")
+            validation_history = [
+                {
+                    "epoch": 1,
+                    "R@1_sum": 123.0,
+                    "D2S": {"R@1": 61.0},
+                    "S2D": {"R@1": 62.0},
+                    "is_best": True,
+                }
+            ]
+            best_metrics = validation_history[0]
+            save_training_record(
+                save_dir=tmp_dir,
+                args=args,
+                validation_history=validation_history,
+                best_metrics=best_metrics,
+                last_completed_epoch=1,
+            )
+            hparam_path = os.path.join(
+                tmp_dir,
+                TRAINING_RECORD_FILENAME,
+            )
             with open(hparam_path, "r", encoding="utf-8") as handle:
-                saved = json.load(handle)["hyperparameters"]
+                record = json.load(handle)
+            saved = record["hyperparameters"]
 
             self.assertEqual(saved["fusion_mode"], "layerwise_soft_orth")
             self.assertEqual(saved["detail_layers"], [19, 27])
@@ -457,6 +481,10 @@ class TeacherFusionModesTest(unittest.TestCase):
             self.assertEqual(saved["lambda19_init"], 0.75)
             self.assertEqual(saved["gamma_sem_init"], 0.01)
             self.assertNotIn(removed_key, saved)
+            self.assertTrue(record["command"])
+            self.assertEqual(record["last_completed_epoch"], 1)
+            self.assertEqual(record["best_metrics"], best_metrics)
+            self.assertEqual(record["validation_results"], validation_history)
 
             defaults = {
                 action.dest: action.default
@@ -470,6 +498,42 @@ class TeacherFusionModesTest(unittest.TestCase):
         self.assertEqual(restored.fusion_mode, "layerwise_soft_orth")
         self.assertEqual(restored.lambda19_init, 0.75)
         self.assertEqual(restored.gamma_sem_init, 0.01)
+
+    def test_legacy_teacher_training_artifacts_are_removed(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            legacy_files = (
+                "hyperparameters.json",
+                "best_metrics.json",
+                "final_model.pth",
+                "validation_results.json",
+            )
+            for filename in legacy_files:
+                with open(
+                    os.path.join(tmp_dir, filename),
+                    "w",
+                    encoding="utf-8",
+                ) as handle:
+                    handle.write("legacy")
+            validation_dir = os.path.join(tmp_dir, "validation_results")
+            os.makedirs(validation_dir)
+            with open(
+                os.path.join(validation_dir, "epoch_0001.json"),
+                "w",
+                encoding="utf-8",
+            ) as handle:
+                handle.write("legacy")
+
+            allowed_path = os.path.join(tmp_dir, "best_model.pth")
+            with open(allowed_path, "wb") as handle:
+                handle.write(b"keep")
+
+            removed = remove_legacy_training_artifacts(tmp_dir)
+
+            self.assertEqual(len(removed), 5)
+            self.assertTrue(os.path.isfile(allowed_path))
+            for filename in legacy_files:
+                self.assertFalse(os.path.exists(os.path.join(tmp_dir, filename)))
+            self.assertFalse(os.path.exists(validation_dir))
 
 
 if __name__ == "__main__":

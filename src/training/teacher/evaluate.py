@@ -24,6 +24,7 @@ from src.models.teacher.checkpoint_guard import (
     validate_fusion_state_matches_model,
 )
 from src.models.teacher.model import TeacherModel
+from src.training.teacher.hparams import TRAINING_RECORD_FILENAME
 from src.utils.train_eval_utils import getdist_1652_val_and_get_recall, run_gta_val_and_get_metrics, run_sues_val_and_get_metrics
 
 
@@ -99,12 +100,12 @@ def default_dataset_dir(dataset, data_root):
 def resolve_checkpoint_path(checkpoint):
     checkpoint_path = Path(checkpoint)
     if checkpoint_path.is_dir():
-        for filename in ("best_model.pth", "final_model.pth"):
+        for filename in ("best_model.pth", "last_model.pth"):
             candidate = checkpoint_path / filename
             if candidate.is_file():
                 return str(candidate)
         raise FileNotFoundError(
-            f"checkpoint directory does not contain best_model.pth or final_model.pth: "
+            f"checkpoint directory does not contain best_model.pth or last_model.pth: "
             f"{checkpoint_path}"
         )
     return str(checkpoint_path)
@@ -114,7 +115,10 @@ def load_checkpoint_hparams(args, parser_defaults, cli_args):
     if args.no_checkpoint_hparams:
         return
 
-    hparam_path = Path(args.checkpoint).resolve().parent / "hyperparameters.json"
+    hparam_path = (
+        Path(args.checkpoint).resolve().parent
+        / TRAINING_RECORD_FILENAME
+    )
     if not hparam_path.is_file():
         return
 
@@ -227,7 +231,7 @@ def load_teacher_checkpoint(model, checkpoint_path, device):
             f"checkpoint did not cover all trainable teacher parameters; "
             f"missing={len(missing_trainable)}, incompatible={len(incompatible)}. "
             "Check that the evaluation hyperparameters match the training run, "
-            "or keep hyperparameters.json next to the checkpoint."
+            f"or keep {TRAINING_RECORD_FILENAME} next to the checkpoint."
         )
 
 
@@ -391,7 +395,7 @@ def parse_args():
         "--checkpoint",
         type=str,
         required=True,
-        help="Path to a run directory, best_model.pth, or final_model.pth.",
+        help="Path to a run directory, best_model.pth, or last_model.pth.",
     )
     parser.add_argument(
         "--dataset",

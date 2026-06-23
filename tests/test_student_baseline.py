@@ -551,7 +551,7 @@ def test_online_teacher_loader_freezes_teacher_and_optimizer_excludes_it(
 
     checkpoint = tmp_path / "best_model.pth"
     checkpoint.touch()
-    (tmp_path / "hyperparameters.json").write_text(
+    (tmp_path / "bset_metricis.json").write_text(
         json.dumps(
             {
                 "hyperparameters": {
