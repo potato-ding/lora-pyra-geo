@@ -1,4 +1,5 @@
 import math
+import os
 
 import torch
 import torch.distributed as dist
@@ -14,6 +15,11 @@ def _dist_info():
 def _rank_log(message):
     world_size, rank = _dist_info()
     print(f"[Rank {rank}/{world_size}] {message}", flush=True)
+
+
+def _verbose_eval_gather_logging():
+    value = os.environ.get("TEACHER_EVAL_VERBOSE_GATHER", "0").strip().lower()
+    return value in {"1", "true", "yes", "y", "on"}
 
 
 def _distributed_sampler_desc(dataloader):
@@ -112,7 +118,8 @@ def _gather_tensor_variable_batch(
     elif batch_idx is not None:
         batch_part = f" | batch={batch_idx}"
 
-    if log_prefix:
+    verbose_gather = bool(log_prefix) and _verbose_eval_gather_logging()
+    if verbose_gather:
         _rank_log(
             f"{log_prefix} all_gather start{batch_part} | "
             f"tensor={tensor_name} | local_shape={tuple(tensor.shape)}"
@@ -123,6 +130,12 @@ def _gather_tensor_variable_batch(
     dist.all_gather(gathered_lens, local_len)
     lengths = [int(item.item()) for item in gathered_lens]
     max_len = max(lengths)
+    uneven_lengths = len(set(lengths)) != 1
+    if log_prefix and uneven_lengths:
+        _rank_log(
+            f"{log_prefix} [WARNING] all_gather uneven local lengths{batch_part} | "
+            f"tensor={tensor_name} | lengths={lengths} | local_shape={tuple(tensor.shape)}"
+        )
 
     padded = _pad_tensor_dim0(tensor.contiguous(), max_len)
     gathered = [torch.empty_like(padded) for _ in range(world_size)]
@@ -138,7 +151,7 @@ def _gather_tensor_variable_batch(
     else:
         result = tensor.new_empty((0,) + tuple(tensor.shape[1:]))
 
-    if log_prefix:
+    if verbose_gather:
         _rank_log(
             f"{log_prefix} all_gather done{batch_part} | "
             f"tensor={tensor_name} | lengths={lengths} | "
@@ -317,7 +330,8 @@ def extract_features_dist(
         ):
             print(
                 f"{log_prefix} batch {batch_idx}/{len(dataloader)} gathered | "
-                f"batch_feats={tuple(feats.shape)}",
+                f"local_feats={tuple(feats.shape)} | "
+                f"gathered_feats={tuple(gathered_feats.shape)}",
                 flush=True,
             )
 
