@@ -2,6 +2,7 @@ import math
 
 import torch
 import torch.distributed as dist
+from torch.utils.data.distributed import DistributedSampler
 
 
 def _dist_info():
@@ -10,14 +11,154 @@ def _dist_info():
     return 1, 0
 
 
-def _gather_tensor_same_shape(tensor):
+def _rank_log(message):
+    world_size, rank = _dist_info()
+    print(f"[Rank {rank}/{world_size}] {message}", flush=True)
+
+
+def _distributed_sampler_desc(dataloader):
+    sampler = getattr(dataloader, "sampler", None)
+    if sampler is None:
+        return "sampler=None"
+
+    parts = [sampler.__class__.__name__]
+    for name in ("num_replicas", "rank", "num_samples", "total_size", "drop_last"):
+        if hasattr(sampler, name):
+            parts.append(f"{name}={getattr(sampler, name)}")
+    return ", ".join(parts)
+
+
+def _dist_control_device():
+    if torch.cuda.is_available():
+        return torch.device("cuda", torch.cuda.current_device())
+    return torch.device("cpu")
+
+
+def _gather_int_vector(values):
+    world_size, _ = _dist_info()
+    tensor = torch.tensor(values, device=_dist_control_device(), dtype=torch.long)
+    gathered = [torch.zeros_like(tensor) for _ in range(world_size)]
+    dist.all_gather(gathered, tensor)
+    return [item.cpu().tolist() for item in gathered]
+
+
+def _validate_eval_loader_sync(dataloader, stage_name, log_prefix):
+    world_size, rank = _dist_info()
+    if world_size == 1 or not stage_name:
+        return
+
+    sampler = getattr(dataloader, "sampler", None)
+    _rank_log(
+        f"{log_prefix} loader sync check | dataset_samples={len(dataloader.dataset)} | "
+        f"local_batches={len(dataloader)} | batch_size={getattr(dataloader, 'batch_size', 'unknown')} | "
+        f"drop_last={getattr(dataloader, 'drop_last', 'unknown')} | "
+        f"{_distributed_sampler_desc(dataloader)}"
+    )
+    if not isinstance(sampler, DistributedSampler):
+        _rank_log(
+            f"{log_prefix} [WARNING] distributed eval loader is not using "
+            "torch.utils.data.distributed.DistributedSampler; all ranks must still "
+            "execute the same number of batches or all_gather can hang"
+        )
+
+    _rank_log(f"{log_prefix} loader sync all_gather start")
+    rank_summaries = _gather_int_vector([len(dataloader), len(dataloader.dataset)])
+    _rank_log(f"{log_prefix} loader sync all_gather done")
+    local_batches = [item[0] for item in rank_summaries]
+    dataset_lengths = [item[1] for item in rank_summaries]
+    _rank_log(
+        f"{log_prefix} loader sync gathered | local_batches_by_rank={local_batches} | "
+        f"dataset_lengths_by_rank={dataset_lengths}"
+    )
+    if len(set(local_batches)) != 1:
+        raise RuntimeError(
+            f"{log_prefix} validation dataloader batch count differs across ranks: "
+            f"{local_batches}. This would desynchronize all_gather calls."
+        )
+
+
+def _pad_tensor_dim0(tensor, length):
+    if tensor.size(0) == length:
+        return tensor
+    if tensor.size(0) > length:
+        return tensor[:length]
+
+    pad_shape = (length - tensor.size(0),) + tuple(tensor.shape[1:])
+    padding = tensor.new_zeros(pad_shape)
+    return torch.cat([tensor, padding], dim=0)
+
+
+def _gather_tensor_variable_batch(
+    tensor,
+    *,
+    log_prefix=None,
+    tensor_name="tensor",
+    batch_idx=None,
+    total_batches=None,
+):
     world_size, _ = _dist_info()
     if world_size == 1:
         return tensor
 
-    gathered = [torch.empty_like(tensor) for _ in range(world_size)]
-    dist.all_gather(gathered, tensor)
-    return torch.cat(gathered, dim=0)
+    if tensor.ndim == 0:
+        raise RuntimeError(
+            f"distributed evaluation all_gather expects a tensor with batch dimension; "
+            f"got scalar {tensor_name}"
+        )
+
+    batch_part = ""
+    if batch_idx is not None and total_batches is not None:
+        batch_part = f" | batch={batch_idx}/{total_batches}"
+    elif batch_idx is not None:
+        batch_part = f" | batch={batch_idx}"
+
+    if log_prefix:
+        _rank_log(
+            f"{log_prefix} all_gather start{batch_part} | "
+            f"tensor={tensor_name} | local_shape={tuple(tensor.shape)}"
+        )
+
+    local_len = torch.tensor([tensor.size(0)], device=tensor.device, dtype=torch.long)
+    gathered_lens = [torch.zeros_like(local_len) for _ in range(world_size)]
+    dist.all_gather(gathered_lens, local_len)
+    lengths = [int(item.item()) for item in gathered_lens]
+    max_len = max(lengths)
+
+    padded = _pad_tensor_dim0(tensor.contiguous(), max_len)
+    gathered = [torch.empty_like(padded) for _ in range(world_size)]
+    dist.all_gather(gathered, padded)
+
+    chunks = [
+        current[:length]
+        for current, length in zip(gathered, lengths)
+        if length > 0
+    ]
+    if chunks:
+        result = torch.cat(chunks, dim=0)
+    else:
+        result = tensor.new_empty((0,) + tuple(tensor.shape[1:]))
+
+    if log_prefix:
+        _rank_log(
+            f"{log_prefix} all_gather done{batch_part} | "
+            f"tensor={tensor_name} | lengths={lengths} | "
+            f"padded_shape={tuple(padded.shape)} | gathered_shape={tuple(result.shape)}"
+        )
+
+    return result
+
+
+def _all_reduce_sum(tensor, *, log_prefix=None, tensor_name="tensor"):
+    if not (dist.is_available() and dist.is_initialized()):
+        return
+
+    if log_prefix:
+        _rank_log(f"{log_prefix} all_reduce start | tensor={tensor_name}")
+    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    if log_prefix:
+        _rank_log(
+            f"{log_prefix} all_reduce done | tensor={tensor_name} | value={tensor.item():.6f}"
+        )
 
 
 def _first_floating_param_dtype(module):
@@ -85,6 +226,7 @@ def extract_features_dist(
             f"local_batches={len(dataloader)} | world_size={world_size}",
             flush=True,
         )
+    _validate_eval_loader_sync(dataloader, stage_name, log_prefix)
 
     input_dtype = _model_input_dtype(model)
     for batch_idx, batch_data in enumerate(dataloader, start=1):
@@ -127,17 +269,41 @@ def extract_features_dist(
             has_indices = True
 
         # 每个 batch 后立即汇聚，避免不同 rank 的验证耗时差累计到一个巨大的 all_gather。
-        gathered_feats = _gather_tensor_same_shape(feats)
-        gathered_labels = _gather_tensor_same_shape(labels)
+        gathered_feats = _gather_tensor_variable_batch(
+            feats,
+            log_prefix=log_prefix if stage_name else None,
+            tensor_name="features",
+            batch_idx=batch_idx,
+            total_batches=len(dataloader),
+        )
+        gathered_labels = _gather_tensor_variable_batch(
+            labels,
+            log_prefix=log_prefix if stage_name else None,
+            tensor_name="labels",
+            batch_idx=batch_idx,
+            total_batches=len(dataloader),
+        )
         local_feats.append(gathered_feats.detach().cpu())
         local_labels.append(gathered_labels.detach().cpu())
 
         if coord_extra is not None:
-            gathered_coords = _gather_tensor_same_shape(coord_extra)
+            gathered_coords = _gather_tensor_variable_batch(
+                coord_extra,
+                log_prefix=log_prefix if stage_name else None,
+                tensor_name="coords",
+                batch_idx=batch_idx,
+                total_batches=len(dataloader),
+            )
             local_coords.append(gathered_coords.detach().cpu())
 
         if index_extra is not None:
-            gathered_indices = _gather_tensor_same_shape(index_extra)
+            gathered_indices = _gather_tensor_variable_batch(
+                index_extra,
+                log_prefix=log_prefix if stage_name else None,
+                tensor_name="indices",
+                batch_idx=batch_idx,
+                total_batches=len(dataloader),
+            )
             local_indices.append(gathered_indices.detach().cpu())
 
         if (
@@ -327,10 +493,11 @@ def getdist_1652_val_and_get_recall(
 
     # 7. 多卡汇总统计量
     if dist.is_available() and dist.is_initialized():
-        dist.all_reduce(local_correct_1, op=dist.ReduceOp.SUM)
-        dist.all_reduce(local_correct_5, op=dist.ReduceOp.SUM)
-        dist.all_reduce(local_correct_10, op=dist.ReduceOp.SUM)
-        dist.all_reduce(local_ap_sum, op=dist.ReduceOp.SUM)
+        metric_log_prefix = f"[Eval:{task_name}:metrics]" if task_name else None
+        _all_reduce_sum(local_correct_1, log_prefix=metric_log_prefix, tensor_name="correct@1")
+        _all_reduce_sum(local_correct_5, log_prefix=metric_log_prefix, tensor_name="correct@5")
+        _all_reduce_sum(local_correct_10, log_prefix=metric_log_prefix, tensor_name="correct@10")
+        _all_reduce_sum(local_ap_sum, log_prefix=metric_log_prefix, tensor_name="ap_sum")
 
     # 8. 计算最终指标
     recall_1 = local_correct_1.item() / real_num_queries * 100

@@ -314,7 +314,7 @@ def build_gta_val_dataloaders(
         raise KeyError(f"GTA-UAV meta file does not contain '{pair_key}'")
 
     def make_loader(dataset):
-        sampler = DistributedSampler(dataset, shuffle=False) if dist.is_available() and dist.is_initialized() else None
+        sampler = DistributedSampler(dataset, shuffle=False, drop_last=False) if dist.is_available() and dist.is_initialized() else None
         return DataLoader(
             dataset,
             batch_size=batch_size,

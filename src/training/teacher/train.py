@@ -98,6 +98,32 @@ def is_main_process():
     return not dist.is_available() or not dist.is_initialized() or dist.get_rank() == 0
 
 
+def get_dist_rank_world():
+    if dist.is_available() and dist.is_initialized():
+        return dist.get_rank(), dist.get_world_size()
+    return 0, 1
+
+
+def rank_log(message):
+    rank, world_size = get_dist_rank_world()
+    print(f"[Rank {rank}/{world_size}] {message}", flush=True)
+
+
+def distributed_barrier_with_log(label, local_rank=None):
+    if not (dist.is_available() and dist.is_initialized()):
+        return
+
+    rank_log(f"{label} | barrier enter")
+    if torch.cuda.is_available() and local_rank is not None:
+        try:
+            dist.barrier(device_ids=[int(local_rank)])
+        except TypeError:
+            dist.barrier()
+    else:
+        dist.barrier()
+    rank_log(f"{label} | barrier exit")
+
+
 def _json_safe_value(value):
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
@@ -1100,8 +1126,7 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
             last_completed_epoch=0,
         )
         print(f"[Checkpoint] Save directory: {save_dir}")
-    if dist.is_available() and dist.is_initialized():
-        dist.barrier()
+    distributed_barrier_with_log("[Checkpoint] initial training record saved", local_rank)
 
     ema = LiteEMA(get_base_model(model_engine), decay=args.ema_decay)
     best_r1_sum = -1.0
@@ -1313,7 +1338,10 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                 f"updates={loss_counts['total']} | {avg_text} | time={elapsed_min:.1f}m"
             )
             last_state = {name: value.cpu() for name, value in ema.shadow.items()}
+            rank_log(f"[Checkpoint] last_model.pth save start | epoch={epoch}")
             torch.save(last_state, os.path.join(save_dir, "last_model.pth"))
+            rank_log(f"[Checkpoint] last_model.pth save done | epoch={epoch}")
+            rank_log(f"[Checkpoint] bset_metricis.json save start | epoch={epoch}")
             save_training_record(
                 save_dir=save_dir,
                 args=args,
@@ -1321,24 +1349,35 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                 best_metrics=best_metrics,
                 last_completed_epoch=epoch,
             )
+            rank_log(f"[Checkpoint] bset_metricis.json save done | epoch={epoch}")
             print(
                 f"[Checkpoint] Saved last_model.pth | epoch={epoch}",
                 flush=True,
             )
         cur_epoch = epoch
+        distributed_barrier_with_log(
+            f"[Checkpoint] epoch={cur_epoch} after last_model save",
+            local_rank,
+        )
         if val_loaders is not None and should_run_validation(cur_epoch, args):
-            if is_main_process():
-                print(f"[Eval] Epoch {cur_epoch}/{args.epochs} start | weights=EMA")
+            rank_log(f"[Eval] Epoch {cur_epoch}/{args.epochs} enter | weights=EMA")
+            distributed_barrier_with_log(
+                f"[Eval] epoch={cur_epoch} before validation",
+                local_rank,
+            )
             eval_model = get_base_model(model_engine)
             ema_applied = False
             try:
+                rank_log(f"[Eval] Epoch {cur_epoch}/{args.epochs} apply EMA start")
                 ema.apply_shadow(eval_model)
                 ema_applied = True
+                rank_log(f"[Eval] Epoch {cur_epoch}/{args.epochs} apply EMA done")
                 model_engine.eval()
                 q_loader_d2s, g_loader_d2s = val_loaders["D2S"]
                 q_loader_s2d, g_loader_s2d = val_loaders["S2D"]
 
                 clear_memory_cache()
+                rank_log(f"[Eval] Epoch {cur_epoch}/{args.epochs} D2S start")
                 d2s_r1, d2s_r5, d2s_r10, d2s_map = getdist_1652_val_and_get_recall(
                     model_engine,
                     q_loader_d2s,
@@ -1347,7 +1386,9 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                     task_name="D2S",
                     feature_name="fused",
                 )
+                rank_log(f"[Eval] Epoch {cur_epoch}/{args.epochs} D2S done")
                 clear_memory_cache()
+                rank_log(f"[Eval] Epoch {cur_epoch}/{args.epochs} S2D start")
                 s2d_r1, s2d_r5, s2d_r10, s2d_map = getdist_1652_val_and_get_recall(
                     model_engine,
                     q_loader_s2d,
@@ -1356,12 +1397,19 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                     task_name="S2D",
                     feature_name="fused",
                 )
+                rank_log(f"[Eval] Epoch {cur_epoch}/{args.epochs} S2D done")
             finally:
                 if ema_applied:
+                    rank_log(f"[Eval] Epoch {cur_epoch}/{args.epochs} restore EMA start")
                     ema.restore(eval_model)
+                    rank_log(f"[Eval] Epoch {cur_epoch}/{args.epochs} restore EMA done")
                 model_engine.train()
                 clear_memory_cache()
 
+            distributed_barrier_with_log(
+                f"[Eval] epoch={cur_epoch} before rank0 metric/checkpoint",
+                local_rank,
+            )
             if is_main_process():
                 trainable_state = {k: v.cpu() for k, v in ema.shadow.items()}
                 current_metrics = build_validation_metrics(
@@ -1379,8 +1427,11 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                     best_r1_sum = r1_sum
                     best_epoch = cur_epoch
                     best_metrics = current_metrics
+                    rank_log(f"[Checkpoint] best_model.pth save start | epoch={cur_epoch}")
                     torch.save(trainable_state, os.path.join(save_dir, "best_model.pth"))
+                    rank_log(f"[Checkpoint] best_model.pth save done | epoch={cur_epoch}")
 
+                rank_log(f"[Checkpoint] bset_metricis.json save start | epoch={cur_epoch} after eval")
                 save_training_record(
                     save_dir=save_dir,
                     args=args,
@@ -1388,6 +1439,7 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                     best_metrics=best_metrics,
                     last_completed_epoch=cur_epoch,
                 )
+                rank_log(f"[Checkpoint] bset_metricis.json save done | epoch={cur_epoch} after eval")
 
                 print(
                     f"[Eval] Epoch {cur_epoch}/{args.epochs} done | "
@@ -1400,10 +1452,13 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                         f"[Checkpoint] Saved best_model.pth | epoch={cur_epoch} | "
                         f"D2S_R@1={d2s_r1:.2f} | S2D_R@1={s2d_r1:.2f} | R@1_sum={r1_sum:.2f}"
                     )
+            distributed_barrier_with_log(
+                f"[Eval] epoch={cur_epoch} after rank0 metric/checkpoint",
+                local_rank,
+            )
 
         # 7. 分布式同步：让所有显卡等 Rank 0 写完再进下一个 Epoch
-        if dist.is_initialized():
-            dist.barrier()
+        distributed_barrier_with_log(f"[Train] epoch={epoch} end", local_rank)
     if not dist.is_initialized() or local_rank == 0:
         print("训练完成！")
 
