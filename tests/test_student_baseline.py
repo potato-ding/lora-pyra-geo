@@ -14,6 +14,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from src.models.student_model import StudentModel
+from src.loss.proxy_loss import ViewSharedIdentityProxyLoss
 import src.training.student_train as student_train
 import src.dataset.datasets as student_datasets
 from src.dataset.datasets import U1652PairDataset
@@ -160,6 +161,59 @@ def test_student_soft_orth_fusion_uses_f3_and_f4():
     assert model.backbone.f4.grad is not None
 
 
+def test_student_proxy_module_is_saved_with_model_but_not_forwarded():
+    torch.manual_seed(19)
+    model = StudentModel(
+        ckpt_path=None,
+        use_proxy_loss=True,
+        num_train_ids=7,
+        proxy_scale=25.0,
+        proxy_label_smoothing=0.05,
+    ).eval()
+    x = torch.randn(2, 3, 64, 64)
+
+    def fail_proxy_forward(*args, **kwargs):
+        raise AssertionError("proxy classifier must not run during descriptor extraction")
+
+    model.proxy_loss_module.forward = fail_proxy_forward
+    with torch.no_grad():
+        embedding = model(x)
+
+    assert embedding.shape == (2, 512)
+    torch.testing.assert_close(
+        embedding.norm(p=2, dim=1),
+        torch.ones(2),
+        atol=1e-5,
+        rtol=1e-5,
+    )
+    assert model.proxy_loss_module.proxies.shape == (7, 512)
+    assert "proxy_loss_module.proxies" in model.state_dict()
+    assert id(model.proxy_loss_module.proxies) in {
+        id(param) for param in model.parameters()
+    }
+
+
+def test_view_shared_identity_proxy_loss_uses_shared_proxy_matrix():
+    torch.manual_seed(23)
+    proxy_loss = ViewSharedIdentityProxyLoss(
+        num_train_ids=3,
+        embedding_dim=2,
+        proxy_scale=10.0,
+        label_smoothing=0.1,
+    )
+    drone = F.normalize(torch.tensor([[1.0, 0.0], [0.0, 1.0]]), dim=1)
+    satellite = F.normalize(torch.tensor([[0.9, 0.1], [0.1, 0.9]]), dim=1)
+    labels = torch.tensor([0, 1])
+
+    loss, stats = proxy_loss(drone, satellite, labels, labels)
+    loss.backward()
+
+    assert proxy_loss.proxies.shape == (3, 2)
+    assert torch.isfinite(loss)
+    assert proxy_loss.proxies.grad is not None
+    assert set(stats) == {"proxy_drone_acc", "proxy_sat_acc"}
+
+
 def test_student_batch_loss_is_only_symmetric_infonce():
     class IdentityFeatureModel(nn.Module):
         def __init__(self):
@@ -198,6 +252,73 @@ def test_student_batch_loss_is_only_symmetric_infonce():
     }
     torch.testing.assert_close(losses["loss"], expected)
     torch.testing.assert_close(losses["main_loss"], expected)
+
+
+def test_proxy_loss_adds_to_total_loss_without_changing_retrieval_path():
+    class ProxyFeatureModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.logit_scale = nn.Parameter(torch.tensor(0.0))
+            self.proxy_loss_module = ViewSharedIdentityProxyLoss(
+                num_train_ids=2,
+                embedding_dim=2,
+                proxy_scale=5.0,
+                label_smoothing=0.0,
+            )
+
+        def forward(self, x):
+            return F.normalize(x.float(), dim=1)
+
+        def compute_proxy_loss(
+            self,
+            drone_features,
+            satellite_features,
+            drone_labels,
+            satellite_labels,
+        ):
+            return self.proxy_loss_module(
+                drone_features,
+                satellite_features,
+                drone_labels,
+                satellite_labels,
+            )
+
+    class Args:
+        use_proxy_loss = True
+        proxy_loss_weight = 0.2
+
+    features = torch.tensor([
+        [1.0, 0.0],
+        [0.0, 1.0],
+        [0.9, 0.1],
+        [0.1, 0.9],
+    ])
+    labels = torch.tensor([0, 1])
+    model = ProxyFeatureModel()
+    losses = compute_student_batch_losses(
+        model,
+        features,
+        pair_batch_size=2,
+        criterion=student_train.Sample4GeoLoss(label_smoothing=0.0),
+        args=Args,
+        id_labels=labels,
+    )
+
+    expected_retrieval = student_train.sample4geo_loss(
+        model,
+        F.normalize(features, dim=1),
+        student_train.Sample4GeoLoss(label_smoothing=0.0),
+        pair_batch_size=2,
+    )
+    torch.testing.assert_close(losses["main_loss"], expected_retrieval)
+    torch.testing.assert_close(
+        losses["loss"],
+        losses["main_loss"] + Args.proxy_loss_weight * losses["loss_proxy"],
+    )
+    assert losses["proxy_loss_weight"] == pytest.approx(Args.proxy_loss_weight)
+    assert losses["proxy_scale"] == pytest.approx(5.0)
+    assert losses["num_train_ids"] == 2
+    assert set(losses["proxy_stats"]) == {"proxy_drone_acc", "proxy_sat_acc"}
 
 
 def test_soft_orth_fusion_does_not_change_student_training_loss():
@@ -248,6 +369,81 @@ def test_soft_orth_fusion_does_not_change_student_training_loss():
         "soft_orth_detail_norm",
         "soft_orth_cos_f3_f4",
     }
+
+
+def test_soft_orth_and_proxy_loss_combine_on_model_output():
+    class SoftProxyFeatureModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.logit_scale = nn.Parameter(torch.tensor(0.0))
+            self.proxy_loss_module = ViewSharedIdentityProxyLoss(
+                num_train_ids=2,
+                embedding_dim=2,
+                proxy_scale=7.0,
+                label_smoothing=0.0,
+            )
+            self.last_features = None
+            self.proxy_features = None
+
+        def forward(self, x):
+            self.last_features = F.normalize(x.float() + 0.25, dim=1)
+            return self.last_features
+
+        def get_soft_orth_stats(self):
+            return {
+                "soft_orth_lambda": torch.tensor(0.5),
+                "soft_orth_gamma": torch.tensor(0.01),
+                "soft_orth_f4_norm": torch.tensor(1.0),
+                "soft_orth_f3_proj_norm": torch.tensor(1.0),
+                "soft_orth_parallel_norm": torch.tensor(0.2),
+                "soft_orth_detail_norm": torch.tensor(0.9),
+                "soft_orth_cos_f3_f4": torch.tensor(0.1),
+            }
+
+        def compute_proxy_loss(
+            self,
+            drone_features,
+            satellite_features,
+            drone_labels,
+            satellite_labels,
+        ):
+            self.proxy_features = torch.cat([drone_features, satellite_features])
+            return self.proxy_loss_module(
+                drone_features,
+                satellite_features,
+                drone_labels,
+                satellite_labels,
+            )
+
+    class Args:
+        use_soft_orth_fusion = True
+        use_proxy_loss = True
+        proxy_loss_weight = 0.3
+
+    features = torch.tensor([
+        [1.0, 0.0],
+        [0.0, 1.0],
+        [0.9, 0.1],
+        [0.1, 0.9],
+    ])
+    labels = torch.tensor([0, 1])
+    model = SoftProxyFeatureModel()
+    losses = compute_student_batch_losses(
+        model,
+        features,
+        pair_batch_size=2,
+        criterion=student_train.Sample4GeoLoss(label_smoothing=0.0),
+        args=Args,
+        id_labels=labels,
+    )
+
+    torch.testing.assert_close(model.proxy_features, model.last_features)
+    torch.testing.assert_close(
+        losses["loss"],
+        losses["main_loss"] + Args.proxy_loss_weight * losses["loss_proxy"],
+    )
+    assert "soft_orth_stats" in losses
+    assert "proxy_stats" in losses
 
 
 def test_distributed_pair_gather_preserves_global_positive_diagonal(monkeypatch):
@@ -359,6 +555,11 @@ def test_cli_defaults_to_clean_baseline(monkeypatch):
     assert args.soft_orth_gamma_init == pytest.approx(0.01)
     assert args.soft_orth_gamma_max == pytest.approx(0.05)
     assert args.soft_orth_detach_global is True
+    assert args.use_proxy_loss is False
+    assert args.proxy_loss_weight == pytest.approx(0.1)
+    assert args.proxy_scale == pytest.approx(30.0)
+    assert args.proxy_label_smoothing == pytest.approx(0.1)
+    assert args.num_train_ids == -1
     assert args.teacher_precision == "bf16"
     assert args.teacher_micro_batch_size == 1
     assert args.deepspeed_config == "configs/ds_student_baseline.json"
@@ -824,6 +1025,10 @@ def test_student_dataset_returns_only_baseline_pair_fields(
     assert drone.shape == satellite.shape == (3, 8, 8)
     assert label == 0
     assert pid == "0001"
+    assert dataset.num_ids == 1
+    assert dataset.num_classes == 1
+    assert dataset.pid_to_label == {"0001": 0}
+    assert student_train.infer_num_train_ids_from_dataset(dataset) == 1
 
 
 def test_deepspeed_epoch_updates_student_with_infonce_only(

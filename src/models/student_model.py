@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from src.loss.proxy_loss import ViewSharedIdentityProxyLoss
 from src.models.repvit_backbone import RepViTBackbone
 from src.utils.rank_logging import rank0_print
 
@@ -117,10 +118,15 @@ class StudentModel(nn.Module):
         soft_orth_gamma_init=0.01,
         soft_orth_gamma_max=0.05,
         soft_orth_detach_global=True,
+        use_proxy_loss=False,
+        num_train_ids=None,
+        proxy_scale=30.0,
+        proxy_label_smoothing=0.1,
     ):
         super().__init__()
         self.embedding_dim = 512
         self.use_soft_orth_fusion = bool(use_soft_orth_fusion)
+        self.use_proxy_loss = bool(use_proxy_loss)
         self._soft_orth_stats = {}
         self.backbone = RepViTBackbone(ckpt_path=ckpt_path)
         self.neck = nn.BatchNorm1d(self.embedding_dim)
@@ -131,6 +137,15 @@ class StudentModel(nn.Module):
                 gamma_init=soft_orth_gamma_init,
                 gamma_max=soft_orth_gamma_max,
                 detach_global=soft_orth_detach_global,
+            )
+        if self.use_proxy_loss:
+            if num_train_ids is None:
+                raise ValueError("num_train_ids is required when proxy loss is enabled")
+            self.proxy_loss_module = ViewSharedIdentityProxyLoss(
+                num_train_ids=num_train_ids,
+                embedding_dim=self.embedding_dim,
+                proxy_scale=proxy_scale,
+                label_smoothing=proxy_label_smoothing,
             )
         if (
             distill_teacher_dim is not None
@@ -154,6 +169,14 @@ class StudentModel(nn.Module):
             rank0_print(
                 "  soft-orth detach_global: "
                 f"{self.soft_orth_fusion.detach_global}"
+            )
+        if self.use_proxy_loss:
+            rank0_print(
+                "  proxy loss: enabled "
+                f"(num_train_ids={self.proxy_loss_module.num_train_ids}, "
+                f"scale={self.proxy_loss_module.proxy_scale:g}, "
+                f"label_smoothing="
+                f"{self.proxy_loss_module.label_smoothing:g})"
             )
         if hasattr(self, "distill_projection"):
             rank0_print(
@@ -181,6 +204,23 @@ class StudentModel(nn.Module):
 
     def get_soft_orth_stats(self):
         return dict(self._soft_orth_stats)
+
+    def compute_proxy_loss(
+        self,
+        drone_features,
+        satellite_features,
+        drone_labels,
+        satellite_labels,
+    ):
+        proxy_loss_module = getattr(self, "proxy_loss_module", None)
+        if proxy_loss_module is None:
+            raise RuntimeError("Proxy loss is enabled but proxy module is unavailable")
+        return proxy_loss_module(
+            drone_features,
+            satellite_features,
+            drone_labels,
+            satellite_labels,
+        )
 
     def project_for_distillation(self, embedding):
         """Project student embeddings only for plain feature distillation."""

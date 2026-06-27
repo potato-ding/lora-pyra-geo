@@ -352,8 +352,13 @@ class U1652PairDataset(Dataset):
         self.shuffle_batch_size = shuffle_batch_size
         self.pairs = []
         self.pair_pids = []
+        self.pids = []
+        self.pid_to_label = {}
+        self.class_to_idx = self.pid_to_label
         self.samples = []
         self._parse_dataset()
+        self.num_ids = len(self.pids)
+        self.num_classes = self.num_ids
         self.samples = self.pairs[:]
 
     def _parse_dataset(self):
@@ -365,7 +370,7 @@ class U1652PairDataset(Dataset):
             raise FileNotFoundError(f"drone directory not found: {drone_root}")
 
         pids = sorted(pid for pid in os.listdir(sat_root) if os.path.isdir(os.path.join(sat_root, pid)))
-        for label, pid in enumerate(pids):
+        for pid in pids:
             sat_dir = os.path.join(sat_root, pid)
             drone_dir = os.path.join(drone_root, pid)
             if not os.path.isdir(drone_dir):
@@ -384,6 +389,9 @@ class U1652PairDataset(Dataset):
             if not sat_paths or not drone_paths:
                 continue
 
+            label = len(self.pids)
+            self.pids.append(pid)
+            self.pid_to_label[pid] = label
             for drone_path in drone_paths:
                 self.pairs.append((pid, label, sat_paths[0], drone_path))
                 self.pair_pids.append(pid)

@@ -341,6 +341,7 @@ def compute_student_batch_losses(
     pair_batch_size,
     criterion,
     args=None,
+    id_labels=None,
     teacher_features=None,
 ):
     local_features = model(images)
@@ -360,6 +361,39 @@ def compute_student_batch_losses(
         "main_loss": loss_infonce,
         "global_pair_batch_size": global_pair_batch_size,
     }
+    if bool(getattr(args, "use_proxy_loss", False)):
+        if id_labels is None:
+            raise ValueError("Proxy loss requires identity labels.")
+        if id_labels.numel() != pair_batch_size:
+            raise ValueError(
+                f"Expected {pair_batch_size} proxy labels, got {id_labels.numel()}"
+            )
+        drone_features = local_features[:pair_batch_size]
+        satellite_features = local_features[pair_batch_size:pair_batch_size * 2]
+        raw_model = get_raw_model(model)
+        proxy_loss_fn = getattr(raw_model, "compute_proxy_loss", None)
+        if proxy_loss_fn is None:
+            raise RuntimeError("Proxy loss is enabled but model has no proxy module")
+        loss_proxy, proxy_stats = proxy_loss_fn(
+            drone_features,
+            satellite_features,
+            id_labels,
+            id_labels,
+        )
+        proxy_loss_weight = float(getattr(args, "proxy_loss_weight", 0.0))
+        total_loss = loss_infonce + proxy_loss_weight * loss_proxy
+        proxy_module = getattr(raw_model, "proxy_loss_module", None)
+        if proxy_module is None:
+            raise RuntimeError("Proxy loss module is unavailable")
+        losses.update({
+            "loss": total_loss,
+            "loss_retrieval": loss_infonce,
+            "loss_proxy": loss_proxy,
+            "proxy_loss_weight": proxy_loss_weight,
+            "proxy_scale": float(proxy_module.proxy_scale),
+            "num_train_ids": int(proxy_module.num_train_ids),
+            "proxy_stats": proxy_stats,
+        })
     if bool(getattr(args, "use_soft_orth_fusion", False)):
         stats_fn = getattr(get_raw_model(model), "get_soft_orth_stats", None)
         if stats_fn is None:
@@ -438,7 +472,7 @@ def compute_student_batch_losses(
         args.kd_temperature,
     )
     total_loss = (
-        loss_infonce
+        losses["loss"]
         + kd_feat_weight * loss_kd_feat
         + kd_sim_weight * loss_kd_sim
     )
@@ -580,6 +614,55 @@ def print_trainable_parameter_summary(model):
         f"trainable={trainable / 1e6:.3f}M | "
         f"frozen={(total - trainable) / 1e6:.3f}M"
     )
+
+
+def infer_num_train_ids_from_dataset(dataset):
+    def count_contiguous_labels(labels):
+        expected = set(range(max(labels) + 1))
+        if labels != expected:
+            raise ValueError("Proxy labels must be continuous in [0, num_train_ids - 1]")
+        return max(labels) + 1
+
+    for attr in ("num_classes", "num_ids"):
+        value = getattr(dataset, attr, None)
+        if value is not None:
+            return int(value)
+
+    for attr in ("class_to_idx", "id_to_label", "pid_to_label"):
+        mapping = getattr(dataset, attr, None)
+        if mapping is not None:
+            return len(mapping)
+
+    labels = set()
+    for attr in ("pairs", "samples"):
+        records = getattr(dataset, attr, None)
+        if records is None:
+            continue
+        for record in records:
+            if len(record) >= 2:
+                labels.add(int(record[1]))
+        if labels:
+            return count_contiguous_labels(labels)
+
+    for idx in range(len(dataset)):
+        sample = dataset[idx]
+        if len(sample) < 3:
+            raise ValueError("Cannot infer train IDs from dataset samples.")
+        labels.add(int(sample[2]))
+    if not labels:
+        raise ValueError("Cannot infer train IDs from an empty dataset.")
+    return count_contiguous_labels(labels)
+
+
+def resolve_num_train_ids(args, train_loader):
+    if not bool(getattr(args, "use_proxy_loss", False)):
+        return
+    if int(args.num_train_ids) == -1:
+        args.num_train_ids = infer_num_train_ids_from_dataset(train_loader.dataset)
+    if int(args.num_train_ids) <= 0:
+        raise ValueError("--num_train_ids must be positive when proxy loss is enabled")
+    if is_main_process():
+        print(f"[ProxyLoss] num_train_ids={int(args.num_train_ids)}")
 
 
 def format_optional_float(value, precision=4):
@@ -805,6 +888,41 @@ def format_kd_step_log(meters, kd_feat_weight, kd_sim_weight):
     )
 
 
+PROXY_LOG_KEYS = (
+    "loss_proxy",
+    "proxy_drone_acc",
+    "proxy_sat_acc",
+)
+
+
+def create_proxy_log_meters():
+    return {key: AverageMeter() for key in PROXY_LOG_KEYS}
+
+
+def update_proxy_log_meters(meters, batch_losses, n):
+    meters["loss_proxy"].update(batch_losses["loss_proxy"].item(), n)
+    meters["proxy_drone_acc"].update(
+        batch_losses["proxy_stats"]["proxy_drone_acc"].item(),
+        n,
+    )
+    meters["proxy_sat_acc"].update(
+        batch_losses["proxy_stats"]["proxy_sat_acc"].item(),
+        n,
+    )
+
+
+def format_proxy_step_log(meters, batch_losses):
+    return (
+        f"loss_proxy {meters['loss_proxy'].val:.4f} "
+        f"({meters['loss_proxy'].avg:.4f}) | "
+        f"proxy_loss_weight {batch_losses['proxy_loss_weight']:.6f} | "
+        f"proxy_scale {batch_losses['proxy_scale']:.3f} | "
+        f"proxy_drone_acc {meters['proxy_drone_acc'].val:.4f} | "
+        f"proxy_sat_acc {meters['proxy_sat_acc'].val:.4f} | "
+        f"num_train_ids {batch_losses['num_train_ids']} | "
+    )
+
+
 SOFT_ORTH_LOG_KEYS = (
     "soft_orth_lambda",
     "soft_orth_gamma",
@@ -860,6 +978,11 @@ def train_one_epoch(
     loss_total_meter = AverageMeter()
     loss_retrieval_meter = AverageMeter()
     kd_log_meters = create_kd_log_meters() if teacher_model is not None else None
+    proxy_log_meters = (
+        create_proxy_log_meters()
+        if bool(getattr(args, "use_proxy_loss", False))
+        else None
+    )
     soft_orth_log_meters = (
         create_soft_orth_log_meters()
         if bool(getattr(args, "use_soft_orth_fusion", False))
@@ -874,7 +997,7 @@ def train_one_epoch(
 
     for step, batch in enumerate(train_loader):
         data_time.update(time.time() - end)
-        images, _, meta = unpack_sample4geo_batch(batch, device)
+        images, id_labels, meta = unpack_sample4geo_batch(batch, device)
         pair_batch_size = meta["pair_batch_size"]
         teacher_features = (
             forward_teacher_online(
@@ -894,6 +1017,7 @@ def train_one_epoch(
                 pair_batch_size,
                 criterion,
                 args,
+                id_labels=id_labels,
                 teacher_features=teacher_features,
             )
             loss = batch_losses["loss"]
@@ -935,6 +1059,12 @@ def train_one_epoch(
                 batch_losses,
                 images.size(0),
             )
+        if proxy_log_meters is not None:
+            update_proxy_log_meters(
+                proxy_log_meters,
+                batch_losses,
+                images.size(0),
+            )
         if soft_orth_log_meters is not None:
             update_soft_orth_log_meters(
                 soft_orth_log_meters,
@@ -949,19 +1079,29 @@ def train_one_epoch(
             or step == len(train_loader) - 1
         ):
             aux_text = ""
+            total_loss_logged = False
             if soft_orth_log_meters is not None:
                 aux_text += format_soft_orth_step_log(soft_orth_log_meters)
+            if proxy_log_meters is not None:
+                aux_text += (
+                    f"total_loss {loss_total_meter.val:.4f} "
+                    f"({loss_total_meter.avg:.4f}) | "
+                    f"{format_proxy_step_log(proxy_log_meters, batch_losses)}"
+                )
+                total_loss_logged = True
             if kd_log_meters is not None:
                 kd_step_log = format_kd_step_log(
                     kd_log_meters,
                     batch_losses["kd_feat_weight"],
                     batch_losses["kd_sim_weight"],
                 )
-                aux_text += (
-                    f"total_loss {loss_total_meter.val:.4f} "
-                    f"({loss_total_meter.avg:.4f}) | "
-                    f"{kd_step_log}"
-                )
+                if not total_loss_logged:
+                    aux_text += (
+                        f"total_loss {loss_total_meter.val:.4f} "
+                        f"({loss_total_meter.avg:.4f}) | "
+                    )
+                    total_loss_logged = True
+                aux_text += kd_step_log
             print(
                 f"Epoch [{epoch}/{args.epochs}] "
                 f"Step [{step + 1}/{len(train_loader)}] | "
@@ -988,6 +1128,14 @@ def train_one_epoch(
         })
         stats["kd_feat_weight"] = float(args.kd_feat_weight)
         stats["kd_sim_weight"] = float(args.kd_sim_weight)
+    if proxy_log_meters is not None:
+        stats.update({
+            key: meter.avg
+            for key, meter in proxy_log_meters.items()
+        })
+        stats["proxy_loss_weight"] = float(args.proxy_loss_weight)
+        stats["proxy_scale"] = float(args.proxy_scale)
+        stats["num_train_ids"] = int(args.num_train_ids)
     if soft_orth_log_meters is not None:
         stats.update({
             key: meter.avg
@@ -1013,6 +1161,11 @@ def train_one_epoch_deepspeed(
     loss_total_meter = AverageMeter()
     loss_retrieval_meter = AverageMeter()
     kd_log_meters = create_kd_log_meters() if teacher_model is not None else None
+    proxy_log_meters = (
+        create_proxy_log_meters()
+        if bool(getattr(args, "use_proxy_loss", False))
+        else None
+    )
     soft_orth_log_meters = (
         create_soft_orth_log_meters()
         if bool(getattr(args, "use_soft_orth_fusion", False))
@@ -1025,7 +1178,7 @@ def train_one_epoch_deepspeed(
 
     for step, batch in enumerate(train_loader):
         data_time.update(time.time() - end)
-        images, _, meta = unpack_sample4geo_batch(batch, device)
+        images, id_labels, meta = unpack_sample4geo_batch(batch, device)
         images = images.to(dtype=input_dtype)
         pair_batch_size = meta["pair_batch_size"]
         teacher_features = (
@@ -1044,6 +1197,7 @@ def train_one_epoch_deepspeed(
             pair_batch_size,
             criterion,
             args,
+            id_labels=id_labels,
             teacher_features=teacher_features,
         )
         loss = batch_losses["loss"]
@@ -1059,6 +1213,8 @@ def train_one_epoch_deepspeed(
         loss_retrieval_meter.update(batch_losses["main_loss"].item(), weight)
         if kd_log_meters is not None:
             update_kd_log_meters(kd_log_meters, batch_losses, weight)
+        if proxy_log_meters is not None:
+            update_proxy_log_meters(proxy_log_meters, batch_losses, weight)
         if soft_orth_log_meters is not None:
             update_soft_orth_log_meters(
                 soft_orth_log_meters,
@@ -1073,19 +1229,29 @@ def train_one_epoch_deepspeed(
             or step == len(train_loader) - 1
         ):
             aux_text = ""
+            total_loss_logged = False
             if soft_orth_log_meters is not None:
                 aux_text += format_soft_orth_step_log(soft_orth_log_meters)
+            if proxy_log_meters is not None:
+                aux_text += (
+                    f"total_loss {loss_total_meter.val:.4f} "
+                    f"({loss_total_meter.avg:.4f}) | "
+                    f"{format_proxy_step_log(proxy_log_meters, batch_losses)}"
+                )
+                total_loss_logged = True
             if kd_log_meters is not None:
                 kd_step_log = format_kd_step_log(
                     kd_log_meters,
                     batch_losses["kd_feat_weight"],
                     batch_losses["kd_sim_weight"],
                 )
-                aux_text += (
-                    f"total_loss {loss_total_meter.val:.4f} "
-                    f"({loss_total_meter.avg:.4f}) | "
-                    f"{kd_step_log}"
-                )
+                if not total_loss_logged:
+                    aux_text += (
+                        f"total_loss {loss_total_meter.val:.4f} "
+                        f"({loss_total_meter.avg:.4f}) | "
+                    )
+                    total_loss_logged = True
+                aux_text += kd_step_log
             print(
                 f"Epoch [{epoch}/{args.epochs}] "
                 f"Step [{step + 1}/{len(train_loader)}] | "
@@ -1113,6 +1279,14 @@ def train_one_epoch_deepspeed(
         })
         stats["kd_feat_weight"] = float(args.kd_feat_weight)
         stats["kd_sim_weight"] = float(args.kd_sim_weight)
+    if proxy_log_meters is not None:
+        stats.update({
+            key: meter.avg
+            for key, meter in proxy_log_meters.items()
+        })
+        stats["proxy_loss_weight"] = float(args.proxy_loss_weight)
+        stats["proxy_scale"] = float(args.proxy_scale)
+        stats["num_train_ids"] = int(args.num_train_ids)
     if soft_orth_log_meters is not None:
         stats.update({
             key: meter.avg
@@ -1207,6 +1381,19 @@ def train(
                 f" | kd_feat_weight={train_stats['kd_feat_weight']:.6f}"
                 f" | kd_sim_weight={train_stats['kd_sim_weight']:.6f}"
             )
+        proxy_text = ""
+        if bool(getattr(args, "use_proxy_loss", False)):
+            proxy_text = (
+                f" | loss_proxy={train_stats['loss_proxy']:.4f}"
+                f" | proxy_loss_weight="
+                f"{train_stats['proxy_loss_weight']:.6f}"
+                f" | proxy_scale={train_stats['proxy_scale']:.3f}"
+                f" | proxy_drone_acc="
+                f"{train_stats['proxy_drone_acc']:.4f}"
+                f" | proxy_sat_acc="
+                f"{train_stats['proxy_sat_acc']:.4f}"
+                f" | num_train_ids={train_stats['num_train_ids']}"
+            )
         soft_orth_text = ""
         if bool(getattr(args, "use_soft_orth_fusion", False)):
             soft_orth_text = (
@@ -1230,6 +1417,7 @@ def train(
             f"loss_retrieval={train_stats['loss_retrieval']:.4f}"
             f" | total_loss={train_stats['total_loss']:.4f}"
             f"{soft_orth_text}"
+            f"{proxy_text}"
             f"{kd_text}"
         )
 
@@ -1339,6 +1527,19 @@ def train_deepspeed(
                     f" | kd_feat_weight={train_stats['kd_feat_weight']:.6f}"
                     f" | kd_sim_weight={train_stats['kd_sim_weight']:.6f}"
                 )
+            proxy_text = ""
+            if bool(getattr(args, "use_proxy_loss", False)):
+                proxy_text = (
+                    f" | loss_proxy={train_stats['loss_proxy']:.4f}"
+                    f" | proxy_loss_weight="
+                    f"{train_stats['proxy_loss_weight']:.6f}"
+                    f" | proxy_scale={train_stats['proxy_scale']:.3f}"
+                    f" | proxy_drone_acc="
+                    f"{train_stats['proxy_drone_acc']:.4f}"
+                    f" | proxy_sat_acc="
+                    f"{train_stats['proxy_sat_acc']:.4f}"
+                    f" | num_train_ids={train_stats['num_train_ids']}"
+                )
             soft_orth_text = ""
             if bool(getattr(args, "use_soft_orth_fusion", False)):
                 soft_orth_text = (
@@ -1363,6 +1564,7 @@ def train_deepspeed(
                 f"total_loss={train_stats['total_loss']:.4f} | "
                 f"world_size={get_world_size()}"
                 f"{soft_orth_text}"
+                f"{proxy_text}"
                 f"{kd_text}"
             )
 
@@ -1478,6 +1680,11 @@ def parse_args():
         const=True,
         default=True,
     )
+    parser.add_argument("--use_proxy_loss", action="store_true", default=False)
+    parser.add_argument("--proxy_loss_weight", type=float, default=0.1)
+    parser.add_argument("--proxy_scale", type=float, default=30.0)
+    parser.add_argument("--proxy_label_smoothing", type=float, default=0.1)
+    parser.add_argument("--num_train_ids", type=int, default=-1)
     parser.add_argument("--amp", dest="amp", action="store_true", default=True)
     parser.add_argument("--no_amp", dest="amp", action="store_false")
     parser.add_argument("--grad_clip", type=float, default=0.0)
@@ -1544,6 +1751,14 @@ def parse_args():
             "--soft_orth_gamma_init must be greater than 0 and smaller than "
             "--soft_orth_gamma_max"
         )
+    if args.proxy_loss_weight < 0:
+        parser.error("--proxy_loss_weight must be non-negative")
+    if args.proxy_scale <= 0:
+        parser.error("--proxy_scale must be greater than 0")
+    if args.proxy_label_smoothing < 0 or args.proxy_label_smoothing >= 1:
+        parser.error("--proxy_label_smoothing must be in [0, 1)")
+    if args.num_train_ids < -1 or args.num_train_ids == 0:
+        parser.error("--num_train_ids must be -1 or a positive integer")
     if args.print_freq <= 0:
         parser.error("--print_freq must be greater than 0")
     if args.distill and args.kd_feat_weight + args.kd_sim_weight <= 0:
@@ -1611,6 +1826,7 @@ def main():
         torch.cuda.manual_seed_all(args.seed + rank)
 
     train_loader = create_student_train_dataset_and_loader(args)
+    resolve_num_train_ids(args, train_loader)
     val_loaders = build_1652_val_dataloaders(
         data_dir=args.val_data_dir,
         img_size=[args.img_size, args.img_size],
@@ -1635,6 +1851,14 @@ def main():
         soft_orth_gamma_init=args.soft_orth_gamma_init,
         soft_orth_gamma_max=args.soft_orth_gamma_max,
         soft_orth_detach_global=args.soft_orth_detach_global,
+        use_proxy_loss=args.use_proxy_loss,
+        num_train_ids=(
+            args.num_train_ids
+            if args.use_proxy_loss
+            else None
+        ),
+        proxy_scale=args.proxy_scale,
+        proxy_label_smoothing=args.proxy_label_smoothing,
     ).to(device)
     print_trainable_parameter_summary(model)
     optimizer = build_student_optimizer(
