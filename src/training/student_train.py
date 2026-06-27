@@ -344,7 +344,10 @@ def compute_student_batch_losses(
     id_labels=None,
     teacher_features=None,
 ):
-    local_features = model(images)
+    if bool(getattr(args, "use_soft_orth_fusion", False)):
+        local_features = model(images, pair_batch_size=pair_batch_size)
+    else:
+        local_features = model(images)
     features, global_pair_batch_size = gather_paired_views(
         local_features,
         pair_batch_size,
@@ -924,6 +927,7 @@ def format_proxy_step_log(meters, batch_losses):
 
 
 SOFT_ORTH_LOG_KEYS = (
+    "soft_orth_active_ratio",
     "soft_orth_lambda",
     "soft_orth_gamma",
     "soft_orth_f4_norm",
@@ -944,8 +948,12 @@ def update_soft_orth_log_meters(meters, batch_losses, n):
         meters[key].update(stats[key].item(), n)
 
 
-def format_soft_orth_step_log(meters):
+def format_soft_orth_step_log(meters, batch_losses):
+    apply_views = batch_losses["soft_orth_stats"]["soft_orth_apply_views"]
     return (
+        f"soft_orth_apply_views {apply_views} | "
+        f"soft_orth_active_ratio "
+        f"{meters['soft_orth_active_ratio'].val:.4f} | "
         f"soft_orth_lambda {meters['soft_orth_lambda'].val:.6f} | "
         f"soft_orth_gamma {meters['soft_orth_gamma'].val:.6f} | "
         f"soft_orth_f4_norm {meters['soft_orth_f4_norm'].val:.4f} | "
@@ -1081,7 +1089,10 @@ def train_one_epoch(
             aux_text = ""
             total_loss_logged = False
             if soft_orth_log_meters is not None:
-                aux_text += format_soft_orth_step_log(soft_orth_log_meters)
+                aux_text += format_soft_orth_step_log(
+                    soft_orth_log_meters,
+                    batch_losses,
+                )
             if proxy_log_meters is not None:
                 aux_text += (
                     f"total_loss {loss_total_meter.val:.4f} "
@@ -1141,6 +1152,7 @@ def train_one_epoch(
             key: meter.avg
             for key, meter in soft_orth_log_meters.items()
         })
+        stats["soft_orth_apply_views"] = args.soft_orth_apply_views
     return stats
 
 
@@ -1231,7 +1243,10 @@ def train_one_epoch_deepspeed(
             aux_text = ""
             total_loss_logged = False
             if soft_orth_log_meters is not None:
-                aux_text += format_soft_orth_step_log(soft_orth_log_meters)
+                aux_text += format_soft_orth_step_log(
+                    soft_orth_log_meters,
+                    batch_losses,
+                )
             if proxy_log_meters is not None:
                 aux_text += (
                     f"total_loss {loss_total_meter.val:.4f} "
@@ -1292,6 +1307,7 @@ def train_one_epoch_deepspeed(
             key: meter.avg
             for key, meter in soft_orth_log_meters.items()
         })
+        stats["soft_orth_apply_views"] = args.soft_orth_apply_views
     return stats
 
 
@@ -1397,6 +1413,10 @@ def train(
         soft_orth_text = ""
         if bool(getattr(args, "use_soft_orth_fusion", False)):
             soft_orth_text = (
+                f" | soft_orth_apply_views="
+                f"{train_stats['soft_orth_apply_views']}"
+                f" | soft_orth_active_ratio="
+                f"{train_stats['soft_orth_active_ratio']:.4f}"
                 f" | soft_orth_lambda="
                 f"{train_stats['soft_orth_lambda']:.6f}"
                 f" | soft_orth_gamma="
@@ -1543,6 +1563,10 @@ def train_deepspeed(
             soft_orth_text = ""
             if bool(getattr(args, "use_soft_orth_fusion", False)):
                 soft_orth_text = (
+                    f" | soft_orth_apply_views="
+                    f"{train_stats['soft_orth_apply_views']}"
+                    f" | soft_orth_active_ratio="
+                    f"{train_stats['soft_orth_active_ratio']:.4f}"
                     f" | soft_orth_lambda="
                     f"{train_stats['soft_orth_lambda']:.6f}"
                     f" | soft_orth_gamma="
@@ -1673,6 +1697,12 @@ def parse_args():
     parser.add_argument("--soft_orth_lambda_init", type=float, default=0.5)
     parser.add_argument("--soft_orth_gamma_init", type=float, default=0.01)
     parser.add_argument("--soft_orth_gamma_max", type=float, default=0.05)
+    parser.add_argument(
+        "--soft_orth_apply_views",
+        type=str,
+        choices=["all", "drone", "sat"],
+        default="all",
+    )
     parser.add_argument(
         "--soft_orth_detach_global",
         type=str2bool,
@@ -1851,6 +1881,7 @@ def main():
         soft_orth_gamma_init=args.soft_orth_gamma_init,
         soft_orth_gamma_max=args.soft_orth_gamma_max,
         soft_orth_detach_global=args.soft_orth_detach_global,
+        soft_orth_apply_views=args.soft_orth_apply_views,
         use_proxy_loss=args.use_proxy_loss,
         num_train_ids=(
             args.num_train_ids

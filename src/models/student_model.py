@@ -118,6 +118,7 @@ class StudentModel(nn.Module):
         soft_orth_gamma_init=0.01,
         soft_orth_gamma_max=0.05,
         soft_orth_detach_global=True,
+        soft_orth_apply_views="all",
         use_proxy_loss=False,
         num_train_ids=None,
         proxy_scale=30.0,
@@ -126,6 +127,9 @@ class StudentModel(nn.Module):
         super().__init__()
         self.embedding_dim = 512
         self.use_soft_orth_fusion = bool(use_soft_orth_fusion)
+        if soft_orth_apply_views not in {"all", "drone", "sat"}:
+            raise ValueError("soft_orth_apply_views must be one of: all, drone, sat")
+        self.soft_orth_apply_views = soft_orth_apply_views
         self.use_proxy_loss = bool(use_proxy_loss)
         self._soft_orth_stats = {}
         self.backbone = RepViTBackbone(ckpt_path=ckpt_path)
@@ -167,6 +171,10 @@ class StudentModel(nn.Module):
         if self.use_soft_orth_fusion:
             rank0_print("  soft-orth fusion: enabled (f3 -> f4)")
             rank0_print(
+                "  soft-orth apply_views: "
+                f"{self.soft_orth_apply_views}"
+            )
+            rank0_print(
                 "  soft-orth detach_global: "
                 f"{self.soft_orth_fusion.detach_global}"
             )
@@ -184,15 +192,66 @@ class StudentModel(nn.Module):
                 f"Linear(512, {self.distill_projection.out_features}, bias=False)"
             )
 
-    def forward(self, x, return_fmap=False):
+    def _soft_orth_active_indices(self, batch_size, pair_batch_size, device):
+        if pair_batch_size is None:
+            return torch.arange(batch_size, device=device)
+
+        pair_batch_size = int(pair_batch_size)
+        if pair_batch_size <= 0:
+            raise ValueError("pair_batch_size must be greater than 0")
+        if batch_size != pair_batch_size * 2:
+            raise ValueError(
+                f"Expected concatenated paired batch size {pair_batch_size * 2}, "
+                f"got {batch_size}"
+            )
+
+        if self.soft_orth_apply_views == "all":
+            start, end = 0, batch_size
+        elif self.soft_orth_apply_views == "drone":
+            start, end = 0, pair_batch_size
+        else:
+            start, end = pair_batch_size, batch_size
+        return torch.arange(start, end, device=device)
+
+    def _apply_soft_orth_fusion(self, f4, f3, pair_batch_size=None):
+        active_indices = self._soft_orth_active_indices(
+            batch_size=f4.size(0),
+            pair_batch_size=pair_batch_size,
+            device=f4.device,
+        )
+        active_ratio = active_indices.numel() / max(1, f4.size(0))
+        if active_indices.numel() == f4.size(0):
+            f4 = self.soft_orth_fusion(f4, f3)
+        else:
+            active_f4 = f4.index_select(0, active_indices)
+            active_f3 = f3.index_select(0, active_indices)
+            enhanced_active_f4 = self.soft_orth_fusion(active_f4, active_f3)
+            fused_f4 = f4.clone()
+            fused_f4.index_copy_(0, active_indices, enhanced_active_f4)
+            f4 = fused_f4
+
+        stats = dict(self.soft_orth_fusion.last_stats)
+        stats["soft_orth_apply_views"] = self.soft_orth_apply_views
+        stats["soft_orth_active_ratio"] = torch.tensor(
+            active_ratio,
+            device=f4.device,
+            dtype=torch.float32,
+        )
+        self._soft_orth_stats = stats
+        return f4
+
+    def forward(self, x, return_fmap=False, pair_batch_size=None):
         features = self.backbone(x)
         if self.use_soft_orth_fusion:
             _, _, f3, f4 = features
         else:
             f4 = features[-1]
         if self.use_soft_orth_fusion:
-            f4 = self.soft_orth_fusion(f4, f3)
-            self._soft_orth_stats = self.soft_orth_fusion.last_stats
+            f4 = self._apply_soft_orth_fusion(
+                f4,
+                f3,
+                pair_batch_size=pair_batch_size,
+            )
         else:
             self._soft_orth_stats = {}
         desc = F.adaptive_avg_pool2d(f4, 1).flatten(1)
