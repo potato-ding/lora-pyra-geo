@@ -13,6 +13,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
+from src.loss.local_align_loss import F4LocalAlignmentLoss
 from src.models.student_model import StudentModel
 import src.training.student_train as student_train
 import src.dataset.datasets as student_datasets
@@ -228,6 +229,11 @@ def test_cli_defaults_to_clean_baseline(monkeypatch):
     assert args.kd_feat_weight == pytest.approx(0.05)
     assert args.kd_sim_weight == pytest.approx(0.05)
     assert args.kd_temperature == pytest.approx(0.1)
+    assert args.use_local_align is False
+    assert args.local_align_weight == pytest.approx(0.03)
+    assert args.local_align_tau == pytest.approx(0.07)
+    assert args.local_align_topk == 3
+    assert args.local_align_warmup_epochs == pytest.approx(5)
     assert args.teacher_precision == "bf16"
     assert args.teacher_micro_batch_size == 1
     assert args.deepspeed_config == "configs/ds_student_baseline.json"
@@ -240,7 +246,6 @@ def test_removed_training_flags_are_rejected(monkeypatch):
     removed_flags = [
         "--use_" + "b" + "rd_distill",
         "--" + "b" + "rd_weight",
-        "--use_" + "local_" + "align",
         "--use_kd_distill",
         "--teacher_checkpoint",
         "--kd_weight",
@@ -259,6 +264,141 @@ def test_plain_distillation_requires_teacher_checkpoint(monkeypatch):
     )
     with pytest.raises(SystemExit):
         student_train.parse_args()
+
+
+def test_f4_local_alignment_loss_matches_bidirectional_topk_ce():
+    torch.manual_seed(31)
+    drone_f4 = torch.randn(3, 4, 2, 2, requires_grad=True)
+    sat_f4 = torch.randn(3, 4, 2, 2, requires_grad=True)
+    criterion = F4LocalAlignmentLoss(tau=0.2, topk=2)
+
+    loss, stats = criterion(drone_f4, sat_f4)
+
+    drone_tokens = F.normalize(
+        drone_f4.flatten(2).transpose(1, 2).float(),
+        dim=-1,
+    )
+    sat_tokens = F.normalize(
+        sat_f4.flatten(2).transpose(1, 2).float(),
+        dim=-1,
+    )
+    sim = torch.einsum("bnd,cmd->bcnm", drone_tokens, sat_tokens)
+    d2s = sim.topk(2, dim=-1).values.mean(dim=-1).mean(dim=-1)
+    s2d = sim.topk(2, dim=-2).values.mean(dim=-2).mean(dim=-1)
+    local_score = 0.5 * (d2s + s2d)
+    logits = local_score / 0.2
+    labels = torch.arange(3)
+    expected = 0.5 * (
+        F.cross_entropy(logits, labels)
+        + F.cross_entropy(logits.t(), labels)
+    )
+
+    torch.testing.assert_close(loss, expected)
+    torch.testing.assert_close(
+        stats["local_pos_mean"],
+        local_score.diagonal().mean().detach(),
+    )
+    torch.testing.assert_close(
+        stats["local_neg_mean"],
+        local_score[~torch.eye(3, dtype=torch.bool)].mean().detach(),
+    )
+    loss.backward()
+    assert drone_f4.grad is not None
+    assert sat_f4.grad is not None
+
+
+def test_local_alignment_is_added_to_student_total_loss():
+    class TinyF4Student(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = nn.Linear(4, 2, bias=False)
+            self.logit_scale = nn.Parameter(torch.tensor(0.0))
+
+        def forward(self, x, return_fmap=False):
+            embedding = F.normalize(self.proj(x.float()), dim=1)
+            if not return_fmap:
+                return embedding
+            f4 = x.float().view(x.size(0), 1, 2, 2)
+            return embedding, f4
+
+    class Args:
+        use_local_align = True
+        local_align_weight = 0.4
+        local_align_tau = 0.2
+        local_align_topk = 2
+        local_align_warmup_epochs = 2
+
+    inputs = torch.tensor([
+        [1.0, 0.0, 0.2, 0.1],
+        [0.0, 1.0, 0.1, 0.2],
+        [0.8, 0.1, 0.2, 0.0],
+        [0.1, 0.7, 0.0, 0.3],
+    ])
+    model = TinyF4Student()
+    losses = compute_student_batch_losses(
+        model,
+        inputs,
+        pair_batch_size=2,
+        criterion=student_train.Sample4GeoLoss(label_smoothing=0.0),
+        args=Args,
+        local_align_criterion=F4LocalAlignmentLoss(tau=0.2, topk=2),
+        epoch=1,
+    )
+
+    assert losses["local_align_weight_eff"] == pytest.approx(0.2)
+    torch.testing.assert_close(
+        losses["loss"],
+        losses["main_loss"] + 0.2 * losses["loss_local_align"],
+    )
+    assert set(losses["local_align_stats"]) == {
+        "local_pos_mean",
+        "local_neg_mean",
+        "local_pos_neg_gap",
+    }
+    losses["loss"].backward()
+    assert model.proj.weight.grad is not None
+
+
+def test_local_alignment_routes_f4_through_paired_gather(monkeypatch):
+    class TinyF4Student(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.logit_scale = nn.Parameter(torch.tensor(0.0))
+
+        def forward(self, x, return_fmap=False):
+            embedding = F.normalize(x.float()[:, :2], dim=1)
+            if not return_fmap:
+                return embedding
+            return embedding, x.float().view(x.size(0), 1, 2, 2)
+
+    class Args:
+        use_local_align = True
+        local_align_weight = 0.1
+        local_align_tau = 0.2
+        local_align_topk = 1
+        local_align_warmup_epochs = 1
+
+    gathered_shapes = []
+    original_gather = student_train.gather_paired_views
+
+    def spy_gather(tensor, pair_batch_size, with_grad=True):
+        gathered_shapes.append(tuple(tensor.shape))
+        return original_gather(tensor, pair_batch_size, with_grad)
+
+    monkeypatch.setattr(student_train, "gather_paired_views", spy_gather)
+    inputs = torch.randn(4, 4)
+    compute_student_batch_losses(
+        TinyF4Student(),
+        inputs,
+        pair_batch_size=2,
+        criterion=student_train.Sample4GeoLoss(label_smoothing=0.0),
+        args=Args,
+        local_align_criterion=F4LocalAlignmentLoss(tau=0.2, topk=1),
+        epoch=1,
+    )
+
+    assert (4, 2) in gathered_shapes
+    assert (4, 1, 2, 2) in gathered_shapes
 
 
 def test_plain_distillation_projection_is_optional_and_trainable():

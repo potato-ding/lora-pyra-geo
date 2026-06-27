@@ -15,6 +15,7 @@ import torch.nn.functional as F
 from torch.amp import GradScaler, autocast
 
 from src.loss.blocks_infoNCE import Sample4GeoLoss
+from src.loss.local_align_loss import F4LocalAlignmentLoss
 from src.models.student_model import StudentModel
 from src.utils.gather_features_and_labels_and_views import (
     GatherLayer,
@@ -135,6 +136,16 @@ def sample4geo_loss(model, features, criterion, pair_batch_size):
     satellite_feat = features[pair_batch_size:pair_batch_size * 2]
     logit_scale = get_raw_model(model).logit_scale.exp()
     return criterion(drone_feat, satellite_feat, logit_scale)
+
+
+def local_align_weight_eff(args, epoch):
+    if not bool(getattr(args, "use_local_align", False)):
+        return 0.0
+    weight = float(getattr(args, "local_align_weight", 0.03))
+    warmup_epochs = float(getattr(args, "local_align_warmup_epochs", 5))
+    if warmup_epochs <= 0:
+        return weight
+    return weight * min(1.0, float(epoch) / warmup_epochs)
 
 
 def gather_tensor_with_grad(tensor):
@@ -342,8 +353,16 @@ def compute_student_batch_losses(
     criterion,
     args=None,
     teacher_features=None,
+    local_align_criterion=None,
+    epoch=None,
 ):
-    local_features = model(images)
+    use_local_align = bool(getattr(args, "use_local_align", False))
+    if use_local_align:
+        local_features, local_f4 = model(images, return_fmap=True)
+    else:
+        local_features = model(images)
+        local_f4 = None
+
     features, global_pair_batch_size = gather_paired_views(
         local_features,
         pair_batch_size,
@@ -360,6 +379,39 @@ def compute_student_batch_losses(
         "main_loss": loss_infonce,
         "global_pair_batch_size": global_pair_batch_size,
     }
+    if use_local_align:
+        if local_align_criterion is None:
+            local_align_criterion = F4LocalAlignmentLoss(
+                tau=args.local_align_tau,
+                topk=args.local_align_topk,
+            )
+        global_f4, f4_pair_batch_size = gather_paired_views(
+            local_f4,
+            pair_batch_size,
+            with_grad=True,
+        )
+        if f4_pair_batch_size != global_pair_batch_size:
+            raise RuntimeError(
+                "Embedding and f4 global pair batches differ: "
+                f"embedding={global_pair_batch_size} f4={f4_pair_batch_size}"
+            )
+        drone_f4 = global_f4[:global_pair_batch_size]
+        satellite_f4 = global_f4[
+            global_pair_batch_size:global_pair_batch_size * 2
+        ]
+        loss_local_align, local_align_stats = local_align_criterion(
+            drone_f4,
+            satellite_f4,
+        )
+        current_epoch = 1 if epoch is None else epoch
+        weight_eff = local_align_weight_eff(args, current_epoch)
+        losses.update({
+            "loss": loss_infonce + weight_eff * loss_local_align,
+            "loss_retrieval": loss_infonce,
+            "loss_local_align": loss_local_align,
+            "local_align_weight_eff": weight_eff,
+            "local_align_stats": local_align_stats,
+        })
     if teacher_features is None:
         return losses
     if args is None or not bool(getattr(args, "distill", False)):
@@ -433,7 +485,7 @@ def compute_student_batch_losses(
         args.kd_temperature,
     )
     total_loss = (
-        loss_infonce
+        losses["loss"]
         + kd_feat_weight * loss_kd_feat
         + kd_sim_weight * loss_kd_sim
     )
@@ -800,6 +852,55 @@ def format_kd_step_log(meters, kd_feat_weight, kd_sim_weight):
     )
 
 
+LOCAL_ALIGN_LOG_KEYS = (
+    "loss_local_align",
+    "local_align_weight_eff",
+    "local_pos_mean",
+    "local_neg_mean",
+    "local_pos_neg_gap",
+)
+
+
+def create_local_align_log_meters():
+    return {key: AverageMeter() for key in LOCAL_ALIGN_LOG_KEYS}
+
+
+def update_local_align_log_meters(meters, batch_losses, n):
+    meters["loss_local_align"].update(
+        batch_losses["loss_local_align"].item(),
+        n,
+    )
+    meters["local_align_weight_eff"].update(
+        batch_losses["local_align_weight_eff"],
+        n,
+    )
+    for key in (
+        "local_pos_mean",
+        "local_neg_mean",
+        "local_pos_neg_gap",
+    ):
+        meters[key].update(batch_losses["local_align_stats"][key].item(), n)
+
+
+def format_total_loss_step_log(loss_total_meter):
+    return (
+        f"total_loss {loss_total_meter.val:.4f} "
+        f"({loss_total_meter.avg:.4f}) | "
+    )
+
+
+def format_local_align_step_log(meters):
+    return (
+        f"loss_local_align {meters['loss_local_align'].val:.4f} "
+        f"({meters['loss_local_align'].avg:.4f}) | "
+        f"local_align_weight_eff "
+        f"{meters['local_align_weight_eff'].val:.6f} | "
+        f"local_pos_mean {meters['local_pos_mean'].val:.4f} | "
+        f"local_neg_mean {meters['local_neg_mean'].val:.4f} | "
+        f"local_pos_neg_gap {meters['local_pos_neg_gap'].val:.4f} | "
+    )
+
+
 def train_one_epoch(
     model,
     train_loader,
@@ -818,6 +919,19 @@ def train_one_epoch(
     loss_total_meter = AverageMeter()
     loss_retrieval_meter = AverageMeter()
     kd_log_meters = create_kd_log_meters() if teacher_model is not None else None
+    local_align_log_meters = (
+        create_local_align_log_meters()
+        if bool(getattr(args, "use_local_align", False))
+        else None
+    )
+    local_align_criterion = (
+        F4LocalAlignmentLoss(
+            tau=args.local_align_tau,
+            topk=args.local_align_topk,
+        )
+        if local_align_log_meters is not None
+        else None
+    )
     end = time.time()
 
     if hasattr(train_loader.batch_sampler, "set_epoch"):
@@ -848,6 +962,8 @@ def train_one_epoch(
                 criterion,
                 args,
                 teacher_features=teacher_features,
+                local_align_criterion=local_align_criterion,
+                epoch=epoch,
             )
             loss = batch_losses["loss"]
 
@@ -888,6 +1004,12 @@ def train_one_epoch(
                 batch_losses,
                 images.size(0),
             )
+        if local_align_log_meters is not None:
+            update_local_align_log_meters(
+                local_align_log_meters,
+                batch_losses,
+                images.size(0),
+            )
         batch_time.update(time.time() - end)
         end = time.time()
 
@@ -895,18 +1017,21 @@ def train_one_epoch(
             (step + 1) % args.print_freq == 0
             or step == len(train_loader) - 1
         ):
-            kd_text = ""
+            aux_text = ""
+            if local_align_log_meters is not None:
+                aux_text += format_total_loss_step_log(loss_total_meter)
+                aux_text += format_local_align_step_log(
+                    local_align_log_meters
+                )
             if kd_log_meters is not None:
+                if not aux_text:
+                    aux_text += format_total_loss_step_log(loss_total_meter)
                 kd_step_log = format_kd_step_log(
                     kd_log_meters,
                     batch_losses["kd_feat_weight"],
                     batch_losses["kd_sim_weight"],
                 )
-                kd_text = (
-                    f"total_loss {loss_total_meter.val:.4f} "
-                    f"({loss_total_meter.avg:.4f}) | "
-                    f"{kd_step_log}"
-                )
+                aux_text += kd_step_log
             print(
                 f"Epoch [{epoch}/{args.epochs}] "
                 f"Step [{step + 1}/{len(train_loader)}] | "
@@ -917,7 +1042,7 @@ def train_one_epoch(
                 f"batch {batch_time.val:.3f}s ({batch_time.avg:.3f}s) | "
                 f"loss_retrieval {loss_retrieval_meter.val:.4f} "
                 f"({loss_retrieval_meter.avg:.4f}) | "
-                f"{kd_text}"
+                f"{aux_text}"
                 f"logit_scale {raw_model.logit_scale.exp().item():.3f} | "
                 f"lr {optimizer.param_groups[0]['lr']:.8f}"
             )
@@ -933,6 +1058,11 @@ def train_one_epoch(
         })
         stats["kd_feat_weight"] = float(args.kd_feat_weight)
         stats["kd_sim_weight"] = float(args.kd_sim_weight)
+    if local_align_log_meters is not None:
+        stats.update({
+            key: meter.avg
+            for key, meter in local_align_log_meters.items()
+        })
     return stats
 
 
@@ -953,6 +1083,19 @@ def train_one_epoch_deepspeed(
     loss_total_meter = AverageMeter()
     loss_retrieval_meter = AverageMeter()
     kd_log_meters = create_kd_log_meters() if teacher_model is not None else None
+    local_align_log_meters = (
+        create_local_align_log_meters()
+        if bool(getattr(args, "use_local_align", False))
+        else None
+    )
+    local_align_criterion = (
+        F4LocalAlignmentLoss(
+            tau=args.local_align_tau,
+            topk=args.local_align_topk,
+        )
+        if local_align_log_meters is not None
+        else None
+    )
     batch_time = AverageMeter()
     data_time = AverageMeter()
     end = time.time()
@@ -980,6 +1123,8 @@ def train_one_epoch_deepspeed(
             criterion,
             args,
             teacher_features=teacher_features,
+            local_align_criterion=local_align_criterion,
+            epoch=epoch,
         )
         loss = batch_losses["loss"]
         model_engine.backward(loss)
@@ -994,6 +1139,12 @@ def train_one_epoch_deepspeed(
         loss_retrieval_meter.update(batch_losses["main_loss"].item(), weight)
         if kd_log_meters is not None:
             update_kd_log_meters(kd_log_meters, batch_losses, weight)
+        if local_align_log_meters is not None:
+            update_local_align_log_meters(
+                local_align_log_meters,
+                batch_losses,
+                weight,
+            )
         batch_time.update(time.time() - end)
         end = time.time()
 
@@ -1001,18 +1152,21 @@ def train_one_epoch_deepspeed(
             (step + 1) % args.print_freq == 0
             or step == len(train_loader) - 1
         ):
-            kd_text = ""
+            aux_text = ""
+            if local_align_log_meters is not None:
+                aux_text += format_total_loss_step_log(loss_total_meter)
+                aux_text += format_local_align_step_log(
+                    local_align_log_meters
+                )
             if kd_log_meters is not None:
+                if not aux_text:
+                    aux_text += format_total_loss_step_log(loss_total_meter)
                 kd_step_log = format_kd_step_log(
                     kd_log_meters,
                     batch_losses["kd_feat_weight"],
                     batch_losses["kd_sim_weight"],
                 )
-                kd_text = (
-                    f"total_loss {loss_total_meter.val:.4f} "
-                    f"({loss_total_meter.avg:.4f}) | "
-                    f"{kd_step_log}"
-                )
+                aux_text += kd_step_log
             print(
                 f"Epoch [{epoch}/{args.epochs}] "
                 f"Step [{step + 1}/{len(train_loader)}] | "
@@ -1023,7 +1177,7 @@ def train_one_epoch_deepspeed(
                 f"batch {batch_time.val:.3f}s ({batch_time.avg:.3f}s) | "
                 f"loss_retrieval {loss_retrieval_meter.val:.4f} "
                 f"({loss_retrieval_meter.avg:.4f}) | "
-                f"{kd_text}"
+                f"{aux_text}"
                 f"logit_scale "
                 f"{get_raw_model(model_engine).logit_scale.exp().item():.3f} | "
                 f"lr {optimizer.param_groups[0]['lr']:.8f}"
@@ -1040,6 +1194,11 @@ def train_one_epoch_deepspeed(
         })
         stats["kd_feat_weight"] = float(args.kd_feat_weight)
         stats["kd_sim_weight"] = float(args.kd_sim_weight)
+    if local_align_log_meters is not None:
+        stats.update({
+            key: meter.avg
+            for key, meter in local_align_log_meters.items()
+        })
     return stats
 
 
@@ -1129,10 +1288,23 @@ def train(
                 f" | kd_feat_weight={train_stats['kd_feat_weight']:.6f}"
                 f" | kd_sim_weight={train_stats['kd_sim_weight']:.6f}"
             )
+        local_align_text = ""
+        if bool(getattr(args, "use_local_align", False)):
+            local_align_text = (
+                f" | loss_local_align="
+                f"{train_stats['loss_local_align']:.4f}"
+                f" | local_align_weight_eff="
+                f"{train_stats['local_align_weight_eff']:.6f}"
+                f" | local_pos_mean={train_stats['local_pos_mean']:.4f}"
+                f" | local_neg_mean={train_stats['local_neg_mean']:.4f}"
+                f" | local_pos_neg_gap="
+                f"{train_stats['local_pos_neg_gap']:.4f}"
+            )
         print(
             f"[Train] Epoch {epoch}/{args.epochs} | "
             f"loss_retrieval={train_stats['loss_retrieval']:.4f}"
             f" | total_loss={train_stats['total_loss']:.4f}"
+            f"{local_align_text}"
             f"{kd_text}"
         )
 
@@ -1242,11 +1414,24 @@ def train_deepspeed(
                     f" | kd_feat_weight={train_stats['kd_feat_weight']:.6f}"
                     f" | kd_sim_weight={train_stats['kd_sim_weight']:.6f}"
                 )
+            local_align_text = ""
+            if bool(getattr(args, "use_local_align", False)):
+                local_align_text = (
+                    f" | loss_local_align="
+                    f"{train_stats['loss_local_align']:.4f}"
+                    f" | local_align_weight_eff="
+                    f"{train_stats['local_align_weight_eff']:.6f}"
+                    f" | local_pos_mean={train_stats['local_pos_mean']:.4f}"
+                    f" | local_neg_mean={train_stats['local_neg_mean']:.4f}"
+                    f" | local_pos_neg_gap="
+                    f"{train_stats['local_pos_neg_gap']:.4f}"
+                )
             print(
                 f"[Train] Epoch {epoch}/{args.epochs} | "
                 f"loss_retrieval={train_stats['loss_retrieval']:.4f} | "
                 f"total_loss={train_stats['total_loss']:.4f} | "
                 f"world_size={get_world_size()}"
+                f"{local_align_text}"
                 f"{kd_text}"
             )
 
@@ -1351,6 +1536,11 @@ def parse_args():
     parser.add_argument("--min_lr_ratio", type=float, default=0.01)
     parser.add_argument("--temperature", type=float, default=0.07)
     parser.add_argument("--label_smoothing", type=float, default=0.1)
+    parser.add_argument("--use_local_align", action="store_true", default=False)
+    parser.add_argument("--local_align_weight", type=float, default=0.03)
+    parser.add_argument("--local_align_tau", type=float, default=0.07)
+    parser.add_argument("--local_align_topk", type=int, default=3)
+    parser.add_argument("--local_align_warmup_epochs", type=float, default=5)
     parser.add_argument("--amp", dest="amp", action="store_true", default=True)
     parser.add_argument("--no_amp", dest="amp", action="store_false")
     parser.add_argument("--grad_clip", type=float, default=0.0)
@@ -1405,6 +1595,14 @@ def parse_args():
     args = parser.parse_args()
     if args.kd_feat_weight < 0 or args.kd_sim_weight < 0:
         parser.error("--kd_feat_weight and --kd_sim_weight must be non-negative")
+    if args.local_align_weight < 0:
+        parser.error("--local_align_weight must be non-negative")
+    if args.local_align_tau <= 0:
+        parser.error("--local_align_tau must be greater than 0")
+    if args.local_align_topk <= 0:
+        parser.error("--local_align_topk must be greater than 0")
+    if args.local_align_warmup_epochs < 0:
+        parser.error("--local_align_warmup_epochs must be non-negative")
     if args.print_freq <= 0:
         parser.error("--print_freq must be greater than 0")
     if args.distill and args.kd_feat_weight + args.kd_sim_weight <= 0:

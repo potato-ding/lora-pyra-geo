@@ -1,4 +1,5 @@
 import os
+from datetime import datetime
 # 用于根据args返回路径
 
 def _fmt_weight(value):
@@ -42,4 +43,8 @@ def get_save_pth(args):
     return save_dir
 
 def get_student_save_pth(args):
-    return getattr(args, "output_root", "src/checkpoint/student")
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    return os.path.join(
+        getattr(args, "output_root", "src/checkpoint/student"),
+        timestamp,
+    )
