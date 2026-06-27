@@ -929,12 +929,22 @@ def format_proxy_step_log(meters, batch_losses):
 SOFT_ORTH_LOG_KEYS = (
     "soft_orth_active_ratio",
     "soft_orth_lambda",
-    "soft_orth_gamma",
+    "soft_orth_gamma_detail",
+    "soft_orth_gamma_detail_mean",
+    "soft_orth_gamma_detail_min",
+    "soft_orth_gamma_detail_max",
+    "soft_orth_gamma_sem",
+    "soft_orth_gamma_sem_mean",
+    "soft_orth_gamma_sem_min",
+    "soft_orth_gamma_sem_max",
     "soft_orth_f4_norm",
     "soft_orth_f3_proj_norm",
     "soft_orth_parallel_norm",
     "soft_orth_detail_norm",
     "soft_orth_cos_f3_f4",
+    "soft_orth_enhance_ratio_detail",
+    "soft_orth_semantic_norm",
+    "soft_orth_enhance_ratio_sem",
 )
 
 
@@ -945,17 +955,53 @@ def create_soft_orth_log_meters():
 def update_soft_orth_log_meters(meters, batch_losses, n):
     stats = batch_losses["soft_orth_stats"]
     for key in SOFT_ORTH_LOG_KEYS:
-        meters[key].update(stats[key].item(), n)
+        if key in stats:
+            meters[key].update(stats[key].item(), n)
 
 
 def format_soft_orth_step_log(meters, batch_losses):
-    apply_views = batch_losses["soft_orth_stats"]["soft_orth_apply_views"]
-    return (
+    stats = batch_losses["soft_orth_stats"]
+    apply_views = stats["soft_orth_apply_views"]
+    gate_type = stats["soft_orth_gate_type"]
+    fusion_mode = stats["soft_orth_fusion_mode"]
+    text = (
         f"soft_orth_apply_views {apply_views} | "
         f"soft_orth_active_ratio "
         f"{meters['soft_orth_active_ratio'].val:.4f} | "
+        f"soft_orth_gate_type {gate_type} | "
+        f"soft_orth_fusion_mode {fusion_mode} | "
         f"soft_orth_lambda {meters['soft_orth_lambda'].val:.6f} | "
-        f"soft_orth_gamma {meters['soft_orth_gamma'].val:.6f} | "
+    )
+    if gate_type == "scalar":
+        text += (
+            f"soft_orth_gamma_detail "
+            f"{meters['soft_orth_gamma_detail'].val:.6f} | "
+        )
+    else:
+        text += (
+            f"soft_orth_gamma_detail_mean "
+            f"{meters['soft_orth_gamma_detail_mean'].val:.6f} | "
+            f"soft_orth_gamma_detail_min "
+            f"{meters['soft_orth_gamma_detail_min'].val:.6f} | "
+            f"soft_orth_gamma_detail_max "
+            f"{meters['soft_orth_gamma_detail_max'].val:.6f} | "
+        )
+    if fusion_mode == "dual_path":
+        if gate_type == "scalar":
+            text += (
+                f"soft_orth_gamma_sem "
+                f"{meters['soft_orth_gamma_sem'].val:.6f} | "
+            )
+        else:
+            text += (
+                f"soft_orth_gamma_sem_mean "
+                f"{meters['soft_orth_gamma_sem_mean'].val:.6f} | "
+                f"soft_orth_gamma_sem_min "
+                f"{meters['soft_orth_gamma_sem_min'].val:.6f} | "
+                f"soft_orth_gamma_sem_max "
+                f"{meters['soft_orth_gamma_sem_max'].val:.6f} | "
+            )
+    text += (
         f"soft_orth_f4_norm {meters['soft_orth_f4_norm'].val:.4f} | "
         f"soft_orth_f3_proj_norm "
         f"{meters['soft_orth_f3_proj_norm'].val:.4f} | "
@@ -965,7 +1011,82 @@ def format_soft_orth_step_log(meters, batch_losses):
         f"{meters['soft_orth_detail_norm'].val:.4f} | "
         f"soft_orth_cos_f3_f4 "
         f"{meters['soft_orth_cos_f3_f4'].val:.4f} | "
+        f"soft_orth_enhance_ratio_detail "
+        f"{meters['soft_orth_enhance_ratio_detail'].val:.6f} | "
     )
+    if fusion_mode == "dual_path":
+        text += (
+            f"soft_orth_semantic_norm "
+            f"{meters['soft_orth_semantic_norm'].val:.4f} | "
+            f"soft_orth_enhance_ratio_sem "
+            f"{meters['soft_orth_enhance_ratio_sem'].val:.6f} | "
+        )
+    return text
+
+
+def format_soft_orth_epoch_log(train_stats):
+    gate_type = train_stats["soft_orth_gate_type"]
+    fusion_mode = train_stats["soft_orth_fusion_mode"]
+    text = (
+        f" | soft_orth_apply_views="
+        f"{train_stats['soft_orth_apply_views']}"
+        f" | soft_orth_active_ratio="
+        f"{train_stats['soft_orth_active_ratio']:.4f}"
+        f" | soft_orth_gate_type={gate_type}"
+        f" | soft_orth_fusion_mode={fusion_mode}"
+        f" | soft_orth_lambda={train_stats['soft_orth_lambda']:.6f}"
+    )
+    if gate_type == "scalar":
+        text += (
+            f" | soft_orth_gamma_detail="
+            f"{train_stats['soft_orth_gamma_detail']:.6f}"
+        )
+    else:
+        text += (
+            f" | soft_orth_gamma_detail_mean="
+            f"{train_stats['soft_orth_gamma_detail_mean']:.6f}"
+            f" | soft_orth_gamma_detail_min="
+            f"{train_stats['soft_orth_gamma_detail_min']:.6f}"
+            f" | soft_orth_gamma_detail_max="
+            f"{train_stats['soft_orth_gamma_detail_max']:.6f}"
+        )
+    if fusion_mode == "dual_path":
+        if gate_type == "scalar":
+            text += (
+                f" | soft_orth_gamma_sem="
+                f"{train_stats['soft_orth_gamma_sem']:.6f}"
+            )
+        else:
+            text += (
+                f" | soft_orth_gamma_sem_mean="
+                f"{train_stats['soft_orth_gamma_sem_mean']:.6f}"
+                f" | soft_orth_gamma_sem_min="
+                f"{train_stats['soft_orth_gamma_sem_min']:.6f}"
+                f" | soft_orth_gamma_sem_max="
+                f"{train_stats['soft_orth_gamma_sem_max']:.6f}"
+            )
+    text += (
+        f" | soft_orth_f4_norm="
+        f"{train_stats['soft_orth_f4_norm']:.4f}"
+        f" | soft_orth_f3_proj_norm="
+        f"{train_stats['soft_orth_f3_proj_norm']:.4f}"
+        f" | soft_orth_parallel_norm="
+        f"{train_stats['soft_orth_parallel_norm']:.4f}"
+        f" | soft_orth_detail_norm="
+        f"{train_stats['soft_orth_detail_norm']:.4f}"
+        f" | soft_orth_cos_f3_f4="
+        f"{train_stats['soft_orth_cos_f3_f4']:.4f}"
+        f" | soft_orth_enhance_ratio_detail="
+        f"{train_stats['soft_orth_enhance_ratio_detail']:.6f}"
+    )
+    if fusion_mode == "dual_path":
+        text += (
+            f" | soft_orth_semantic_norm="
+            f"{train_stats['soft_orth_semantic_norm']:.4f}"
+            f" | soft_orth_enhance_ratio_sem="
+            f"{train_stats['soft_orth_enhance_ratio_sem']:.6f}"
+        )
+    return text
 
 
 def train_one_epoch(
@@ -1151,8 +1272,11 @@ def train_one_epoch(
         stats.update({
             key: meter.avg
             for key, meter in soft_orth_log_meters.items()
+            if meter.count > 0
         })
         stats["soft_orth_apply_views"] = args.soft_orth_apply_views
+        stats["soft_orth_gate_type"] = args.soft_orth_gate_type
+        stats["soft_orth_fusion_mode"] = args.soft_orth_fusion_mode
     return stats
 
 
@@ -1306,8 +1430,11 @@ def train_one_epoch_deepspeed(
         stats.update({
             key: meter.avg
             for key, meter in soft_orth_log_meters.items()
+            if meter.count > 0
         })
         stats["soft_orth_apply_views"] = args.soft_orth_apply_views
+        stats["soft_orth_gate_type"] = args.soft_orth_gate_type
+        stats["soft_orth_fusion_mode"] = args.soft_orth_fusion_mode
     return stats
 
 
@@ -1412,26 +1539,7 @@ def train(
             )
         soft_orth_text = ""
         if bool(getattr(args, "use_soft_orth_fusion", False)):
-            soft_orth_text = (
-                f" | soft_orth_apply_views="
-                f"{train_stats['soft_orth_apply_views']}"
-                f" | soft_orth_active_ratio="
-                f"{train_stats['soft_orth_active_ratio']:.4f}"
-                f" | soft_orth_lambda="
-                f"{train_stats['soft_orth_lambda']:.6f}"
-                f" | soft_orth_gamma="
-                f"{train_stats['soft_orth_gamma']:.6f}"
-                f" | soft_orth_f4_norm="
-                f"{train_stats['soft_orth_f4_norm']:.4f}"
-                f" | soft_orth_f3_proj_norm="
-                f"{train_stats['soft_orth_f3_proj_norm']:.4f}"
-                f" | soft_orth_parallel_norm="
-                f"{train_stats['soft_orth_parallel_norm']:.4f}"
-                f" | soft_orth_detail_norm="
-                f"{train_stats['soft_orth_detail_norm']:.4f}"
-                f" | soft_orth_cos_f3_f4="
-                f"{train_stats['soft_orth_cos_f3_f4']:.4f}"
-            )
+            soft_orth_text = format_soft_orth_epoch_log(train_stats)
         print(
             f"[Train] Epoch {epoch}/{args.epochs} | "
             f"loss_retrieval={train_stats['loss_retrieval']:.4f}"
@@ -1562,26 +1670,7 @@ def train_deepspeed(
                 )
             soft_orth_text = ""
             if bool(getattr(args, "use_soft_orth_fusion", False)):
-                soft_orth_text = (
-                    f" | soft_orth_apply_views="
-                    f"{train_stats['soft_orth_apply_views']}"
-                    f" | soft_orth_active_ratio="
-                    f"{train_stats['soft_orth_active_ratio']:.4f}"
-                    f" | soft_orth_lambda="
-                    f"{train_stats['soft_orth_lambda']:.6f}"
-                    f" | soft_orth_gamma="
-                    f"{train_stats['soft_orth_gamma']:.6f}"
-                    f" | soft_orth_f4_norm="
-                    f"{train_stats['soft_orth_f4_norm']:.4f}"
-                    f" | soft_orth_f3_proj_norm="
-                    f"{train_stats['soft_orth_f3_proj_norm']:.4f}"
-                    f" | soft_orth_parallel_norm="
-                    f"{train_stats['soft_orth_parallel_norm']:.4f}"
-                    f" | soft_orth_detail_norm="
-                    f"{train_stats['soft_orth_detail_norm']:.4f}"
-                    f" | soft_orth_cos_f3_f4="
-                    f"{train_stats['soft_orth_cos_f3_f4']:.4f}"
-                )
+                soft_orth_text = format_soft_orth_epoch_log(train_stats)
             print(
                 f"[Train] Epoch {epoch}/{args.epochs} | "
                 f"loss_retrieval={train_stats['loss_retrieval']:.4f} | "
@@ -1698,6 +1787,20 @@ def parse_args():
     parser.add_argument("--soft_orth_gamma_init", type=float, default=0.01)
     parser.add_argument("--soft_orth_gamma_max", type=float, default=0.05)
     parser.add_argument(
+        "--soft_orth_gate_type",
+        type=str,
+        choices=["scalar", "channel"],
+        default="scalar",
+    )
+    parser.add_argument(
+        "--soft_orth_fusion_mode",
+        type=str,
+        choices=["detail_only", "dual_path"],
+        default="detail_only",
+    )
+    parser.add_argument("--soft_orth_sem_gamma_init", type=float, default=0.005)
+    parser.add_argument("--soft_orth_sem_gamma_max", type=float, default=0.02)
+    parser.add_argument(
         "--soft_orth_apply_views",
         type=str,
         choices=["all", "drone", "sat"],
@@ -1780,6 +1883,16 @@ def parse_args():
         parser.error(
             "--soft_orth_gamma_init must be greater than 0 and smaller than "
             "--soft_orth_gamma_max"
+        )
+    if args.soft_orth_sem_gamma_max <= 0:
+        parser.error("--soft_orth_sem_gamma_max must be greater than 0")
+    if (
+        args.soft_orth_sem_gamma_init <= 0
+        or args.soft_orth_sem_gamma_init >= args.soft_orth_sem_gamma_max
+    ):
+        parser.error(
+            "--soft_orth_sem_gamma_init must be greater than 0 and smaller "
+            "than --soft_orth_sem_gamma_max"
         )
     if args.proxy_loss_weight < 0:
         parser.error("--proxy_loss_weight must be non-negative")
@@ -1882,6 +1995,10 @@ def main():
         soft_orth_gamma_max=args.soft_orth_gamma_max,
         soft_orth_detach_global=args.soft_orth_detach_global,
         soft_orth_apply_views=args.soft_orth_apply_views,
+        soft_orth_gate_type=args.soft_orth_gate_type,
+        soft_orth_fusion_mode=args.soft_orth_fusion_mode,
+        soft_orth_sem_gamma_init=args.soft_orth_sem_gamma_init,
+        soft_orth_sem_gamma_max=args.soft_orth_sem_gamma_max,
         use_proxy_loss=args.use_proxy_loss,
         num_train_ids=(
             args.num_train_ids
