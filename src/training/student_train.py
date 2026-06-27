@@ -808,11 +808,11 @@ def format_kd_step_log(meters, kd_feat_weight, kd_sim_weight):
 SOFT_ORTH_LOG_KEYS = (
     "soft_orth_lambda",
     "soft_orth_gamma",
-    "soft_orth_g_norm",
-    "soft_orth_l3_norm",
+    "soft_orth_f4_norm",
+    "soft_orth_f3_proj_norm",
     "soft_orth_parallel_norm",
     "soft_orth_detail_norm",
-    "soft_orth_cos_l3_g",
+    "soft_orth_cos_f3_f4",
 )
 
 
@@ -830,13 +830,15 @@ def format_soft_orth_step_log(meters):
     return (
         f"soft_orth_lambda {meters['soft_orth_lambda'].val:.6f} | "
         f"soft_orth_gamma {meters['soft_orth_gamma'].val:.6f} | "
-        f"soft_orth_g_norm {meters['soft_orth_g_norm'].val:.4f} | "
-        f"soft_orth_l3_norm {meters['soft_orth_l3_norm'].val:.4f} | "
+        f"soft_orth_f4_norm {meters['soft_orth_f4_norm'].val:.4f} | "
+        f"soft_orth_f3_proj_norm "
+        f"{meters['soft_orth_f3_proj_norm'].val:.4f} | "
         f"soft_orth_parallel_norm "
         f"{meters['soft_orth_parallel_norm'].val:.4f} | "
         f"soft_orth_detail_norm "
         f"{meters['soft_orth_detail_norm'].val:.4f} | "
-        f"soft_orth_cos_l3_g {meters['soft_orth_cos_l3_g'].val:.4f} | "
+        f"soft_orth_cos_f3_f4 "
+        f"{meters['soft_orth_cos_f3_f4'].val:.4f} | "
     )
 
 
@@ -1212,16 +1214,16 @@ def train(
                 f"{train_stats['soft_orth_lambda']:.6f}"
                 f" | soft_orth_gamma="
                 f"{train_stats['soft_orth_gamma']:.6f}"
-                f" | soft_orth_g_norm="
-                f"{train_stats['soft_orth_g_norm']:.4f}"
-                f" | soft_orth_l3_norm="
-                f"{train_stats['soft_orth_l3_norm']:.4f}"
+                f" | soft_orth_f4_norm="
+                f"{train_stats['soft_orth_f4_norm']:.4f}"
+                f" | soft_orth_f3_proj_norm="
+                f"{train_stats['soft_orth_f3_proj_norm']:.4f}"
                 f" | soft_orth_parallel_norm="
                 f"{train_stats['soft_orth_parallel_norm']:.4f}"
                 f" | soft_orth_detail_norm="
                 f"{train_stats['soft_orth_detail_norm']:.4f}"
-                f" | soft_orth_cos_l3_g="
-                f"{train_stats['soft_orth_cos_l3_g']:.4f}"
+                f" | soft_orth_cos_f3_f4="
+                f"{train_stats['soft_orth_cos_f3_f4']:.4f}"
             )
         print(
             f"[Train] Epoch {epoch}/{args.epochs} | "
@@ -1344,16 +1346,16 @@ def train_deepspeed(
                     f"{train_stats['soft_orth_lambda']:.6f}"
                     f" | soft_orth_gamma="
                     f"{train_stats['soft_orth_gamma']:.6f}"
-                    f" | soft_orth_g_norm="
-                    f"{train_stats['soft_orth_g_norm']:.4f}"
-                    f" | soft_orth_l3_norm="
-                    f"{train_stats['soft_orth_l3_norm']:.4f}"
+                    f" | soft_orth_f4_norm="
+                    f"{train_stats['soft_orth_f4_norm']:.4f}"
+                    f" | soft_orth_f3_proj_norm="
+                    f"{train_stats['soft_orth_f3_proj_norm']:.4f}"
                     f" | soft_orth_parallel_norm="
                     f"{train_stats['soft_orth_parallel_norm']:.4f}"
                     f" | soft_orth_detail_norm="
                     f"{train_stats['soft_orth_detail_norm']:.4f}"
-                    f" | soft_orth_cos_l3_g="
-                    f"{train_stats['soft_orth_cos_l3_g']:.4f}"
+                    f" | soft_orth_cos_f3_f4="
+                    f"{train_stats['soft_orth_cos_f3_f4']:.4f}"
                 )
             print(
                 f"[Train] Epoch {epoch}/{args.epochs} | "
@@ -1466,15 +1468,9 @@ def parse_args():
     parser.add_argument("--temperature", type=float, default=0.07)
     parser.add_argument("--label_smoothing", type=float, default=0.1)
     parser.add_argument("--use_soft_orth_fusion", action="store_true", default=False)
-    parser.add_argument(
-        "--soft_orth_layer",
-        type=str,
-        choices=["f3"],
-        default="f3",
-    )
     parser.add_argument("--soft_orth_lambda_init", type=float, default=0.5)
     parser.add_argument("--soft_orth_gamma_init", type=float, default=0.01)
-    parser.add_argument("--soft_orth_gamma_max", type=float, default=0.1)
+    parser.add_argument("--soft_orth_gamma_max", type=float, default=0.05)
     parser.add_argument(
         "--soft_orth_detach_global",
         type=str2bool,
@@ -1536,8 +1532,6 @@ def parse_args():
     args = parser.parse_args()
     if args.kd_feat_weight < 0 or args.kd_sim_weight < 0:
         parser.error("--kd_feat_weight and --kd_sim_weight must be non-negative")
-    if args.soft_orth_layer != "f3":
-        parser.error("Only --soft_orth_layer f3 is currently implemented")
     if args.soft_orth_lambda_init <= 0 or args.soft_orth_lambda_init >= 1:
         parser.error("--soft_orth_lambda_init must be in (0, 1)")
     if args.soft_orth_gamma_max <= 0:
@@ -1637,7 +1631,6 @@ def main():
             else None
         ),
         use_soft_orth_fusion=args.use_soft_orth_fusion,
-        soft_orth_layer=args.soft_orth_layer,
         soft_orth_lambda_init=args.soft_orth_lambda_init,
         soft_orth_gamma_init=args.soft_orth_gamma_init,
         soft_orth_gamma_max=args.soft_orth_gamma_max,

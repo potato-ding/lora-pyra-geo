@@ -121,14 +121,15 @@ def test_student_soft_orth_fusion_outputs_normalized_embedding():
         0.02,
         abs=1e-6,
     )
+    assert model.soft_orth_fusion.last_f3_proj_shape == (2, 512, 7, 7)
     assert set(model.get_soft_orth_stats()) == {
         "soft_orth_lambda",
         "soft_orth_gamma",
-        "soft_orth_g_norm",
-        "soft_orth_l3_norm",
+        "soft_orth_f4_norm",
+        "soft_orth_f3_proj_norm",
         "soft_orth_parallel_norm",
         "soft_orth_detail_norm",
-        "soft_orth_cos_l3_g",
+        "soft_orth_cos_f3_f4",
     }
 
 
@@ -212,11 +213,11 @@ def test_soft_orth_fusion_does_not_change_student_training_loss():
             return {
                 "soft_orth_lambda": torch.tensor(0.5),
                 "soft_orth_gamma": torch.tensor(0.01),
-                "soft_orth_g_norm": torch.tensor(1.0),
-                "soft_orth_l3_norm": torch.tensor(1.0),
+                "soft_orth_f4_norm": torch.tensor(1.0),
+                "soft_orth_f3_proj_norm": torch.tensor(1.0),
                 "soft_orth_parallel_norm": torch.tensor(0.2),
                 "soft_orth_detail_norm": torch.tensor(0.9),
-                "soft_orth_cos_l3_g": torch.tensor(0.1),
+                "soft_orth_cos_f3_f4": torch.tensor(0.1),
             }
 
     class Args:
@@ -241,11 +242,11 @@ def test_soft_orth_fusion_does_not_change_student_training_loss():
     assert set(losses["soft_orth_stats"]) == {
         "soft_orth_lambda",
         "soft_orth_gamma",
-        "soft_orth_g_norm",
-        "soft_orth_l3_norm",
+        "soft_orth_f4_norm",
+        "soft_orth_f3_proj_norm",
         "soft_orth_parallel_norm",
         "soft_orth_detail_norm",
-        "soft_orth_cos_l3_g",
+        "soft_orth_cos_f3_f4",
     }
 
 
@@ -354,10 +355,9 @@ def test_cli_defaults_to_clean_baseline(monkeypatch):
     assert args.kd_sim_weight == pytest.approx(0.05)
     assert args.kd_temperature == pytest.approx(0.1)
     assert args.use_soft_orth_fusion is False
-    assert args.soft_orth_layer == "f3"
     assert args.soft_orth_lambda_init == pytest.approx(0.5)
     assert args.soft_orth_gamma_init == pytest.approx(0.01)
-    assert args.soft_orth_gamma_max == pytest.approx(0.1)
+    assert args.soft_orth_gamma_max == pytest.approx(0.05)
     assert args.soft_orth_detach_global is True
     assert args.teacher_precision == "bf16"
     assert args.teacher_micro_batch_size == 1
@@ -371,6 +371,11 @@ def test_removed_training_flags_are_rejected(monkeypatch):
     removed_flags = [
         "--use_" + "b" + "rd_distill",
         "--" + "b" + "rd_weight",
+        "--use_" + "local" + "_align",
+        "--" + "local" + "_align_weight",
+        "--" + "local" + "_align_tau",
+        "--" + "local" + "_align_topk",
+        "--" + "local" + "_align_warmup_epochs",
         "--use_kd_distill",
         "--teacher_checkpoint",
         "--kd_weight",
@@ -379,6 +384,27 @@ def test_removed_training_flags_are_rejected(monkeypatch):
         monkeypatch.setattr(sys, "argv", ["student_train.py", flag])
         with pytest.raises(SystemExit):
             student_train.parse_args()
+
+
+def test_removed_local_feature_alignment_code_is_absent():
+    needles = [
+        "local" + "_align",
+        "F4" + "LocalAlignmentLoss",
+        "loss_" + "local" + "_align",
+        "local_" + "pos_mean",
+        "local_" + "neg_mean",
+        "local_" + "pos_neg_gap",
+    ]
+    for dirpath, _, filenames in os.walk(os.path.join(ROOT, "src")):
+        if "__pycache__" in dirpath.split(os.sep):
+            continue
+        for filename in filenames:
+            if not filename.endswith(".py"):
+                continue
+            path = os.path.join(dirpath, filename)
+            with open(path, "r", encoding="utf-8") as handle:
+                text = handle.read()
+            assert not any(needle in text for needle in needles), path
 
 
 def test_plain_distillation_requires_teacher_checkpoint(monkeypatch):

@@ -15,13 +15,13 @@ def _logit_from_probability(value, name):
 
 
 class F3ToF4SoftOrthFusion(nn.Module):
-    """Shallow f3 complement projected into the f4 descriptor space."""
+    """Feature-map level shallow f3 complement for the f4 map."""
 
     def __init__(
         self,
         lambda_init=0.5,
         gamma_init=0.01,
-        gamma_max=0.1,
+        gamma_max=0.05,
         detach_global=True,
     ):
         super().__init__()
@@ -33,7 +33,8 @@ class F3ToF4SoftOrthFusion(nn.Module):
                 "than soft_orth_gamma_max"
             )
 
-        self.f3_proj = nn.Linear(256, 512)
+        self.f3_down = nn.AvgPool2d(kernel_size=2, stride=2)
+        self.f3_proj = nn.Conv2d(256, 512, kernel_size=1, bias=True)
         self.lambda_raw = nn.Parameter(
             torch.tensor(
                 _logit_from_probability(lambda_init, "soft_orth_lambda_init"),
@@ -52,6 +53,7 @@ class F3ToF4SoftOrthFusion(nn.Module):
         self.gamma_max = float(gamma_max)
         self.detach_global = bool(detach_global)
         self.last_stats = {}
+        self.last_f3_proj_shape = None
 
     def lambda_value(self):
         return torch.sigmoid(self.lambda_raw)
@@ -59,38 +61,47 @@ class F3ToF4SoftOrthFusion(nn.Module):
     def gamma_value(self):
         return self.gamma_max * torch.sigmoid(self.gamma_raw)
 
-    def forward(self, g, f3):
-        l3 = F.adaptive_avg_pool2d(f3, 1).flatten(1)
-        l3_proj = self.f3_proj(l3)
-        global_for_direction = g.detach() if self.detach_global else g
+    def forward(self, f4, f3):
+        f3_down = self.f3_down(f3)
+        f3_proj = self.f3_proj(f3_down)
+        if f3_proj.shape != f4.shape:
+            raise ValueError(
+                "f3 projection must match f4 shape: "
+                f"f3_proj={tuple(f3_proj.shape)} f4={tuple(f4.shape)}"
+            )
+        self.last_f3_proj_shape = tuple(f3_proj.shape)
+
+        global_for_direction = f4.detach() if self.detach_global else f4
         u = F.normalize(global_for_direction, p=2, dim=1, eps=1e-6)
-        parallel = (l3_proj * u).sum(dim=1, keepdim=True) * u
+        parallel = (f3_proj * u).sum(dim=1, keepdim=True) * u
         lambda_value = self.lambda_value()
-        l3_soft = l3_proj - lambda_value * parallel
+        detail = f3_proj - lambda_value * parallel
         gamma_value = self.gamma_value()
-        fused = g + gamma_value * l3_soft
+        f4_enhanced = f4 + gamma_value * detail
 
         with torch.no_grad():
-            l3_normed = F.normalize(l3_proj.float(), p=2, dim=1, eps=1e-6)
-            g_normed = F.normalize(g.float(), p=2, dim=1, eps=1e-6)
+            f3_normed = F.normalize(f3_proj.float(), p=2, dim=1, eps=1e-6)
+            f4_normed = F.normalize(f4.float(), p=2, dim=1, eps=1e-6)
             self.last_stats = {
                 "soft_orth_lambda": lambda_value.detach(),
                 "soft_orth_gamma": gamma_value.detach(),
-                "soft_orth_g_norm": g.float().norm(p=2, dim=1).mean().detach(),
-                "soft_orth_l3_norm": (
-                    l3_proj.float().norm(p=2, dim=1).mean().detach()
+                "soft_orth_f4_norm": (
+                    f4.float().norm(p=2, dim=1).mean().detach()
+                ),
+                "soft_orth_f3_proj_norm": (
+                    f3_proj.float().norm(p=2, dim=1).mean().detach()
                 ),
                 "soft_orth_parallel_norm": (
                     parallel.float().norm(p=2, dim=1).mean().detach()
                 ),
                 "soft_orth_detail_norm": (
-                    l3_soft.float().norm(p=2, dim=1).mean().detach()
+                    detail.float().norm(p=2, dim=1).mean().detach()
                 ),
-                "soft_orth_cos_l3_g": (
-                    (l3_normed * g_normed).sum(dim=1).mean().detach()
+                "soft_orth_cos_f3_f4": (
+                    (f3_normed * f4_normed).sum(dim=1).mean().detach()
                 ),
             }
-        return fused
+        return f4_enhanced
 
 
 class StudentModel(nn.Module):
@@ -102,19 +113,15 @@ class StudentModel(nn.Module):
         temperature=0.07,
         distill_teacher_dim=None,
         use_soft_orth_fusion=False,
-        soft_orth_layer="f3",
         soft_orth_lambda_init=0.5,
         soft_orth_gamma_init=0.01,
-        soft_orth_gamma_max=0.1,
+        soft_orth_gamma_max=0.05,
         soft_orth_detach_global=True,
     ):
         super().__init__()
         self.embedding_dim = 512
         self.use_soft_orth_fusion = bool(use_soft_orth_fusion)
-        self.soft_orth_layer = soft_orth_layer
         self._soft_orth_stats = {}
-        if self.use_soft_orth_fusion and self.soft_orth_layer != "f3":
-            raise ValueError("Only soft_orth_layer='f3' is implemented")
         self.backbone = RepViTBackbone(ckpt_path=ckpt_path)
         self.neck = nn.BatchNorm1d(self.embedding_dim)
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / temperature))
@@ -160,12 +167,12 @@ class StudentModel(nn.Module):
             _, _, f3, f4 = features
         else:
             f4 = features[-1]
-        desc = F.adaptive_avg_pool2d(f4, 1).flatten(1)
         if self.use_soft_orth_fusion:
-            desc = self.soft_orth_fusion(desc, f3)
+            f4 = self.soft_orth_fusion(f4, f3)
             self._soft_orth_stats = self.soft_orth_fusion.last_stats
         else:
             self._soft_orth_stats = {}
+        desc = F.adaptive_avg_pool2d(f4, 1).flatten(1)
         desc = self.neck(desc)
         embedding = F.normalize(desc, dim=1)
         if return_fmap:
