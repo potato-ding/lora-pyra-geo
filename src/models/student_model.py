@@ -7,6 +7,92 @@ from src.models.repvit_backbone import RepViTBackbone
 from src.utils.rank_logging import rank0_print
 
 
+def _logit_from_probability(value, name):
+    value = float(value)
+    if value <= 0.0 or value >= 1.0:
+        raise ValueError(f"{name} must be in (0, 1), got {value}")
+    return np.log(value / (1.0 - value))
+
+
+class F3ToF4SoftOrthFusion(nn.Module):
+    """Shallow f3 complement projected into the f4 descriptor space."""
+
+    def __init__(
+        self,
+        lambda_init=0.5,
+        gamma_init=0.01,
+        gamma_max=0.1,
+        detach_global=True,
+    ):
+        super().__init__()
+        if gamma_max <= 0:
+            raise ValueError("soft_orth_gamma_max must be greater than 0")
+        if gamma_init <= 0 or gamma_init >= gamma_max:
+            raise ValueError(
+                "soft_orth_gamma_init must be greater than 0 and smaller "
+                "than soft_orth_gamma_max"
+            )
+
+        self.f3_proj = nn.Linear(256, 512)
+        self.lambda_raw = nn.Parameter(
+            torch.tensor(
+                _logit_from_probability(lambda_init, "soft_orth_lambda_init"),
+                dtype=torch.float32,
+            )
+        )
+        self.gamma_raw = nn.Parameter(
+            torch.tensor(
+                _logit_from_probability(
+                    gamma_init / gamma_max,
+                    "soft_orth_gamma_init / soft_orth_gamma_max",
+                ),
+                dtype=torch.float32,
+            )
+        )
+        self.gamma_max = float(gamma_max)
+        self.detach_global = bool(detach_global)
+        self.last_stats = {}
+
+    def lambda_value(self):
+        return torch.sigmoid(self.lambda_raw)
+
+    def gamma_value(self):
+        return self.gamma_max * torch.sigmoid(self.gamma_raw)
+
+    def forward(self, g, f3):
+        l3 = F.adaptive_avg_pool2d(f3, 1).flatten(1)
+        l3_proj = self.f3_proj(l3)
+        global_for_direction = g.detach() if self.detach_global else g
+        u = F.normalize(global_for_direction, p=2, dim=1, eps=1e-6)
+        parallel = (l3_proj * u).sum(dim=1, keepdim=True) * u
+        lambda_value = self.lambda_value()
+        l3_soft = l3_proj - lambda_value * parallel
+        gamma_value = self.gamma_value()
+        fused = g + gamma_value * l3_soft
+
+        with torch.no_grad():
+            l3_normed = F.normalize(l3_proj.float(), p=2, dim=1, eps=1e-6)
+            g_normed = F.normalize(g.float(), p=2, dim=1, eps=1e-6)
+            self.last_stats = {
+                "soft_orth_lambda": lambda_value.detach(),
+                "soft_orth_gamma": gamma_value.detach(),
+                "soft_orth_g_norm": g.float().norm(p=2, dim=1).mean().detach(),
+                "soft_orth_l3_norm": (
+                    l3_proj.float().norm(p=2, dim=1).mean().detach()
+                ),
+                "soft_orth_parallel_norm": (
+                    parallel.float().norm(p=2, dim=1).mean().detach()
+                ),
+                "soft_orth_detail_norm": (
+                    l3_soft.float().norm(p=2, dim=1).mean().detach()
+                ),
+                "soft_orth_cos_l3_g": (
+                    (l3_normed * g_normed).sum(dim=1).mean().detach()
+                ),
+            }
+        return fused
+
+
 class StudentModel(nn.Module):
     """RepViT-M1.5 backbone with pretrained weight loading."""
 
@@ -15,12 +101,30 @@ class StudentModel(nn.Module):
         ckpt_path="src/models/repvit/repvit_m1_5_distill_450e.pth",
         temperature=0.07,
         distill_teacher_dim=None,
+        use_soft_orth_fusion=False,
+        soft_orth_layer="f3",
+        soft_orth_lambda_init=0.5,
+        soft_orth_gamma_init=0.01,
+        soft_orth_gamma_max=0.1,
+        soft_orth_detach_global=True,
     ):
         super().__init__()
         self.embedding_dim = 512
+        self.use_soft_orth_fusion = bool(use_soft_orth_fusion)
+        self.soft_orth_layer = soft_orth_layer
+        self._soft_orth_stats = {}
+        if self.use_soft_orth_fusion and self.soft_orth_layer != "f3":
+            raise ValueError("Only soft_orth_layer='f3' is implemented")
         self.backbone = RepViTBackbone(ckpt_path=ckpt_path)
         self.neck = nn.BatchNorm1d(self.embedding_dim)
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / temperature))
+        if self.use_soft_orth_fusion:
+            self.soft_orth_fusion = F3ToF4SoftOrthFusion(
+                lambda_init=soft_orth_lambda_init,
+                gamma_init=soft_orth_gamma_init,
+                gamma_max=soft_orth_gamma_max,
+                detach_global=soft_orth_detach_global,
+            )
         if (
             distill_teacher_dim is not None
             and int(distill_teacher_dim) != self.embedding_dim
@@ -38,6 +142,12 @@ class StudentModel(nn.Module):
         rank0_print("  neck: BatchNorm1d(512)")
         rank0_print("  pooling: global average pooling")
         rank0_print("  output: L2-normalized 512-d feature")
+        if self.use_soft_orth_fusion:
+            rank0_print("  soft-orth fusion: enabled (f3 -> f4)")
+            rank0_print(
+                "  soft-orth detach_global: "
+                f"{self.soft_orth_fusion.detach_global}"
+            )
         if hasattr(self, "distill_projection"):
             rank0_print(
                 "  plain KD projection: "
@@ -45,13 +155,25 @@ class StudentModel(nn.Module):
             )
 
     def forward(self, x, return_fmap=False):
-        _, _, _, f4 = self.backbone(x)
+        features = self.backbone(x)
+        if self.use_soft_orth_fusion:
+            _, _, f3, f4 = features
+        else:
+            f4 = features[-1]
         desc = F.adaptive_avg_pool2d(f4, 1).flatten(1)
+        if self.use_soft_orth_fusion:
+            desc = self.soft_orth_fusion(desc, f3)
+            self._soft_orth_stats = self.soft_orth_fusion.last_stats
+        else:
+            self._soft_orth_stats = {}
         desc = self.neck(desc)
         embedding = F.normalize(desc, dim=1)
         if return_fmap:
             return embedding, f4
         return embedding
+
+    def get_soft_orth_stats(self):
+        return dict(self._soft_orth_stats)
 
     def project_for_distillation(self, embedding):
         """Project student embeddings only for plain feature distillation."""

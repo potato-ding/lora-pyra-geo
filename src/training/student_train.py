@@ -15,7 +15,6 @@ import torch.nn.functional as F
 from torch.amp import GradScaler, autocast
 
 from src.loss.blocks_infoNCE import Sample4GeoLoss
-from src.loss.local_align_loss import F4LocalAlignmentLoss
 from src.models.student_model import StudentModel
 from src.utils.gather_features_and_labels_and_views import (
     GatherLayer,
@@ -136,16 +135,6 @@ def sample4geo_loss(model, features, criterion, pair_batch_size):
     satellite_feat = features[pair_batch_size:pair_batch_size * 2]
     logit_scale = get_raw_model(model).logit_scale.exp()
     return criterion(drone_feat, satellite_feat, logit_scale)
-
-
-def local_align_weight_eff(args, epoch):
-    if not bool(getattr(args, "use_local_align", False)):
-        return 0.0
-    weight = float(getattr(args, "local_align_weight", 0.03))
-    warmup_epochs = float(getattr(args, "local_align_warmup_epochs", 5))
-    if warmup_epochs <= 0:
-        return weight
-    return weight * min(1.0, float(epoch) / warmup_epochs)
 
 
 def gather_tensor_with_grad(tensor):
@@ -353,16 +342,8 @@ def compute_student_batch_losses(
     criterion,
     args=None,
     teacher_features=None,
-    local_align_criterion=None,
-    epoch=None,
 ):
-    use_local_align = bool(getattr(args, "use_local_align", False))
-    if use_local_align:
-        local_features, local_f4 = model(images, return_fmap=True)
-    else:
-        local_features = model(images)
-        local_f4 = None
-
+    local_features = model(images)
     features, global_pair_batch_size = gather_paired_views(
         local_features,
         pair_batch_size,
@@ -379,39 +360,11 @@ def compute_student_batch_losses(
         "main_loss": loss_infonce,
         "global_pair_batch_size": global_pair_batch_size,
     }
-    if use_local_align:
-        if local_align_criterion is None:
-            local_align_criterion = F4LocalAlignmentLoss(
-                tau=args.local_align_tau,
-                topk=args.local_align_topk,
-            )
-        global_f4, f4_pair_batch_size = gather_paired_views(
-            local_f4,
-            pair_batch_size,
-            with_grad=True,
-        )
-        if f4_pair_batch_size != global_pair_batch_size:
-            raise RuntimeError(
-                "Embedding and f4 global pair batches differ: "
-                f"embedding={global_pair_batch_size} f4={f4_pair_batch_size}"
-            )
-        drone_f4 = global_f4[:global_pair_batch_size]
-        satellite_f4 = global_f4[
-            global_pair_batch_size:global_pair_batch_size * 2
-        ]
-        loss_local_align, local_align_stats = local_align_criterion(
-            drone_f4,
-            satellite_f4,
-        )
-        current_epoch = 1 if epoch is None else epoch
-        weight_eff = local_align_weight_eff(args, current_epoch)
-        losses.update({
-            "loss": loss_infonce + weight_eff * loss_local_align,
-            "loss_retrieval": loss_infonce,
-            "loss_local_align": loss_local_align,
-            "local_align_weight_eff": weight_eff,
-            "local_align_stats": local_align_stats,
-        })
+    if bool(getattr(args, "use_soft_orth_fusion", False)):
+        stats_fn = getattr(get_raw_model(model), "get_soft_orth_stats", None)
+        if stats_fn is None:
+            raise RuntimeError("Soft-orth fusion is enabled but stats are unavailable")
+        losses["soft_orth_stats"] = stats_fn()
     if teacher_features is None:
         return losses
     if args is None or not bool(getattr(args, "distill", False)):
@@ -485,7 +438,7 @@ def compute_student_batch_losses(
         args.kd_temperature,
     )
     total_loss = (
-        losses["loss"]
+        loss_infonce
         + kd_feat_weight * loss_kd_feat
         + kd_sim_weight * loss_kd_sim
     )
@@ -852,52 +805,38 @@ def format_kd_step_log(meters, kd_feat_weight, kd_sim_weight):
     )
 
 
-LOCAL_ALIGN_LOG_KEYS = (
-    "loss_local_align",
-    "local_align_weight_eff",
-    "local_pos_mean",
-    "local_neg_mean",
-    "local_pos_neg_gap",
+SOFT_ORTH_LOG_KEYS = (
+    "soft_orth_lambda",
+    "soft_orth_gamma",
+    "soft_orth_g_norm",
+    "soft_orth_l3_norm",
+    "soft_orth_parallel_norm",
+    "soft_orth_detail_norm",
+    "soft_orth_cos_l3_g",
 )
 
 
-def create_local_align_log_meters():
-    return {key: AverageMeter() for key in LOCAL_ALIGN_LOG_KEYS}
+def create_soft_orth_log_meters():
+    return {key: AverageMeter() for key in SOFT_ORTH_LOG_KEYS}
 
 
-def update_local_align_log_meters(meters, batch_losses, n):
-    meters["loss_local_align"].update(
-        batch_losses["loss_local_align"].item(),
-        n,
-    )
-    meters["local_align_weight_eff"].update(
-        batch_losses["local_align_weight_eff"],
-        n,
-    )
-    for key in (
-        "local_pos_mean",
-        "local_neg_mean",
-        "local_pos_neg_gap",
-    ):
-        meters[key].update(batch_losses["local_align_stats"][key].item(), n)
+def update_soft_orth_log_meters(meters, batch_losses, n):
+    stats = batch_losses["soft_orth_stats"]
+    for key in SOFT_ORTH_LOG_KEYS:
+        meters[key].update(stats[key].item(), n)
 
 
-def format_total_loss_step_log(loss_total_meter):
+def format_soft_orth_step_log(meters):
     return (
-        f"total_loss {loss_total_meter.val:.4f} "
-        f"({loss_total_meter.avg:.4f}) | "
-    )
-
-
-def format_local_align_step_log(meters):
-    return (
-        f"loss_local_align {meters['loss_local_align'].val:.4f} "
-        f"({meters['loss_local_align'].avg:.4f}) | "
-        f"local_align_weight_eff "
-        f"{meters['local_align_weight_eff'].val:.6f} | "
-        f"local_pos_mean {meters['local_pos_mean'].val:.4f} | "
-        f"local_neg_mean {meters['local_neg_mean'].val:.4f} | "
-        f"local_pos_neg_gap {meters['local_pos_neg_gap'].val:.4f} | "
+        f"soft_orth_lambda {meters['soft_orth_lambda'].val:.6f} | "
+        f"soft_orth_gamma {meters['soft_orth_gamma'].val:.6f} | "
+        f"soft_orth_g_norm {meters['soft_orth_g_norm'].val:.4f} | "
+        f"soft_orth_l3_norm {meters['soft_orth_l3_norm'].val:.4f} | "
+        f"soft_orth_parallel_norm "
+        f"{meters['soft_orth_parallel_norm'].val:.4f} | "
+        f"soft_orth_detail_norm "
+        f"{meters['soft_orth_detail_norm'].val:.4f} | "
+        f"soft_orth_cos_l3_g {meters['soft_orth_cos_l3_g'].val:.4f} | "
     )
 
 
@@ -919,17 +858,9 @@ def train_one_epoch(
     loss_total_meter = AverageMeter()
     loss_retrieval_meter = AverageMeter()
     kd_log_meters = create_kd_log_meters() if teacher_model is not None else None
-    local_align_log_meters = (
-        create_local_align_log_meters()
-        if bool(getattr(args, "use_local_align", False))
-        else None
-    )
-    local_align_criterion = (
-        F4LocalAlignmentLoss(
-            tau=args.local_align_tau,
-            topk=args.local_align_topk,
-        )
-        if local_align_log_meters is not None
+    soft_orth_log_meters = (
+        create_soft_orth_log_meters()
+        if bool(getattr(args, "use_soft_orth_fusion", False))
         else None
     )
     end = time.time()
@@ -962,8 +893,6 @@ def train_one_epoch(
                 criterion,
                 args,
                 teacher_features=teacher_features,
-                local_align_criterion=local_align_criterion,
-                epoch=epoch,
             )
             loss = batch_losses["loss"]
 
@@ -1004,9 +933,9 @@ def train_one_epoch(
                 batch_losses,
                 images.size(0),
             )
-        if local_align_log_meters is not None:
-            update_local_align_log_meters(
-                local_align_log_meters,
+        if soft_orth_log_meters is not None:
+            update_soft_orth_log_meters(
+                soft_orth_log_meters,
                 batch_losses,
                 images.size(0),
             )
@@ -1018,20 +947,19 @@ def train_one_epoch(
             or step == len(train_loader) - 1
         ):
             aux_text = ""
-            if local_align_log_meters is not None:
-                aux_text += format_total_loss_step_log(loss_total_meter)
-                aux_text += format_local_align_step_log(
-                    local_align_log_meters
-                )
+            if soft_orth_log_meters is not None:
+                aux_text += format_soft_orth_step_log(soft_orth_log_meters)
             if kd_log_meters is not None:
-                if not aux_text:
-                    aux_text += format_total_loss_step_log(loss_total_meter)
                 kd_step_log = format_kd_step_log(
                     kd_log_meters,
                     batch_losses["kd_feat_weight"],
                     batch_losses["kd_sim_weight"],
                 )
-                aux_text += kd_step_log
+                aux_text += (
+                    f"total_loss {loss_total_meter.val:.4f} "
+                    f"({loss_total_meter.avg:.4f}) | "
+                    f"{kd_step_log}"
+                )
             print(
                 f"Epoch [{epoch}/{args.epochs}] "
                 f"Step [{step + 1}/{len(train_loader)}] | "
@@ -1058,10 +986,10 @@ def train_one_epoch(
         })
         stats["kd_feat_weight"] = float(args.kd_feat_weight)
         stats["kd_sim_weight"] = float(args.kd_sim_weight)
-    if local_align_log_meters is not None:
+    if soft_orth_log_meters is not None:
         stats.update({
             key: meter.avg
-            for key, meter in local_align_log_meters.items()
+            for key, meter in soft_orth_log_meters.items()
         })
     return stats
 
@@ -1083,17 +1011,9 @@ def train_one_epoch_deepspeed(
     loss_total_meter = AverageMeter()
     loss_retrieval_meter = AverageMeter()
     kd_log_meters = create_kd_log_meters() if teacher_model is not None else None
-    local_align_log_meters = (
-        create_local_align_log_meters()
-        if bool(getattr(args, "use_local_align", False))
-        else None
-    )
-    local_align_criterion = (
-        F4LocalAlignmentLoss(
-            tau=args.local_align_tau,
-            topk=args.local_align_topk,
-        )
-        if local_align_log_meters is not None
+    soft_orth_log_meters = (
+        create_soft_orth_log_meters()
+        if bool(getattr(args, "use_soft_orth_fusion", False))
         else None
     )
     batch_time = AverageMeter()
@@ -1123,8 +1043,6 @@ def train_one_epoch_deepspeed(
             criterion,
             args,
             teacher_features=teacher_features,
-            local_align_criterion=local_align_criterion,
-            epoch=epoch,
         )
         loss = batch_losses["loss"]
         model_engine.backward(loss)
@@ -1139,9 +1057,9 @@ def train_one_epoch_deepspeed(
         loss_retrieval_meter.update(batch_losses["main_loss"].item(), weight)
         if kd_log_meters is not None:
             update_kd_log_meters(kd_log_meters, batch_losses, weight)
-        if local_align_log_meters is not None:
-            update_local_align_log_meters(
-                local_align_log_meters,
+        if soft_orth_log_meters is not None:
+            update_soft_orth_log_meters(
+                soft_orth_log_meters,
                 batch_losses,
                 weight,
             )
@@ -1153,20 +1071,19 @@ def train_one_epoch_deepspeed(
             or step == len(train_loader) - 1
         ):
             aux_text = ""
-            if local_align_log_meters is not None:
-                aux_text += format_total_loss_step_log(loss_total_meter)
-                aux_text += format_local_align_step_log(
-                    local_align_log_meters
-                )
+            if soft_orth_log_meters is not None:
+                aux_text += format_soft_orth_step_log(soft_orth_log_meters)
             if kd_log_meters is not None:
-                if not aux_text:
-                    aux_text += format_total_loss_step_log(loss_total_meter)
                 kd_step_log = format_kd_step_log(
                     kd_log_meters,
                     batch_losses["kd_feat_weight"],
                     batch_losses["kd_sim_weight"],
                 )
-                aux_text += kd_step_log
+                aux_text += (
+                    f"total_loss {loss_total_meter.val:.4f} "
+                    f"({loss_total_meter.avg:.4f}) | "
+                    f"{kd_step_log}"
+                )
             print(
                 f"Epoch [{epoch}/{args.epochs}] "
                 f"Step [{step + 1}/{len(train_loader)}] | "
@@ -1194,10 +1111,10 @@ def train_one_epoch_deepspeed(
         })
         stats["kd_feat_weight"] = float(args.kd_feat_weight)
         stats["kd_sim_weight"] = float(args.kd_sim_weight)
-    if local_align_log_meters is not None:
+    if soft_orth_log_meters is not None:
         stats.update({
             key: meter.avg
-            for key, meter in local_align_log_meters.items()
+            for key, meter in soft_orth_log_meters.items()
         })
     return stats
 
@@ -1288,23 +1205,29 @@ def train(
                 f" | kd_feat_weight={train_stats['kd_feat_weight']:.6f}"
                 f" | kd_sim_weight={train_stats['kd_sim_weight']:.6f}"
             )
-        local_align_text = ""
-        if bool(getattr(args, "use_local_align", False)):
-            local_align_text = (
-                f" | loss_local_align="
-                f"{train_stats['loss_local_align']:.4f}"
-                f" | local_align_weight_eff="
-                f"{train_stats['local_align_weight_eff']:.6f}"
-                f" | local_pos_mean={train_stats['local_pos_mean']:.4f}"
-                f" | local_neg_mean={train_stats['local_neg_mean']:.4f}"
-                f" | local_pos_neg_gap="
-                f"{train_stats['local_pos_neg_gap']:.4f}"
+        soft_orth_text = ""
+        if bool(getattr(args, "use_soft_orth_fusion", False)):
+            soft_orth_text = (
+                f" | soft_orth_lambda="
+                f"{train_stats['soft_orth_lambda']:.6f}"
+                f" | soft_orth_gamma="
+                f"{train_stats['soft_orth_gamma']:.6f}"
+                f" | soft_orth_g_norm="
+                f"{train_stats['soft_orth_g_norm']:.4f}"
+                f" | soft_orth_l3_norm="
+                f"{train_stats['soft_orth_l3_norm']:.4f}"
+                f" | soft_orth_parallel_norm="
+                f"{train_stats['soft_orth_parallel_norm']:.4f}"
+                f" | soft_orth_detail_norm="
+                f"{train_stats['soft_orth_detail_norm']:.4f}"
+                f" | soft_orth_cos_l3_g="
+                f"{train_stats['soft_orth_cos_l3_g']:.4f}"
             )
         print(
             f"[Train] Epoch {epoch}/{args.epochs} | "
             f"loss_retrieval={train_stats['loss_retrieval']:.4f}"
             f" | total_loss={train_stats['total_loss']:.4f}"
-            f"{local_align_text}"
+            f"{soft_orth_text}"
             f"{kd_text}"
         )
 
@@ -1414,24 +1337,30 @@ def train_deepspeed(
                     f" | kd_feat_weight={train_stats['kd_feat_weight']:.6f}"
                     f" | kd_sim_weight={train_stats['kd_sim_weight']:.6f}"
                 )
-            local_align_text = ""
-            if bool(getattr(args, "use_local_align", False)):
-                local_align_text = (
-                    f" | loss_local_align="
-                    f"{train_stats['loss_local_align']:.4f}"
-                    f" | local_align_weight_eff="
-                    f"{train_stats['local_align_weight_eff']:.6f}"
-                    f" | local_pos_mean={train_stats['local_pos_mean']:.4f}"
-                    f" | local_neg_mean={train_stats['local_neg_mean']:.4f}"
-                    f" | local_pos_neg_gap="
-                    f"{train_stats['local_pos_neg_gap']:.4f}"
+            soft_orth_text = ""
+            if bool(getattr(args, "use_soft_orth_fusion", False)):
+                soft_orth_text = (
+                    f" | soft_orth_lambda="
+                    f"{train_stats['soft_orth_lambda']:.6f}"
+                    f" | soft_orth_gamma="
+                    f"{train_stats['soft_orth_gamma']:.6f}"
+                    f" | soft_orth_g_norm="
+                    f"{train_stats['soft_orth_g_norm']:.4f}"
+                    f" | soft_orth_l3_norm="
+                    f"{train_stats['soft_orth_l3_norm']:.4f}"
+                    f" | soft_orth_parallel_norm="
+                    f"{train_stats['soft_orth_parallel_norm']:.4f}"
+                    f" | soft_orth_detail_norm="
+                    f"{train_stats['soft_orth_detail_norm']:.4f}"
+                    f" | soft_orth_cos_l3_g="
+                    f"{train_stats['soft_orth_cos_l3_g']:.4f}"
                 )
             print(
                 f"[Train] Epoch {epoch}/{args.epochs} | "
                 f"loss_retrieval={train_stats['loss_retrieval']:.4f} | "
                 f"total_loss={train_stats['total_loss']:.4f} | "
                 f"world_size={get_world_size()}"
-                f"{local_align_text}"
+                f"{soft_orth_text}"
                 f"{kd_text}"
             )
 
@@ -1536,11 +1465,23 @@ def parse_args():
     parser.add_argument("--min_lr_ratio", type=float, default=0.01)
     parser.add_argument("--temperature", type=float, default=0.07)
     parser.add_argument("--label_smoothing", type=float, default=0.1)
-    parser.add_argument("--use_local_align", action="store_true", default=False)
-    parser.add_argument("--local_align_weight", type=float, default=0.03)
-    parser.add_argument("--local_align_tau", type=float, default=0.07)
-    parser.add_argument("--local_align_topk", type=int, default=3)
-    parser.add_argument("--local_align_warmup_epochs", type=float, default=5)
+    parser.add_argument("--use_soft_orth_fusion", action="store_true", default=False)
+    parser.add_argument(
+        "--soft_orth_layer",
+        type=str,
+        choices=["f3"],
+        default="f3",
+    )
+    parser.add_argument("--soft_orth_lambda_init", type=float, default=0.5)
+    parser.add_argument("--soft_orth_gamma_init", type=float, default=0.01)
+    parser.add_argument("--soft_orth_gamma_max", type=float, default=0.1)
+    parser.add_argument(
+        "--soft_orth_detach_global",
+        type=str2bool,
+        nargs="?",
+        const=True,
+        default=True,
+    )
     parser.add_argument("--amp", dest="amp", action="store_true", default=True)
     parser.add_argument("--no_amp", dest="amp", action="store_false")
     parser.add_argument("--grad_clip", type=float, default=0.0)
@@ -1595,14 +1536,20 @@ def parse_args():
     args = parser.parse_args()
     if args.kd_feat_weight < 0 or args.kd_sim_weight < 0:
         parser.error("--kd_feat_weight and --kd_sim_weight must be non-negative")
-    if args.local_align_weight < 0:
-        parser.error("--local_align_weight must be non-negative")
-    if args.local_align_tau <= 0:
-        parser.error("--local_align_tau must be greater than 0")
-    if args.local_align_topk <= 0:
-        parser.error("--local_align_topk must be greater than 0")
-    if args.local_align_warmup_epochs < 0:
-        parser.error("--local_align_warmup_epochs must be non-negative")
+    if args.soft_orth_layer != "f3":
+        parser.error("Only --soft_orth_layer f3 is currently implemented")
+    if args.soft_orth_lambda_init <= 0 or args.soft_orth_lambda_init >= 1:
+        parser.error("--soft_orth_lambda_init must be in (0, 1)")
+    if args.soft_orth_gamma_max <= 0:
+        parser.error("--soft_orth_gamma_max must be greater than 0")
+    if (
+        args.soft_orth_gamma_init <= 0
+        or args.soft_orth_gamma_init >= args.soft_orth_gamma_max
+    ):
+        parser.error(
+            "--soft_orth_gamma_init must be greater than 0 and smaller than "
+            "--soft_orth_gamma_max"
+        )
     if args.print_freq <= 0:
         parser.error("--print_freq must be greater than 0")
     if args.distill and args.kd_feat_weight + args.kd_sim_weight <= 0:
@@ -1689,6 +1636,12 @@ def main():
             if args.distill and args.kd_feat_weight > 0
             else None
         ),
+        use_soft_orth_fusion=args.use_soft_orth_fusion,
+        soft_orth_layer=args.soft_orth_layer,
+        soft_orth_lambda_init=args.soft_orth_lambda_init,
+        soft_orth_gamma_init=args.soft_orth_gamma_init,
+        soft_orth_gamma_max=args.soft_orth_gamma_max,
+        soft_orth_detach_global=args.soft_orth_detach_global,
     ).to(device)
     print_trainable_parameter_summary(model)
     optimizer = build_student_optimizer(
