@@ -13,13 +13,26 @@ def _dist_info():
 
 
 def _rank_log(message):
+    if not _verbose_eval_logging():
+        return
     world_size, rank = _dist_info()
     print(f"[Rank {rank}/{world_size}] {message}", flush=True)
 
 
-def _verbose_eval_gather_logging():
-    value = os.environ.get("TEACHER_EVAL_VERBOSE_GATHER", "0").strip().lower()
+def _truthy_env(name):
+    value = os.environ.get(name, "0").strip().lower()
     return value in {"1", "true", "yes", "y", "on"}
+
+
+def _verbose_eval_logging():
+    return any(
+        _truthy_env(name)
+        for name in (
+            "EVAL_VERBOSE",
+            "EVAL_VERBOSE_GATHER",
+            "TEACHER_EVAL_VERBOSE_GATHER",
+        )
+    )
 
 
 def _distributed_sampler_desc(dataloader):
@@ -49,7 +62,7 @@ def _gather_int_vector(values):
 
 
 def _validate_eval_loader_sync(dataloader, stage_name, log_prefix):
-    world_size, rank = _dist_info()
+    world_size, _ = _dist_info()
     if world_size == 1 or not stage_name:
         return
 
@@ -118,7 +131,7 @@ def _gather_tensor_variable_batch(
     elif batch_idx is not None:
         batch_part = f" | batch={batch_idx}"
 
-    verbose_gather = bool(log_prefix) and _verbose_eval_gather_logging()
+    verbose_gather = bool(log_prefix) and _verbose_eval_logging()
     if verbose_gather:
         _rank_log(
             f"{log_prefix} all_gather start{batch_part} | "
@@ -232,8 +245,9 @@ def extract_features_dist(
     has_indices = False
     world_size, rank = _dist_info()
     log_prefix = f"[Eval:{stage_name}]" if stage_name else "[Eval]"
+    verbose_eval = _verbose_eval_logging()
 
-    if rank == 0 and stage_name:
+    if rank == 0 and stage_name and verbose_eval:
         print(
             f"{log_prefix} extract start | samples={len(dataloader.dataset)} | "
             f"local_batches={len(dataloader)} | world_size={world_size}",
@@ -322,6 +336,7 @@ def extract_features_dist(
         if (
             rank == 0
             and stage_name
+            and verbose_eval
             and (
                 batch_idx == 1
                 or batch_idx == len(dataloader)
@@ -340,7 +355,7 @@ def extract_features_dist(
     res_coords = torch.cat(local_coords, dim=0) if has_coords else None
     res_indices = torch.cat(local_indices, dim=0) if has_indices else None
 
-    if rank == 0 and stage_name:
+    if rank == 0 and stage_name and verbose_eval:
         print(
             f"{log_prefix} extract done | gathered_feats={tuple(res_feats.shape)}",
             flush=True,

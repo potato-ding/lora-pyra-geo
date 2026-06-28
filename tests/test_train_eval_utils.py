@@ -1,3 +1,5 @@
+import contextlib
+import io
 import os
 import sys
 import unittest
@@ -179,6 +181,46 @@ class ExtractFeaturesDistTest(unittest.TestCase):
         self.assertEqual(r5, 100.0)
         self.assertEqual(r10, 100.0)
         self.assertEqual(mean_ap, 100.0)
+
+    def test_stage_name_logging_is_quiet_by_default(self):
+        loader = DataLoader(TinyIndexedDataset(), batch_size=2, shuffle=False)
+        output = io.StringIO()
+
+        with unittest.mock.patch.dict(
+            os.environ,
+            {
+                "EVAL_VERBOSE": "0",
+                "EVAL_VERBOSE_GATHER": "0",
+                "TEACHER_EVAL_VERBOSE_GATHER": "0",
+            },
+        ), contextlib.redirect_stdout(output):
+            train_eval_utils.extract_features_dist(
+                IdentityModel(),
+                loader,
+                torch.device("cpu"),
+                stage_name="student:D2S:query",
+            )
+
+        self.assertEqual(output.getvalue(), "")
+
+    def test_stage_name_logging_can_be_enabled_for_debugging(self):
+        loader = DataLoader(TinyIndexedDataset(), batch_size=2, shuffle=False)
+        output = io.StringIO()
+
+        with unittest.mock.patch.dict(
+            os.environ,
+            {"EVAL_VERBOSE": "1"},
+        ), contextlib.redirect_stdout(output):
+            train_eval_utils.extract_features_dist(
+                IdentityModel(),
+                loader,
+                torch.device("cpu"),
+                stage_name="student:D2S:query",
+            )
+
+        text = output.getvalue()
+        self.assertIn("[Eval:student:D2S:query] extract start", text)
+        self.assertIn("[Eval:student:D2S:query] extract done", text)
 
     def test_deep_and_fused_descriptor_selection_both_produce_metrics(self):
         loader = DataLoader(TinyIndexedDataset(), batch_size=2, shuffle=False)

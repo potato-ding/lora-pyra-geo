@@ -42,19 +42,6 @@ def strip_module_prefix(state_dict):
 def load_student_checkpoint(model, checkpoint_path, strict=True):
     ckpt = safe_torch_load(checkpoint_path, map_location="cpu")
     state_dict = strip_module_prefix(unwrap_state_dict(ckpt))
-    if not hasattr(model, "distill_projection"):
-        projection_keys = [
-            key
-            for key in state_dict
-            if key.startswith("distill_projection.")
-        ]
-        for key in projection_keys:
-            state_dict.pop(key)
-        if projection_keys:
-            print(
-                "[Eval] ignored training-only distillation projection keys: "
-                f"{len(projection_keys)}"
-            )
     msg = model.load_state_dict(state_dict, strict=strict)
     print(f"[Eval] loaded checkpoint: {checkpoint_path}")
     print(f"[Eval] strict load: {strict}")
