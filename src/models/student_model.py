@@ -213,20 +213,12 @@ class StudentModel(nn.Module):
             start, end = pair_batch_size, batch_size
         return torch.arange(start, end, device=device)
 
-    def _apply_soft_orth_fusion(
-        self,
-        f4,
-        f3,
-        pair_batch_size=None,
-        active_indices=None,
-        apply_views=None,
-    ):
-        if active_indices is None:
-            active_indices = self._soft_orth_active_indices(
-                batch_size=f4.size(0),
-                pair_batch_size=pair_batch_size,
-                device=f4.device,
-            )
+    def _apply_soft_orth_fusion(self, f4, f3, pair_batch_size=None):
+        active_indices = self._soft_orth_active_indices(
+            batch_size=f4.size(0),
+            pair_batch_size=pair_batch_size,
+            device=f4.device,
+        )
         active_ratio = active_indices.numel() / max(1, f4.size(0))
         if active_indices.numel() == f4.size(0):
             f4 = self.soft_orth_fusion(f4, f3)
@@ -239,9 +231,7 @@ class StudentModel(nn.Module):
             f4 = fused_f4
 
         stats = dict(self.soft_orth_fusion.last_stats)
-        stats["soft_orth_apply_views"] = (
-            self.soft_orth_apply_views if apply_views is None else apply_views
-        )
+        stats["soft_orth_apply_views"] = self.soft_orth_apply_views
         stats["soft_orth_active_ratio"] = torch.tensor(
             active_ratio,
             device=f4.device,
@@ -250,111 +240,12 @@ class StudentModel(nn.Module):
         self._soft_orth_stats = stats
         return f4
 
-    def _apply_neck(self, desc, update_running_stats=True):
-        if update_running_stats or not isinstance(
-            self.neck,
-            nn.modules.batchnorm._BatchNorm,
-        ):
-            return self.neck(desc)
-        if self.neck.training:
-            return F.batch_norm(
-                desc,
-                None,
-                None,
-                self.neck.weight,
-                self.neck.bias,
-                training=True,
-                momentum=0.0,
-                eps=self.neck.eps,
-            )
-        return F.batch_norm(
-            desc,
-            self.neck.running_mean,
-            self.neck.running_var,
-            self.neck.weight,
-            self.neck.bias,
-            training=False,
-            momentum=0.0,
-            eps=self.neck.eps,
-        )
-
-    def _embedding_from_f4(self, f4, update_neck_running_stats=True):
-        desc = F.adaptive_avg_pool2d(f4, 1).flatten(1)
-        desc = self._apply_neck(
-            desc,
-            update_running_stats=update_neck_running_stats,
-        )
-        return F.normalize(desc, dim=1)
-
-    def _forward_soft_orth_preserve(self, f3, f4, pair_batch_size):
-        if pair_batch_size is None:
-            raise ValueError(
-                "pair_batch_size is required for soft-orth preserve loss"
-            )
-        pair_batch_size = int(pair_batch_size)
-        if pair_batch_size <= 0:
-            raise ValueError("pair_batch_size must be greater than 0")
-        if f4.size(0) != pair_batch_size * 2:
-            raise ValueError(
-                f"Expected concatenated paired batch size {pair_batch_size * 2}, "
-                f"got {f4.size(0)}"
-            )
-
-        drone_indices = torch.arange(
-            0,
-            pair_batch_size,
-            device=f4.device,
-        )
-        soft_f4 = self._apply_soft_orth_fusion(
-            f4,
-            f3,
-            pair_batch_size=pair_batch_size,
-            active_indices=drone_indices,
-            apply_views="drone",
-        )
-        base_embedding = self._embedding_from_f4(
-            f4,
-            update_neck_running_stats=False,
-        )
-        soft_embedding = self._embedding_from_f4(
-            soft_f4,
-            update_neck_running_stats=True,
-        )
-        drone_soft_embedding = soft_embedding[:pair_batch_size]
-        drone_base_embedding = base_embedding[:pair_batch_size]
-        sat_embedding = base_embedding[pair_batch_size:pair_batch_size * 2]
-        final_embedding = torch.cat(
-            [drone_soft_embedding, sat_embedding],
-            dim=0,
-        )
-        return final_embedding, drone_base_embedding, sat_embedding
-
-    def forward(
-        self,
-        x,
-        return_fmap=False,
-        pair_batch_size=None,
-        return_soft_orth_preserve=False,
-    ):
-        if return_fmap and return_soft_orth_preserve:
-            raise ValueError(
-                "return_fmap cannot be combined with return_soft_orth_preserve"
-            )
+    def forward(self, x, return_fmap=False, pair_batch_size=None):
         features = self.backbone(x)
         if self.use_soft_orth_fusion:
             _, _, f3, f4 = features
         else:
             f4 = features[-1]
-        if return_soft_orth_preserve:
-            if not self.use_soft_orth_fusion:
-                raise ValueError(
-                    "soft-orth preserve outputs require soft-orth fusion"
-                )
-            return self._forward_soft_orth_preserve(
-                f3,
-                f4,
-                pair_batch_size=pair_batch_size,
-            )
         if self.use_soft_orth_fusion:
             f4 = self._apply_soft_orth_fusion(
                 f4,
@@ -363,7 +254,9 @@ class StudentModel(nn.Module):
             )
         else:
             self._soft_orth_stats = {}
-        embedding = self._embedding_from_f4(f4)
+        desc = F.adaptive_avg_pool2d(f4, 1).flatten(1)
+        desc = self.neck(desc)
+        embedding = F.normalize(desc, dim=1)
         if return_fmap:
             return embedding, f4
         return embedding

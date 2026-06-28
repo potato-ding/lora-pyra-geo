@@ -137,57 +137,6 @@ def sample4geo_loss(model, features, criterion, pair_batch_size):
     return criterion(drone_feat, satellite_feat, logit_scale)
 
 
-def soft_orth_preserve_enabled(args):
-    return bool(getattr(args, "use_soft_orth_fusion", False)) and bool(
-        getattr(args, "use_soft_orth_preserve_loss", False)
-    )
-
-
-def soft_orth_preserve_loss(
-    drone_soft_embedding,
-    drone_base_embedding,
-    sat_embedding,
-    margin=0.0,
-):
-    if drone_soft_embedding.shape != drone_base_embedding.shape:
-        raise ValueError(
-            "Soft-orth preserve loss requires matching drone shapes: "
-            f"soft={tuple(drone_soft_embedding.shape)} "
-            f"base={tuple(drone_base_embedding.shape)}"
-        )
-    if drone_soft_embedding.shape != sat_embedding.shape:
-        raise ValueError(
-            "Soft-orth preserve loss requires paired drone/satellite shapes: "
-            f"drone={tuple(drone_soft_embedding.shape)} "
-            f"satellite={tuple(sat_embedding.shape)}"
-        )
-
-    sat_detached = sat_embedding.detach()
-    sim_base_pos = F.cosine_similarity(
-        drone_base_embedding.detach(),
-        sat_detached,
-        dim=1,
-        eps=1e-6,
-    )
-    sim_soft_pos = F.cosine_similarity(
-        drone_soft_embedding,
-        sat_detached,
-        dim=1,
-        eps=1e-6,
-    )
-    preserve_loss = F.relu(
-        sim_base_pos - sim_soft_pos + float(margin)
-    ).mean()
-    stats = {
-        "sim_base_pos_mean": sim_base_pos.mean().detach(),
-        "sim_soft_pos_mean": sim_soft_pos.detach().mean(),
-        "sim_soft_minus_base": (
-            sim_soft_pos.detach() - sim_base_pos
-        ).mean(),
-    }
-    return preserve_loss, stats
-
-
 def gather_tensor_with_grad(tensor):
     if not is_distributed():
         return tensor
@@ -395,18 +344,7 @@ def compute_student_batch_losses(
     id_labels=None,
     teacher_features=None,
 ):
-    use_preserve_loss = soft_orth_preserve_enabled(args)
-    if use_preserve_loss:
-        (
-            local_features,
-            drone_base_embedding,
-            sat_embedding,
-        ) = model(
-            images,
-            pair_batch_size=pair_batch_size,
-            return_soft_orth_preserve=True,
-        )
-    elif bool(getattr(args, "use_soft_orth_fusion", False)):
+    if bool(getattr(args, "use_soft_orth_fusion", False)):
         local_features = model(images, pair_batch_size=pair_batch_size)
     else:
         local_features = model(images)
@@ -458,24 +396,6 @@ def compute_student_batch_losses(
             "proxy_scale": float(proxy_module.proxy_scale),
             "num_train_ids": int(proxy_module.num_train_ids),
             "proxy_stats": proxy_stats,
-        })
-    if use_preserve_loss:
-        drone_soft_embedding = local_features[:pair_batch_size]
-        loss_preserve, preserve_stats = soft_orth_preserve_loss(
-            drone_soft_embedding,
-            drone_base_embedding,
-            sat_embedding,
-            margin=float(getattr(args, "soft_orth_preserve_margin", 0.0)),
-        )
-        preserve_weight = float(
-            getattr(args, "soft_orth_preserve_weight", 0.0)
-        )
-        losses.update({
-            "loss": losses["loss"] + preserve_weight * loss_preserve,
-            "loss_retrieval": loss_infonce,
-            "loss_preserve": loss_preserve,
-            "preserve_weight": preserve_weight,
-            "preserve_stats": preserve_stats,
         })
     if bool(getattr(args, "use_soft_orth_fusion", False)):
         stats_fn = getattr(get_raw_model(model), "get_soft_orth_stats", None)
@@ -1006,38 +926,6 @@ def format_proxy_step_log(meters, batch_losses):
     )
 
 
-PRESERVE_LOG_KEYS = (
-    "loss_preserve",
-    "sim_base_pos_mean",
-    "sim_soft_pos_mean",
-    "sim_soft_minus_base",
-)
-
-
-def create_preserve_log_meters():
-    return {key: AverageMeter() for key in PRESERVE_LOG_KEYS}
-
-
-def update_preserve_log_meters(meters, batch_losses, n):
-    meters["loss_preserve"].update(batch_losses["loss_preserve"].item(), n)
-    preserve_stats = batch_losses["preserve_stats"]
-    for key in PRESERVE_LOG_KEYS:
-        if key == "loss_preserve":
-            continue
-        meters[key].update(preserve_stats[key].item(), n)
-
-
-def format_preserve_step_log(meters, batch_losses):
-    return (
-        f"loss_preserve {meters['loss_preserve'].val:.4f} "
-        f"({meters['loss_preserve'].avg:.4f}) | "
-        f"preserve_weight {batch_losses['preserve_weight']:.6f} | "
-        f"sim_base_pos_mean {meters['sim_base_pos_mean'].val:.4f} | "
-        f"sim_soft_pos_mean {meters['sim_soft_pos_mean'].val:.4f} | "
-        f"sim_soft_minus_base {meters['sim_soft_minus_base'].val:.4f} | "
-    )
-
-
 SOFT_ORTH_LOG_KEYS = (
     "soft_orth_active_ratio",
     "soft_orth_lambda",
@@ -1101,11 +989,6 @@ def train_one_epoch(
     proxy_log_meters = (
         create_proxy_log_meters()
         if bool(getattr(args, "use_proxy_loss", False))
-        else None
-    )
-    preserve_log_meters = (
-        create_preserve_log_meters()
-        if soft_orth_preserve_enabled(args)
         else None
     )
     soft_orth_log_meters = (
@@ -1190,12 +1073,6 @@ def train_one_epoch(
                 batch_losses,
                 images.size(0),
             )
-        if preserve_log_meters is not None:
-            update_preserve_log_meters(
-                preserve_log_meters,
-                batch_losses,
-                images.size(0),
-            )
         if soft_orth_log_meters is not None:
             update_soft_orth_log_meters(
                 soft_orth_log_meters,
@@ -1214,11 +1091,6 @@ def train_one_epoch(
             if soft_orth_log_meters is not None:
                 aux_text += format_soft_orth_step_log(
                     soft_orth_log_meters,
-                    batch_losses,
-                )
-            if preserve_log_meters is not None:
-                aux_text += format_preserve_step_log(
-                    preserve_log_meters,
                     batch_losses,
                 )
             if proxy_log_meters is not None:
@@ -1275,12 +1147,6 @@ def train_one_epoch(
         stats["proxy_loss_weight"] = float(args.proxy_loss_weight)
         stats["proxy_scale"] = float(args.proxy_scale)
         stats["num_train_ids"] = int(args.num_train_ids)
-    if preserve_log_meters is not None:
-        stats.update({
-            key: meter.avg
-            for key, meter in preserve_log_meters.items()
-        })
-        stats["preserve_weight"] = float(args.soft_orth_preserve_weight)
     if soft_orth_log_meters is not None:
         stats.update({
             key: meter.avg
@@ -1310,11 +1176,6 @@ def train_one_epoch_deepspeed(
     proxy_log_meters = (
         create_proxy_log_meters()
         if bool(getattr(args, "use_proxy_loss", False))
-        else None
-    )
-    preserve_log_meters = (
-        create_preserve_log_meters()
-        if soft_orth_preserve_enabled(args)
         else None
     )
     soft_orth_log_meters = (
@@ -1366,12 +1227,6 @@ def train_one_epoch_deepspeed(
             update_kd_log_meters(kd_log_meters, batch_losses, weight)
         if proxy_log_meters is not None:
             update_proxy_log_meters(proxy_log_meters, batch_losses, weight)
-        if preserve_log_meters is not None:
-            update_preserve_log_meters(
-                preserve_log_meters,
-                batch_losses,
-                weight,
-            )
         if soft_orth_log_meters is not None:
             update_soft_orth_log_meters(
                 soft_orth_log_meters,
@@ -1392,11 +1247,6 @@ def train_one_epoch_deepspeed(
                     soft_orth_log_meters,
                     batch_losses,
                 )
-                if preserve_log_meters is not None:
-                    aux_text += format_preserve_step_log(
-                        preserve_log_meters,
-                        batch_losses,
-                    )
             if proxy_log_meters is not None:
                 aux_text += (
                     f"total_loss {loss_total_meter.val:.4f} "
@@ -1452,12 +1302,6 @@ def train_one_epoch_deepspeed(
         stats["proxy_loss_weight"] = float(args.proxy_loss_weight)
         stats["proxy_scale"] = float(args.proxy_scale)
         stats["num_train_ids"] = int(args.num_train_ids)
-    if preserve_log_meters is not None:
-        stats.update({
-            key: meter.avg
-            for key, meter in preserve_log_meters.items()
-        })
-        stats["preserve_weight"] = float(args.soft_orth_preserve_weight)
     if soft_orth_log_meters is not None:
         stats.update({
             key: meter.avg
@@ -1588,25 +1432,11 @@ def train(
                 f" | soft_orth_cos_f3_f4="
                 f"{train_stats['soft_orth_cos_f3_f4']:.4f}"
             )
-        preserve_text = ""
-        if soft_orth_preserve_enabled(args):
-            preserve_text = (
-                f" | loss_preserve={train_stats['loss_preserve']:.4f}"
-                f" | preserve_weight="
-                f"{train_stats['preserve_weight']:.6f}"
-                f" | sim_base_pos_mean="
-                f"{train_stats['sim_base_pos_mean']:.4f}"
-                f" | sim_soft_pos_mean="
-                f"{train_stats['sim_soft_pos_mean']:.4f}"
-                f" | sim_soft_minus_base="
-                f"{train_stats['sim_soft_minus_base']:.4f}"
-            )
         print(
             f"[Train] Epoch {epoch}/{args.epochs} | "
             f"loss_retrieval={train_stats['loss_retrieval']:.4f}"
             f" | total_loss={train_stats['total_loss']:.4f}"
             f"{soft_orth_text}"
-            f"{preserve_text}"
             f"{proxy_text}"
             f"{kd_text}"
         )
@@ -1752,26 +1582,12 @@ def train_deepspeed(
                     f" | soft_orth_cos_f3_f4="
                     f"{train_stats['soft_orth_cos_f3_f4']:.4f}"
                 )
-            preserve_text = ""
-            if soft_orth_preserve_enabled(args):
-                preserve_text = (
-                    f" | loss_preserve={train_stats['loss_preserve']:.4f}"
-                    f" | preserve_weight="
-                    f"{train_stats['preserve_weight']:.6f}"
-                    f" | sim_base_pos_mean="
-                    f"{train_stats['sim_base_pos_mean']:.4f}"
-                    f" | sim_soft_pos_mean="
-                    f"{train_stats['sim_soft_pos_mean']:.4f}"
-                    f" | sim_soft_minus_base="
-                    f"{train_stats['sim_soft_minus_base']:.4f}"
-                )
             print(
                 f"[Train] Epoch {epoch}/{args.epochs} | "
                 f"loss_retrieval={train_stats['loss_retrieval']:.4f} | "
                 f"total_loss={train_stats['total_loss']:.4f} | "
                 f"world_size={get_world_size()}"
                 f"{soft_orth_text}"
-                f"{preserve_text}"
                 f"{proxy_text}"
                 f"{kd_text}"
             )
@@ -1899,13 +1715,6 @@ def parse_args():
     parser.add_argument("--proxy_scale", type=float, default=30.0)
     parser.add_argument("--proxy_label_smoothing", type=float, default=0.1)
     parser.add_argument("--num_train_ids", type=int, default=-1)
-    parser.add_argument(
-        "--use_soft_orth_preserve_loss",
-        action="store_true",
-        default=False,
-    )
-    parser.add_argument("--soft_orth_preserve_weight", type=float, default=0.05)
-    parser.add_argument("--soft_orth_preserve_margin", type=float, default=0.0)
     parser.add_argument("--amp", dest="amp", action="store_true", default=True)
     parser.add_argument("--no_amp", dest="amp", action="store_false")
     parser.add_argument("--grad_clip", type=float, default=0.0)
@@ -1980,10 +1789,6 @@ def parse_args():
         parser.error("--proxy_label_smoothing must be in [0, 1)")
     if args.num_train_ids < -1 or args.num_train_ids == 0:
         parser.error("--num_train_ids must be -1 or a positive integer")
-    if args.soft_orth_preserve_weight < 0:
-        parser.error("--soft_orth_preserve_weight must be non-negative")
-    if args.soft_orth_preserve_margin < 0:
-        parser.error("--soft_orth_preserve_margin must be non-negative")
     if args.print_freq <= 0:
         parser.error("--print_freq must be greater than 0")
     if args.distill and args.kd_feat_weight + args.kd_sim_weight <= 0:
