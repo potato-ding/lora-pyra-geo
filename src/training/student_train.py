@@ -11,6 +11,7 @@ if ROOT not in sys.path:
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from torch.amp import GradScaler, autocast
 
 from src.loss.blocks_infoNCE import Sample4GeoLoss
@@ -47,6 +48,768 @@ def is_main_process():
 def distributed_barrier():
     if is_distributed():
         dist.barrier()
+
+
+def str2bool(value):
+    if isinstance(value, bool):
+        return value
+    value = value.lower()
+    if value in {"1", "true", "t", "yes", "y"}:
+        return True
+    if value in {"0", "false", "f", "no", "n"}:
+        return False
+    raise argparse.ArgumentTypeError("expected a boolean value")
+
+
+def has_online_kd_weight(args):
+    return float(args.kd_feat_weight) > 0.0 or float(args.kd_sim_weight) > 0.0
+
+
+def is_feature_kd_enabled(args):
+    return bool(args.enable_online_kd) and float(args.kd_feat_weight) > 0.0
+
+
+def is_similarity_kd_enabled(args):
+    return bool(args.enable_online_kd) and float(args.kd_sim_weight) > 0.0
+
+
+def has_local_kd_weight(args):
+    return (
+        float(args.local_attn_weight) > 0.0
+        or float(args.local_desc_weight) > 0.0
+    )
+
+
+def is_local_kd_enabled(args):
+    return bool(getattr(args, "enable_local_kd", False)) and has_local_kd_weight(args)
+
+
+def is_local_attn_kd_enabled(args):
+    return bool(getattr(args, "enable_local_kd", False)) and float(args.local_attn_weight) > 0.0
+
+
+def is_local_desc_kd_enabled(args):
+    return bool(getattr(args, "enable_local_kd", False)) and float(args.local_desc_weight) > 0.0
+
+
+def is_online_kd_active(args):
+    return bool(args.enable_online_kd) and (
+        has_online_kd_weight(args) or is_local_kd_enabled(args)
+    )
+
+
+def build_online_kd_state(args):
+    return {
+        "active": is_online_kd_active(args),
+        "feature_kd_enabled": is_feature_kd_enabled(args),
+        "similarity_kd_enabled": is_similarity_kd_enabled(args),
+        "local_kd_enabled": is_local_kd_enabled(args),
+        "local_attn_enabled": is_local_attn_kd_enabled(args),
+        "local_desc_enabled": is_local_desc_kd_enabled(args),
+        "enable_online_kd": bool(args.enable_online_kd),
+        "teacher_ckpt": args.teacher_ckpt,
+        "kd_feat_weight": float(args.kd_feat_weight),
+        "kd_sim_weight": float(args.kd_sim_weight),
+        "kd_temperature": float(args.kd_temperature),
+        "teacher": None,
+        "teacher_dim": None,
+        "feature_shapes_logged": False,
+        "local_teacher_layer": int(args.local_teacher_layer),
+        "local_student_stage": args.local_student_stage,
+        "local_attn_weight": float(args.local_attn_weight),
+        "local_desc_weight": float(args.local_desc_weight),
+        "local_temperature": float(args.local_temperature),
+        "local_teacher_tokens": None,
+        "local_student_feature": None,
+        "local_shapes_logged": False,
+        "local_hook_handles": [],
+    }
+
+
+def log_online_kd_state(state):
+    if not is_main_process():
+        return
+    print(
+        "[OnlineKD] "
+        f"enable_online_kd={state['enable_online_kd']} | "
+        f"active={state['active']} | "
+        f"teacher_ckpt={state['teacher_ckpt']} | "
+        f"kd_feat_weight={state['kd_feat_weight']:g} | "
+        f"kd_sim_weight={state['kd_sim_weight']:g} | "
+        f"kd_temperature={state['kd_temperature']:g}"
+    )
+    if state["active"]:
+        print(
+            "[OnlineKD] active: frozen teacher online forward is enabled; "
+            f"feature_kd_enabled={state['feature_kd_enabled']} | "
+            f"similarity_kd_enabled={state['similarity_kd_enabled']} | "
+            f"local_kd_enabled={state['local_kd_enabled']} | "
+            f"local_attn_enabled={state['local_attn_enabled']} | "
+            f"local_desc_enabled={state['local_desc_enabled']}"
+        )
+    else:
+        print(
+            "[OnlineKD] inactive: baseline InfoNCE path only; no teacher, "
+            "no kd_projector, no forward/checkpoint structure changes."
+        )
+
+
+def build_frozen_online_teacher(args, device):
+    if not is_online_kd_active(args):
+        return None
+    if not args.teacher_ckpt:
+        raise ValueError("--teacher_ckpt is required when Plain Online KD is active")
+
+    from src.models.teacher.model import TeacherModel
+    from src.training.teacher.args import build_arg_parser as build_teacher_arg_parser
+    from src.training.teacher.evaluate import (
+        load_checkpoint_hparams,
+        load_teacher_checkpoint,
+        resolve_checkpoint_path,
+    )
+
+    teacher_parser = build_teacher_arg_parser()
+    teacher_args = teacher_parser.parse_args([])
+    teacher_defaults = {
+        action.dest: action.default
+        for action in teacher_parser._actions
+    }
+    teacher_args.device = str(device)
+    teacher_args.checkpoint = resolve_checkpoint_path(args.teacher_ckpt)
+    teacher_args.no_checkpoint_hparams = False
+    load_checkpoint_hparams(teacher_args, teacher_defaults, [])
+
+    teacher = TeacherModel(teacher_args)
+    teacher.to(device)
+    load_teacher_checkpoint(teacher, teacher_args.checkpoint, device)
+    teacher.eval()
+    for param in teacher.parameters():
+        param.requires_grad_(False)
+
+    if is_main_process():
+        print(f"[OnlineKD] frozen teacher loaded: {teacher_args.checkpoint}")
+    return teacher
+
+
+def extract_teacher_features(teacher_output):
+    if isinstance(teacher_output, (tuple, list)):
+        if len(teacher_output) >= 2 and torch.is_tensor(teacher_output[1]):
+            return teacher_output[1]
+        if teacher_output and torch.is_tensor(teacher_output[0]):
+            return teacher_output[0]
+    if torch.is_tensor(teacher_output):
+        return teacher_output
+    raise RuntimeError(
+        "Teacher forward must return a feature tensor or "
+        "(deep_feats, teacher_feats, debug_info)."
+    )
+
+
+def run_online_teacher_forward(teacher, images):
+    with torch.no_grad():
+        with autocast(device_type=images.device.type, dtype=torch.bfloat16):
+            teacher_output = teacher(images)
+    return extract_teacher_features(teacher_output).detach().float()
+
+
+def log_online_kd_feature_shapes_once(state, teacher_feats, student_feats):
+    if state.get("feature_shapes_logged", False):
+        return
+    if is_main_process() and state.get("enable_online_kd", False):
+        print(
+            "[OnlineKD] feature shapes | "
+            f"teacher_feats={tuple(teacher_feats.shape)} | "
+            f"student_feats={tuple(student_feats.shape)}"
+        )
+    state["feature_shapes_logged"] = True
+
+
+def first_tensor(value):
+    if torch.is_tensor(value):
+        return value
+    if isinstance(value, (tuple, list)):
+        for item in value:
+            tensor = first_tensor(item)
+            if tensor is not None:
+                return tensor
+    return None
+
+
+def extract_teacher_patch_tokens_from_hook(output):
+    tokens = first_tensor(output)
+    if tokens is None:
+        raise RuntimeError("Teacher local hook did not receive a tensor output.")
+    if tokens.ndim != 3:
+        raise RuntimeError(
+            "Teacher local hook expects transformer tokens with shape "
+            f"[B, 1+N, C], got {tuple(tokens.shape)}"
+        )
+    if tokens.size(1) <= 1:
+        raise RuntimeError(
+            "Teacher local hook cannot remove CLS token from an empty "
+            f"token sequence: {tuple(tokens.shape)}"
+        )
+    return tokens[:, 1:, :].detach()
+
+
+def extract_student_stage_feature_from_hook(output, detach=True):
+    feature = first_tensor(output)
+    if feature is None:
+        raise RuntimeError("Student local hook did not receive a tensor output.")
+    if feature.ndim != 4:
+        raise RuntimeError(
+            "Student local hook expects a feature map with shape [B, C, H, W], "
+            f"got {tuple(feature.shape)}"
+        )
+    return feature.detach() if detach else feature
+
+
+STUDENT_STAGE_TO_FEATURE_INDEX = {
+    "stage1": 5,
+    "stage2": 11,
+    "stage3": 37,
+    "stage4": 42,
+}
+
+STUDENT_STAGE_CHANNELS = {
+    "stage1": 64,
+    "stage2": 128,
+    "stage3": 256,
+    "stage4": 512,
+}
+
+
+def resolve_student_stage_module(model, stage_name):
+    stage_key = str(stage_name).strip().lower()
+    if stage_key not in STUDENT_STAGE_TO_FEATURE_INDEX:
+        raise ValueError(
+            f"unsupported local_student_stage={stage_name!r}; "
+            f"expected one of {sorted(STUDENT_STAGE_TO_FEATURE_INDEX)}"
+        )
+    raw_model = get_raw_model(model)
+    features = getattr(getattr(raw_model, "backbone", None), "features", None)
+    if features is None:
+        raise AttributeError("Student model does not expose backbone.features")
+    feature_idx = STUDENT_STAGE_TO_FEATURE_INDEX[stage_key]
+    if feature_idx >= len(features):
+        raise IndexError(
+            f"student {stage_key} maps to features[{feature_idx}], "
+            f"but backbone.features has length {len(features)}"
+        )
+    return features[feature_idx]
+
+
+def resolve_teacher_layer_module(teacher, layer_idx):
+    blocks = getattr(getattr(teacher, "backbone", None), "model", None)
+    blocks = getattr(blocks, "blocks", None)
+    if blocks is None:
+        raise AttributeError("Teacher model does not expose backbone.model.blocks")
+    layer_idx = int(layer_idx)
+    if layer_idx < 0:
+        layer_idx = len(blocks) + layer_idx
+    if layer_idx < 0 or layer_idx >= len(blocks):
+        raise IndexError(
+            f"local_teacher_layer={layer_idx} is outside teacher block range "
+            f"[0, {len(blocks) - 1}]"
+        )
+    return blocks[layer_idx]
+
+
+def make_teacher_local_hook(state):
+    def hook(_module, _inputs, output):
+        state["local_teacher_tokens"] = extract_teacher_patch_tokens_from_hook(
+            output
+        )
+
+    return hook
+
+
+def make_student_local_hook(state):
+    def hook(module, _inputs, output):
+        if not getattr(module, "training", False):
+            return
+        if not state.get("local_kd_enabled", False):
+            return
+        keep_grad = (
+            state.get("local_attn_enabled", False)
+            or state.get("local_desc_enabled", False)
+        )
+        state["local_student_feature"] = extract_student_stage_feature_from_hook(
+            output,
+            detach=not keep_grad,
+        )
+
+    return hook
+
+
+def register_local_kd_hooks(model, online_kd_state):
+    if online_kd_state is None or not online_kd_state.get("local_kd_enabled", False):
+        return []
+
+    teacher = online_kd_state.get("teacher")
+    if teacher is None:
+        raise RuntimeError("Local KD requires a frozen online teacher.")
+
+    teacher_module = resolve_teacher_layer_module(
+        teacher,
+        online_kd_state["local_teacher_layer"],
+    )
+    student_module = resolve_student_stage_module(
+        model,
+        online_kd_state["local_student_stage"],
+    )
+    handles = [
+        teacher_module.register_forward_hook(make_teacher_local_hook(online_kd_state)),
+        student_module.register_forward_hook(make_student_local_hook(online_kd_state)),
+    ]
+    online_kd_state["local_hook_handles"].extend(handles)
+
+    if is_main_process():
+        print(
+            "[LocalKD] hooks registered | "
+            f"teacher_layer={online_kd_state['local_teacher_layer']} | "
+            f"student_stage={online_kd_state['local_student_stage']}"
+        )
+    return handles
+
+
+def maybe_log_local_kd_shapes_once(state):
+    if state is None or not state.get("local_kd_enabled", False):
+        return
+    if state.get("local_shapes_logged", False):
+        return
+    teacher_tokens = state.get("local_teacher_tokens")
+    student_feature = state.get("local_student_feature")
+    if teacher_tokens is None or student_feature is None:
+        return
+    if is_main_process():
+        print(
+            "[LocalKD] feature shapes | "
+            f"teacher_local_tokens={tuple(teacher_tokens.shape)} | "
+            f"student_stage3={tuple(student_feature.shape)}"
+        )
+    state["local_shapes_logged"] = True
+
+
+def resolve_student_stage_channels(stage_name):
+    stage_key = str(stage_name).strip().lower()
+    if stage_key not in STUDENT_STAGE_CHANNELS:
+        raise ValueError(
+            f"unsupported local_student_stage={stage_name!r}; "
+            f"expected one of {sorted(STUDENT_STAGE_CHANNELS)}"
+        )
+    return STUDENT_STAGE_CHANNELS[stage_key]
+
+
+def maybe_create_local_attn_head(model, online_kd_state, device):
+    if online_kd_state is None or not online_kd_state.get("local_attn_enabled", False):
+        return
+
+    raw_model = get_raw_model(model)
+    if hasattr(raw_model, "local_attn_head"):
+        return
+
+    student_channels = resolve_student_stage_channels(
+        online_kd_state["local_student_stage"]
+    )
+    raw_model.local_attn_head = torch.nn.Conv2d(
+        student_channels,
+        1,
+        kernel_size=1,
+        bias=True,
+    ).to(device)
+
+    if is_main_process():
+        print(
+            "[LocalKD] created local_attn_head: "
+            f"Conv2d({student_channels} -> 1, kernel_size=1)"
+        )
+
+
+def maybe_create_local_desc_projectors(model, online_kd_state, device):
+    if online_kd_state is None or not online_kd_state.get("local_desc_enabled", False):
+        return
+
+    raw_model = get_raw_model(model)
+    if hasattr(raw_model, "student_local_proj") and hasattr(raw_model, "teacher_local_proj"):
+        return
+
+    teacher = online_kd_state.get("teacher")
+    if teacher is None:
+        raise RuntimeError("Local descriptor KD requires a frozen online teacher.")
+    teacher_dim = online_kd_state.get("teacher_dim")
+    if teacher_dim is None:
+        teacher_dim = resolve_teacher_feature_dim(teacher)
+        online_kd_state["teacher_dim"] = teacher_dim
+
+    student_channels = resolve_student_stage_channels(
+        online_kd_state["local_student_stage"]
+    )
+    distill_dim = 512
+    raw_model.student_local_proj = torch.nn.Linear(
+        student_channels,
+        distill_dim,
+        bias=False,
+    ).to(device)
+    raw_model.teacher_local_proj = torch.nn.Linear(
+        int(teacher_dim),
+        distill_dim,
+        bias=False,
+    ).to(device)
+    raw_model.teacher_local_proj.requires_grad_(False)
+
+    if is_main_process():
+        print(
+            "[LocalKD] created local descriptor projectors: "
+            f"student_local_proj=Linear({student_channels} -> {distill_dim}, bias=False) | "
+            f"teacher_local_proj=Linear({int(teacher_dim)} -> {distill_dim}, bias=False, frozen)"
+        )
+
+
+def infer_square_grid(num_tokens, name):
+    side = int(math.sqrt(int(num_tokens)))
+    if side * side != int(num_tokens):
+        raise RuntimeError(
+            f"{name} token count must form a square grid, got {num_tokens}"
+        )
+    return side, side
+
+
+def resize_teacher_attention(teacher_prob, student_hw):
+    batch_size, num_tokens = teacher_prob.shape
+    teacher_h, teacher_w = infer_square_grid(num_tokens, "teacher attention")
+    student_h, student_w = student_hw
+    if (teacher_h, teacher_w) == (student_h, student_w):
+        return teacher_prob
+
+    teacher_map = teacher_prob.view(batch_size, 1, teacher_h, teacher_w)
+    resized = F.interpolate(
+        teacher_map,
+        size=(student_h, student_w),
+        mode="bilinear",
+        align_corners=False,
+    ).flatten(1)
+    return resized / resized.sum(dim=1, keepdim=True).clamp_min(1e-12)
+
+
+def compute_teacher_patch_attention(teacher_tokens, teacher_global, local_temperature):
+    local_temperature = float(local_temperature)
+    if local_temperature <= 0.0:
+        raise ValueError("local_temperature must be greater than 0")
+    if teacher_tokens is None:
+        raise RuntimeError("Local KD requires teacher patch tokens.")
+
+    teacher_tokens = teacher_tokens.float().detach()
+    teacher_global = teacher_global.float().detach()
+    if teacher_tokens.ndim != 3:
+        raise RuntimeError(
+            "Teacher patch tokens must have shape [B, N, C], "
+            f"got {tuple(teacher_tokens.shape)}"
+        )
+    if teacher_global.ndim != 2:
+        raise RuntimeError(
+            "Teacher global feature must have shape [B, C], "
+            f"got {tuple(teacher_global.shape)}"
+        )
+    if teacher_tokens.size(0) != teacher_global.size(0):
+        raise RuntimeError(
+            "Teacher local attention batch size mismatch: "
+            f"tokens={teacher_tokens.size(0)} global={teacher_global.size(0)}"
+        )
+    if teacher_tokens.size(-1) != teacher_global.size(-1):
+        raise RuntimeError(
+            "Teacher local attention channel mismatch: "
+            f"tokens={teacher_tokens.size(-1)} global={teacher_global.size(-1)}"
+        )
+
+    teacher_scores = F.cosine_similarity(
+        teacher_tokens,
+        teacher_global.unsqueeze(1),
+        dim=-1,
+    )
+    return F.softmax(teacher_scores / local_temperature, dim=1).detach()
+
+
+def compute_local_attention_kd_loss(
+    model,
+    teacher_tokens,
+    teacher_global,
+    student_feature,
+    local_temperature,
+    teacher_prob=None,
+):
+    local_temperature = float(local_temperature)
+    if local_temperature <= 0.0:
+        raise ValueError("local_temperature must be greater than 0")
+
+    local_attn_head = getattr(get_raw_model(model), "local_attn_head", None)
+    if local_attn_head is None:
+        raise RuntimeError("Local attention KD is enabled but local_attn_head is missing.")
+    if teacher_tokens is None or student_feature is None:
+        raise RuntimeError("Local attention KD requires teacher tokens and student feature map.")
+    if teacher_tokens.size(0) != student_feature.size(0):
+        raise RuntimeError(
+            "Local attention KD batch size mismatch: "
+            f"teacher={teacher_tokens.size(0)} student={student_feature.size(0)}"
+        )
+
+    with autocast(device_type=student_feature.device.type, enabled=False):
+        teacher_tokens = teacher_tokens.float().detach()
+        teacher_global = teacher_global.float().detach()
+        student_feature = student_feature.float()
+
+        if teacher_prob is None:
+            teacher_prob = compute_teacher_patch_attention(
+                teacher_tokens,
+                teacher_global,
+                local_temperature,
+            )
+        else:
+            teacher_prob = teacher_prob.float().detach()
+        teacher_prob = resize_teacher_attention(
+            teacher_prob,
+            student_feature.shape[-2:],
+        ).detach()
+
+        student_scores = F.conv2d(
+            student_feature,
+            local_attn_head.weight.float(),
+            local_attn_head.bias.float() if local_attn_head.bias is not None else None,
+        ).flatten(1)
+        student_log_prob = F.log_softmax(student_scores, dim=1)
+        student_prob = student_log_prob.exp()
+        local_attn_loss = F.kl_div(
+            student_log_prob,
+            teacher_prob,
+            reduction="batchmean",
+        )
+        return {
+            "local_attn_loss": local_attn_loss,
+            "teacher_attn_entropy": mean_entropy(teacher_prob),
+            "student_attn_entropy": mean_entropy(student_prob),
+        }
+
+
+def compute_local_descriptor_kd_loss(
+    model,
+    teacher_tokens,
+    teacher_global,
+    student_feature,
+    local_temperature,
+    teacher_prob=None,
+):
+    if teacher_tokens is None or student_feature is None:
+        raise RuntimeError("Local descriptor KD requires teacher tokens and student feature map.")
+
+    raw_model = get_raw_model(model)
+    student_local_proj = getattr(raw_model, "student_local_proj", None)
+    teacher_local_proj = getattr(raw_model, "teacher_local_proj", None)
+    if student_local_proj is None or teacher_local_proj is None:
+        raise RuntimeError("Local descriptor KD is enabled but local projectors are missing.")
+    if teacher_tokens.size(0) != student_feature.size(0):
+        raise RuntimeError(
+            "Local descriptor KD batch size mismatch: "
+            f"teacher={teacher_tokens.size(0)} student={student_feature.size(0)}"
+        )
+
+    with autocast(device_type=student_feature.device.type, enabled=False):
+        teacher_tokens = teacher_tokens.float().detach()
+        teacher_global = teacher_global.float().detach()
+        student_feature = student_feature.float()
+
+        if teacher_prob is None:
+            teacher_prob = compute_teacher_patch_attention(
+                teacher_tokens,
+                teacher_global,
+                local_temperature,
+            )
+        else:
+            teacher_prob = teacher_prob.float().detach()
+
+        teacher_desc = torch.sum(
+            teacher_prob.unsqueeze(-1) * teacher_tokens,
+            dim=1,
+        )
+        teacher_desc = F.linear(
+            teacher_desc,
+            teacher_local_proj.weight.float(),
+            None,
+        )
+        teacher_desc = F.normalize(teacher_desc.float(), dim=1).detach()
+
+        student_tokens = student_feature.flatten(2).transpose(1, 2)
+        student_tokens = F.linear(
+            student_tokens,
+            student_local_proj.weight.float(),
+            None,
+        )
+        student_prob = resize_teacher_attention(
+            teacher_prob,
+            student_feature.shape[-2:],
+        ).detach()
+        student_desc = torch.sum(
+            student_prob.unsqueeze(-1) * student_tokens.float(),
+            dim=1,
+        )
+        student_desc = F.normalize(student_desc.float(), dim=1)
+
+        local_desc_cosine = F.cosine_similarity(
+            student_desc,
+            teacher_desc,
+            dim=1,
+        )
+        local_desc_loss = (1.0 - local_desc_cosine).mean()
+        return {
+            "local_desc_loss": local_desc_loss,
+            "local_desc_cosine": local_desc_cosine.mean(),
+        }
+
+
+def resolve_teacher_feature_dim(teacher):
+    teacher_dim = getattr(teacher, "feature_dim", None)
+    if teacher_dim is None:
+        raise AttributeError(
+            "Teacher feature dimension is unavailable; expected TeacherModel "
+            "to expose feature_dim."
+        )
+    return int(teacher_dim)
+
+
+def maybe_create_kd_projector(model, online_kd_state, device):
+    if online_kd_state is None or not online_kd_state.get("feature_kd_enabled", False):
+        return
+
+    teacher = online_kd_state.get("teacher")
+    if teacher is None:
+        raise RuntimeError("Feature KD requires a frozen online teacher.")
+
+    raw_model = get_raw_model(model)
+    if hasattr(raw_model, "kd_projector"):
+        return
+
+    student_dim = int(getattr(raw_model, "embedding_dim", 512))
+    teacher_dim = resolve_teacher_feature_dim(teacher)
+    raw_model.kd_projector = torch.nn.Linear(
+        student_dim,
+        teacher_dim,
+        bias=False,
+    ).to(device)
+    online_kd_state["teacher_dim"] = teacher_dim
+
+    if is_main_process():
+        print(
+            "[OnlineKD] created kd_projector: "
+            f"Linear({student_dim} -> {teacher_dim}, bias=False)"
+        )
+
+
+def compute_feature_kd_loss(model, student_feats, teacher_feats):
+    kd_projector = getattr(get_raw_model(model), "kd_projector", None)
+    if kd_projector is None:
+        raise RuntimeError("Feature KD is enabled but kd_projector is missing.")
+    if student_feats.size(0) != teacher_feats.size(0):
+        raise RuntimeError(
+            "Feature KD batch size mismatch: "
+            f"student={student_feats.size(0)} teacher={teacher_feats.size(0)}"
+        )
+
+    with autocast(device_type=student_feats.device.type, enabled=False):
+        projected = F.linear(
+            student_feats.float(),
+            kd_projector.weight.float(),
+            None,
+        )
+        student_proj = F.normalize(
+            projected.float(),
+            p=2,
+            dim=1,
+        )
+        teacher_norm = F.normalize(
+            teacher_feats.float().detach(),
+            p=2,
+            dim=1,
+        )
+        cosine = (student_proj * teacher_norm).sum(dim=1)
+        return (1.0 - cosine).mean()
+
+
+def split_paired_features(features, pair_batch_size, name):
+    expected = pair_batch_size * 2
+    if features.size(0) != expected:
+        raise RuntimeError(
+            f"{name} must contain [drone_1..drone_B, satellite_1..satellite_B] "
+            f"with first dimension {expected}, got {features.size(0)}"
+        )
+    return features[:pair_batch_size], features[pair_batch_size:expected]
+
+
+def mean_entropy(probabilities):
+    probs = probabilities.float()
+    return -(probs * probs.clamp_min(1e-12).log()).sum(dim=1).mean()
+
+
+def compute_similarity_kd_loss(
+    student_feats,
+    teacher_feats,
+    pair_batch_size,
+    temperature,
+):
+    temperature = float(temperature)
+    if temperature <= 0.0:
+        raise ValueError("kd_temperature must be greater than 0")
+
+    with autocast(device_type=student_feats.device.type, enabled=False):
+        student_drone, student_satellite = split_paired_features(
+            student_feats.float(),
+            pair_batch_size,
+            "student_feats",
+        )
+        teacher_drone, teacher_satellite = split_paired_features(
+            teacher_feats.float().detach(),
+            pair_batch_size,
+            "teacher_feats",
+        )
+
+        student_d2s_logits = student_drone @ student_satellite.t()
+        teacher_d2s_logits = teacher_drone @ teacher_satellite.t()
+        student_s2d_logits = student_d2s_logits.t()
+        teacher_s2d_logits = teacher_d2s_logits.t()
+
+        student_d2s_log_prob = F.log_softmax(
+            student_d2s_logits / temperature,
+            dim=1,
+        )
+        teacher_d2s_prob = F.softmax(
+            teacher_d2s_logits / temperature,
+            dim=1,
+        )
+        student_s2d_log_prob = F.log_softmax(
+            student_s2d_logits / temperature,
+            dim=1,
+        )
+        teacher_s2d_prob = F.softmax(
+            teacher_s2d_logits / temperature,
+            dim=1,
+        )
+
+        kl_d2s = F.kl_div(
+            student_d2s_log_prob,
+            teacher_d2s_prob,
+            reduction="batchmean",
+        )
+        kl_s2d = F.kl_div(
+            student_s2d_log_prob,
+            teacher_s2d_prob,
+            reduction="batchmean",
+        )
+        similarity_kd_loss = 0.5 * kl_d2s + 0.5 * kl_s2d
+        return {
+            "similarity_kd_loss": similarity_kd_loss,
+            "kl_d2s": kl_d2s,
+            "kl_s2d": kl_s2d,
+            "teacher_d2s_entropy": mean_entropy(teacher_d2s_prob),
+            "student_d2s_entropy": mean_entropy(student_d2s_log_prob.exp()),
+        }
 
 
 class AverageMeter:
@@ -174,7 +937,12 @@ def compute_student_batch_losses(
     images,
     pair_batch_size,
     criterion,
+    online_kd_state=None,
 ):
+    if online_kd_state is not None and online_kd_state.get("local_kd_enabled", False):
+        online_kd_state["local_teacher_tokens"] = None
+        online_kd_state["local_student_feature"] = None
+
     local_features = model(images)
     features, global_pair_batch_size = gather_paired_views(
         local_features,
@@ -187,11 +955,109 @@ def compute_student_batch_losses(
         criterion,
         global_pair_batch_size,
     )
+    total_loss = loss_infonce
     losses = {
-        "loss": loss_infonce,
+        "loss": total_loss,
         "main_loss": loss_infonce,
         "global_pair_batch_size": global_pair_batch_size,
     }
+    if online_kd_state is not None and online_kd_state.get("active", False):
+        teacher = online_kd_state.get("teacher")
+        if teacher is None:
+            raise RuntimeError("Plain Online KD is active but teacher is not built.")
+        teacher_feats = run_online_teacher_forward(teacher, images)
+        log_online_kd_feature_shapes_once(
+            online_kd_state,
+            teacher_feats,
+            local_features,
+        )
+        maybe_log_local_kd_shapes_once(online_kd_state)
+        feature_kd_loss = loss_infonce.new_zeros(())
+        similarity_kd_loss = loss_infonce.new_zeros(())
+        local_attn_loss = loss_infonce.new_zeros(())
+        local_desc_loss = loss_infonce.new_zeros(())
+        kl_d2s = loss_infonce.new_zeros(())
+        kl_s2d = loss_infonce.new_zeros(())
+        teacher_d2s_entropy = loss_infonce.new_zeros(())
+        student_d2s_entropy = loss_infonce.new_zeros(())
+        teacher_attn_entropy = loss_infonce.new_zeros(())
+        student_attn_entropy = loss_infonce.new_zeros(())
+        local_desc_cosine = loss_infonce.new_zeros(())
+        teacher_patch_attention = None
+        if (
+            online_kd_state.get("local_attn_enabled", False)
+            or online_kd_state.get("local_desc_enabled", False)
+        ):
+            teacher_patch_attention = compute_teacher_patch_attention(
+                online_kd_state.get("local_teacher_tokens"),
+                teacher_feats,
+                online_kd_state["local_temperature"],
+            )
+        if online_kd_state.get("feature_kd_enabled", False):
+            feature_kd_loss = compute_feature_kd_loss(
+                model,
+                local_features,
+                teacher_feats,
+            )
+        if online_kd_state.get("similarity_kd_enabled", False):
+            similarity_terms = compute_similarity_kd_loss(
+                local_features,
+                teacher_feats,
+                pair_batch_size,
+                online_kd_state["kd_temperature"],
+            )
+            similarity_kd_loss = similarity_terms["similarity_kd_loss"]
+            kl_d2s = similarity_terms["kl_d2s"]
+            kl_s2d = similarity_terms["kl_s2d"]
+            teacher_d2s_entropy = similarity_terms["teacher_d2s_entropy"]
+            student_d2s_entropy = similarity_terms["student_d2s_entropy"]
+        if online_kd_state.get("local_attn_enabled", False):
+            local_attn_terms = compute_local_attention_kd_loss(
+                model,
+                online_kd_state.get("local_teacher_tokens"),
+                teacher_feats,
+                online_kd_state.get("local_student_feature"),
+                online_kd_state["local_temperature"],
+                teacher_patch_attention,
+            )
+            local_attn_loss = local_attn_terms["local_attn_loss"]
+            teacher_attn_entropy = local_attn_terms["teacher_attn_entropy"]
+            student_attn_entropy = local_attn_terms["student_attn_entropy"]
+        if online_kd_state.get("local_desc_enabled", False):
+            local_desc_terms = compute_local_descriptor_kd_loss(
+                model,
+                online_kd_state.get("local_teacher_tokens"),
+                teacher_feats,
+                online_kd_state.get("local_student_feature"),
+                online_kd_state["local_temperature"],
+                teacher_patch_attention,
+            )
+            local_desc_loss = local_desc_terms["local_desc_loss"]
+            local_desc_cosine = local_desc_terms["local_desc_cosine"]
+        total_loss = (
+            loss_infonce
+            + float(online_kd_state["kd_feat_weight"]) * feature_kd_loss
+            + float(online_kd_state["kd_sim_weight"]) * similarity_kd_loss
+            + float(online_kd_state.get("local_attn_weight", 0.0)) * local_attn_loss
+            + float(online_kd_state.get("local_desc_weight", 0.0)) * local_desc_loss
+        )
+        losses.update({
+            "loss": total_loss,
+            "loss_retrieval": loss_infonce,
+            "feature_kd_loss": feature_kd_loss,
+            "loss_kd_feat": feature_kd_loss,
+            "similarity_kd_loss": similarity_kd_loss,
+            "loss_kd_sim": similarity_kd_loss,
+            "kl_d2s": kl_d2s,
+            "kl_s2d": kl_s2d,
+            "teacher_d2s_entropy": teacher_d2s_entropy,
+            "student_d2s_entropy": student_d2s_entropy,
+            "local_attn_loss": local_attn_loss,
+            "teacher_attn_entropy": teacher_attn_entropy,
+            "student_attn_entropy": student_attn_entropy,
+            "local_desc_loss": local_desc_loss,
+            "local_desc_cosine": local_desc_cosine,
+        })
     return losses
 
 
@@ -349,12 +1215,27 @@ def train_one_epoch(
     device,
     args,
     epoch,
+    online_kd_state=None,
 ):
     model.train()
+    online_kd_active = (
+        online_kd_state is not None and online_kd_state.get("active", False)
+    )
     batch_time = AverageMeter()
     data_time = AverageMeter()
     loss_total_meter = AverageMeter()
     loss_retrieval_meter = AverageMeter()
+    feature_kd_loss_meter = AverageMeter()
+    similarity_kd_loss_meter = AverageMeter()
+    kl_d2s_meter = AverageMeter()
+    kl_s2d_meter = AverageMeter()
+    teacher_d2s_entropy_meter = AverageMeter()
+    student_d2s_entropy_meter = AverageMeter()
+    local_attn_loss_meter = AverageMeter()
+    teacher_attn_entropy_meter = AverageMeter()
+    student_attn_entropy_meter = AverageMeter()
+    local_desc_loss_meter = AverageMeter()
+    local_desc_cosine_meter = AverageMeter()
     end = time.time()
 
     if hasattr(train_loader.batch_sampler, "set_epoch"):
@@ -374,6 +1255,7 @@ def train_one_epoch(
                 images,
                 pair_batch_size,
                 criterion,
+                online_kd_state=online_kd_state,
             )
             loss = batch_losses["loss"]
 
@@ -408,6 +1290,51 @@ def train_one_epoch(
             batch_losses["main_loss"].item(),
             images.size(0),
         )
+        if online_kd_active:
+            feature_kd_loss_meter.update(
+                batch_losses["feature_kd_loss"].item(),
+                images.size(0),
+            )
+            similarity_kd_loss_meter.update(
+                batch_losses["similarity_kd_loss"].item(),
+                images.size(0),
+            )
+            kl_d2s_meter.update(
+                batch_losses["kl_d2s"].item(),
+                images.size(0),
+            )
+            kl_s2d_meter.update(
+                batch_losses["kl_s2d"].item(),
+                images.size(0),
+            )
+            teacher_d2s_entropy_meter.update(
+                batch_losses["teacher_d2s_entropy"].item(),
+                images.size(0),
+            )
+            student_d2s_entropy_meter.update(
+                batch_losses["student_d2s_entropy"].item(),
+                images.size(0),
+            )
+            local_attn_loss_meter.update(
+                batch_losses["local_attn_loss"].item(),
+                images.size(0),
+            )
+            teacher_attn_entropy_meter.update(
+                batch_losses["teacher_attn_entropy"].item(),
+                images.size(0),
+            )
+            student_attn_entropy_meter.update(
+                batch_losses["student_attn_entropy"].item(),
+                images.size(0),
+            )
+            local_desc_loss_meter.update(
+                batch_losses["local_desc_loss"].item(),
+                images.size(0),
+            )
+            local_desc_cosine_meter.update(
+                batch_losses["local_desc_cosine"].item(),
+                images.size(0),
+            )
         batch_time.update(time.time() - end)
         end = time.time()
 
@@ -419,6 +1346,35 @@ def train_one_epoch(
                 f"total_loss {loss_total_meter.val:.4f} "
                 f"({loss_total_meter.avg:.4f}) | "
             )
+            if online_kd_active:
+                aux_text += (
+                    f"feature_kd_loss {feature_kd_loss_meter.val:.4f} "
+                    f"({feature_kd_loss_meter.avg:.4f}) | "
+                    f"kd_feat_weight {args.kd_feat_weight:g} | "
+                    f"similarity_kd_loss {similarity_kd_loss_meter.val:.4f} "
+                    f"({similarity_kd_loss_meter.avg:.4f}) | "
+                    f"KL_D2S {kl_d2s_meter.val:.4f} "
+                    f"({kl_d2s_meter.avg:.4f}) | "
+                    f"KL_S2D {kl_s2d_meter.val:.4f} "
+                    f"({kl_s2d_meter.avg:.4f}) | "
+                    f"teacher_d2s_entropy {teacher_d2s_entropy_meter.val:.4f} "
+                    f"({teacher_d2s_entropy_meter.avg:.4f}) | "
+                    f"student_d2s_entropy {student_d2s_entropy_meter.val:.4f} "
+                    f"({student_d2s_entropy_meter.avg:.4f}) | "
+                    f"kd_sim_weight {args.kd_sim_weight:g} | "
+                    f"local_attn_loss {local_attn_loss_meter.val:.4f} "
+                    f"({local_attn_loss_meter.avg:.4f}) | "
+                    f"local_attn_weight {args.local_attn_weight:g} | "
+                    f"teacher_attn_entropy {teacher_attn_entropy_meter.val:.4f} "
+                    f"({teacher_attn_entropy_meter.avg:.4f}) | "
+                    f"student_attn_entropy {student_attn_entropy_meter.val:.4f} "
+                    f"({student_attn_entropy_meter.avg:.4f}) | "
+                    f"local_desc_loss {local_desc_loss_meter.val:.4f} "
+                    f"({local_desc_loss_meter.avg:.4f}) | "
+                    f"local_desc_weight {args.local_desc_weight:g} | "
+                    f"local_desc_cosine {local_desc_cosine_meter.val:.4f} "
+                    f"({local_desc_cosine_meter.avg:.4f}) | "
+                )
             print(
                 f"Epoch [{epoch}/{args.epochs}] "
                 f"Step [{step + 1}/{len(train_loader)}] | "
@@ -426,7 +1382,7 @@ def train_one_epoch(
                 f"global_pair_batch "
                 f"{batch_losses['global_pair_batch_size']} | "
                 f"world_size {get_world_size()} | "
-                f"loss_retrieval {loss_retrieval_meter.val:.4f} "
+                f"retrieval_loss {loss_retrieval_meter.val:.4f} "
                 f"({loss_retrieval_meter.avg:.4f}) | "
                 f"{aux_text}"
                 f"logit_scale {raw_model.logit_scale.exp().item():.3f} | "
@@ -437,6 +1393,20 @@ def train_one_epoch(
         "total_loss": loss_total_meter.avg,
         "loss_retrieval": loss_retrieval_meter.avg,
     }
+    if online_kd_active:
+        stats["feature_kd_loss"] = feature_kd_loss_meter.avg
+        stats["loss_kd_feat"] = feature_kd_loss_meter.avg
+        stats["similarity_kd_loss"] = similarity_kd_loss_meter.avg
+        stats["loss_kd_sim"] = similarity_kd_loss_meter.avg
+        stats["kl_d2s"] = kl_d2s_meter.avg
+        stats["kl_s2d"] = kl_s2d_meter.avg
+        stats["teacher_d2s_entropy"] = teacher_d2s_entropy_meter.avg
+        stats["student_d2s_entropy"] = student_d2s_entropy_meter.avg
+        stats["local_attn_loss"] = local_attn_loss_meter.avg
+        stats["teacher_attn_entropy"] = teacher_attn_entropy_meter.avg
+        stats["student_attn_entropy"] = student_attn_entropy_meter.avg
+        stats["local_desc_loss"] = local_desc_loss_meter.avg
+        stats["local_desc_cosine"] = local_desc_cosine_meter.avg
     return stats
 
 
@@ -448,13 +1418,28 @@ def train_one_epoch_deepspeed(
     device,
     args,
     epoch,
+    online_kd_state=None,
 ):
     model_engine.train()
+    online_kd_active = (
+        online_kd_state is not None and online_kd_state.get("active", False)
+    )
     if hasattr(train_loader.batch_sampler, "set_epoch"):
         train_loader.batch_sampler.set_epoch(epoch)
 
     loss_total_meter = AverageMeter()
     loss_retrieval_meter = AverageMeter()
+    feature_kd_loss_meter = AverageMeter()
+    similarity_kd_loss_meter = AverageMeter()
+    kl_d2s_meter = AverageMeter()
+    kl_s2d_meter = AverageMeter()
+    teacher_d2s_entropy_meter = AverageMeter()
+    student_d2s_entropy_meter = AverageMeter()
+    local_attn_loss_meter = AverageMeter()
+    teacher_attn_entropy_meter = AverageMeter()
+    student_attn_entropy_meter = AverageMeter()
+    local_desc_loss_meter = AverageMeter()
+    local_desc_cosine_meter = AverageMeter()
     batch_time = AverageMeter()
     data_time = AverageMeter()
     end = time.time()
@@ -471,6 +1456,7 @@ def train_one_epoch_deepspeed(
             images,
             pair_batch_size,
             criterion,
+            online_kd_state=online_kd_state,
         )
         loss = batch_losses["loss"]
         model_engine.backward(loss)
@@ -483,6 +1469,45 @@ def train_one_epoch_deepspeed(
         weight = batch_losses["global_pair_batch_size"] * 2
         loss_total_meter.update(loss.item(), weight)
         loss_retrieval_meter.update(batch_losses["main_loss"].item(), weight)
+        if online_kd_active:
+            feature_kd_loss_meter.update(
+                batch_losses["feature_kd_loss"].item(),
+                weight,
+            )
+            similarity_kd_loss_meter.update(
+                batch_losses["similarity_kd_loss"].item(),
+                weight,
+            )
+            kl_d2s_meter.update(batch_losses["kl_d2s"].item(), weight)
+            kl_s2d_meter.update(batch_losses["kl_s2d"].item(), weight)
+            teacher_d2s_entropy_meter.update(
+                batch_losses["teacher_d2s_entropy"].item(),
+                weight,
+            )
+            student_d2s_entropy_meter.update(
+                batch_losses["student_d2s_entropy"].item(),
+                weight,
+            )
+            local_attn_loss_meter.update(
+                batch_losses["local_attn_loss"].item(),
+                weight,
+            )
+            teacher_attn_entropy_meter.update(
+                batch_losses["teacher_attn_entropy"].item(),
+                weight,
+            )
+            student_attn_entropy_meter.update(
+                batch_losses["student_attn_entropy"].item(),
+                weight,
+            )
+            local_desc_loss_meter.update(
+                batch_losses["local_desc_loss"].item(),
+                weight,
+            )
+            local_desc_cosine_meter.update(
+                batch_losses["local_desc_cosine"].item(),
+                weight,
+            )
         batch_time.update(time.time() - end)
         end = time.time()
 
@@ -494,6 +1519,35 @@ def train_one_epoch_deepspeed(
                 f"total_loss {loss_total_meter.val:.4f} "
                 f"({loss_total_meter.avg:.4f}) | "
             )
+            if online_kd_active:
+                aux_text += (
+                    f"feature_kd_loss {feature_kd_loss_meter.val:.4f} "
+                    f"({feature_kd_loss_meter.avg:.4f}) | "
+                    f"kd_feat_weight {args.kd_feat_weight:g} | "
+                    f"similarity_kd_loss {similarity_kd_loss_meter.val:.4f} "
+                    f"({similarity_kd_loss_meter.avg:.4f}) | "
+                    f"KL_D2S {kl_d2s_meter.val:.4f} "
+                    f"({kl_d2s_meter.avg:.4f}) | "
+                    f"KL_S2D {kl_s2d_meter.val:.4f} "
+                    f"({kl_s2d_meter.avg:.4f}) | "
+                    f"teacher_d2s_entropy {teacher_d2s_entropy_meter.val:.4f} "
+                    f"({teacher_d2s_entropy_meter.avg:.4f}) | "
+                    f"student_d2s_entropy {student_d2s_entropy_meter.val:.4f} "
+                    f"({student_d2s_entropy_meter.avg:.4f}) | "
+                    f"kd_sim_weight {args.kd_sim_weight:g} | "
+                    f"local_attn_loss {local_attn_loss_meter.val:.4f} "
+                    f"({local_attn_loss_meter.avg:.4f}) | "
+                    f"local_attn_weight {args.local_attn_weight:g} | "
+                    f"teacher_attn_entropy {teacher_attn_entropy_meter.val:.4f} "
+                    f"({teacher_attn_entropy_meter.avg:.4f}) | "
+                    f"student_attn_entropy {student_attn_entropy_meter.val:.4f} "
+                    f"({student_attn_entropy_meter.avg:.4f}) | "
+                    f"local_desc_loss {local_desc_loss_meter.val:.4f} "
+                    f"({local_desc_loss_meter.avg:.4f}) | "
+                    f"local_desc_weight {args.local_desc_weight:g} | "
+                    f"local_desc_cosine {local_desc_cosine_meter.val:.4f} "
+                    f"({local_desc_cosine_meter.avg:.4f}) | "
+                )
             print(
                 f"Epoch [{epoch}/{args.epochs}] "
                 f"Step [{step + 1}/{len(train_loader)}] | "
@@ -501,7 +1555,7 @@ def train_one_epoch_deepspeed(
                 f"global_pair_batch "
                 f"{batch_losses['global_pair_batch_size']} | "
                 f"world_size {get_world_size()} | "
-                f"loss_retrieval {loss_retrieval_meter.val:.4f} "
+                f"retrieval_loss {loss_retrieval_meter.val:.4f} "
                 f"({loss_retrieval_meter.avg:.4f}) | "
                 f"{aux_text}"
                 f"logit_scale "
@@ -513,6 +1567,20 @@ def train_one_epoch_deepspeed(
         "total_loss": loss_total_meter.avg,
         "loss_retrieval": loss_retrieval_meter.avg,
     }
+    if online_kd_active:
+        stats["feature_kd_loss"] = feature_kd_loss_meter.avg
+        stats["loss_kd_feat"] = feature_kd_loss_meter.avg
+        stats["similarity_kd_loss"] = similarity_kd_loss_meter.avg
+        stats["loss_kd_sim"] = similarity_kd_loss_meter.avg
+        stats["kl_d2s"] = kl_d2s_meter.avg
+        stats["kl_s2d"] = kl_s2d_meter.avg
+        stats["teacher_d2s_entropy"] = teacher_d2s_entropy_meter.avg
+        stats["student_d2s_entropy"] = student_d2s_entropy_meter.avg
+        stats["local_attn_loss"] = local_attn_loss_meter.avg
+        stats["teacher_attn_entropy"] = teacher_attn_entropy_meter.avg
+        stats["student_attn_entropy"] = student_attn_entropy_meter.avg
+        stats["local_desc_loss"] = local_desc_loss_meter.avg
+        stats["local_desc_cosine"] = local_desc_cosine_meter.avg
     return stats
 
 
@@ -566,6 +1634,7 @@ def train(
     scheduler,
     device,
     args,
+    online_kd_state=None,
 ):
     os.makedirs(args.output_dir, exist_ok=True)
     scaler = GradScaler("cuda", enabled=args.amp)
@@ -591,13 +1660,40 @@ def train(
             device,
             args,
             epoch,
+            online_kd_state=online_kd_state,
         )
-        print(
+        train_text = (
             f"[Train] Epoch {epoch}/{args.epochs} | "
-            f"loss_retrieval={train_stats['loss_retrieval']:.4f}"
+            f"retrieval_loss={train_stats['loss_retrieval']:.4f}"
+        )
+        if "feature_kd_loss" in train_stats:
+            train_text += (
+                f" | feature_kd_loss={train_stats['feature_kd_loss']:.4f}"
+                f" | kd_feat_weight={args.kd_feat_weight:g}"
+                f" | similarity_kd_loss="
+                f"{train_stats['similarity_kd_loss']:.4f}"
+                f" | KL_D2S={train_stats['kl_d2s']:.4f}"
+                f" | KL_S2D={train_stats['kl_s2d']:.4f}"
+                f" | teacher_d2s_entropy="
+                f"{train_stats['teacher_d2s_entropy']:.4f}"
+                f" | student_d2s_entropy="
+                f"{train_stats['student_d2s_entropy']:.4f}"
+                f" | kd_sim_weight={args.kd_sim_weight:g}"
+                f" | local_attn_loss={train_stats['local_attn_loss']:.4f}"
+                f" | local_attn_weight={args.local_attn_weight:g}"
+                f" | teacher_attn_entropy="
+                f"{train_stats['teacher_attn_entropy']:.4f}"
+                f" | student_attn_entropy="
+                f"{train_stats['student_attn_entropy']:.4f}"
+                f" | local_desc_loss={train_stats['local_desc_loss']:.4f}"
+                f" | local_desc_weight={args.local_desc_weight:g}"
+                f" | local_desc_cosine={train_stats['local_desc_cosine']:.4f}"
+            )
+        train_text += (
             f" | total_loss={train_stats['total_loss']:.4f}"
             f" | world_size={get_world_size()}"
         )
+        print(train_text)
 
         if args.save_last:
             save_model_only_checkpoint(
@@ -667,6 +1763,7 @@ def train_deepspeed(
     optimizer,
     device,
     args,
+    online_kd_state=None,
 ):
     if is_main_process():
         os.makedirs(args.output_dir, exist_ok=True)
@@ -693,14 +1790,41 @@ def train_deepspeed(
             device,
             args,
             epoch,
+            online_kd_state=online_kd_state,
         )
         if is_main_process():
-            print(
+            train_text = (
                 f"[Train] Epoch {epoch}/{args.epochs} | "
-                f"loss_retrieval={train_stats['loss_retrieval']:.4f} | "
-                f"total_loss={train_stats['total_loss']:.4f} | "
+                f"retrieval_loss={train_stats['loss_retrieval']:.4f}"
+            )
+            if "feature_kd_loss" in train_stats:
+                train_text += (
+                    f" | feature_kd_loss={train_stats['feature_kd_loss']:.4f}"
+                    f" | kd_feat_weight={args.kd_feat_weight:g}"
+                    f" | similarity_kd_loss="
+                    f"{train_stats['similarity_kd_loss']:.4f}"
+                    f" | KL_D2S={train_stats['kl_d2s']:.4f}"
+                    f" | KL_S2D={train_stats['kl_s2d']:.4f}"
+                    f" | teacher_d2s_entropy="
+                    f"{train_stats['teacher_d2s_entropy']:.4f}"
+                    f" | student_d2s_entropy="
+                    f"{train_stats['student_d2s_entropy']:.4f}"
+                    f" | kd_sim_weight={args.kd_sim_weight:g}"
+                    f" | local_attn_loss={train_stats['local_attn_loss']:.4f}"
+                    f" | local_attn_weight={args.local_attn_weight:g}"
+                    f" | teacher_attn_entropy="
+                    f"{train_stats['teacher_attn_entropy']:.4f}"
+                    f" | student_attn_entropy="
+                    f"{train_stats['student_attn_entropy']:.4f}"
+                    f" | local_desc_loss={train_stats['local_desc_loss']:.4f}"
+                    f" | local_desc_weight={args.local_desc_weight:g}"
+                    f" | local_desc_cosine={train_stats['local_desc_cosine']:.4f}"
+                )
+            train_text += (
+                f" | total_loss={train_stats['total_loss']:.4f} | "
                 f"world_size={get_world_size()}"
             )
+            print(train_text)
 
         if args.save_last:
             save_model_only_checkpoint(
@@ -789,6 +1913,35 @@ def parse_args():
     parser.add_argument("--min_lr_ratio", type=float, default=0.01)
     parser.add_argument("--temperature", type=float, default=0.07)
     parser.add_argument("--label_smoothing", type=float, default=0.1)
+    parser.add_argument(
+        "--enable_online_kd",
+        type=str2bool,
+        nargs="?",
+        const=True,
+        default=False,
+        help="Enable Plain Online KD scaffold when at least one KD weight is > 0.",
+    )
+    parser.add_argument("--teacher_ckpt", type=str, default=None)
+    parser.add_argument("--kd_feat_weight", type=float, default=0.0)
+    parser.add_argument("--kd_sim_weight", type=float, default=0.0)
+    parser.add_argument("--kd_temperature", type=float, default=0.1)
+    parser.add_argument(
+        "--enable_local_kd",
+        type=str2bool,
+        nargs="?",
+        const=True,
+        default=False,
+    )
+    parser.add_argument("--local_teacher_layer", type=int, default=36)
+    parser.add_argument(
+        "--local_student_stage",
+        type=str,
+        choices=sorted(STUDENT_STAGE_TO_FEATURE_INDEX),
+        default="stage3",
+    )
+    parser.add_argument("--local_attn_weight", type=float, default=0.0)
+    parser.add_argument("--local_desc_weight", type=float, default=0.0)
+    parser.add_argument("--local_temperature", type=float, default=0.5)
     parser.add_argument("--amp", dest="amp", action="store_true", default=True)
     parser.add_argument("--no_amp", dest="amp", action="store_false")
     parser.add_argument("--grad_clip", type=float, default=0.0)
@@ -810,6 +1963,24 @@ def parse_args():
     args = parser.parse_args()
     if args.print_freq <= 0:
         parser.error("--print_freq must be greater than 0")
+    if args.kd_feat_weight < 0.0:
+        parser.error("--kd_feat_weight must be non-negative")
+    if args.kd_sim_weight < 0.0:
+        parser.error("--kd_sim_weight must be non-negative")
+    if args.kd_temperature <= 0.0:
+        parser.error("--kd_temperature must be greater than 0")
+    if args.local_teacher_layer < 0:
+        parser.error("--local_teacher_layer must be non-negative")
+    if args.local_attn_weight < 0.0:
+        parser.error("--local_attn_weight must be non-negative")
+    if args.local_desc_weight < 0.0:
+        parser.error("--local_desc_weight must be non-negative")
+    if args.local_temperature <= 0.0:
+        parser.error("--local_temperature must be greater than 0")
+    if is_local_kd_enabled(args) and not args.enable_online_kd:
+        parser.error("--enable_local_kd requires --enable_online_kd true")
+    if is_online_kd_active(args) and not args.teacher_ckpt:
+        parser.error("--teacher_ckpt is required when Plain Online KD is active")
     if args.best_metric_name != "R1_sum":
         print(
             f"[Best] overriding best_metric_name="
@@ -830,6 +2001,7 @@ def main():
     args.rank = rank
     args.world_size = world_size
     args.deepspeed = bool(args.deepspeed or world_size > 1)
+    online_kd_state = build_online_kd_state(args)
 
     if args.deepspeed and not is_distributed():
         raise RuntimeError(
@@ -847,11 +2019,14 @@ def main():
 
     if is_main_process():
         print(f"[Output] checkpoints will be saved to: {args.output_dir}")
+        log_online_kd_state(online_kd_state)
     distributed_barrier()
 
     torch.manual_seed(args.seed + rank)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed + rank)
+
+    online_kd_state["teacher"] = build_frozen_online_teacher(args, device)
 
     train_loader = create_student_train_dataset_and_loader(args)
     val_loaders = build_1652_val_dataloaders(
@@ -864,6 +2039,10 @@ def main():
     model = StudentModel(
         temperature=args.temperature,
     ).to(device)
+    maybe_create_kd_projector(model, online_kd_state, device)
+    maybe_create_local_attn_head(model, online_kd_state, device)
+    maybe_create_local_desc_projectors(model, online_kd_state, device)
+    register_local_kd_hooks(model, online_kd_state)
     print_trainable_parameter_summary(model)
     optimizer = build_student_optimizer(
         model,
@@ -903,6 +2082,7 @@ def main():
             optimizer,
             device,
             args,
+            online_kd_state=online_kd_state,
         )
     else:
         scheduler = build_student_scheduler(
@@ -919,6 +2099,7 @@ def main():
             scheduler,
             device,
             args,
+            online_kd_state=online_kd_state,
         )
 
 

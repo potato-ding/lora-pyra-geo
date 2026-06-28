@@ -92,6 +92,19 @@ def test_cli_defaults_to_clean_baseline(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["student_train.py"])
     args = student_train.parse_args()
 
+    assert args.enable_online_kd is False
+    assert args.teacher_ckpt is None
+    assert args.kd_feat_weight == 0.0
+    assert args.kd_sim_weight == 0.0
+    assert args.kd_temperature == 0.1
+    assert args.enable_local_kd is False
+    assert args.local_teacher_layer == 36
+    assert args.local_student_stage == "stage3"
+    assert args.local_attn_weight == 0.0
+    assert args.local_desc_weight == 0.0
+    assert args.local_temperature == 0.5
+    assert student_train.is_online_kd_active(args) is False
+
     removed_attrs = [
         "use_" + "pro" + "xy_loss",
         "pro" + "xy_loss_weight",
@@ -101,6 +114,703 @@ def test_cli_defaults_to_clean_baseline(monkeypatch):
     ]
     for attr in removed_attrs:
         assert not hasattr(args, attr)
+
+
+def test_online_kd_is_inactive_when_disabled_or_zero_weight(monkeypatch):
+    monkeypatch.setattr(sys, "argv", [
+        "student_train.py",
+        "--enable_online_kd",
+        "false",
+        "--kd_feat_weight",
+        "1.0",
+        "--kd_sim_weight",
+        "1.0",
+    ])
+    disabled_args = student_train.parse_args()
+    assert student_train.is_online_kd_active(disabled_args) is False
+
+    monkeypatch.setattr(sys, "argv", [
+        "student_train.py",
+        "--enable_online_kd",
+        "true",
+        "--kd_feat_weight",
+        "0.0",
+        "--kd_sim_weight",
+        "0.0",
+    ])
+    zero_weight_args = student_train.parse_args()
+    assert student_train.is_online_kd_active(zero_weight_args) is False
+
+
+def test_online_kd_active_requires_teacher_checkpoint(monkeypatch):
+    monkeypatch.setattr(sys, "argv", [
+        "student_train.py",
+        "--enable_online_kd",
+        "true",
+        "--kd_feat_weight",
+        "1.0",
+    ])
+    with pytest.raises(SystemExit):
+        student_train.parse_args()
+
+
+def test_local_kd_requires_online_kd(monkeypatch):
+    monkeypatch.setattr(sys, "argv", [
+        "student_train.py",
+        "--enable_local_kd",
+        "true",
+        "--local_attn_weight",
+        "1.0",
+    ])
+    with pytest.raises(SystemExit):
+        student_train.parse_args()
+
+
+def test_local_kd_zero_weights_is_inactive_without_teacher_checkpoint(monkeypatch):
+    monkeypatch.setattr(sys, "argv", [
+        "student_train.py",
+        "--enable_local_kd",
+        "true",
+    ])
+    args = student_train.parse_args()
+
+    assert student_train.is_online_kd_active(args) is False
+    assert student_train.is_local_kd_enabled(args) is False
+    assert student_train.is_local_attn_kd_enabled(args) is False
+    assert student_train.is_local_desc_kd_enabled(args) is False
+
+
+def test_local_kd_can_activate_online_teacher_without_kd_weights(monkeypatch):
+    monkeypatch.setattr(sys, "argv", [
+        "student_train.py",
+        "--enable_online_kd",
+        "true",
+        "--enable_local_kd",
+        "true",
+        "--local_attn_weight",
+        "1.0",
+        "--teacher_ckpt",
+        "teacher.pth",
+    ])
+    args = student_train.parse_args()
+
+    assert student_train.is_online_kd_active(args) is True
+    assert student_train.is_feature_kd_enabled(args) is False
+    assert student_train.is_similarity_kd_enabled(args) is False
+    assert student_train.is_local_kd_enabled(args) is True
+    assert student_train.is_local_attn_kd_enabled(args) is True
+
+
+def test_local_attention_head_created_only_when_weight_positive():
+    class TinyStudent(nn.Module):
+        pass
+
+    model = TinyStudent()
+    inactive_state = {
+        "local_attn_enabled": False,
+        "local_student_stage": "stage3",
+    }
+    active_state = {
+        "local_attn_enabled": True,
+        "local_student_stage": "stage3",
+    }
+
+    student_train.maybe_create_local_attn_head(
+        model,
+        inactive_state,
+        torch.device("cpu"),
+    )
+    assert not hasattr(model, "local_attn_head")
+
+    student_train.maybe_create_local_attn_head(
+        model,
+        active_state,
+        torch.device("cpu"),
+    )
+    assert isinstance(model.local_attn_head, nn.Conv2d)
+    assert model.local_attn_head.weight.shape == (1, 256, 1, 1)
+
+
+def test_local_descriptor_projectors_created_only_when_weight_positive():
+    class TinyStudent(nn.Module):
+        pass
+
+    class FakeTeacher(nn.Module):
+        feature_dim = 4
+
+    model = TinyStudent()
+    inactive_state = {
+        "local_desc_enabled": False,
+        "local_student_stage": "stage3",
+        "teacher": FakeTeacher(),
+    }
+    active_state = {
+        "local_desc_enabled": True,
+        "local_student_stage": "stage3",
+        "teacher": FakeTeacher(),
+        "teacher_dim": None,
+    }
+
+    student_train.maybe_create_local_desc_projectors(
+        model,
+        inactive_state,
+        torch.device("cpu"),
+    )
+    assert not hasattr(model, "student_local_proj")
+    assert not hasattr(model, "teacher_local_proj")
+
+    student_train.maybe_create_local_desc_projectors(
+        model,
+        active_state,
+        torch.device("cpu"),
+    )
+    assert isinstance(model.student_local_proj, nn.Linear)
+    assert isinstance(model.teacher_local_proj, nn.Linear)
+    assert model.student_local_proj.weight.shape == (512, 256)
+    assert model.teacher_local_proj.weight.shape == (512, 4)
+    assert model.student_local_proj.weight.requires_grad is True
+    assert model.teacher_local_proj.weight.requires_grad is False
+    assert active_state["teacher_dim"] == 4
+
+    optimizer = student_train.build_student_optimizer(model)
+    optimizer_param_ids = {
+        id(param)
+        for group in optimizer.param_groups
+        for param in group["params"]
+    }
+    assert id(model.student_local_proj.weight) in optimizer_param_ids
+    assert id(model.teacher_local_proj.weight) not in optimizer_param_ids
+
+
+def test_online_teacher_forward_is_no_grad_and_float():
+    class FakeTeacher(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.grad_enabled_seen = None
+
+        def forward(self, x):
+            self.grad_enabled_seen = torch.is_grad_enabled()
+            return x, x.to(torch.bfloat16), {}
+
+    teacher = FakeTeacher()
+    images = torch.ones(2, 3)
+
+    with torch.enable_grad():
+        teacher_feats = student_train.run_online_teacher_forward(
+            teacher,
+            images,
+        )
+
+    assert teacher.grad_enabled_seen is False
+    assert teacher_feats.dtype == torch.float32
+    assert teacher_feats.requires_grad is False
+
+
+def test_local_kd_disabled_registers_no_hooks():
+    state = {"local_kd_enabled": False}
+
+    handles = student_train.register_local_kd_hooks(nn.Identity(), state)
+
+    assert handles == []
+
+
+def test_local_kd_hooks_capture_teacher_tokens_and_student_stage3(capsys):
+    class TinyStudent(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.backbone = nn.Module()
+            self.backbone.features = nn.ModuleList(
+                [nn.Identity() for _ in range(43)]
+            )
+
+        def forward(self, x):
+            for block in self.backbone.features:
+                x = block(x)
+            return x.flatten(1)
+
+    class TinyTeacher(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.backbone = nn.Module()
+            self.backbone.model = nn.Module()
+            self.backbone.model.blocks = nn.ModuleList(
+                [nn.Identity() for _ in range(40)]
+            )
+
+        def forward(self, x):
+            tokens = x
+            for block in self.backbone.model.blocks:
+                tokens = block(tokens)
+            return tokens[:, 0], tokens[:, 0], {}
+
+    student = TinyStudent()
+    teacher = TinyTeacher()
+    state = {
+        "local_kd_enabled": True,
+        "teacher": teacher,
+        "local_teacher_layer": 36,
+        "local_student_stage": "stage3",
+        "local_teacher_tokens": None,
+        "local_student_feature": None,
+        "local_shapes_logged": False,
+        "local_hook_handles": [],
+    }
+
+    handles = student_train.register_local_kd_hooks(student, state)
+    student(torch.zeros(2, 3, 4, 5))
+    teacher(torch.zeros(2, 7, 8))
+    student_train.maybe_log_local_kd_shapes_once(state)
+    student_train.maybe_log_local_kd_shapes_once(state)
+
+    assert tuple(state["local_teacher_tokens"].shape) == (2, 6, 8)
+    assert tuple(state["local_student_feature"].shape) == (2, 3, 4, 5)
+    output = capsys.readouterr().out
+    assert output.count("[LocalKD] feature shapes") == 1
+    assert "teacher_local_tokens=(2, 6, 8)" in output
+    assert "student_stage3=(2, 3, 4, 5)" in output
+
+    for handle in handles:
+        handle.remove()
+
+
+def test_local_descriptor_hook_keeps_student_stage3_grad():
+    state = {
+        "local_kd_enabled": True,
+        "local_attn_enabled": False,
+        "local_desc_enabled": True,
+    }
+    module = nn.Identity().train()
+    feature = torch.randn(2, 3, 4, 5, requires_grad=True)
+
+    hook = student_train.make_student_local_hook(state)
+    hook(module, None, feature)
+
+    assert state["local_student_feature"].requires_grad is True
+
+
+def test_student_local_hook_skips_eval_mode():
+    state = {
+        "local_kd_enabled": True,
+        "local_attn_enabled": True,
+        "local_desc_enabled": False,
+    }
+    module = nn.Identity().eval()
+    feature = torch.randn(2, 3, 4, 5, requires_grad=True)
+
+    hook = student_train.make_student_local_hook(state)
+    hook(module, None, feature)
+
+    assert "local_student_feature" not in state
+
+
+def test_local_attention_kd_loss_uses_teacher_attention_and_student_log_prob():
+    class TinyStudent(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.local_attn_head = nn.Conv2d(1, 1, kernel_size=1, bias=False)
+            with torch.no_grad():
+                self.local_attn_head.weight.fill_(1.0)
+
+    model = TinyStudent()
+    teacher_tokens = torch.tensor([
+        [
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+        ]
+    ])
+    teacher_global = torch.tensor([[1.0, 0.0]])
+    student_feature = torch.tensor([[[[2.0, 0.0], [2.0, 0.0]]]])
+
+    terms = student_train.compute_local_attention_kd_loss(
+        model,
+        teacher_tokens,
+        teacher_global,
+        student_feature,
+        local_temperature=1.0,
+    )
+
+    teacher_scores = torch.tensor([[1.0, 0.0, 1.0, 0.0]])
+    teacher_prob = F.softmax(teacher_scores, dim=1)
+    student_scores = torch.tensor([[2.0, 0.0, 2.0, 0.0]])
+    student_log_prob = F.log_softmax(student_scores, dim=1)
+    expected_loss = F.kl_div(
+        student_log_prob,
+        teacher_prob,
+        reduction="batchmean",
+    )
+    expected_teacher_entropy = -(
+        teacher_prob * teacher_prob.clamp_min(1e-12).log()
+    ).sum(dim=1).mean()
+
+    torch.testing.assert_close(terms["local_attn_loss"], expected_loss)
+    torch.testing.assert_close(
+        terms["teacher_attn_entropy"],
+        expected_teacher_entropy,
+    )
+
+
+def test_local_attention_kd_loss_resizes_teacher_grid():
+    class TinyStudent(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.local_attn_head = nn.Conv2d(1, 1, kernel_size=1)
+
+    model = TinyStudent()
+    teacher_tokens = F.normalize(torch.randn(1, 4, 3), dim=-1)
+    teacher_global = F.normalize(torch.randn(1, 3), dim=-1)
+    student_feature = torch.randn(1, 1, 4, 4)
+
+    terms = student_train.compute_local_attention_kd_loss(
+        model,
+        teacher_tokens,
+        teacher_global,
+        student_feature,
+        local_temperature=0.5,
+    )
+
+    assert terms["local_attn_loss"].ndim == 0
+    assert torch.isfinite(terms["local_attn_loss"])
+
+
+def test_local_descriptor_kd_loss_uses_teacher_attention_weights_and_detach():
+    class TinyStudent(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.student_local_proj = nn.Linear(2, 2, bias=False)
+            self.teacher_local_proj = nn.Linear(2, 2, bias=False)
+            with torch.no_grad():
+                self.student_local_proj.weight.copy_(torch.eye(2))
+                self.teacher_local_proj.weight.copy_(torch.eye(2))
+
+    model = TinyStudent()
+    teacher_tokens = torch.tensor([
+        [
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+        ]
+    ], requires_grad=True)
+    teacher_global = torch.tensor([[1.0, 0.0]], requires_grad=True)
+    student_tokens = torch.tensor([
+        [
+            [0.0, 1.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 0.0],
+        ]
+    ])
+    student_feature = (
+        student_tokens.transpose(1, 2)
+        .view(1, 2, 2, 2)
+        .clone()
+        .requires_grad_(True)
+    )
+
+    terms = student_train.compute_local_descriptor_kd_loss(
+        model,
+        teacher_tokens,
+        teacher_global,
+        student_feature,
+        local_temperature=1.0,
+    )
+
+    teacher_prob = F.softmax(torch.tensor([[1.0, 0.0, 1.0, 0.0]]), dim=1)
+    expected_teacher_desc = F.normalize(
+        torch.sum(teacher_prob.unsqueeze(-1) * teacher_tokens.detach(), dim=1),
+        dim=1,
+    )
+    expected_student_desc = F.normalize(
+        torch.sum(teacher_prob.unsqueeze(-1) * student_tokens, dim=1),
+        dim=1,
+    )
+    expected_cosine = F.cosine_similarity(
+        expected_student_desc,
+        expected_teacher_desc,
+        dim=1,
+    ).mean()
+    expected_loss = (1.0 - expected_cosine).mean()
+
+    torch.testing.assert_close(terms["local_desc_cosine"], expected_cosine)
+    torch.testing.assert_close(terms["local_desc_loss"], expected_loss)
+
+    terms["local_desc_loss"].backward()
+    assert teacher_tokens.grad is None
+    assert teacher_global.grad is None
+    assert student_feature.grad is not None
+
+
+def test_kd_projector_is_created_only_for_feature_kd():
+    class TinyStudent(nn.Module):
+        embedding_dim = 2
+
+    class FakeTeacher(nn.Module):
+        feature_dim = 4
+
+    model = TinyStudent()
+    inactive_state = {
+        "feature_kd_enabled": False,
+        "teacher": FakeTeacher(),
+    }
+    active_state = {
+        "feature_kd_enabled": True,
+        "teacher": FakeTeacher(),
+        "teacher_dim": None,
+    }
+
+    student_train.maybe_create_kd_projector(
+        model,
+        inactive_state,
+        torch.device("cpu"),
+    )
+    assert not hasattr(model, "kd_projector")
+
+    student_train.maybe_create_kd_projector(
+        model,
+        active_state,
+        torch.device("cpu"),
+    )
+    assert isinstance(model.kd_projector, nn.Linear)
+    assert model.kd_projector.weight.shape == (4, 2)
+    assert active_state["teacher_dim"] == 4
+
+    optimizer = student_train.build_student_optimizer(model)
+    optimizer_param_ids = {
+        id(param)
+        for group in optimizer.param_groups
+        for param in group["params"]
+    }
+    assert id(model.kd_projector.weight) in optimizer_param_ids
+
+
+def test_online_kd_feature_loss_is_added_only_when_active():
+    class IdentityFeatureModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.logit_scale = nn.Parameter(torch.tensor(0.0))
+            self.kd_projector = nn.Linear(2, 2, bias=False)
+            with torch.no_grad():
+                self.kd_projector.weight.copy_(torch.eye(2))
+
+        def forward(self, x):
+            return F.normalize(x.float(), dim=1)
+
+    class FakeTeacher(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        def forward(self, x):
+            self.calls += 1
+            return x, -x.to(torch.bfloat16), {}
+
+    features = torch.tensor([
+        [1.0, 0.0],
+        [0.0, 1.0],
+        [1.0, 0.0],
+        [0.0, 1.0],
+    ])
+    model = IdentityFeatureModel()
+    criterion = student_train.Sample4GeoLoss(label_smoothing=0.0)
+    inactive_state = {
+        "active": False,
+        "kd_feat_weight": 1.0,
+        "kd_sim_weight": 1.0,
+        "kd_temperature": 0.1,
+    }
+    active_state = {
+        "active": True,
+        "feature_kd_enabled": True,
+        "enable_online_kd": True,
+        "teacher": FakeTeacher(),
+        "feature_shapes_logged": False,
+        "kd_feat_weight": 0.5,
+        "kd_sim_weight": 0.0,
+        "kd_temperature": 0.1,
+    }
+
+    inactive_losses = compute_student_batch_losses(
+        model,
+        features,
+        pair_batch_size=2,
+        criterion=criterion,
+        online_kd_state=inactive_state,
+    )
+    active_losses = compute_student_batch_losses(
+        model,
+        features,
+        pair_batch_size=2,
+        criterion=criterion,
+        online_kd_state=active_state,
+    )
+
+    assert "loss_kd_feat" not in inactive_losses
+    assert "loss_kd_sim" not in inactive_losses
+    assert "feature_kd_loss" in active_losses
+    assert "loss_kd_sim" in active_losses
+    assert active_state["teacher"].calls == 1
+    torch.testing.assert_close(
+        active_losses["feature_kd_loss"],
+        torch.tensor(2.0),
+    )
+    torch.testing.assert_close(
+        active_losses["loss"],
+        active_losses["main_loss"] + 0.5 * active_losses["feature_kd_loss"],
+    )
+    torch.testing.assert_close(
+        active_losses["loss_kd_sim"],
+        torch.tensor(0.0),
+    )
+
+
+def test_similarity_kd_loss_matches_kl_formula():
+    student_feats = F.normalize(
+        torch.tensor([
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+        ]),
+        dim=1,
+    )
+    teacher_feats = student_feats.clone()
+
+    terms = student_train.compute_similarity_kd_loss(
+        student_feats,
+        teacher_feats,
+        pair_batch_size=2,
+        temperature=1.0,
+    )
+    expected_prob = F.softmax(
+        torch.tensor([
+            [1.0, 0.0],
+            [0.0, 1.0],
+        ]),
+        dim=1,
+    )
+    expected_entropy = -(expected_prob * expected_prob.log()).sum(dim=1).mean()
+
+    torch.testing.assert_close(terms["kl_d2s"], torch.tensor(0.0))
+    torch.testing.assert_close(terms["kl_s2d"], torch.tensor(0.0))
+    torch.testing.assert_close(
+        terms["similarity_kd_loss"],
+        torch.tensor(0.0),
+    )
+    torch.testing.assert_close(
+        terms["teacher_d2s_entropy"],
+        expected_entropy,
+    )
+    torch.testing.assert_close(
+        terms["student_d2s_entropy"],
+        expected_entropy,
+    )
+
+
+def test_online_kd_similarity_loss_is_added_without_projector():
+    class IdentityFeatureModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.logit_scale = nn.Parameter(torch.tensor(0.0))
+
+        def forward(self, x):
+            return F.normalize(x.float(), dim=1)
+
+    class SwappedSatelliteTeacher(nn.Module):
+        def forward(self, x):
+            return x, torch.stack([x[0], x[1], x[3], x[2]]), {}
+
+    features = torch.tensor([
+        [1.0, 0.0],
+        [0.0, 1.0],
+        [1.0, 0.0],
+        [0.0, 1.0],
+    ])
+    model = IdentityFeatureModel()
+    criterion = student_train.Sample4GeoLoss(label_smoothing=0.0)
+    active_state = {
+        "active": True,
+        "feature_kd_enabled": False,
+        "similarity_kd_enabled": True,
+        "enable_online_kd": True,
+        "teacher": SwappedSatelliteTeacher(),
+        "feature_shapes_logged": False,
+        "kd_feat_weight": 0.0,
+        "kd_sim_weight": 0.25,
+        "kd_temperature": 1.0,
+    }
+
+    losses = compute_student_batch_losses(
+        model,
+        features,
+        pair_batch_size=2,
+        criterion=criterion,
+        online_kd_state=active_state,
+    )
+
+    assert not hasattr(model, "kd_projector")
+    assert losses["feature_kd_loss"].item() == 0.0
+    assert losses["similarity_kd_loss"].item() > 0.0
+    torch.testing.assert_close(losses["kl_d2s"], losses["kl_s2d"])
+    torch.testing.assert_close(
+        losses["loss"],
+        losses["main_loss"] + 0.25 * losses["similarity_kd_loss"],
+    )
+
+
+def test_online_kd_feature_shape_log_prints_once(capsys):
+    state = {
+        "enable_online_kd": True,
+        "feature_shapes_logged": False,
+    }
+    teacher_feats = torch.zeros(4, 4096)
+    student_feats = torch.zeros(4, 512)
+
+    student_train.log_online_kd_feature_shapes_once(
+        state,
+        teacher_feats,
+        student_feats,
+    )
+    student_train.log_online_kd_feature_shapes_once(
+        state,
+        teacher_feats,
+        student_feats,
+    )
+
+    output = capsys.readouterr().out
+    assert output.count("[OnlineKD] feature shapes") == 1
+    assert "teacher_feats=(4, 4096)" in output
+    assert "student_feats=(4, 512)" in output
+
+
+def test_student_eval_ignores_training_only_kd_projector(tmp_path):
+    from src.inference.student_eval import load_student_checkpoint
+
+    class TinyEvalModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.zeros(1))
+
+    checkpoint_path = tmp_path / "student_with_projector.pth"
+    torch.save(
+        {
+            "model": {
+                "weight": torch.ones(1),
+                "kd_projector.weight": torch.ones(2, 2),
+                "local_attn_head.weight": torch.ones(1, 2, 1, 1),
+                "local_attn_head.bias": torch.ones(1),
+                "student_local_proj.weight": torch.ones(512, 2),
+                "teacher_local_proj.weight": torch.ones(512, 4),
+            }
+        },
+        checkpoint_path,
+    )
+    model = TinyEvalModel()
+
+    load_student_checkpoint(model, str(checkpoint_path), strict=True)
+
+    torch.testing.assert_close(model.weight, torch.ones(1))
 
 
 def test_removed_student_experiment_flags_are_rejected(monkeypatch):
