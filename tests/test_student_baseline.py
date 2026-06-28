@@ -247,6 +247,66 @@ def test_student_soft_orth_apply_views_selects_expected_view_maps():
     assert sat_model.get_soft_orth_stats()["soft_orth_active_ratio"].item() == pytest.approx(0.5)
 
 
+def test_student_soft_orth_preserve_forward_returns_drone_soft_sat_baseline():
+    class FixedBackbone(nn.Module):
+        def __init__(self):
+            super().__init__()
+            base = torch.zeros(4, 512, 1, 1)
+            base[0, 0] = 1.0
+            base[1, 1] = 1.0
+            base[2, 2] = 1.0
+            base[3, 3] = 1.0
+            self.f4 = nn.Parameter(base)
+            self.f3 = nn.Parameter(torch.zeros(4, 256, 2, 2))
+
+        def forward(self, x):
+            f1 = x.new_zeros(x.size(0), 64, 4, 4)
+            f2 = x.new_zeros(x.size(0), 128, 2, 2)
+            return f1, f2, self.f3[:x.size(0)], self.f4[:x.size(0)]
+
+    class AddOneFusion(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.last_stats = {}
+
+        def forward(self, f4, f3):
+            self.last_stats = {
+                "soft_orth_lambda": f4.new_tensor(0.5),
+                "soft_orth_gamma": f4.new_tensor(0.01),
+                "soft_orth_f4_norm": f4.float().norm(dim=1).mean().detach(),
+                "soft_orth_f3_proj_norm": f4.new_tensor(1.0),
+                "soft_orth_parallel_norm": f4.new_tensor(0.2),
+                "soft_orth_detail_norm": f4.new_tensor(0.9),
+                "soft_orth_cos_f3_f4": f4.new_tensor(0.1),
+            }
+            return f4 + 1.0
+
+    model = StudentModel(ckpt_path=None, use_soft_orth_fusion=True).eval()
+    model.backbone = FixedBackbone()
+    model.soft_orth_fusion = AddOneFusion()
+    model.neck = nn.Identity()
+    x = torch.randn(4, 3, 8, 8)
+
+    with torch.no_grad():
+        final_embedding, drone_base_embedding, sat_embedding = model(
+            x,
+            pair_batch_size=2,
+            return_soft_orth_preserve=True,
+        )
+
+    base_embedding = F.normalize(model.backbone.f4.flatten(1), dim=1)
+    soft_drone_embedding = F.normalize(
+        (model.backbone.f4[:2] + 1.0).flatten(1),
+        dim=1,
+    )
+    torch.testing.assert_close(final_embedding[:2], soft_drone_embedding)
+    torch.testing.assert_close(final_embedding[2:], base_embedding[2:])
+    torch.testing.assert_close(drone_base_embedding, base_embedding[:2])
+    torch.testing.assert_close(sat_embedding, base_embedding[2:])
+    assert model.get_soft_orth_stats()["soft_orth_apply_views"] == "drone"
+    assert model.get_soft_orth_stats()["soft_orth_active_ratio"].item() == pytest.approx(0.5)
+
+
 def test_student_proxy_module_is_saved_with_model_but_not_forwarded():
     torch.manual_seed(19)
     model = StudentModel(
@@ -538,6 +598,143 @@ def test_soft_orth_and_proxy_loss_combine_on_model_output():
     assert "proxy_stats" in losses
 
 
+def test_soft_orth_preserve_loss_detaches_base_and_satellite():
+    drone_soft = torch.tensor(
+        [[0.0, 1.0], [1.0, 0.0]],
+        requires_grad=True,
+    )
+    drone_base = torch.tensor(
+        [[1.0, 0.0], [0.0, 1.0]],
+        requires_grad=True,
+    )
+    satellite = torch.tensor(
+        [[1.0, 0.0], [0.0, 1.0]],
+        requires_grad=True,
+    )
+
+    loss, stats = student_train.soft_orth_preserve_loss(
+        drone_soft,
+        drone_base,
+        satellite,
+        margin=0.1,
+    )
+
+    torch.testing.assert_close(loss, torch.tensor(1.1))
+    assert stats["sim_base_pos_mean"].item() == pytest.approx(1.0)
+    assert stats["sim_soft_pos_mean"].item() == pytest.approx(0.0)
+    assert stats["sim_soft_minus_base"].item() == pytest.approx(-1.0)
+    loss.backward()
+    assert drone_soft.grad is not None
+    assert drone_base.grad is None
+    assert satellite.grad is None
+
+
+def test_soft_orth_preserve_and_proxy_loss_use_final_embedding():
+    class PreserveProxyFeatureModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.logit_scale = nn.Parameter(torch.tensor(0.0))
+            self.proxy_loss_module = ViewSharedIdentityProxyLoss(
+                num_train_ids=2,
+                embedding_dim=2,
+                proxy_scale=7.0,
+                label_smoothing=0.0,
+            )
+            self.proxy_features = None
+            self.last_features = None
+
+        def forward(
+            self,
+            x,
+            pair_batch_size=None,
+            return_soft_orth_preserve=False,
+        ):
+            base = F.normalize(x.float(), dim=1)
+            if not return_soft_orth_preserve:
+                return base
+            soft_drone = torch.flip(base[:pair_batch_size], dims=[1])
+            final = torch.cat(
+                [soft_drone, base[pair_batch_size:pair_batch_size * 2]],
+                dim=0,
+            )
+            self.last_features = final
+            return (
+                final,
+                base[:pair_batch_size],
+                base[pair_batch_size:pair_batch_size * 2],
+            )
+
+        def get_soft_orth_stats(self):
+            return {
+                "soft_orth_apply_views": "drone",
+                "soft_orth_active_ratio": torch.tensor(0.5),
+                "soft_orth_lambda": torch.tensor(0.5),
+                "soft_orth_gamma": torch.tensor(0.01),
+                "soft_orth_f4_norm": torch.tensor(1.0),
+                "soft_orth_f3_proj_norm": torch.tensor(1.0),
+                "soft_orth_parallel_norm": torch.tensor(0.2),
+                "soft_orth_detail_norm": torch.tensor(0.9),
+                "soft_orth_cos_f3_f4": torch.tensor(0.1),
+            }
+
+        def compute_proxy_loss(
+            self,
+            drone_features,
+            satellite_features,
+            drone_labels,
+            satellite_labels,
+        ):
+            self.proxy_features = torch.cat([drone_features, satellite_features])
+            return self.proxy_loss_module(
+                drone_features,
+                satellite_features,
+                drone_labels,
+                satellite_labels,
+            )
+
+    class Args:
+        use_soft_orth_fusion = True
+        use_soft_orth_preserve_loss = True
+        soft_orth_preserve_weight = 0.4
+        soft_orth_preserve_margin = 0.0
+        use_proxy_loss = True
+        proxy_loss_weight = 0.3
+
+    features = torch.tensor([
+        [1.0, 0.0],
+        [0.0, 1.0],
+        [1.0, 0.0],
+        [0.0, 1.0],
+    ])
+    labels = torch.tensor([0, 1])
+    model = PreserveProxyFeatureModel()
+    losses = compute_student_batch_losses(
+        model,
+        features,
+        pair_batch_size=2,
+        criterion=student_train.Sample4GeoLoss(label_smoothing=0.0),
+        args=Args,
+        id_labels=labels,
+    )
+
+    torch.testing.assert_close(model.proxy_features, model.last_features)
+    torch.testing.assert_close(
+        losses["loss"],
+        (
+            losses["main_loss"]
+            + Args.proxy_loss_weight * losses["loss_proxy"]
+            + Args.soft_orth_preserve_weight * losses["loss_preserve"]
+        ),
+    )
+    assert losses["preserve_weight"] == pytest.approx(
+        Args.soft_orth_preserve_weight,
+    )
+    assert losses["loss_preserve"].item() == pytest.approx(1.0)
+    assert losses["preserve_stats"]["sim_base_pos_mean"].item() == pytest.approx(1.0)
+    assert losses["preserve_stats"]["sim_soft_pos_mean"].item() == pytest.approx(0.0)
+    assert losses["soft_orth_stats"]["soft_orth_apply_views"] == "drone"
+
+
 def test_distributed_pair_gather_preserves_global_positive_diagonal(monkeypatch):
     def fake_gather(tensor):
         return torch.cat([tensor, tensor + 100.0], dim=0)
@@ -653,6 +850,9 @@ def test_cli_defaults_to_clean_baseline(monkeypatch):
     assert args.proxy_scale == pytest.approx(30.0)
     assert args.proxy_label_smoothing == pytest.approx(0.1)
     assert args.num_train_ids == -1
+    assert args.use_soft_orth_preserve_loss is False
+    assert args.soft_orth_preserve_weight == pytest.approx(0.05)
+    assert args.soft_orth_preserve_margin == pytest.approx(0.0)
     assert args.teacher_precision == "bf16"
     assert args.teacher_micro_batch_size == 1
     assert args.deepspeed_config == "configs/ds_student_baseline.json"
