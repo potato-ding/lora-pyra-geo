@@ -16,7 +16,7 @@ def _logit_from_probability(value, name):
 
 
 class F3ToF4SoftOrthFusion(nn.Module):
-    """Feature-map level shallow f3 complement for the f4 map."""
+    """Drone-only scalar detail-path shallow f3 complement for the f4 map."""
 
     def __init__(
         self,
@@ -24,18 +24,8 @@ class F3ToF4SoftOrthFusion(nn.Module):
         gamma_init=0.01,
         gamma_max=0.05,
         detach_global=True,
-        gate_type="scalar",
-        fusion_mode="detail_only",
-        sem_gamma_init=0.005,
-        sem_gamma_max=0.02,
     ):
         super().__init__()
-        if gate_type not in {"scalar", "channel"}:
-            raise ValueError("soft_orth_gate_type must be one of: scalar, channel")
-        if fusion_mode not in {"detail_only", "dual_path"}:
-            raise ValueError(
-                "soft_orth_fusion_mode must be one of: detail_only, dual_path"
-            )
         if gamma_max <= 0:
             raise ValueError("soft_orth_gamma_max must be greater than 0")
         if gamma_init <= 0 or gamma_init >= gamma_max:
@@ -43,19 +33,9 @@ class F3ToF4SoftOrthFusion(nn.Module):
                 "soft_orth_gamma_init must be greater than 0 and smaller "
                 "than soft_orth_gamma_max"
             )
-        if sem_gamma_max <= 0:
-            raise ValueError("soft_orth_sem_gamma_max must be greater than 0")
-        if sem_gamma_init <= 0 or sem_gamma_init >= sem_gamma_max:
-            raise ValueError(
-                "soft_orth_sem_gamma_init must be greater than 0 and smaller "
-                "than soft_orth_sem_gamma_max"
-            )
 
         self.f3_down = nn.AvgPool2d(kernel_size=2, stride=2)
         self.f3_proj = nn.Conv2d(256, 512, kernel_size=1, bias=True)
-        self.gate_type = gate_type
-        self.fusion_mode = fusion_mode
-        gate_shape = () if self.gate_type == "scalar" else (1, 512, 1, 1)
         self.lambda_raw = nn.Parameter(
             torch.tensor(
                 _logit_from_probability(lambda_init, "soft_orth_lambda_init"),
@@ -63,8 +43,7 @@ class F3ToF4SoftOrthFusion(nn.Module):
             )
         )
         self.gamma_raw = nn.Parameter(
-            torch.full(
-                gate_shape,
+            torch.tensor(
                 _logit_from_probability(
                     gamma_init / gamma_max,
                     "soft_orth_gamma_init / soft_orth_gamma_max",
@@ -72,19 +51,7 @@ class F3ToF4SoftOrthFusion(nn.Module):
                 dtype=torch.float32,
             )
         )
-        if self.fusion_mode == "dual_path":
-            self.sem_gamma_raw = nn.Parameter(
-                torch.full(
-                    gate_shape,
-                    _logit_from_probability(
-                        sem_gamma_init / sem_gamma_max,
-                        "soft_orth_sem_gamma_init / soft_orth_sem_gamma_max",
-                    ),
-                    dtype=torch.float32,
-                )
-            )
         self.gamma_max = float(gamma_max)
-        self.sem_gamma_max = float(sem_gamma_max)
         self.detach_global = bool(detach_global)
         self.last_stats = {}
         self.last_f3_proj_shape = None
@@ -94,11 +61,6 @@ class F3ToF4SoftOrthFusion(nn.Module):
 
     def gamma_value(self):
         return self.gamma_max * torch.sigmoid(self.gamma_raw)
-
-    def gamma_sem_value(self):
-        if self.fusion_mode != "dual_path":
-            return None
-        return self.sem_gamma_max * torch.sigmoid(self.sem_gamma_raw)
 
     def forward(self, f4, f3):
         f3_down = self.f3_down(f3)
@@ -115,14 +77,9 @@ class F3ToF4SoftOrthFusion(nn.Module):
         parallel = (f3_proj * u).sum(dim=1, keepdim=True) * u
         lambda_value = self.lambda_value()
         detail = f3_proj - lambda_value * parallel
-        gamma_detail = self.gamma_value()
-        detail_enhance = gamma_detail * detail
+        gamma_value = self.gamma_value()
+        detail_enhance = gamma_value * detail
         f4_enhanced = f4 + detail_enhance
-        semantic_enhance = None
-        gamma_sem = self.gamma_sem_value()
-        if self.fusion_mode == "dual_path":
-            semantic_enhance = gamma_sem * parallel
-            f4_enhanced = f4_enhanced + semantic_enhance
 
         with torch.no_grad():
             f3_normed = F.normalize(f3_proj.float(), p=2, dim=1, eps=1e-6)
@@ -132,9 +89,8 @@ class F3ToF4SoftOrthFusion(nn.Module):
                 detail_enhance.float().norm(p=2, dim=1).mean().detach()
             )
             self.last_stats = {
-                "soft_orth_gate_type": self.gate_type,
-                "soft_orth_fusion_mode": self.fusion_mode,
                 "soft_orth_lambda": lambda_value.detach(),
+                "soft_orth_gamma": gamma_value.detach(),
                 "soft_orth_f4_norm": f4_norm,
                 "soft_orth_f3_proj_norm": (
                     f3_proj.float().norm(p=2, dim=1).mean().detach()
@@ -152,53 +108,6 @@ class F3ToF4SoftOrthFusion(nn.Module):
                     detail_enhance_norm / f4_norm.clamp_min(1e-6)
                 ).detach(),
             }
-            gamma_detail_stats = gamma_detail.detach().float()
-            if self.gate_type == "scalar":
-                self.last_stats["soft_orth_gamma_detail"] = (
-                    gamma_detail_stats.reshape(()).detach()
-                )
-            else:
-                self.last_stats.update({
-                    "soft_orth_gamma_detail_mean": (
-                        gamma_detail_stats.mean().detach()
-                    ),
-                    "soft_orth_gamma_detail_min": (
-                        gamma_detail_stats.min().detach()
-                    ),
-                    "soft_orth_gamma_detail_max": (
-                        gamma_detail_stats.max().detach()
-                    ),
-                })
-            if self.fusion_mode == "dual_path":
-                semantic_norm = (
-                    parallel.float().norm(p=2, dim=1).mean().detach()
-                )
-                sem_enhance_norm = (
-                    semantic_enhance.float().norm(p=2, dim=1).mean().detach()
-                )
-                self.last_stats.update({
-                    "soft_orth_semantic_norm": semantic_norm,
-                    "soft_orth_enhance_ratio_sem": (
-                        sem_enhance_norm / f4_norm.clamp_min(1e-6)
-                    ).detach(),
-                })
-                gamma_sem_stats = gamma_sem.detach().float()
-                if self.gate_type == "scalar":
-                    self.last_stats["soft_orth_gamma_sem"] = (
-                        gamma_sem_stats.reshape(()).detach()
-                    )
-                else:
-                    self.last_stats.update({
-                        "soft_orth_gamma_sem_mean": (
-                            gamma_sem_stats.mean().detach()
-                        ),
-                        "soft_orth_gamma_sem_min": (
-                            gamma_sem_stats.min().detach()
-                        ),
-                        "soft_orth_gamma_sem_max": (
-                            gamma_sem_stats.max().detach()
-                        ),
-                    })
         return f4_enhanced
 
 
@@ -215,11 +124,6 @@ class StudentModel(nn.Module):
         soft_orth_gamma_init=0.01,
         soft_orth_gamma_max=0.05,
         soft_orth_detach_global=True,
-        soft_orth_apply_views="all",
-        soft_orth_gate_type="scalar",
-        soft_orth_fusion_mode="detail_only",
-        soft_orth_sem_gamma_init=0.005,
-        soft_orth_sem_gamma_max=0.02,
         use_proxy_loss=False,
         num_train_ids=None,
         proxy_scale=30.0,
@@ -228,9 +132,6 @@ class StudentModel(nn.Module):
         super().__init__()
         self.embedding_dim = 512
         self.use_soft_orth_fusion = bool(use_soft_orth_fusion)
-        if soft_orth_apply_views not in {"all", "drone", "sat"}:
-            raise ValueError("soft_orth_apply_views must be one of: all, drone, sat")
-        self.soft_orth_apply_views = soft_orth_apply_views
         self.use_proxy_loss = bool(use_proxy_loss)
         self._soft_orth_stats = {}
         self.backbone = RepViTBackbone(ckpt_path=ckpt_path)
@@ -242,10 +143,6 @@ class StudentModel(nn.Module):
                 gamma_init=soft_orth_gamma_init,
                 gamma_max=soft_orth_gamma_max,
                 detach_global=soft_orth_detach_global,
-                gate_type=soft_orth_gate_type,
-                fusion_mode=soft_orth_fusion_mode,
-                sem_gamma_init=soft_orth_sem_gamma_init,
-                sem_gamma_max=soft_orth_sem_gamma_max,
             )
         if self.use_proxy_loss:
             if num_train_ids is None:
@@ -274,19 +171,7 @@ class StudentModel(nn.Module):
         rank0_print("  pooling: global average pooling")
         rank0_print("  output: L2-normalized 512-d feature")
         if self.use_soft_orth_fusion:
-            rank0_print("  soft-orth fusion: enabled (f3 -> f4)")
-            rank0_print(
-                "  soft-orth apply_views: "
-                f"{self.soft_orth_apply_views}"
-            )
-            rank0_print(
-                "  soft-orth gate_type: "
-                f"{self.soft_orth_fusion.gate_type}"
-            )
-            rank0_print(
-                "  soft-orth fusion_mode: "
-                f"{self.soft_orth_fusion.fusion_mode}"
-            )
+            rank0_print("  soft-orth fusion: enabled (drone-only f3 -> f4)")
             rank0_print(
                 "  soft-orth detach_global: "
                 f"{self.soft_orth_fusion.detach_global}"
@@ -318,13 +203,7 @@ class StudentModel(nn.Module):
                 f"got {batch_size}"
             )
 
-        if self.soft_orth_apply_views == "all":
-            start, end = 0, batch_size
-        elif self.soft_orth_apply_views == "drone":
-            start, end = 0, pair_batch_size
-        else:
-            start, end = pair_batch_size, batch_size
-        return torch.arange(start, end, device=device)
+        return torch.arange(0, pair_batch_size, device=device)
 
     def _apply_soft_orth_fusion(self, f4, f3, pair_batch_size=None):
         active_indices = self._soft_orth_active_indices(
@@ -344,7 +223,6 @@ class StudentModel(nn.Module):
             f4 = fused_f4
 
         stats = dict(self.soft_orth_fusion.last_stats)
-        stats["soft_orth_apply_views"] = self.soft_orth_apply_views
         stats["soft_orth_active_ratio"] = torch.tensor(
             active_ratio,
             device=f4.device,
