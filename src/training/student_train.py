@@ -137,6 +137,15 @@ def sample4geo_loss(model, features, criterion, pair_batch_size):
     return criterion(drone_feat, satellite_feat, logit_scale)
 
 
+def soft_orth_gamma_warmup_scale(args, epoch=None):
+    warmup_epochs = float(getattr(args, "soft_orth_gamma_warmup_epochs", 0.0))
+    if warmup_epochs <= 0:
+        return 1.0
+    if epoch is None:
+        return 1.0
+    return min(1.0, max(0.0, float(epoch) / warmup_epochs))
+
+
 def gather_tensor_with_grad(tensor):
     if not is_distributed():
         return tensor
@@ -343,9 +352,18 @@ def compute_student_batch_losses(
     args=None,
     id_labels=None,
     teacher_features=None,
+    epoch=None,
 ):
     if bool(getattr(args, "use_soft_orth_fusion", False)):
-        local_features = model(images, pair_batch_size=pair_batch_size)
+        gamma_scale = soft_orth_gamma_warmup_scale(args, epoch=epoch)
+        if gamma_scale == 1.0:
+            local_features = model(images, pair_batch_size=pair_batch_size)
+        else:
+            local_features = model(
+                images,
+                pair_batch_size=pair_batch_size,
+                soft_orth_gamma_scale=gamma_scale,
+            )
     else:
         local_features = model(images)
     features, global_pair_batch_size = gather_paired_views(
@@ -930,11 +948,13 @@ SOFT_ORTH_LOG_KEYS = (
     "soft_orth_active_ratio",
     "soft_orth_lambda",
     "soft_orth_gamma",
+    "soft_orth_gamma_eff",
     "soft_orth_f4_norm",
     "soft_orth_f3_proj_norm",
     "soft_orth_parallel_norm",
     "soft_orth_detail_norm",
     "soft_orth_cos_f3_f4",
+    "soft_orth_enhance_ratio_detail",
 )
 
 
@@ -950,12 +970,16 @@ def update_soft_orth_log_meters(meters, batch_losses, n):
 
 def format_soft_orth_step_log(meters, batch_losses):
     apply_views = batch_losses["soft_orth_stats"]["soft_orth_apply_views"]
+    proj_init = batch_losses["soft_orth_stats"]["soft_orth_proj_init"]
     return (
         f"soft_orth_apply_views {apply_views} | "
         f"soft_orth_active_ratio "
         f"{meters['soft_orth_active_ratio'].val:.4f} | "
+        f"soft_orth_proj_init {proj_init} | "
         f"soft_orth_lambda {meters['soft_orth_lambda'].val:.6f} | "
         f"soft_orth_gamma {meters['soft_orth_gamma'].val:.6f} | "
+        f"soft_orth_gamma_eff "
+        f"{meters['soft_orth_gamma_eff'].val:.6f} | "
         f"soft_orth_f4_norm {meters['soft_orth_f4_norm'].val:.4f} | "
         f"soft_orth_f3_proj_norm "
         f"{meters['soft_orth_f3_proj_norm'].val:.4f} | "
@@ -965,6 +989,8 @@ def format_soft_orth_step_log(meters, batch_losses):
         f"{meters['soft_orth_detail_norm'].val:.4f} | "
         f"soft_orth_cos_f3_f4 "
         f"{meters['soft_orth_cos_f3_f4'].val:.4f} | "
+        f"soft_orth_enhance_ratio_detail "
+        f"{meters['soft_orth_enhance_ratio_detail'].val:.6f} | "
     )
 
 
@@ -1027,6 +1053,7 @@ def train_one_epoch(
                 args,
                 id_labels=id_labels,
                 teacher_features=teacher_features,
+                epoch=epoch,
             )
             loss = batch_losses["loss"]
 
@@ -1153,6 +1180,11 @@ def train_one_epoch(
             for key, meter in soft_orth_log_meters.items()
         })
         stats["soft_orth_apply_views"] = args.soft_orth_apply_views
+        stats["soft_orth_proj_init"] = getattr(
+            args,
+            "soft_orth_proj_init",
+            "default",
+        )
     return stats
 
 
@@ -1211,6 +1243,7 @@ def train_one_epoch_deepspeed(
             args,
             id_labels=id_labels,
             teacher_features=teacher_features,
+            epoch=epoch,
         )
         loss = batch_losses["loss"]
         model_engine.backward(loss)
@@ -1308,6 +1341,11 @@ def train_one_epoch_deepspeed(
             for key, meter in soft_orth_log_meters.items()
         })
         stats["soft_orth_apply_views"] = args.soft_orth_apply_views
+        stats["soft_orth_proj_init"] = getattr(
+            args,
+            "soft_orth_proj_init",
+            "default",
+        )
     return stats
 
 
@@ -1417,10 +1455,14 @@ def train(
                 f"{train_stats['soft_orth_apply_views']}"
                 f" | soft_orth_active_ratio="
                 f"{train_stats['soft_orth_active_ratio']:.4f}"
+                f" | soft_orth_proj_init="
+                f"{train_stats['soft_orth_proj_init']}"
                 f" | soft_orth_lambda="
                 f"{train_stats['soft_orth_lambda']:.6f}"
                 f" | soft_orth_gamma="
                 f"{train_stats['soft_orth_gamma']:.6f}"
+                f" | soft_orth_gamma_eff="
+                f"{train_stats['soft_orth_gamma_eff']:.6f}"
                 f" | soft_orth_f4_norm="
                 f"{train_stats['soft_orth_f4_norm']:.4f}"
                 f" | soft_orth_f3_proj_norm="
@@ -1431,6 +1473,8 @@ def train(
                 f"{train_stats['soft_orth_detail_norm']:.4f}"
                 f" | soft_orth_cos_f3_f4="
                 f"{train_stats['soft_orth_cos_f3_f4']:.4f}"
+                f" | soft_orth_enhance_ratio_detail="
+                f"{train_stats['soft_orth_enhance_ratio_detail']:.6f}"
             )
         print(
             f"[Train] Epoch {epoch}/{args.epochs} | "
@@ -1567,10 +1611,14 @@ def train_deepspeed(
                     f"{train_stats['soft_orth_apply_views']}"
                     f" | soft_orth_active_ratio="
                     f"{train_stats['soft_orth_active_ratio']:.4f}"
+                    f" | soft_orth_proj_init="
+                    f"{train_stats['soft_orth_proj_init']}"
                     f" | soft_orth_lambda="
                     f"{train_stats['soft_orth_lambda']:.6f}"
                     f" | soft_orth_gamma="
                     f"{train_stats['soft_orth_gamma']:.6f}"
+                    f" | soft_orth_gamma_eff="
+                    f"{train_stats['soft_orth_gamma_eff']:.6f}"
                     f" | soft_orth_f4_norm="
                     f"{train_stats['soft_orth_f4_norm']:.4f}"
                     f" | soft_orth_f3_proj_norm="
@@ -1581,6 +1629,8 @@ def train_deepspeed(
                     f"{train_stats['soft_orth_detail_norm']:.4f}"
                     f" | soft_orth_cos_f3_f4="
                     f"{train_stats['soft_orth_cos_f3_f4']:.4f}"
+                    f" | soft_orth_enhance_ratio_detail="
+                    f"{train_stats['soft_orth_enhance_ratio_detail']:.6f}"
                 )
             print(
                 f"[Train] Epoch {epoch}/{args.epochs} | "
@@ -1701,7 +1751,18 @@ def parse_args():
         "--soft_orth_apply_views",
         type=str,
         choices=["all", "drone", "sat"],
-        default="all",
+        default="drone",
+    )
+    parser.add_argument(
+        "--soft_orth_proj_init",
+        type=str,
+        choices=["default", "zero_bn"],
+        default="default",
+    )
+    parser.add_argument(
+        "--soft_orth_gamma_warmup_epochs",
+        type=float,
+        default=0.0,
     )
     parser.add_argument(
         "--soft_orth_detach_global",
@@ -1781,6 +1842,8 @@ def parse_args():
             "--soft_orth_gamma_init must be greater than 0 and smaller than "
             "--soft_orth_gamma_max"
         )
+    if args.soft_orth_gamma_warmup_epochs < 0:
+        parser.error("--soft_orth_gamma_warmup_epochs must be non-negative")
     if args.proxy_loss_weight < 0:
         parser.error("--proxy_loss_weight must be non-negative")
     if args.proxy_scale <= 0:
@@ -1882,6 +1945,7 @@ def main():
         soft_orth_gamma_max=args.soft_orth_gamma_max,
         soft_orth_detach_global=args.soft_orth_detach_global,
         soft_orth_apply_views=args.soft_orth_apply_views,
+        soft_orth_proj_init=args.soft_orth_proj_init,
         use_proxy_loss=args.use_proxy_loss,
         num_train_ids=(
             args.num_train_ids

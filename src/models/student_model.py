@@ -24,6 +24,7 @@ class F3ToF4SoftOrthFusion(nn.Module):
         gamma_init=0.01,
         gamma_max=0.05,
         detach_global=True,
+        proj_init="default",
     ):
         super().__init__()
         if gamma_max <= 0:
@@ -33,9 +34,21 @@ class F3ToF4SoftOrthFusion(nn.Module):
                 "soft_orth_gamma_init must be greater than 0 and smaller "
                 "than soft_orth_gamma_max"
             )
+        if proj_init not in {"default", "zero_bn"}:
+            raise ValueError("soft_orth_proj_init must be one of: default, zero_bn")
 
         self.f3_down = nn.AvgPool2d(kernel_size=2, stride=2)
-        self.f3_proj = nn.Conv2d(256, 512, kernel_size=1, bias=True)
+        self.proj_init = proj_init
+        if proj_init == "default":
+            self.f3_proj = nn.Conv2d(256, 512, kernel_size=1, bias=True)
+        else:
+            bn = nn.BatchNorm2d(512)
+            nn.init.zeros_(bn.weight)
+            nn.init.zeros_(bn.bias)
+            self.f3_proj = nn.Sequential(
+                nn.Conv2d(256, 512, kernel_size=1, bias=False),
+                bn,
+            )
         self.lambda_raw = nn.Parameter(
             torch.tensor(
                 _logit_from_probability(lambda_init, "soft_orth_lambda_init"),
@@ -62,7 +75,7 @@ class F3ToF4SoftOrthFusion(nn.Module):
     def gamma_value(self):
         return self.gamma_max * torch.sigmoid(self.gamma_raw)
 
-    def forward(self, f4, f3):
+    def forward(self, f4, f3, gamma_scale=1.0):
         f3_down = self.f3_down(f3)
         f3_proj = self.f3_proj(f3_down)
         if f3_proj.shape != f4.shape:
@@ -78,29 +91,33 @@ class F3ToF4SoftOrthFusion(nn.Module):
         lambda_value = self.lambda_value()
         detail = f3_proj - lambda_value * parallel
         gamma_value = self.gamma_value()
-        f4_enhanced = f4 + gamma_value * detail
+        gamma_eff = gamma_value * float(gamma_scale)
+        detail_update = gamma_eff * detail
+        f4_enhanced = f4 + detail_update
 
         with torch.no_grad():
             f3_normed = F.normalize(f3_proj.float(), p=2, dim=1, eps=1e-6)
             f4_normed = F.normalize(f4.float(), p=2, dim=1, eps=1e-6)
+            f4_norm = f4.float().norm(p=2, dim=1).mean()
+            f3_proj_norm = f3_proj.float().norm(p=2, dim=1).mean()
+            parallel_norm = parallel.float().norm(p=2, dim=1).mean()
+            detail_norm = detail.float().norm(p=2, dim=1).mean()
+            update_norm = detail_update.float().norm(p=2, dim=1).mean()
             self.last_stats = {
+                "soft_orth_proj_init": self.proj_init,
                 "soft_orth_lambda": lambda_value.detach(),
                 "soft_orth_gamma": gamma_value.detach(),
-                "soft_orth_f4_norm": (
-                    f4.float().norm(p=2, dim=1).mean().detach()
-                ),
-                "soft_orth_f3_proj_norm": (
-                    f3_proj.float().norm(p=2, dim=1).mean().detach()
-                ),
-                "soft_orth_parallel_norm": (
-                    parallel.float().norm(p=2, dim=1).mean().detach()
-                ),
-                "soft_orth_detail_norm": (
-                    detail.float().norm(p=2, dim=1).mean().detach()
-                ),
+                "soft_orth_gamma_eff": gamma_eff.detach(),
+                "soft_orth_f4_norm": f4_norm.detach(),
+                "soft_orth_f3_proj_norm": f3_proj_norm.detach(),
+                "soft_orth_parallel_norm": parallel_norm.detach(),
+                "soft_orth_detail_norm": detail_norm.detach(),
                 "soft_orth_cos_f3_f4": (
                     (f3_normed * f4_normed).sum(dim=1).mean().detach()
                 ),
+                "soft_orth_enhance_ratio_detail": (
+                    update_norm / f4_norm.clamp_min(1e-6)
+                ).detach(),
             }
         return f4_enhanced
 
@@ -118,7 +135,8 @@ class StudentModel(nn.Module):
         soft_orth_gamma_init=0.01,
         soft_orth_gamma_max=0.05,
         soft_orth_detach_global=True,
-        soft_orth_apply_views="all",
+        soft_orth_apply_views="drone",
+        soft_orth_proj_init="default",
         use_proxy_loss=False,
         num_train_ids=None,
         proxy_scale=30.0,
@@ -141,6 +159,7 @@ class StudentModel(nn.Module):
                 gamma_init=soft_orth_gamma_init,
                 gamma_max=soft_orth_gamma_max,
                 detach_global=soft_orth_detach_global,
+                proj_init=soft_orth_proj_init,
             )
         if self.use_proxy_loss:
             if num_train_ids is None:
@@ -178,6 +197,10 @@ class StudentModel(nn.Module):
                 "  soft-orth detach_global: "
                 f"{self.soft_orth_fusion.detach_global}"
             )
+            rank0_print(
+                "  soft-orth proj_init: "
+                f"{self.soft_orth_fusion.proj_init}"
+            )
         if self.use_proxy_loss:
             rank0_print(
                 "  proxy loss: enabled "
@@ -213,7 +236,13 @@ class StudentModel(nn.Module):
             start, end = pair_batch_size, batch_size
         return torch.arange(start, end, device=device)
 
-    def _apply_soft_orth_fusion(self, f4, f3, pair_batch_size=None):
+    def _apply_soft_orth_fusion(
+        self,
+        f4,
+        f3,
+        pair_batch_size=None,
+        gamma_scale=1.0,
+    ):
         active_indices = self._soft_orth_active_indices(
             batch_size=f4.size(0),
             pair_batch_size=pair_batch_size,
@@ -221,11 +250,28 @@ class StudentModel(nn.Module):
         )
         active_ratio = active_indices.numel() / max(1, f4.size(0))
         if active_indices.numel() == f4.size(0):
-            f4 = self.soft_orth_fusion(f4, f3)
+            if float(gamma_scale) == 1.0:
+                f4 = self.soft_orth_fusion(f4, f3)
+            else:
+                f4 = self.soft_orth_fusion(
+                    f4,
+                    f3,
+                    gamma_scale=gamma_scale,
+                )
         else:
             active_f4 = f4.index_select(0, active_indices)
             active_f3 = f3.index_select(0, active_indices)
-            enhanced_active_f4 = self.soft_orth_fusion(active_f4, active_f3)
+            if float(gamma_scale) == 1.0:
+                enhanced_active_f4 = self.soft_orth_fusion(
+                    active_f4,
+                    active_f3,
+                )
+            else:
+                enhanced_active_f4 = self.soft_orth_fusion(
+                    active_f4,
+                    active_f3,
+                    gamma_scale=gamma_scale,
+                )
             fused_f4 = f4.clone()
             fused_f4.index_copy_(0, active_indices, enhanced_active_f4)
             f4 = fused_f4
@@ -240,7 +286,13 @@ class StudentModel(nn.Module):
         self._soft_orth_stats = stats
         return f4
 
-    def forward(self, x, return_fmap=False, pair_batch_size=None):
+    def forward(
+        self,
+        x,
+        return_fmap=False,
+        pair_batch_size=None,
+        soft_orth_gamma_scale=1.0,
+    ):
         features = self.backbone(x)
         if self.use_soft_orth_fusion:
             _, _, f3, f4 = features
@@ -251,6 +303,7 @@ class StudentModel(nn.Module):
                 f4,
                 f3,
                 pair_batch_size=pair_batch_size,
+                gamma_scale=soft_orth_gamma_scale,
             )
         else:
             self._soft_orth_stats = {}
