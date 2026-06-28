@@ -16,7 +16,7 @@ def _logit_from_probability(value, name):
 
 
 class F3ToF4SoftOrthFusion(nn.Module):
-    """Drone-only scalar detail-path shallow f3 complement for the f4 map."""
+    """Feature-map level shallow f3 complement for the f4 map."""
 
     def __init__(
         self,
@@ -78,20 +78,17 @@ class F3ToF4SoftOrthFusion(nn.Module):
         lambda_value = self.lambda_value()
         detail = f3_proj - lambda_value * parallel
         gamma_value = self.gamma_value()
-        detail_enhance = gamma_value * detail
-        f4_enhanced = f4 + detail_enhance
+        f4_enhanced = f4 + gamma_value * detail
 
         with torch.no_grad():
             f3_normed = F.normalize(f3_proj.float(), p=2, dim=1, eps=1e-6)
             f4_normed = F.normalize(f4.float(), p=2, dim=1, eps=1e-6)
-            f4_norm = f4.float().norm(p=2, dim=1).mean().detach()
-            detail_enhance_norm = (
-                detail_enhance.float().norm(p=2, dim=1).mean().detach()
-            )
             self.last_stats = {
                 "soft_orth_lambda": lambda_value.detach(),
                 "soft_orth_gamma": gamma_value.detach(),
-                "soft_orth_f4_norm": f4_norm,
+                "soft_orth_f4_norm": (
+                    f4.float().norm(p=2, dim=1).mean().detach()
+                ),
                 "soft_orth_f3_proj_norm": (
                     f3_proj.float().norm(p=2, dim=1).mean().detach()
                 ),
@@ -104,9 +101,6 @@ class F3ToF4SoftOrthFusion(nn.Module):
                 "soft_orth_cos_f3_f4": (
                     (f3_normed * f4_normed).sum(dim=1).mean().detach()
                 ),
-                "soft_orth_enhance_ratio_detail": (
-                    detail_enhance_norm / f4_norm.clamp_min(1e-6)
-                ).detach(),
             }
         return f4_enhanced
 
@@ -124,6 +118,7 @@ class StudentModel(nn.Module):
         soft_orth_gamma_init=0.01,
         soft_orth_gamma_max=0.05,
         soft_orth_detach_global=True,
+        soft_orth_apply_views="all",
         use_proxy_loss=False,
         num_train_ids=None,
         proxy_scale=30.0,
@@ -132,6 +127,9 @@ class StudentModel(nn.Module):
         super().__init__()
         self.embedding_dim = 512
         self.use_soft_orth_fusion = bool(use_soft_orth_fusion)
+        if soft_orth_apply_views not in {"all", "drone", "sat"}:
+            raise ValueError("soft_orth_apply_views must be one of: all, drone, sat")
+        self.soft_orth_apply_views = soft_orth_apply_views
         self.use_proxy_loss = bool(use_proxy_loss)
         self._soft_orth_stats = {}
         self.backbone = RepViTBackbone(ckpt_path=ckpt_path)
@@ -171,7 +169,11 @@ class StudentModel(nn.Module):
         rank0_print("  pooling: global average pooling")
         rank0_print("  output: L2-normalized 512-d feature")
         if self.use_soft_orth_fusion:
-            rank0_print("  soft-orth fusion: enabled (drone-only f3 -> f4)")
+            rank0_print("  soft-orth fusion: enabled (f3 -> f4)")
+            rank0_print(
+                "  soft-orth apply_views: "
+                f"{self.soft_orth_apply_views}"
+            )
             rank0_print(
                 "  soft-orth detach_global: "
                 f"{self.soft_orth_fusion.detach_global}"
@@ -203,7 +205,13 @@ class StudentModel(nn.Module):
                 f"got {batch_size}"
             )
 
-        return torch.arange(0, pair_batch_size, device=device)
+        if self.soft_orth_apply_views == "all":
+            start, end = 0, batch_size
+        elif self.soft_orth_apply_views == "drone":
+            start, end = 0, pair_batch_size
+        else:
+            start, end = pair_batch_size, batch_size
+        return torch.arange(start, end, device=device)
 
     def _apply_soft_orth_fusion(self, f4, f3, pair_batch_size=None):
         active_indices = self._soft_orth_active_indices(
@@ -223,6 +231,7 @@ class StudentModel(nn.Module):
             f4 = fused_f4
 
         stats = dict(self.soft_orth_fusion.last_stats)
+        stats["soft_orth_apply_views"] = self.soft_orth_apply_views
         stats["soft_orth_active_ratio"] = torch.tensor(
             active_ratio,
             device=f4.device,

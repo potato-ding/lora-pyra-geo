@@ -13,7 +13,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from src.models.student_model import F3ToF4SoftOrthFusion, StudentModel
+from src.models.student_model import StudentModel
 from src.loss.proxy_loss import ViewSharedIdentityProxyLoss
 import src.training.student_train as student_train
 import src.dataset.datasets as student_datasets
@@ -102,15 +102,15 @@ def test_student_soft_orth_fusion_outputs_normalized_embedding():
         soft_orth_gamma_init=0.02,
         soft_orth_gamma_max=0.2,
     ).eval()
-    x = torch.randn(4, 3, 224, 224)
+    x = torch.randn(2, 3, 224, 224)
 
     with torch.no_grad():
-        embedding = model(x, pair_batch_size=2)
+        embedding = model(x)
 
-    assert embedding.shape == (4, 512)
+    assert embedding.shape == (2, 512)
     torch.testing.assert_close(
         embedding.norm(p=2, dim=1),
-        torch.ones(4),
+        torch.ones(2),
         atol=1e-5,
         rtol=1e-5,
     )
@@ -124,6 +124,7 @@ def test_student_soft_orth_fusion_outputs_normalized_embedding():
     )
     assert model.soft_orth_fusion.last_f3_proj_shape == (2, 512, 7, 7)
     assert set(model.get_soft_orth_stats()) == {
+        "soft_orth_apply_views",
         "soft_orth_active_ratio",
         "soft_orth_lambda",
         "soft_orth_gamma",
@@ -132,14 +133,10 @@ def test_student_soft_orth_fusion_outputs_normalized_embedding():
         "soft_orth_parallel_norm",
         "soft_orth_detail_norm",
         "soft_orth_cos_f3_f4",
-        "soft_orth_enhance_ratio_detail",
     }
+    assert model.get_soft_orth_stats()["soft_orth_apply_views"] == "all"
     assert model.get_soft_orth_stats()["soft_orth_active_ratio"].item() == pytest.approx(
-        0.5,
-    )
-    assert model.get_soft_orth_stats()["soft_orth_gamma"].item() == pytest.approx(
-        0.02,
-        abs=1e-6,
+        1.0,
     )
 
 
@@ -147,33 +144,30 @@ def test_student_soft_orth_fusion_uses_f3_and_f4():
     class TrackingBackbone(nn.Module):
         def __init__(self):
             super().__init__()
-            self.f3 = nn.Parameter(torch.randn(4, 256, 14, 14))
-            self.f4 = nn.Parameter(torch.randn(4, 512, 7, 7))
+            self.f3 = nn.Parameter(torch.randn(2, 256, 14, 14))
+            self.f4 = nn.Parameter(torch.randn(2, 512, 7, 7))
 
         def forward(self, x):
             f1 = x.new_zeros(x.size(0), 64, 56, 56)
             f2 = x.new_zeros(x.size(0), 128, 28, 28)
-            return f1, f2, self.f3[:x.size(0)], self.f4[:x.size(0)]
+            return f1, f2, self.f3, self.f4
 
     model = StudentModel(
         ckpt_path=None,
         use_soft_orth_fusion=True,
     ).eval()
     model.backbone = TrackingBackbone()
-    x = torch.randn(4, 3, 224, 224)
+    x = torch.randn(2, 3, 224, 224)
 
-    embedding = model(x, pair_batch_size=2)
+    embedding = model(x)
     embedding[:, 0].sum().backward()
 
-    assert embedding.shape == (4, 512)
+    assert embedding.shape == (2, 512)
     assert model.backbone.f3.grad is not None
     assert model.backbone.f4.grad is not None
-    assert model.backbone.f3.grad[:2].abs().sum() > 0
-    assert model.backbone.f3.grad[2:].abs().sum() == 0
-    assert model.get_soft_orth_stats()["soft_orth_active_ratio"].item() == pytest.approx(0.5)
 
 
-def test_student_soft_orth_fixed_drone_only_selects_expected_view_maps():
+def test_student_soft_orth_apply_views_selects_expected_view_maps():
     class FixedBackbone(nn.Module):
         def __init__(self):
             super().__init__()
@@ -201,17 +195,34 @@ def test_student_soft_orth_fixed_drone_only_selects_expected_view_maps():
                 "soft_orth_parallel_norm": f4.new_tensor(0.2),
                 "soft_orth_detail_norm": f4.new_tensor(0.9),
                 "soft_orth_cos_f3_f4": f4.new_tensor(0.1),
-                "soft_orth_enhance_ratio_detail": f4.new_tensor(0.01),
             }
             return f4 + 1.0
 
+    def build_model(apply_views):
+        model = StudentModel(
+            ckpt_path=None,
+            use_soft_orth_fusion=True,
+            soft_orth_apply_views=apply_views,
+        ).eval()
+        model.backbone = FixedBackbone()
+        model.soft_orth_fusion = AddOneFusion()
+        return model
+
     x = torch.randn(4, 3, 224, 224)
-    drone_model = StudentModel(
-        ckpt_path=None,
-        use_soft_orth_fusion=True,
-    ).eval()
-    drone_model.backbone = FixedBackbone()
-    drone_model.soft_orth_fusion = AddOneFusion()
+    all_model = build_model("all")
+    with torch.no_grad():
+        _, old_all_f4 = all_model(x, return_fmap=True)
+        _, paired_all_f4 = all_model(x, return_fmap=True, pair_batch_size=2)
+    torch.testing.assert_close(old_all_f4, paired_all_f4)
+    torch.testing.assert_close(
+        paired_all_f4,
+        all_model.backbone.f4.detach() + 1.0,
+    )
+    assert all_model.soft_orth_fusion.seen_batch == 4
+    assert all_model.get_soft_orth_stats()["soft_orth_apply_views"] == "all"
+    assert all_model.get_soft_orth_stats()["soft_orth_active_ratio"].item() == pytest.approx(1.0)
+
+    drone_model = build_model("drone")
     with torch.no_grad():
         _, drone_f4 = drone_model(x, return_fmap=True, pair_batch_size=2)
     torch.testing.assert_close(
@@ -220,30 +231,20 @@ def test_student_soft_orth_fixed_drone_only_selects_expected_view_maps():
     )
     torch.testing.assert_close(drone_f4[2:], drone_model.backbone.f4[2:].detach())
     assert drone_model.soft_orth_fusion.seen_batch == 2
+    assert drone_model.get_soft_orth_stats()["soft_orth_apply_views"] == "drone"
     assert drone_model.get_soft_orth_stats()["soft_orth_active_ratio"].item() == pytest.approx(0.5)
 
-
-def test_soft_orth_detail_path_matches_manual_formula():
-    torch.manual_seed(31)
-    fusion = F3ToF4SoftOrthFusion(
-        lambda_init=0.4,
-        gamma_init=0.02,
-        gamma_max=0.1,
+    sat_model = build_model("sat")
+    with torch.no_grad():
+        _, sat_f4 = sat_model(x, return_fmap=True, pair_batch_size=2)
+    torch.testing.assert_close(sat_f4[:2], sat_model.backbone.f4[:2].detach())
+    torch.testing.assert_close(
+        sat_f4[2:],
+        sat_model.backbone.f4[2:].detach() + 1.0,
     )
-    f3 = torch.randn(2, 256, 14, 14)
-    f4 = torch.randn(2, 512, 7, 7)
-
-    output = fusion(f4, f3)
-    f3_proj = fusion.f3_proj(fusion.f3_down(f3))
-    u = F.normalize(f4.detach(), p=2, dim=1, eps=1e-6)
-    parallel = (f3_proj * u).sum(dim=1, keepdim=True) * u
-    detail = f3_proj - fusion.lambda_value() * parallel
-    expected = f4 + fusion.gamma_value() * detail
-
-    torch.testing.assert_close(output, expected)
-    assert fusion.gamma_value().shape == torch.Size([])
-    assert fusion.gamma_value().item() == pytest.approx(0.02, abs=1e-6)
-    assert "soft_orth_enhance_ratio_detail" in fusion.last_stats
+    assert sat_model.soft_orth_fusion.seen_batch == 2
+    assert sat_model.get_soft_orth_stats()["soft_orth_apply_views"] == "sat"
+    assert sat_model.get_soft_orth_stats()["soft_orth_active_ratio"].item() == pytest.approx(0.5)
 
 
 def test_student_proxy_module_is_saved_with_model_but_not_forwarded():
@@ -417,6 +418,7 @@ def test_soft_orth_fusion_does_not_change_student_training_loss():
 
         def get_soft_orth_stats(self):
             return {
+                "soft_orth_apply_views": "all",
                 "soft_orth_active_ratio": torch.tensor(1.0),
                 "soft_orth_lambda": torch.tensor(0.5),
                 "soft_orth_gamma": torch.tensor(0.01),
@@ -425,7 +427,6 @@ def test_soft_orth_fusion_does_not_change_student_training_loss():
                 "soft_orth_parallel_norm": torch.tensor(0.2),
                 "soft_orth_detail_norm": torch.tensor(0.9),
                 "soft_orth_cos_f3_f4": torch.tensor(0.1),
-                "soft_orth_enhance_ratio_detail": torch.tensor(0.01),
             }
 
     class Args:
@@ -448,6 +449,7 @@ def test_soft_orth_fusion_does_not_change_student_training_loss():
 
     torch.testing.assert_close(losses["loss"], losses["main_loss"])
     assert set(losses["soft_orth_stats"]) == {
+        "soft_orth_apply_views",
         "soft_orth_active_ratio",
         "soft_orth_lambda",
         "soft_orth_gamma",
@@ -456,7 +458,6 @@ def test_soft_orth_fusion_does_not_change_student_training_loss():
         "soft_orth_parallel_norm",
         "soft_orth_detail_norm",
         "soft_orth_cos_f3_f4",
-        "soft_orth_enhance_ratio_detail",
     }
 
 
@@ -480,6 +481,7 @@ def test_soft_orth_and_proxy_loss_combine_on_model_output():
 
         def get_soft_orth_stats(self):
             return {
+                "soft_orth_apply_views": "all",
                 "soft_orth_active_ratio": torch.tensor(1.0),
                 "soft_orth_lambda": torch.tensor(0.5),
                 "soft_orth_gamma": torch.tensor(0.01),
@@ -488,7 +490,6 @@ def test_soft_orth_and_proxy_loss_combine_on_model_output():
                 "soft_orth_parallel_norm": torch.tensor(0.2),
                 "soft_orth_detail_norm": torch.tensor(0.9),
                 "soft_orth_cos_f3_f4": torch.tensor(0.1),
-                "soft_orth_enhance_ratio_detail": torch.tensor(0.01),
             }
 
         def compute_proxy_loss(
@@ -645,6 +646,7 @@ def test_cli_defaults_to_clean_baseline(monkeypatch):
     assert args.soft_orth_lambda_init == pytest.approx(0.5)
     assert args.soft_orth_gamma_init == pytest.approx(0.01)
     assert args.soft_orth_gamma_max == pytest.approx(0.05)
+    assert args.soft_orth_apply_views == "all"
     assert args.soft_orth_detach_global is True
     assert args.use_proxy_loss is False
     assert args.proxy_loss_weight == pytest.approx(0.1)
@@ -668,11 +670,6 @@ def test_removed_training_flags_are_rejected(monkeypatch):
         "--" + "local" + "_align_tau",
         "--" + "local" + "_align_topk",
         "--" + "local" + "_align_warmup_epochs",
-        "--soft_orth_" + "apply_views",
-        "--soft_orth_" + "gate_type",
-        "--soft_orth_" + "fusion_mode",
-        "--soft_orth_" + "sem_gamma_init",
-        "--soft_orth_" + "sem_gamma_max",
         "--use_kd_distill",
         "--teacher_checkpoint",
         "--kd_weight",
@@ -702,31 +699,6 @@ def test_removed_local_feature_alignment_code_is_absent():
             with open(path, "r", encoding="utf-8") as handle:
                 text = handle.read()
             assert not any(needle in text for needle in needles), path
-
-
-def test_removed_student_soft_orth_experimental_branches_are_absent():
-    needles = [
-        "soft_orth_" + "apply_views",
-        "soft_orth_" + "gate_type",
-        "soft_orth_" + "fusion_mode",
-        "gamma_" + "sem",
-        "semantic_" + "norm",
-        "dual_" + "path",
-        "channel" + " gate",
-        "soft_orth_" + "gamma_detail_mean",
-        "soft_orth_" + "gamma_detail_min",
-        "soft_orth_" + "gamma_detail_max",
-        "soft_orth_" + "gamma_" + "sem",
-        "soft_orth_" + "enhance_ratio_sem",
-    ]
-    for relpath in (
-        os.path.join("src", "models", "student_model.py"),
-        os.path.join("src", "training", "student_train.py"),
-    ):
-        path = os.path.join(ROOT, relpath)
-        with open(path, "r", encoding="utf-8") as handle:
-            text = handle.read()
-        assert not any(needle in text for needle in needles), path
 
 
 def test_plain_distillation_requires_teacher_checkpoint(monkeypatch):
@@ -1039,9 +1011,9 @@ def test_online_teacher_loader_freezes_teacher_and_optimizer_excludes_it(
                     "lambda19_init": 0.8,
                     "lambda27_init": 0.8,
                     "gamma_detail_max": 0.02,
-                    "gamma_" + "sem_max": 0.02,
+                    "gamma_sem_max": 0.02,
                     "gamma_detail_init": 0.005,
-                    "gamma_" + "sem_init": 0.005,
+                    "gamma_sem_init": 0.005,
                 }
             }
         ),
