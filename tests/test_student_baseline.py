@@ -348,6 +348,7 @@ def test_local_kd_hooks_capture_teacher_tokens_and_student_stage3(capsys):
     state = {
         "local_kd_enabled": True,
         "teacher": teacher,
+        "teacher_num_register_tokens": 4,
         "local_teacher_layer": 36,
         "local_student_stage": "stage3",
         "local_teacher_tokens": None,
@@ -357,17 +358,27 @@ def test_local_kd_hooks_capture_teacher_tokens_and_student_stage3(capsys):
     }
 
     handles = student_train.register_local_kd_hooks(student, state)
-    student(torch.zeros(2, 3, 4, 5))
-    teacher(torch.zeros(2, 7, 8))
+    student(torch.zeros(2, 3, 14, 14))
+    teacher(torch.zeros(2, 200, 8))
     student_train.maybe_log_local_kd_shapes_once(state)
     student_train.maybe_log_local_kd_shapes_once(state)
 
-    assert tuple(state["local_teacher_tokens"].shape) == (2, 6, 8)
-    assert tuple(state["local_student_feature"].shape) == (2, 3, 4, 5)
+    assert tuple(state["local_teacher_tokens"].shape) == (2, 196, 8)
+    assert tuple(state["local_student_feature"].shape) == (2, 3, 14, 14)
     output = capsys.readouterr().out
     assert output.count("[LocalKD] feature shapes") == 1
-    assert "teacher_local_tokens=(2, 6, 8)" in output
-    assert "student_stage3=(2, 3, 4, 5)" in output
+    assert "raw_teacher_local_tokens_shape=(2, 200, 8)" in output
+    assert "teacher_num_register_tokens=4" in output
+    assert "final_teacher_patch_tokens_shape=(2, 196, 8)" in output
+    assert "student_stage3=(2, 3, 14, 14)" in output
+
+    raw_tokens = torch.zeros(2, 201, 8)
+    patch_tokens, raw_shape = student_train.extract_teacher_patch_tokens_from_hook(
+        raw_tokens,
+        teacher_num_register_tokens=4,
+    )
+    assert raw_shape == (2, 201, 8)
+    assert tuple(patch_tokens.shape) == (2, 196, 8)
 
     for handle in handles:
         handle.remove()

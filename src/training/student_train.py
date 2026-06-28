@@ -114,12 +114,15 @@ def build_online_kd_state(args):
         "teacher": None,
         "teacher_dim": None,
         "feature_shapes_logged": False,
+        "teacher_num_register_tokens": int(args.teacher_num_register_tokens),
         "local_teacher_layer": int(args.local_teacher_layer),
         "local_student_stage": args.local_student_stage,
         "local_attn_weight": float(args.local_attn_weight),
         "local_desc_weight": float(args.local_desc_weight),
         "local_temperature": float(args.local_temperature),
         "local_teacher_tokens": None,
+        "raw_teacher_local_tokens_shape": None,
+        "final_teacher_patch_tokens_shape": None,
         "local_student_feature": None,
         "local_shapes_logged": False,
         "local_hook_handles": [],
@@ -235,21 +238,85 @@ def first_tensor(value):
     return None
 
 
-def extract_teacher_patch_tokens_from_hook(output):
+REGISTER_TOKEN_ATTR_NAMES = (
+    "num_register_tokens",
+    "n_register_tokens",
+    "num_registers",
+    "n_registers",
+)
+
+
+def coerce_register_token_count(value):
+    if value is None:
+        return None
+    if torch.is_tensor(value):
+        if value.numel() != 1:
+            return None
+        value = value.item()
+    try:
+        count = int(value)
+    except (TypeError, ValueError):
+        return None
+    return count if count >= 0 else None
+
+
+def resolve_teacher_num_register_tokens(teacher, default):
+    default_count = coerce_register_token_count(default)
+    if default_count is None:
+        default_count = 0
+
+    candidate_objects = [
+        teacher,
+        getattr(teacher, "backbone", None),
+        getattr(getattr(teacher, "backbone", None), "model", None),
+    ]
+    for obj in candidate_objects:
+        if obj is None:
+            continue
+        for attr_name in REGISTER_TOKEN_ATTR_NAMES:
+            count = coerce_register_token_count(getattr(obj, attr_name, None))
+            if count is not None:
+                return count
+    return default_count
+
+
+def is_square_token_count(num_tokens):
+    if int(num_tokens) <= 0:
+        return False
+    side = int(math.sqrt(int(num_tokens)))
+    return side * side == int(num_tokens)
+
+
+def extract_teacher_patch_tokens_from_hook(output, teacher_num_register_tokens=4):
     tokens = first_tensor(output)
     if tokens is None:
         raise RuntimeError("Teacher local hook did not receive a tensor output.")
     if tokens.ndim != 3:
         raise RuntimeError(
             "Teacher local hook expects transformer tokens with shape "
-            f"[B, 1+N, C], got {tuple(tokens.shape)}"
+            f"[B, N, C], got {tuple(tokens.shape)}"
         )
-    if tokens.size(1) <= 1:
-        raise RuntimeError(
-            "Teacher local hook cannot remove CLS token from an empty "
-            f"token sequence: {tuple(tokens.shape)}"
-        )
-    return tokens[:, 1:, :].detach()
+
+    register_count = coerce_register_token_count(teacher_num_register_tokens)
+    if register_count is None:
+        register_count = 0
+    token_count = tokens.size(1)
+
+    if is_square_token_count(token_count):
+        patch_tokens = tokens
+    elif (
+        token_count > register_count
+        and is_square_token_count(token_count - register_count)
+    ):
+        patch_tokens = tokens[:, register_count:, :]
+    elif (
+        token_count > register_count + 1
+        and is_square_token_count(token_count - register_count - 1)
+    ):
+        patch_tokens = tokens[:, register_count + 1:, :]
+    else:
+        patch_tokens = tokens
+    return patch_tokens.detach(), tuple(tokens.shape)
 
 
 def extract_student_stage_feature_from_hook(output, detach=True):
@@ -317,9 +384,13 @@ def resolve_teacher_layer_module(teacher, layer_idx):
 
 def make_teacher_local_hook(state):
     def hook(_module, _inputs, output):
-        state["local_teacher_tokens"] = extract_teacher_patch_tokens_from_hook(
-            output
+        patch_tokens, raw_shape = extract_teacher_patch_tokens_from_hook(
+            output,
+            state.get("teacher_num_register_tokens", 4),
         )
+        state["local_teacher_tokens"] = patch_tokens
+        state["raw_teacher_local_tokens_shape"] = raw_shape
+        state["final_teacher_patch_tokens_shape"] = tuple(patch_tokens.shape)
 
     return hook
 
@@ -385,7 +456,12 @@ def maybe_log_local_kd_shapes_once(state):
     if is_main_process():
         print(
             "[LocalKD] feature shapes | "
-            f"teacher_local_tokens={tuple(teacher_tokens.shape)} | "
+            f"raw_teacher_local_tokens_shape="
+            f"{state.get('raw_teacher_local_tokens_shape')} | "
+            f"teacher_num_register_tokens="
+            f"{state.get('teacher_num_register_tokens')} | "
+            f"final_teacher_patch_tokens_shape="
+            f"{state.get('final_teacher_patch_tokens_shape')} | "
             f"student_stage3={tuple(student_feature.shape)}"
         )
     state["local_shapes_logged"] = True
@@ -466,18 +542,56 @@ def maybe_create_local_desc_projectors(model, online_kd_state, device):
         )
 
 
-def infer_square_grid(num_tokens, name):
+def infer_square_grid(
+    num_tokens,
+    name,
+    teacher_num_register_tokens=None,
+    student_hw=None,
+):
     side = int(math.sqrt(int(num_tokens)))
     if side * side != int(num_tokens):
+        context = ""
+        if teacher_num_register_tokens is not None:
+            context += (
+                f" | teacher_num_register_tokens="
+                f"{teacher_num_register_tokens}"
+            )
+        if student_hw is not None:
+            context += f" | student_stage3_hw={tuple(student_hw)}"
         raise RuntimeError(
             f"{name} token count must form a square grid, got {num_tokens}"
+            f"{context}"
         )
     return side, side
 
 
-def resize_teacher_attention(teacher_prob, student_hw):
+def validate_local_teacher_patch_tokens(state):
+    if state is None or not state.get("local_kd_enabled", False):
+        return
+    teacher_tokens = state.get("local_teacher_tokens")
+    student_feature = state.get("local_student_feature")
+    if teacher_tokens is None or student_feature is None:
+        return
+    infer_square_grid(
+        teacher_tokens.size(1),
+        "teacher attention",
+        teacher_num_register_tokens=state.get("teacher_num_register_tokens"),
+        student_hw=student_feature.shape[-2:],
+    )
+
+
+def resize_teacher_attention(
+    teacher_prob,
+    student_hw,
+    teacher_num_register_tokens=None,
+):
     batch_size, num_tokens = teacher_prob.shape
-    teacher_h, teacher_w = infer_square_grid(num_tokens, "teacher attention")
+    teacher_h, teacher_w = infer_square_grid(
+        num_tokens,
+        "teacher attention",
+        teacher_num_register_tokens=teacher_num_register_tokens,
+        student_hw=student_hw,
+    )
     student_h, student_w = student_hw
     if (teacher_h, teacher_w) == (student_h, student_w):
         return teacher_prob
@@ -537,6 +651,7 @@ def compute_local_attention_kd_loss(
     student_feature,
     local_temperature,
     teacher_prob=None,
+    teacher_num_register_tokens=None,
 ):
     local_temperature = float(local_temperature)
     if local_temperature <= 0.0:
@@ -569,6 +684,7 @@ def compute_local_attention_kd_loss(
         teacher_prob = resize_teacher_attention(
             teacher_prob,
             student_feature.shape[-2:],
+            teacher_num_register_tokens=teacher_num_register_tokens,
         ).detach()
 
         student_scores = F.conv2d(
@@ -597,6 +713,7 @@ def compute_local_descriptor_kd_loss(
     student_feature,
     local_temperature,
     teacher_prob=None,
+    teacher_num_register_tokens=None,
 ):
     if teacher_tokens is None or student_feature is None:
         raise RuntimeError("Local descriptor KD requires teacher tokens and student feature map.")
@@ -646,6 +763,7 @@ def compute_local_descriptor_kd_loss(
         student_prob = resize_teacher_attention(
             teacher_prob,
             student_feature.shape[-2:],
+            teacher_num_register_tokens=teacher_num_register_tokens,
         ).detach()
         student_desc = torch.sum(
             student_prob.unsqueeze(-1) * student_tokens.float(),
@@ -972,6 +1090,7 @@ def compute_student_batch_losses(
             local_features,
         )
         maybe_log_local_kd_shapes_once(online_kd_state)
+        validate_local_teacher_patch_tokens(online_kd_state)
         feature_kd_loss = loss_infonce.new_zeros(())
         similarity_kd_loss = loss_infonce.new_zeros(())
         local_attn_loss = loss_infonce.new_zeros(())
@@ -1019,6 +1138,7 @@ def compute_student_batch_losses(
                 online_kd_state.get("local_student_feature"),
                 online_kd_state["local_temperature"],
                 teacher_patch_attention,
+                online_kd_state.get("teacher_num_register_tokens"),
             )
             local_attn_loss = local_attn_terms["local_attn_loss"]
             teacher_attn_entropy = local_attn_terms["teacher_attn_entropy"]
@@ -1031,6 +1151,7 @@ def compute_student_batch_losses(
                 online_kd_state.get("local_student_feature"),
                 online_kd_state["local_temperature"],
                 teacher_patch_attention,
+                online_kd_state.get("teacher_num_register_tokens"),
             )
             local_desc_loss = local_desc_terms["local_desc_loss"]
             local_desc_cosine = local_desc_terms["local_desc_cosine"]
@@ -1933,6 +2054,7 @@ def parse_args():
         default=False,
     )
     parser.add_argument("--local_teacher_layer", type=int, default=36)
+    parser.add_argument("--teacher_num_register_tokens", type=int, default=4)
     parser.add_argument(
         "--local_student_stage",
         type=str,
@@ -1971,6 +2093,8 @@ def parse_args():
         parser.error("--kd_temperature must be greater than 0")
     if args.local_teacher_layer < 0:
         parser.error("--local_teacher_layer must be non-negative")
+    if args.teacher_num_register_tokens < 0:
+        parser.error("--teacher_num_register_tokens must be non-negative")
     if args.local_attn_weight < 0.0:
         parser.error("--local_attn_weight must be non-negative")
     if args.local_desc_weight < 0.0:
@@ -2027,6 +2151,16 @@ def main():
         torch.cuda.manual_seed_all(args.seed + rank)
 
     online_kd_state["teacher"] = build_frozen_online_teacher(args, device)
+    if online_kd_state.get("teacher") is not None and online_kd_state.get(
+        "local_kd_enabled",
+        False,
+    ):
+        online_kd_state["teacher_num_register_tokens"] = (
+            resolve_teacher_num_register_tokens(
+                online_kd_state["teacher"],
+                args.teacher_num_register_tokens,
+            )
+        )
 
     train_loader = create_student_train_dataset_and_loader(args)
     val_loaders = build_1652_val_dataloaders(
