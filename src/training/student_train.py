@@ -98,6 +98,13 @@ def is_online_kd_active(args):
     )
 
 
+def compute_local_kd_scale(epoch_index, local_kd_warmup_epochs):
+    warmup_epochs = int(local_kd_warmup_epochs)
+    if warmup_epochs <= 0:
+        return 1.0
+    return min(1.0, float(epoch_index + 1) / float(warmup_epochs))
+
+
 def build_online_kd_state(args):
     return {
         "active": is_online_kd_active(args),
@@ -1056,6 +1063,7 @@ def compute_student_batch_losses(
     pair_batch_size,
     criterion,
     online_kd_state=None,
+    local_kd_scale=1.0,
 ):
     if online_kd_state is not None and online_kd_state.get("local_kd_enabled", False):
         online_kd_state["local_teacher_tokens"] = None
@@ -1155,12 +1163,16 @@ def compute_student_batch_losses(
             )
             local_desc_loss = local_desc_terms["local_desc_loss"]
             local_desc_cosine = local_desc_terms["local_desc_cosine"]
+        local_kd_scale = float(local_kd_scale)
+        local_kd_loss = (
+            float(online_kd_state.get("local_attn_weight", 0.0)) * local_attn_loss
+            + float(online_kd_state.get("local_desc_weight", 0.0)) * local_desc_loss
+        )
         total_loss = (
             loss_infonce
             + float(online_kd_state["kd_feat_weight"]) * feature_kd_loss
             + float(online_kd_state["kd_sim_weight"]) * similarity_kd_loss
-            + float(online_kd_state.get("local_attn_weight", 0.0)) * local_attn_loss
-            + float(online_kd_state.get("local_desc_weight", 0.0)) * local_desc_loss
+            + local_kd_scale * local_kd_loss
         )
         losses.update({
             "loss": total_loss,
@@ -1178,6 +1190,7 @@ def compute_student_batch_losses(
             "student_attn_entropy": student_attn_entropy,
             "local_desc_loss": local_desc_loss,
             "local_desc_cosine": local_desc_cosine,
+            "local_kd_scale": loss_infonce.new_tensor(local_kd_scale),
         })
     return losses
 
@@ -1357,6 +1370,10 @@ def train_one_epoch(
     student_attn_entropy_meter = AverageMeter()
     local_desc_loss_meter = AverageMeter()
     local_desc_cosine_meter = AverageMeter()
+    local_kd_scale = compute_local_kd_scale(
+        epoch - 1,
+        args.local_kd_warmup_epochs,
+    )
     end = time.time()
 
     if hasattr(train_loader.batch_sampler, "set_epoch"):
@@ -1377,6 +1394,7 @@ def train_one_epoch(
                 pair_batch_size,
                 criterion,
                 online_kd_state=online_kd_state,
+                local_kd_scale=local_kd_scale,
             )
             loss = batch_losses["loss"]
 
@@ -1493,6 +1511,7 @@ def train_one_epoch(
                     f"local_desc_loss {local_desc_loss_meter.val:.4f} "
                     f"({local_desc_loss_meter.avg:.4f}) | "
                     f"local_desc_weight {args.local_desc_weight:g} | "
+                    f"local_kd_scale {local_kd_scale:g} | "
                     f"local_desc_cosine {local_desc_cosine_meter.val:.4f} "
                     f"({local_desc_cosine_meter.avg:.4f}) | "
                 )
@@ -1528,6 +1547,7 @@ def train_one_epoch(
         stats["student_attn_entropy"] = student_attn_entropy_meter.avg
         stats["local_desc_loss"] = local_desc_loss_meter.avg
         stats["local_desc_cosine"] = local_desc_cosine_meter.avg
+        stats["local_kd_scale"] = local_kd_scale
     return stats
 
 
@@ -1561,6 +1581,10 @@ def train_one_epoch_deepspeed(
     student_attn_entropy_meter = AverageMeter()
     local_desc_loss_meter = AverageMeter()
     local_desc_cosine_meter = AverageMeter()
+    local_kd_scale = compute_local_kd_scale(
+        epoch - 1,
+        args.local_kd_warmup_epochs,
+    )
     batch_time = AverageMeter()
     data_time = AverageMeter()
     end = time.time()
@@ -1578,6 +1602,7 @@ def train_one_epoch_deepspeed(
             pair_batch_size,
             criterion,
             online_kd_state=online_kd_state,
+            local_kd_scale=local_kd_scale,
         )
         loss = batch_losses["loss"]
         model_engine.backward(loss)
@@ -1666,6 +1691,7 @@ def train_one_epoch_deepspeed(
                     f"local_desc_loss {local_desc_loss_meter.val:.4f} "
                     f"({local_desc_loss_meter.avg:.4f}) | "
                     f"local_desc_weight {args.local_desc_weight:g} | "
+                    f"local_kd_scale {local_kd_scale:g} | "
                     f"local_desc_cosine {local_desc_cosine_meter.val:.4f} "
                     f"({local_desc_cosine_meter.avg:.4f}) | "
                 )
@@ -1702,6 +1728,7 @@ def train_one_epoch_deepspeed(
         stats["student_attn_entropy"] = student_attn_entropy_meter.avg
         stats["local_desc_loss"] = local_desc_loss_meter.avg
         stats["local_desc_cosine"] = local_desc_cosine_meter.avg
+        stats["local_kd_scale"] = local_kd_scale
     return stats
 
 
@@ -1808,6 +1835,7 @@ def train(
                 f"{train_stats['student_attn_entropy']:.4f}"
                 f" | local_desc_loss={train_stats['local_desc_loss']:.4f}"
                 f" | local_desc_weight={args.local_desc_weight:g}"
+                f" | local_kd_scale={train_stats['local_kd_scale']:.4f}"
                 f" | local_desc_cosine={train_stats['local_desc_cosine']:.4f}"
             )
         train_text += (
@@ -1939,6 +1967,7 @@ def train_deepspeed(
                     f"{train_stats['student_attn_entropy']:.4f}"
                     f" | local_desc_loss={train_stats['local_desc_loss']:.4f}"
                     f" | local_desc_weight={args.local_desc_weight:g}"
+                    f" | local_kd_scale={train_stats['local_kd_scale']:.4f}"
                     f" | local_desc_cosine={train_stats['local_desc_cosine']:.4f}"
                 )
             train_text += (
@@ -2063,6 +2092,7 @@ def parse_args():
     )
     parser.add_argument("--local_attn_weight", type=float, default=0.0)
     parser.add_argument("--local_desc_weight", type=float, default=0.0)
+    parser.add_argument("--local_kd_warmup_epochs", type=int, default=0)
     parser.add_argument("--local_temperature", type=float, default=0.5)
     parser.add_argument("--amp", dest="amp", action="store_true", default=True)
     parser.add_argument("--no_amp", dest="amp", action="store_false")
@@ -2099,6 +2129,8 @@ def parse_args():
         parser.error("--local_attn_weight must be non-negative")
     if args.local_desc_weight < 0.0:
         parser.error("--local_desc_weight must be non-negative")
+    if args.local_kd_warmup_epochs < 0:
+        parser.error("--local_kd_warmup_epochs must be non-negative")
     if args.local_temperature <= 0.0:
         parser.error("--local_temperature must be greater than 0")
     if is_local_kd_enabled(args) and not args.enable_online_kd:

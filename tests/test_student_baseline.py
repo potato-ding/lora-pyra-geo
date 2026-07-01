@@ -102,6 +102,7 @@ def test_cli_defaults_to_clean_baseline(monkeypatch):
     assert args.local_student_stage == "stage3"
     assert args.local_attn_weight == 0.0
     assert args.local_desc_weight == 0.0
+    assert args.local_kd_warmup_epochs == 0
     assert args.local_temperature == 0.5
     assert student_train.is_online_kd_active(args) is False
 
@@ -199,6 +200,14 @@ def test_local_kd_can_activate_online_teacher_without_kd_weights(monkeypatch):
     assert student_train.is_similarity_kd_enabled(args) is False
     assert student_train.is_local_kd_enabled(args) is True
     assert student_train.is_local_attn_kd_enabled(args) is True
+
+
+def test_local_kd_warmup_scale_defaults_to_one():
+    assert student_train.compute_local_kd_scale(0, 0) == 1.0
+    assert student_train.compute_local_kd_scale(0, 5) == 0.2
+    assert student_train.compute_local_kd_scale(3, 5) == 0.8
+    assert student_train.compute_local_kd_scale(4, 5) == 1.0
+    assert student_train.compute_local_kd_scale(9, 5) == 1.0
 
 
 def test_local_attention_head_created_only_when_weight_positive():
