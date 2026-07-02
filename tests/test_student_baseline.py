@@ -99,6 +99,10 @@ def test_cli_defaults_to_clean_baseline(monkeypatch):
     assert args.kd_temperature == 0.1
     assert args.enable_local_kd is False
     assert args.local_teacher_layer == 36
+    assert args.local_teacher_layers is None
+    assert args.local_layer_weights is None
+    assert args.local_teacher_layers_resolved == [36]
+    assert args.local_layer_weights_resolved == [1.0]
     assert args.local_student_stage == "stage3"
     assert args.local_attn_weight == 0.0
     assert args.local_desc_weight == 0.0
@@ -208,6 +212,54 @@ def test_local_kd_warmup_scale_defaults_to_one():
     assert student_train.compute_local_kd_scale(3, 5) == 0.8
     assert student_train.compute_local_kd_scale(4, 5) == 1.0
     assert student_train.compute_local_kd_scale(9, 5) == 1.0
+
+
+def test_local_teacher_layers_default_and_normalized_weights(monkeypatch):
+    monkeypatch.setattr(sys, "argv", [
+        "student_train.py",
+        "--local_teacher_layers",
+        "27,36",
+    ])
+    args = student_train.parse_args()
+
+    assert args.local_teacher_layers_resolved == [27, 36]
+    assert args.local_layer_weights_resolved == [0.5, 0.5]
+
+    monkeypatch.setattr(sys, "argv", [
+        "student_train.py",
+        "--local_teacher_layers",
+        "27,36",
+        "--local_layer_weights",
+        "1,1",
+    ])
+    args = student_train.parse_args()
+
+    assert args.local_teacher_layers_resolved == [27, 36]
+    assert args.local_layer_weights_resolved == [0.5, 0.5]
+
+
+def test_local_layer_weight_count_mismatch_is_rejected(monkeypatch):
+    monkeypatch.setattr(sys, "argv", [
+        "student_train.py",
+        "--local_teacher_layers",
+        "27,36",
+        "--local_layer_weights",
+        "1.0",
+    ])
+    with pytest.raises(SystemExit):
+        student_train.parse_args()
+
+
+def test_multi_layer_local_attention_is_not_implemented(monkeypatch):
+    monkeypatch.setattr(sys, "argv", [
+        "student_train.py",
+        "--local_teacher_layers",
+        "27,36",
+        "--local_attn_weight",
+        "0.1",
+    ])
+    with pytest.raises(NotImplementedError):
+        student_train.parse_args()
 
 
 def test_local_attention_head_created_only_when_weight_positive():
@@ -359,8 +411,13 @@ def test_local_kd_hooks_capture_teacher_tokens_and_student_stage3(capsys):
         "teacher": teacher,
         "teacher_num_register_tokens": 4,
         "local_teacher_layer": 36,
+        "local_teacher_layers": [36],
+        "local_layer_weights": [1.0],
         "local_student_stage": "stage3",
         "local_teacher_tokens": None,
+        "local_teacher_tokens_dict": {},
+        "raw_teacher_local_tokens_shape_dict": {},
+        "final_teacher_patch_tokens_shape_dict": {},
         "local_student_feature": None,
         "local_shapes_logged": False,
         "local_hook_handles": [],
@@ -373,12 +430,15 @@ def test_local_kd_hooks_capture_teacher_tokens_and_student_stage3(capsys):
     student_train.maybe_log_local_kd_shapes_once(state)
 
     assert tuple(state["local_teacher_tokens"].shape) == (2, 196, 8)
+    assert tuple(state["local_teacher_tokens_dict"][36].shape) == (2, 196, 8)
     assert tuple(state["local_student_feature"].shape) == (2, 3, 14, 14)
     output = capsys.readouterr().out
     assert output.count("[LocalKD] feature shapes") == 1
-    assert "raw_teacher_local_tokens_shape=(2, 200, 8)" in output
+    assert "local_teacher_layers=[36]" in output
+    assert "local_layer_weights=[1.0]" in output
+    assert "raw_teacher_local_tokens_shapes={36: (2, 200, 8)}" in output
     assert "teacher_num_register_tokens=4" in output
-    assert "final_teacher_patch_tokens_shape=(2, 196, 8)" in output
+    assert "final_teacher_patch_tokens_shapes={36: (2, 196, 8)}" in output
     assert "student_stage3=(2, 3, 14, 14)" in output
 
     raw_tokens = torch.zeros(2, 201, 8)
@@ -388,6 +448,66 @@ def test_local_kd_hooks_capture_teacher_tokens_and_student_stage3(capsys):
     )
     assert raw_shape == (2, 201, 8)
     assert tuple(patch_tokens.shape) == (2, 196, 8)
+
+    for handle in handles:
+        handle.remove()
+
+
+def test_multi_layer_local_hooks_capture_teacher_tokens():
+    class TinyStudent(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.backbone = nn.Module()
+            self.backbone.features = nn.ModuleList(
+                [nn.Identity() for _ in range(43)]
+            )
+
+        def forward(self, x):
+            for block in self.backbone.features:
+                x = block(x)
+            return x.flatten(1)
+
+    class TinyTeacher(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.backbone = nn.Module()
+            self.backbone.model = nn.Module()
+            self.backbone.model.blocks = nn.ModuleList(
+                [nn.Identity() for _ in range(40)]
+            )
+
+        def forward(self, x):
+            tokens = x
+            for block in self.backbone.model.blocks:
+                tokens = block(tokens)
+            return tokens[:, 0], tokens[:, 0], {}
+
+    state = {
+        "local_kd_enabled": True,
+        "local_attn_enabled": False,
+        "teacher": TinyTeacher(),
+        "teacher_num_register_tokens": 4,
+        "local_teacher_layer": 36,
+        "local_teacher_layers": [27, 36],
+        "local_layer_weights": [0.5, 0.5],
+        "local_student_stage": "stage3",
+        "local_teacher_tokens": None,
+        "local_teacher_tokens_dict": {},
+        "raw_teacher_local_tokens_shape_dict": {},
+        "final_teacher_patch_tokens_shape_dict": {},
+        "local_student_feature": None,
+        "local_hook_handles": [],
+    }
+    student = TinyStudent()
+
+    handles = student_train.register_local_kd_hooks(student, state)
+    student(torch.zeros(2, 3, 14, 14))
+    state["teacher"](torch.zeros(2, 200, 8))
+
+    assert len(handles) == 3
+    assert sorted(state["local_teacher_tokens_dict"]) == [27, 36]
+    assert tuple(state["local_teacher_tokens_dict"][27].shape) == (2, 196, 8)
+    assert tuple(state["local_teacher_tokens_dict"][36].shape) == (2, 196, 8)
 
     for handle in handles:
         handle.remove()
@@ -560,6 +680,83 @@ def test_local_descriptor_kd_loss_uses_teacher_attention_weights_and_detach():
     assert teacher_tokens.grad is None
     assert teacher_global.grad is None
     assert student_feature.grad is not None
+
+
+def test_multi_layer_local_descriptor_loss_uses_normalized_layer_weights():
+    class TinyStudent(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.student_local_proj = nn.Linear(2, 2, bias=False)
+            self.teacher_local_proj = nn.Linear(2, 2, bias=False)
+            with torch.no_grad():
+                self.student_local_proj.weight.copy_(torch.eye(2))
+                self.teacher_local_proj.weight.copy_(torch.eye(2))
+
+    model = TinyStudent()
+    teacher_global = torch.tensor([[1.0, 0.0]])
+    student_tokens = torch.tensor([
+        [
+            [0.0, 1.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 0.0],
+        ]
+    ])
+    student_feature = student_tokens.transpose(1, 2).view(1, 2, 2, 2).clone()
+    layer27_tokens = torch.tensor([
+        [
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+        ]
+    ])
+    layer36_tokens = torch.tensor([
+        [
+            [0.0, 1.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 0.0],
+        ]
+    ])
+
+    layer27_terms = student_train.compute_local_descriptor_kd_loss(
+        model,
+        layer27_tokens,
+        teacher_global,
+        student_feature,
+        local_temperature=1.0,
+    )
+    layer36_terms = student_train.compute_local_descriptor_kd_loss(
+        model,
+        layer36_tokens,
+        teacher_global,
+        student_feature,
+        local_temperature=1.0,
+    )
+    multi_terms = student_train.compute_multi_layer_local_descriptor_kd_loss(
+        model,
+        {27: layer27_tokens, 36: layer36_tokens},
+        teacher_global,
+        student_feature,
+        local_temperature=1.0,
+        local_teacher_layers=[27, 36],
+        local_layer_weights=[0.5, 0.5],
+    )
+
+    expected = (
+        0.5 * layer27_terms["local_desc_loss"]
+        + 0.5 * layer36_terms["local_desc_loss"]
+    )
+    torch.testing.assert_close(multi_terms["local_desc_loss"], expected)
+    torch.testing.assert_close(
+        multi_terms["local_desc_loss_layers"][27],
+        layer27_terms["local_desc_loss"],
+    )
+    torch.testing.assert_close(
+        multi_terms["local_desc_loss_layers"][36],
+        layer36_terms["local_desc_loss"],
+    )
 
 
 def test_kd_projector_is_created_only_for_feature_kd():
@@ -831,6 +1028,34 @@ def test_student_eval_ignores_training_only_kd_projector(tmp_path):
     load_student_checkpoint(model, str(checkpoint_path), strict=True)
 
     torch.testing.assert_close(model.weight, torch.ones(1))
+
+
+def test_local_kd_checkpoint_config_is_optional(tmp_path):
+    class TinyModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones(1))
+
+    plain_path = tmp_path / "plain.pth"
+    local_path = tmp_path / "local.pth"
+    model = TinyModel()
+
+    student_train.save_model_only_checkpoint(model, 1, str(plain_path))
+    student_train.save_model_only_checkpoint(
+        model,
+        1,
+        str(local_path),
+        local_kd_config={
+            "local_teacher_layers": [27, 36],
+            "local_layer_weights": [0.5, 0.5],
+        },
+    )
+
+    plain_ckpt = torch.load(plain_path, map_location="cpu")
+    local_ckpt = torch.load(local_path, map_location="cpu")
+    assert "local_kd_config" not in plain_ckpt
+    assert local_ckpt["local_kd_config"]["local_teacher_layers"] == [27, 36]
+    assert "model" in local_ckpt
 
 
 def test_removed_student_experiment_flags_are_rejected(monkeypatch):

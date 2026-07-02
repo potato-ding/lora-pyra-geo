@@ -105,7 +105,58 @@ def compute_local_kd_scale(epoch_index, local_kd_warmup_epochs):
     return min(1.0, float(epoch_index + 1) / float(warmup_epochs))
 
 
+def parse_local_teacher_layers(value, fallback_layer):
+    if value is None:
+        return [int(fallback_layer)]
+    parts = [part.strip() for part in str(value).split(",") if part.strip()]
+    if not parts:
+        raise ValueError("--local_teacher_layers must contain at least one layer")
+    try:
+        layers = [int(part) for part in parts]
+    except ValueError as exc:
+        raise ValueError("--local_teacher_layers must be comma-separated integers") from exc
+    if any(layer < 0 for layer in layers):
+        raise ValueError("--local_teacher_layers must be non-negative")
+    return layers
+
+
+def parse_local_layer_weights(value, num_layers):
+    if num_layers <= 0:
+        raise ValueError("local teacher layer count must be greater than 0")
+    if value is None:
+        return [1.0 / float(num_layers)] * num_layers
+    parts = [part.strip() for part in str(value).split(",") if part.strip()]
+    if len(parts) != num_layers:
+        raise ValueError(
+            "--local_layer_weights count must match local teacher layer count"
+        )
+    try:
+        weights = [float(part) for part in parts]
+    except ValueError as exc:
+        raise ValueError("--local_layer_weights must be comma-separated floats") from exc
+    if any(weight < 0.0 for weight in weights):
+        raise ValueError("--local_layer_weights must be non-negative")
+    weight_sum = sum(weights)
+    if weight_sum <= 0.0:
+        raise ValueError("--local_layer_weights must sum to a positive value")
+    return [weight / weight_sum for weight in weights]
+
+
 def build_online_kd_state(args):
+    local_teacher_layers = list(
+        getattr(
+            args,
+            "local_teacher_layers_resolved",
+            [int(args.local_teacher_layer)],
+        )
+    )
+    local_layer_weights = list(
+        getattr(
+            args,
+            "local_layer_weights_resolved",
+            [1.0],
+        )
+    )
     return {
         "active": is_online_kd_active(args),
         "feature_kd_enabled": is_feature_kd_enabled(args),
@@ -123,13 +174,19 @@ def build_online_kd_state(args):
         "feature_shapes_logged": False,
         "teacher_num_register_tokens": int(args.teacher_num_register_tokens),
         "local_teacher_layer": int(args.local_teacher_layer),
+        "local_teacher_layers": local_teacher_layers,
+        "local_layer_weights": local_layer_weights,
         "local_student_stage": args.local_student_stage,
         "local_attn_weight": float(args.local_attn_weight),
         "local_desc_weight": float(args.local_desc_weight),
+        "local_kd_warmup_epochs": int(args.local_kd_warmup_epochs),
         "local_temperature": float(args.local_temperature),
         "local_teacher_tokens": None,
+        "local_teacher_tokens_dict": {},
         "raw_teacher_local_tokens_shape": None,
         "final_teacher_patch_tokens_shape": None,
+        "raw_teacher_local_tokens_shape_dict": {},
+        "final_teacher_patch_tokens_shape_dict": {},
         "local_student_feature": None,
         "local_shapes_logged": False,
         "local_hook_handles": [],
@@ -157,6 +214,14 @@ def log_online_kd_state(state):
             f"local_attn_enabled={state['local_attn_enabled']} | "
             f"local_desc_enabled={state['local_desc_enabled']}"
         )
+        if state["local_kd_enabled"]:
+            print(
+                "[LocalKD] config | "
+                f"local_teacher_layers={state['local_teacher_layers']} | "
+                f"local_layer_weights={state['local_layer_weights']} | "
+                f"local_desc_weight={state['local_desc_weight']:g} | "
+                f"local_kd_warmup_epochs={state['local_kd_warmup_epochs']}"
+            )
     else:
         print(
             "[OnlineKD] inactive: baseline InfoNCE path only; no teacher, "
@@ -389,12 +454,22 @@ def resolve_teacher_layer_module(teacher, layer_idx):
     return blocks[layer_idx]
 
 
-def make_teacher_local_hook(state):
+def make_teacher_local_hook(state, layer_idx):
     def hook(_module, _inputs, output):
         patch_tokens, raw_shape = extract_teacher_patch_tokens_from_hook(
             output,
             state.get("teacher_num_register_tokens", 4),
         )
+        layer_idx_int = int(layer_idx)
+        state.setdefault("local_teacher_tokens_dict", {})[layer_idx_int] = (
+            patch_tokens
+        )
+        state.setdefault("raw_teacher_local_tokens_shape_dict", {})[
+            layer_idx_int
+        ] = raw_shape
+        state.setdefault("final_teacher_patch_tokens_shape_dict", {})[
+            layer_idx_int
+        ] = tuple(patch_tokens.shape)
         state["local_teacher_tokens"] = patch_tokens
         state["raw_teacher_local_tokens_shape"] = raw_shape
         state["final_teacher_patch_tokens_shape"] = tuple(patch_tokens.shape)
@@ -427,28 +502,54 @@ def register_local_kd_hooks(model, online_kd_state):
     teacher = online_kd_state.get("teacher")
     if teacher is None:
         raise RuntimeError("Local KD requires a frozen online teacher.")
-
-    teacher_module = resolve_teacher_layer_module(
-        teacher,
-        online_kd_state["local_teacher_layer"],
+    local_teacher_layers = list(
+        online_kd_state.get(
+            "local_teacher_layers",
+            [online_kd_state["local_teacher_layer"]],
+        )
     )
+    if len(local_teacher_layers) > 1 and online_kd_state.get(
+        "local_attn_enabled",
+        False,
+    ):
+        raise NotImplementedError("multi-layer local attention KD not implemented")
+
     student_module = resolve_student_stage_module(
         model,
         online_kd_state["local_student_stage"],
     )
-    handles = [
-        teacher_module.register_forward_hook(make_teacher_local_hook(online_kd_state)),
-        student_module.register_forward_hook(make_student_local_hook(online_kd_state)),
-    ]
+    handles = []
+    for layer_idx in local_teacher_layers:
+        teacher_module = resolve_teacher_layer_module(teacher, layer_idx)
+        handles.append(
+            teacher_module.register_forward_hook(
+                make_teacher_local_hook(online_kd_state, layer_idx)
+            )
+        )
+    handles.append(
+        student_module.register_forward_hook(make_student_local_hook(online_kd_state))
+    )
     online_kd_state["local_hook_handles"].extend(handles)
 
     if is_main_process():
         print(
             "[LocalKD] hooks registered | "
-            f"teacher_layer={online_kd_state['local_teacher_layer']} | "
+            f"teacher_layers={local_teacher_layers} | "
+            f"local_layer_weights={online_kd_state.get('local_layer_weights')} | "
             f"student_stage={online_kd_state['local_student_stage']}"
         )
     return handles
+
+
+def get_local_teacher_tokens_dict(state):
+    tokens_dict = state.get("local_teacher_tokens_dict")
+    if tokens_dict:
+        return tokens_dict
+    teacher_tokens = state.get("local_teacher_tokens")
+    if teacher_tokens is None:
+        return {}
+    layers = state.get("local_teacher_layers", [state["local_teacher_layer"]])
+    return {int(layers[0]): teacher_tokens}
 
 
 def maybe_log_local_kd_shapes_once(state):
@@ -456,19 +557,26 @@ def maybe_log_local_kd_shapes_once(state):
         return
     if state.get("local_shapes_logged", False):
         return
-    teacher_tokens = state.get("local_teacher_tokens")
+    teacher_tokens_dict = get_local_teacher_tokens_dict(state)
+    local_teacher_layers = list(
+        state.get("local_teacher_layers", [state["local_teacher_layer"]])
+    )
     student_feature = state.get("local_student_feature")
-    if teacher_tokens is None or student_feature is None:
+    if student_feature is None:
+        return
+    if any(int(layer) not in teacher_tokens_dict for layer in local_teacher_layers):
         return
     if is_main_process():
         print(
             "[LocalKD] feature shapes | "
-            f"raw_teacher_local_tokens_shape="
-            f"{state.get('raw_teacher_local_tokens_shape')} | "
+            f"local_teacher_layers={local_teacher_layers} | "
+            f"local_layer_weights={state.get('local_layer_weights')} | "
+            f"raw_teacher_local_tokens_shapes="
+            f"{state.get('raw_teacher_local_tokens_shape_dict')} | "
             f"teacher_num_register_tokens="
             f"{state.get('teacher_num_register_tokens')} | "
-            f"final_teacher_patch_tokens_shape="
-            f"{state.get('final_teacher_patch_tokens_shape')} | "
+            f"final_teacher_patch_tokens_shapes="
+            f"{state.get('final_teacher_patch_tokens_shape_dict')} | "
             f"student_stage3={tuple(student_feature.shape)}"
         )
     state["local_shapes_logged"] = True
@@ -575,16 +683,42 @@ def infer_square_grid(
 def validate_local_teacher_patch_tokens(state):
     if state is None or not state.get("local_kd_enabled", False):
         return
-    teacher_tokens = state.get("local_teacher_tokens")
+    teacher_tokens_dict = get_local_teacher_tokens_dict(state)
     student_feature = state.get("local_student_feature")
-    if teacher_tokens is None or student_feature is None:
+    if not teacher_tokens_dict or student_feature is None:
         return
-    infer_square_grid(
-        teacher_tokens.size(1),
-        "teacher attention",
-        teacher_num_register_tokens=state.get("teacher_num_register_tokens"),
-        student_hw=student_feature.shape[-2:],
+    local_teacher_layers = list(
+        state.get("local_teacher_layers", [state["local_teacher_layer"]])
     )
+    student_hw = student_feature.shape[-2:]
+    expected_tokens = int(student_hw[0]) * int(student_hw[1])
+    raw_shapes = state.get("raw_teacher_local_tokens_shape_dict", {})
+    for layer_idx in local_teacher_layers:
+        layer_idx = int(layer_idx)
+        teacher_tokens = teacher_tokens_dict.get(layer_idx)
+        if teacher_tokens is None:
+            raise RuntimeError(
+                f"Teacher local layer{layer_idx} tokens were not captured."
+            )
+        final_count = int(teacher_tokens.size(1))
+        raw_shape = raw_shapes.get(layer_idx)
+        raw_count = raw_shape[1] if raw_shape is not None and len(raw_shape) > 1 else None
+        infer_square_grid(
+            final_count,
+            f"teacher attention layer{layer_idx}",
+            teacher_num_register_tokens=state.get("teacher_num_register_tokens"),
+            student_hw=student_hw,
+        )
+        if final_count != expected_tokens:
+            raise RuntimeError(
+                f"Teacher local layer{layer_idx} patch token count mismatch: "
+                f"raw_token_count={raw_count} | "
+                f"final_token_count={final_count} | "
+                f"expected_patch_tokens={expected_tokens} | "
+                f"teacher_num_register_tokens="
+                f"{state.get('teacher_num_register_tokens')} | "
+                f"student_stage3_hw={tuple(student_hw)}"
+            )
 
 
 def resize_teacher_attention(
@@ -790,6 +924,64 @@ def compute_local_descriptor_kd_loss(
         }
 
 
+def compute_multi_layer_local_descriptor_kd_loss(
+    model,
+    teacher_tokens_dict,
+    teacher_global,
+    student_feature,
+    local_temperature,
+    local_teacher_layers,
+    local_layer_weights,
+    teacher_num_register_tokens=None,
+    teacher_prob_dict=None,
+):
+    if len(local_teacher_layers) != len(local_layer_weights):
+        raise RuntimeError("local teacher layer and layer weight counts do not match.")
+
+    combined_loss = None
+    combined_cosine = None
+    loss_layers = {}
+    cosine_layers = {}
+    teacher_prob_dict = teacher_prob_dict or {}
+
+    for layer_idx, layer_weight in zip(local_teacher_layers, local_layer_weights):
+        layer_idx = int(layer_idx)
+        teacher_tokens = teacher_tokens_dict.get(layer_idx)
+        if teacher_tokens is None:
+            raise RuntimeError(
+                f"Local descriptor KD missing teacher tokens for layer{layer_idx}."
+            )
+        layer_terms = compute_local_descriptor_kd_loss(
+            model,
+            teacher_tokens,
+            teacher_global,
+            student_feature,
+            local_temperature,
+            teacher_prob=teacher_prob_dict.get(layer_idx),
+            teacher_num_register_tokens=teacher_num_register_tokens,
+        )
+        weight = float(layer_weight)
+        layer_loss = layer_terms["local_desc_loss"]
+        layer_cosine = layer_terms["local_desc_cosine"]
+        loss_layers[layer_idx] = layer_loss
+        cosine_layers[layer_idx] = layer_cosine
+        if combined_loss is None:
+            combined_loss = weight * layer_loss
+            combined_cosine = weight * layer_cosine
+        else:
+            combined_loss = combined_loss + weight * layer_loss
+            combined_cosine = combined_cosine + weight * layer_cosine
+
+    if combined_loss is None:
+        raise RuntimeError("Local descriptor KD requires at least one teacher layer.")
+    return {
+        "local_desc_loss": combined_loss,
+        "local_desc_cosine": combined_cosine,
+        "local_desc_loss_layers": loss_layers,
+        "local_desc_cosine_layers": cosine_layers,
+    }
+
+
 def resolve_teacher_feature_dim(teacher):
     teacher_dim = getattr(teacher, "feature_dim", None)
     if teacher_dim is None:
@@ -954,6 +1146,39 @@ class AverageMeter:
         self.avg = self.sum / max(1, self.count)
 
 
+def make_local_desc_layer_meters(online_kd_state):
+    if online_kd_state is None or not online_kd_state.get("local_desc_enabled", False):
+        return {}
+    return {
+        int(layer): AverageMeter()
+        for layer in online_kd_state.get("local_teacher_layers", [])
+    }
+
+
+def update_local_desc_layer_meters(meters, batch_losses, weight):
+    for layer, value in batch_losses.get("local_desc_loss_layers", {}).items():
+        layer = int(layer)
+        if layer not in meters:
+            meters[layer] = AverageMeter()
+        meters[layer].update(value.item(), weight)
+
+
+def format_local_desc_layer_meters(meters):
+    text = ""
+    for layer in sorted(meters):
+        meter = meters[layer]
+        text += (
+            f"local_desc_loss_layer{layer} {meter.val:.4f} "
+            f"({meter.avg:.4f}) | "
+        )
+    return text
+
+
+def add_local_desc_layer_stats(stats, meters):
+    for layer in sorted(meters):
+        stats[f"local_desc_loss_layer{layer}"] = meters[layer].avg
+
+
 def unpack_sample4geo_batch(batch, device):
     if len(batch) != 4:
         raise ValueError(f"Expected 4 fields from Sample4Geo batch, got {len(batch)}")
@@ -1067,6 +1292,11 @@ def compute_student_batch_losses(
 ):
     if online_kd_state is not None and online_kd_state.get("local_kd_enabled", False):
         online_kd_state["local_teacher_tokens"] = None
+        online_kd_state["local_teacher_tokens_dict"] = {}
+        online_kd_state["raw_teacher_local_tokens_shape"] = None
+        online_kd_state["final_teacher_patch_tokens_shape"] = None
+        online_kd_state["raw_teacher_local_tokens_shape_dict"] = {}
+        online_kd_state["final_teacher_patch_tokens_shape_dict"] = {}
         online_kd_state["local_student_feature"] = None
 
     local_features = model(images)
@@ -1110,13 +1340,27 @@ def compute_student_batch_losses(
         teacher_attn_entropy = loss_infonce.new_zeros(())
         student_attn_entropy = loss_infonce.new_zeros(())
         local_desc_cosine = loss_infonce.new_zeros(())
+        local_desc_loss_layers = {}
+        local_desc_cosine_layers = {}
         teacher_patch_attention = None
-        if (
-            online_kd_state.get("local_attn_enabled", False)
-            or online_kd_state.get("local_desc_enabled", False)
-        ):
+        local_teacher_layers = list(
+            online_kd_state.get(
+                "local_teacher_layers",
+                [online_kd_state.get("local_teacher_layer", 36)],
+            )
+        )
+        local_layer_weights = list(
+            online_kd_state.get("local_layer_weights", [1.0])
+        )
+        teacher_tokens_dict = get_local_teacher_tokens_dict(online_kd_state)
+        if online_kd_state.get("local_attn_enabled", False):
+            if len(local_teacher_layers) > 1:
+                raise NotImplementedError(
+                    "multi-layer local attention KD not implemented"
+                )
+            attn_layer = int(local_teacher_layers[0])
             teacher_patch_attention = compute_teacher_patch_attention(
-                online_kd_state.get("local_teacher_tokens"),
+                teacher_tokens_dict.get(attn_layer),
                 teacher_feats,
                 online_kd_state["local_temperature"],
             )
@@ -1141,7 +1385,7 @@ def compute_student_batch_losses(
         if online_kd_state.get("local_attn_enabled", False):
             local_attn_terms = compute_local_attention_kd_loss(
                 model,
-                online_kd_state.get("local_teacher_tokens"),
+                teacher_tokens_dict.get(int(local_teacher_layers[0])),
                 teacher_feats,
                 online_kd_state.get("local_student_feature"),
                 online_kd_state["local_temperature"],
@@ -1152,17 +1396,26 @@ def compute_student_batch_losses(
             teacher_attn_entropy = local_attn_terms["teacher_attn_entropy"]
             student_attn_entropy = local_attn_terms["student_attn_entropy"]
         if online_kd_state.get("local_desc_enabled", False):
-            local_desc_terms = compute_local_descriptor_kd_loss(
+            teacher_prob_dict = {}
+            if teacher_patch_attention is not None and len(local_teacher_layers) == 1:
+                teacher_prob_dict[int(local_teacher_layers[0])] = teacher_patch_attention
+            local_desc_terms = compute_multi_layer_local_descriptor_kd_loss(
                 model,
-                online_kd_state.get("local_teacher_tokens"),
+                teacher_tokens_dict,
                 teacher_feats,
                 online_kd_state.get("local_student_feature"),
                 online_kd_state["local_temperature"],
-                teacher_patch_attention,
-                online_kd_state.get("teacher_num_register_tokens"),
+                local_teacher_layers,
+                local_layer_weights,
+                teacher_num_register_tokens=online_kd_state.get(
+                    "teacher_num_register_tokens"
+                ),
+                teacher_prob_dict=teacher_prob_dict,
             )
             local_desc_loss = local_desc_terms["local_desc_loss"]
             local_desc_cosine = local_desc_terms["local_desc_cosine"]
+            local_desc_loss_layers = local_desc_terms["local_desc_loss_layers"]
+            local_desc_cosine_layers = local_desc_terms["local_desc_cosine_layers"]
         local_kd_scale = float(local_kd_scale)
         local_kd_loss = (
             float(online_kd_state.get("local_attn_weight", 0.0)) * local_attn_loss
@@ -1190,12 +1443,30 @@ def compute_student_batch_losses(
             "student_attn_entropy": student_attn_entropy,
             "local_desc_loss": local_desc_loss,
             "local_desc_cosine": local_desc_cosine,
+            "local_desc_loss_layers": local_desc_loss_layers,
+            "local_desc_cosine_layers": local_desc_cosine_layers,
             "local_kd_scale": loss_infonce.new_tensor(local_kd_scale),
         })
     return losses
 
 
-def save_model_only_checkpoint(model, epoch, save_path):
+def build_local_kd_checkpoint_config(args, online_kd_state):
+    if online_kd_state is None or not online_kd_state.get("local_kd_enabled", False):
+        return None
+    return {
+        "local_teacher_layer": int(args.local_teacher_layer),
+        "local_teacher_layers": list(online_kd_state.get("local_teacher_layers", [])),
+        "local_layer_weights": list(online_kd_state.get("local_layer_weights", [])),
+        "teacher_num_register_tokens": int(args.teacher_num_register_tokens),
+        "local_student_stage": args.local_student_stage,
+        "local_attn_weight": float(args.local_attn_weight),
+        "local_desc_weight": float(args.local_desc_weight),
+        "local_kd_warmup_epochs": int(args.local_kd_warmup_epochs),
+        "local_temperature": float(args.local_temperature),
+    }
+
+
+def save_model_only_checkpoint(model, epoch, save_path, local_kd_config=None):
     if not is_main_process():
         return
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
@@ -1203,7 +1474,10 @@ def save_model_only_checkpoint(model, epoch, save_path):
         key: value.detach().cpu()
         for key, value in get_raw_model(model).state_dict().items()
     }
-    torch.save({"epoch": epoch, "model": state_dict}, save_path)
+    payload = {"epoch": epoch, "model": state_dict}
+    if local_kd_config is not None:
+        payload["local_kd_config"] = local_kd_config
+    torch.save(payload, save_path)
     print(f"[Checkpoint] saved model weights to: {save_path}")
 
 
@@ -1370,6 +1644,7 @@ def train_one_epoch(
     student_attn_entropy_meter = AverageMeter()
     local_desc_loss_meter = AverageMeter()
     local_desc_cosine_meter = AverageMeter()
+    local_desc_layer_meters = make_local_desc_layer_meters(online_kd_state)
     local_kd_scale = compute_local_kd_scale(
         epoch - 1,
         args.local_kd_warmup_epochs,
@@ -1470,6 +1745,11 @@ def train_one_epoch(
                 batch_losses["local_desc_loss"].item(),
                 images.size(0),
             )
+            update_local_desc_layer_meters(
+                local_desc_layer_meters,
+                batch_losses,
+                images.size(0),
+            )
             local_desc_cosine_meter.update(
                 batch_losses["local_desc_cosine"].item(),
                 images.size(0),
@@ -1511,6 +1791,7 @@ def train_one_epoch(
                     f"local_desc_loss {local_desc_loss_meter.val:.4f} "
                     f"({local_desc_loss_meter.avg:.4f}) | "
                     f"local_desc_weight {args.local_desc_weight:g} | "
+                    f"{format_local_desc_layer_meters(local_desc_layer_meters)}"
                     f"local_kd_scale {local_kd_scale:g} | "
                     f"local_desc_cosine {local_desc_cosine_meter.val:.4f} "
                     f"({local_desc_cosine_meter.avg:.4f}) | "
@@ -1546,6 +1827,7 @@ def train_one_epoch(
         stats["teacher_attn_entropy"] = teacher_attn_entropy_meter.avg
         stats["student_attn_entropy"] = student_attn_entropy_meter.avg
         stats["local_desc_loss"] = local_desc_loss_meter.avg
+        add_local_desc_layer_stats(stats, local_desc_layer_meters)
         stats["local_desc_cosine"] = local_desc_cosine_meter.avg
         stats["local_kd_scale"] = local_kd_scale
     return stats
@@ -1581,6 +1863,7 @@ def train_one_epoch_deepspeed(
     student_attn_entropy_meter = AverageMeter()
     local_desc_loss_meter = AverageMeter()
     local_desc_cosine_meter = AverageMeter()
+    local_desc_layer_meters = make_local_desc_layer_meters(online_kd_state)
     local_kd_scale = compute_local_kd_scale(
         epoch - 1,
         args.local_kd_warmup_epochs,
@@ -1650,6 +1933,11 @@ def train_one_epoch_deepspeed(
                 batch_losses["local_desc_loss"].item(),
                 weight,
             )
+            update_local_desc_layer_meters(
+                local_desc_layer_meters,
+                batch_losses,
+                weight,
+            )
             local_desc_cosine_meter.update(
                 batch_losses["local_desc_cosine"].item(),
                 weight,
@@ -1691,6 +1979,7 @@ def train_one_epoch_deepspeed(
                     f"local_desc_loss {local_desc_loss_meter.val:.4f} "
                     f"({local_desc_loss_meter.avg:.4f}) | "
                     f"local_desc_weight {args.local_desc_weight:g} | "
+                    f"{format_local_desc_layer_meters(local_desc_layer_meters)}"
                     f"local_kd_scale {local_kd_scale:g} | "
                     f"local_desc_cosine {local_desc_cosine_meter.val:.4f} "
                     f"({local_desc_cosine_meter.avg:.4f}) | "
@@ -1727,6 +2016,7 @@ def train_one_epoch_deepspeed(
         stats["teacher_attn_entropy"] = teacher_attn_entropy_meter.avg
         stats["student_attn_entropy"] = student_attn_entropy_meter.avg
         stats["local_desc_loss"] = local_desc_loss_meter.avg
+        add_local_desc_layer_stats(stats, local_desc_layer_meters)
         stats["local_desc_cosine"] = local_desc_cosine_meter.avg
         stats["local_kd_scale"] = local_kd_scale
     return stats
@@ -1833,11 +2123,19 @@ def train(
                 f"{train_stats['teacher_attn_entropy']:.4f}"
                 f" | student_attn_entropy="
                 f"{train_stats['student_attn_entropy']:.4f}"
+                f" | local_teacher_layers="
+                f"{online_kd_state.get('local_teacher_layers')}"
+                f" | local_layer_weights="
+                f"{online_kd_state.get('local_layer_weights')}"
                 f" | local_desc_loss={train_stats['local_desc_loss']:.4f}"
                 f" | local_desc_weight={args.local_desc_weight:g}"
                 f" | local_kd_scale={train_stats['local_kd_scale']:.4f}"
                 f" | local_desc_cosine={train_stats['local_desc_cosine']:.4f}"
             )
+            for layer in online_kd_state.get("local_teacher_layers", []):
+                key = f"local_desc_loss_layer{int(layer)}"
+                if key in train_stats:
+                    train_text += f" | {key}={train_stats[key]:.4f}"
         train_text += (
             f" | total_loss={train_stats['total_loss']:.4f}"
             f" | world_size={get_world_size()}"
@@ -1849,6 +2147,7 @@ def train(
                 model,
                 epoch,
                 os.path.join(args.output_dir, "last_model.pth"),
+                build_local_kd_checkpoint_config(args, online_kd_state),
             )
 
         if args.val_interval > 0 and (
@@ -1876,6 +2175,7 @@ def train(
                     model,
                     epoch,
                     os.path.join(args.output_dir, "best_model.pth"),
+                    build_local_kd_checkpoint_config(args, online_kd_state),
                 )
                 print(f"[Best] R1_sum improved to {best_metric:.6f}")
 
@@ -1965,11 +2265,19 @@ def train_deepspeed(
                     f"{train_stats['teacher_attn_entropy']:.4f}"
                     f" | student_attn_entropy="
                     f"{train_stats['student_attn_entropy']:.4f}"
+                    f" | local_teacher_layers="
+                    f"{online_kd_state.get('local_teacher_layers')}"
+                    f" | local_layer_weights="
+                    f"{online_kd_state.get('local_layer_weights')}"
                     f" | local_desc_loss={train_stats['local_desc_loss']:.4f}"
                     f" | local_desc_weight={args.local_desc_weight:g}"
                     f" | local_kd_scale={train_stats['local_kd_scale']:.4f}"
                     f" | local_desc_cosine={train_stats['local_desc_cosine']:.4f}"
                 )
+                for layer in online_kd_state.get("local_teacher_layers", []):
+                    key = f"local_desc_loss_layer{int(layer)}"
+                    if key in train_stats:
+                        train_text += f" | {key}={train_stats[key]:.4f}"
             train_text += (
                 f" | total_loss={train_stats['total_loss']:.4f} | "
                 f"world_size={get_world_size()}"
@@ -1981,6 +2289,7 @@ def train_deepspeed(
                 model_engine,
                 epoch,
                 os.path.join(args.output_dir, "last_model.pth"),
+                build_local_kd_checkpoint_config(args, online_kd_state),
             )
 
         if args.val_interval > 0 and (
@@ -2007,6 +2316,7 @@ def train_deepspeed(
                     model_engine,
                     epoch,
                     os.path.join(args.output_dir, "best_model.pth"),
+                    build_local_kd_checkpoint_config(args, online_kd_state),
                 )
 
             if is_main_process():
@@ -2083,6 +2393,8 @@ def parse_args():
         default=False,
     )
     parser.add_argument("--local_teacher_layer", type=int, default=36)
+    parser.add_argument("--local_teacher_layers", type=str, default=None)
+    parser.add_argument("--local_layer_weights", type=str, default=None)
     parser.add_argument("--teacher_num_register_tokens", type=int, default=4)
     parser.add_argument(
         "--local_student_stage",
@@ -2133,6 +2445,22 @@ def parse_args():
         parser.error("--local_kd_warmup_epochs must be non-negative")
     if args.local_temperature <= 0.0:
         parser.error("--local_temperature must be greater than 0")
+    try:
+        args.local_teacher_layers_resolved = parse_local_teacher_layers(
+            args.local_teacher_layers,
+            args.local_teacher_layer,
+        )
+        args.local_layer_weights_resolved = parse_local_layer_weights(
+            args.local_layer_weights,
+            len(args.local_teacher_layers_resolved),
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+    if (
+        len(args.local_teacher_layers_resolved) > 1
+        and float(args.local_attn_weight) > 0.0
+    ):
+        raise NotImplementedError("multi-layer local attention KD not implemented")
     if is_local_kd_enabled(args) and not args.enable_online_kd:
         parser.error("--enable_local_kd requires --enable_online_kd true")
     if is_online_kd_active(args) and not args.teacher_ckpt:
