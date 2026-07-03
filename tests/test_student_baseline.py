@@ -11,7 +11,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from src.models.student_model import StudentModel
+from src.models.student_model import LargeKernelDWAdapter, PSATiny, StudentModel
 import src.training.student_train as student_train
 from src.training.student_train import compute_student_batch_losses
 from src.utils.rank_logging import rank0_print
@@ -46,6 +46,83 @@ def test_student_forward_matches_f4_gap_bn_l2_path():
         expected = F.normalize(model.neck(desc), dim=1)
 
     torch.testing.assert_close(embedding, expected, atol=1e-6, rtol=1e-6)
+
+
+def test_large_kernel_dw_adapter_shape_params_and_macs():
+    torch.manual_seed(17)
+    adapter = LargeKernelDWAdapter(gamma_init=0.0).eval()
+    x = torch.randn(2, 512, 7, 7)
+
+    with torch.no_grad():
+        out = adapter(x)
+
+    params = adapter.parameter_count()
+    macs = LargeKernelDWAdapter.estimate_macs((1, 512, 7, 7))
+
+    assert out.shape == (2, 512, 7, 7)
+    torch.testing.assert_close(out, x, atol=1e-6, rtol=1e-6)
+    assert params == 289281
+    assert params / 1e6 == pytest.approx(0.289, abs=0.001)
+    assert macs == 14074368
+    assert macs / 1e9 == pytest.approx(0.014, abs=0.001)
+
+
+def test_student_lk_adapter_is_only_registered_when_enabled():
+    torch.manual_seed(23)
+    baseline = StudentModel(ckpt_path=None)
+    enabled = StudentModel(ckpt_path=None, enable_lk_adapter=True).eval()
+    x = torch.randn(1, 3, 224, 224)
+
+    assert baseline.lk_adapter is None
+    assert isinstance(enabled.lk_adapter, LargeKernelDWAdapter)
+    assert enabled.lk_adapter.parameter_count() == 289281
+
+    with torch.no_grad():
+        embedding = enabled(x)
+
+    assert embedding.shape == (1, 512)
+
+
+def test_psa_tiny_shape_params_and_macs():
+    torch.manual_seed(29)
+    psa = PSATiny(gamma_init=0.0).eval()
+    x = torch.randn(2, 512, 7, 7)
+
+    with torch.no_grad():
+        out = psa(x)
+
+    params = psa.parameter_count()
+    macs = PSATiny.estimate_macs(
+        (1, 512, 7, 7),
+        ratio=0.25,
+        num_heads=4,
+        ffn_ratio=1.0,
+    )
+
+    assert out.shape == (2, 512, 7, 7)
+    torch.testing.assert_close(out, x, atol=1e-6, rtol=1e-6)
+    assert params == 82433
+    assert params / 1e6 == pytest.approx(0.082, abs=0.001)
+    assert macs == 4475072
+    assert 0.004 <= macs / 1e9 <= 0.006
+
+
+def test_student_psa_tiny_is_only_registered_when_enabled():
+    torch.manual_seed(31)
+    baseline = StudentModel(ckpt_path=None)
+    enabled = StudentModel(ckpt_path=None, enable_psa_tiny=True).eval()
+    x = torch.randn(1, 3, 224, 224)
+
+    assert baseline.psa_tiny is None
+    assert isinstance(enabled.psa_tiny, PSATiny)
+    assert enabled.psa_tiny.attn_channels == 128
+    assert enabled.psa_tiny.bypass_channels == 384
+    assert enabled.psa_tiny.parameter_count() == 82433
+
+    with torch.no_grad():
+        embedding = enabled(x)
+
+    assert embedding.shape == (1, 512)
 
 
 def test_student_batch_loss_is_only_symmetric_infonce():

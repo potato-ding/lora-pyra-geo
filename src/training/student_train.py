@@ -2397,6 +2397,24 @@ def parse_args():
     parser.add_argument("--temperature", type=float, default=0.07)
     parser.add_argument("--label_smoothing", type=float, default=0.1)
     parser.add_argument(
+        "--enable_lk_adapter",
+        type=str2bool,
+        nargs="?",
+        const=True,
+        default=False,
+    )
+    parser.add_argument(
+        "--enable_psa_tiny",
+        type=str2bool,
+        nargs="?",
+        const=True,
+        default=False,
+    )
+    parser.add_argument("--psa_ratio", type=float, default=0.25)
+    parser.add_argument("--psa_num_heads", type=int, default=4)
+    parser.add_argument("--psa_ffn_ratio", type=float, default=1.0)
+    parser.add_argument("--adapter_gamma_init", type=float, default=0.0)
+    parser.add_argument(
         "--enable_online_kd",
         type=str2bool,
         nargs="?",
@@ -2462,6 +2480,12 @@ def parse_args():
         parser.error("--kd_sim_weight must be non-negative")
     if args.kd_temperature <= 0.0:
         parser.error("--kd_temperature must be greater than 0")
+    if args.psa_ratio <= 0.0:
+        parser.error("--psa_ratio must be greater than 0")
+    if args.psa_num_heads <= 0:
+        parser.error("--psa_num_heads must be greater than 0")
+    if args.psa_ffn_ratio <= 0.0:
+        parser.error("--psa_ffn_ratio must be greater than 0")
     if args.local_teacher_layer < 0:
         parser.error("--local_teacher_layer must be non-negative")
     if args.teacher_num_register_tokens < 0:
@@ -2561,6 +2585,12 @@ def main():
 
     model = StudentModel(
         temperature=args.temperature,
+        enable_lk_adapter=args.enable_lk_adapter,
+        enable_psa_tiny=args.enable_psa_tiny,
+        psa_ratio=args.psa_ratio,
+        psa_num_heads=args.psa_num_heads,
+        psa_ffn_ratio=args.psa_ffn_ratio,
+        adapter_gamma_init=args.adapter_gamma_init,
     ).to(device)
     maybe_create_kd_projector(model, online_kd_state, device)
     maybe_create_local_attn_head(model, online_kd_state, device)
