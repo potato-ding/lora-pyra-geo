@@ -18,8 +18,8 @@ from src.dataset.teacher.val_dataloaders import (
     build_gta_val_dataloaders,
     build_sues200_val_dataloaders,
 )
-from src.inference.student_eval import load_student_checkpoint
 from src.models.student_model import StudentModel
+from src.utils.student_checkpoint import load_student_checkpoint
 from src.utils.train_eval_utils import (
     getdist_1652_val_and_get_recall,
     run_gta_val_and_get_metrics,

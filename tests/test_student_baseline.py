@@ -1001,8 +1001,8 @@ def test_online_kd_feature_shape_log_prints_once(capsys):
     assert "student_feats=(4, 512)" in output
 
 
-def test_student_eval_ignores_training_only_kd_projector(tmp_path):
-    from src.inference.student_eval import load_student_checkpoint
+def test_student_checkpoint_loader_ignores_training_only_kd_projector(tmp_path):
+    from src.utils.student_checkpoint import load_student_checkpoint
 
     class TinyEvalModel(nn.Module):
         def __init__(self):
@@ -1097,7 +1097,7 @@ def test_student_source_has_no_removed_experiment_strings():
     paths = [
         os.path.join(ROOT, "src", "models", "student_model.py"),
         os.path.join(ROOT, "src", "training", "student_train.py"),
-        os.path.join(ROOT, "src", "inference", "student_eval.py"),
+        os.path.join(ROOT, "src", "utils", "student_checkpoint.py"),
     ]
 
     assert not os.path.exists(
