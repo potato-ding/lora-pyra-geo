@@ -98,6 +98,20 @@ def is_online_kd_active(args):
     )
 
 
+# Verified KD path. Do not change loss behavior without re-running ablations.
+#
+# Current verified KD recipe:
+# - Plain Online KD enabled
+# - kd_feat_weight = 0.05
+# - kd_sim_weight = 0.05
+# - kd_temperature = 0.1
+# - enable_local_kd = true
+# - local_attn_weight = 0
+# - local_desc_weight = 0.02
+# - local_kd_warmup_epochs = 5
+# - local_teacher_layers = 27,36
+# - local_layer_weights = 0.5,0.5
+# - local_desc_weight is the total local descriptor KD weight, not per-layer.
 def compute_local_kd_scale(epoch_index, local_kd_warmup_epochs):
     warmup_epochs = int(local_kd_warmup_epochs)
     if warmup_epochs <= 0:
@@ -455,6 +469,8 @@ def resolve_teacher_layer_module(teacher, layer_idx):
 
 
 def make_teacher_local_hook(state, layer_idx):
+    # Verified KD path: teacher local token capture feeds descriptor KD.
+    # Keep CLS/register-token handling aligned with extract_teacher_patch_tokens_from_hook.
     def hook(_module, _inputs, output):
         patch_tokens, raw_shape = extract_teacher_patch_tokens_from_hook(
             output,
@@ -478,6 +494,8 @@ def make_teacher_local_hook(state, layer_idx):
 
 
 def make_student_local_hook(state):
+    # Verified KD path: captures the RepViT stage feature map only in training.
+    # Do not detach when local descriptor/attention needs student gradients.
     def hook(module, _inputs, output):
         if not getattr(module, "training", False):
             return
@@ -935,6 +953,9 @@ def compute_multi_layer_local_descriptor_kd_loss(
     teacher_num_register_tokens=None,
     teacher_prob_dict=None,
 ):
+    # Verified KD path. Multi-layer descriptor loss is a weighted average of
+    # per-layer descriptor losses. The caller applies the total
+    # local_desc_weight once after this function returns.
     if len(local_teacher_layers) != len(local_layer_weights):
         raise RuntimeError("local teacher layer and layer weight counts do not match.")
 
@@ -1421,6 +1442,8 @@ def compute_student_batch_losses(
             float(online_kd_state.get("local_attn_weight", 0.0)) * local_attn_loss
             + float(online_kd_state.get("local_desc_weight", 0.0)) * local_desc_loss
         )
+        # Verified KD path. local_kd_scale applies to local attention/descriptor
+        # only; feature/similarity KD and retrieval loss are intentionally outside.
         total_loss = (
             loss_infonce
             + float(online_kd_state["kd_feat_weight"]) * feature_kd_loss
@@ -2385,6 +2408,8 @@ def parse_args():
     parser.add_argument("--kd_feat_weight", type=float, default=0.0)
     parser.add_argument("--kd_sim_weight", type=float, default=0.0)
     parser.add_argument("--kd_temperature", type=float, default=0.1)
+    # Verified KD recipe uses Plain KD weights 0.05/0.05 with T=0.1.
+    # Keep defaults at zero so no-KD baseline behavior stays unchanged.
     parser.add_argument(
         "--enable_local_kd",
         type=str2bool,
@@ -2406,6 +2431,10 @@ def parse_args():
     parser.add_argument("--local_desc_weight", type=float, default=0.0)
     parser.add_argument("--local_kd_warmup_epochs", type=int, default=0)
     parser.add_argument("--local_temperature", type=float, default=0.5)
+    # Verified local descriptor recipe:
+    # --enable_local_kd true --local_attn_weight 0 --local_desc_weight 0.02
+    # --local_kd_warmup_epochs 5 --local_teacher_layers 27,36
+    # --local_layer_weights 0.5,0.5. The descriptor weight is total weight.
     parser.add_argument("--amp", dest="amp", action="store_true", default=True)
     parser.add_argument("--no_amp", dest="amp", action="store_false")
     parser.add_argument("--grad_clip", type=float, default=0.0)
