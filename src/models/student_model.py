@@ -7,34 +7,13 @@ from src.models.repvit_backbone import RepViTBackbone
 from src.utils.rank_logging import rank0_print
 
 
-class GeM(nn.Module):
-    """Generalized mean pooling for the final feature map."""
-
-    def __init__(self, p=3.0, eps=1e-6, learn_p=True):
-        super().__init__()
-        p = torch.ones([]) * float(p)
-        self.eps = float(eps)
-        if learn_p:
-            self.p = nn.Parameter(p)
-        else:
-            self.register_buffer("p", p)
-
-    def forward(self, x):
-        p = self.p
-        x = x.clamp(min=self.eps).pow(p)
-        x = F.adaptive_avg_pool2d(x, 1)
-        x = x.pow(1.0 / p)
-        return x.flatten(1)
-
-
 class LargeKernelDWAdapter(nn.Module):
     """7x7 depthwise adapter for the RepViT f4 feature map."""
 
-    def __init__(self, channels=None, gamma_init=0.0, gamma_cap=None):
+    def __init__(self, channels=None, gamma_init=0.0):
         super().__init__()
         self.channels = int(channels) if channels is not None else None
         self.gamma_init = float(gamma_init)
-        self.gamma_cap = None if gamma_cap is None else float(gamma_cap)
 
         if self.channels is not None:
             self._build(self.channels)
@@ -99,10 +78,7 @@ class LargeKernelDWAdapter(nn.Module):
         out = self.act(out)
         out = self.pwconv(out)
         out = self.pw_bn(out)
-        if self.gamma_cap is None:
-            scale = self.gamma
-        else:
-            scale = self.gamma_cap * torch.tanh(self.gamma)
+        scale = self.gamma
         return x + scale * out
 
 
@@ -116,7 +92,6 @@ class PSATiny(nn.Module):
         num_heads=4,
         ffn_ratio=1.0,
         gamma_init=0.0,
-        gamma_cap=None,
     ):
         super().__init__()
         self.channels = int(channels) if channels is not None else None
@@ -124,7 +99,6 @@ class PSATiny(nn.Module):
         self.num_heads = int(num_heads)
         self.ffn_ratio = float(ffn_ratio)
         self.gamma_init = float(gamma_init)
-        self.gamma_cap = None if gamma_cap is None else float(gamma_cap)
 
         if self.channels is not None:
             self._build(self.channels)
@@ -285,10 +259,7 @@ class PSATiny(nn.Module):
             width,
         )
         mixed = torch.cat([x_bypass, x_attn_out], dim=1)
-        if self.gamma_cap is None:
-            scale = self.gamma
-        else:
-            scale = self.gamma_cap * torch.tanh(self.gamma)
+        scale = self.gamma
         return x + scale * (mixed - x)
 
 
@@ -297,7 +268,6 @@ class StudentModel(nn.Module):
 
     BACKBONE_NAME = "RepViT-M1.5"
     ADAPTER_FUSION_MODES = ("sequential", "parallel")
-    POOLING_TYPES = ("gap", "gem")
 
     def __init__(
         self,
@@ -310,8 +280,6 @@ class StudentModel(nn.Module):
         psa_ffn_ratio=1.0,
         adapter_gamma_init=0.0,
         adapter_fusion_mode="sequential",
-        gamma_cap=None,
-        pooling_type="gap",
     ):
         super().__init__()
         self.embedding_dim = 512
@@ -324,18 +292,10 @@ class StudentModel(nn.Module):
                 f"{self.ADAPTER_FUSION_MODES}, got {adapter_fusion_mode!r}"
             )
         self.adapter_fusion_mode = adapter_fusion_mode
-        pooling_type = str(pooling_type)
-        if pooling_type not in self.POOLING_TYPES:
-            raise ValueError(
-                "pooling_type must be one of "
-                f"{self.POOLING_TYPES}, got {pooling_type!r}"
-            )
-        self.pooling_type = pooling_type
         self.psa_ratio = float(psa_ratio)
         self.psa_num_heads = int(psa_num_heads)
         self.psa_ffn_ratio = float(psa_ffn_ratio)
         self.adapter_gamma_init = float(adapter_gamma_init)
-        self.gamma_cap = None if gamma_cap is None else float(gamma_cap)
         self._f4_shape_logged = False
 
         self.backbone = RepViTBackbone(ckpt_path=ckpt_path)
@@ -343,7 +303,6 @@ class StudentModel(nn.Module):
             self.lk_adapter = LargeKernelDWAdapter(
                 channels=self.embedding_dim,
                 gamma_init=self.adapter_gamma_init,
-                gamma_cap=self.gamma_cap,
             )
         else:
             self.lk_adapter = None
@@ -354,14 +313,9 @@ class StudentModel(nn.Module):
                 num_heads=self.psa_num_heads,
                 ffn_ratio=self.psa_ffn_ratio,
                 gamma_init=self.adapter_gamma_init,
-                gamma_cap=self.gamma_cap,
             )
         else:
             self.psa_tiny = None
-        if self.pooling_type == "gem":
-            self.pooling = GeM(p=3.0, learn_p=True)
-        else:
-            self.pooling = None
         self.neck = nn.BatchNorm1d(self.embedding_dim)
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / temperature))
 
@@ -371,14 +325,8 @@ class StudentModel(nn.Module):
         rank0_print("StudentModel config:")
         rank0_print(f"  student_backbone: {self.BACKBONE_NAME}")
         rank0_print("  architecture: RepViT-M1.5 backbone only")
-        rank0_print(
-            f"  descriptor: f4 -> {self.pooling_type.upper()} "
-            "-> BatchNorm1d(512) -> L2"
-        )
+        rank0_print("  descriptor: f4 -> GAP -> BatchNorm1d(512) -> L2")
         rank0_print(f"  embedding_dim: {self.embedding_dim}")
-        rank0_print(f"  pooling_type: {self.pooling_type}")
-        if self.pooling is not None:
-            rank0_print(f"  gem_p: {self.pooling.p.detach().float().item():g}")
         rank0_print(f"  adapter_fusion_mode: {self.adapter_fusion_mode}")
         rank0_print(f"  enable_lk_adapter: {self.enable_lk_adapter}")
         rank0_print(f"  enable_psa_tiny: {self.enable_psa_tiny}")
@@ -386,7 +334,6 @@ class StudentModel(nn.Module):
         rank0_print(f"  psa_num_heads: {self.psa_num_heads}")
         rank0_print(f"  psa_ffn_ratio: {self.psa_ffn_ratio:g}")
         rank0_print(f"  adapter_gamma_init: {self.adapter_gamma_init:g}")
-        rank0_print(f"  gamma_cap: {self.gamma_cap}")
         total_params = sum(param.numel() for param in self.parameters())
         rank0_print(
             "  total_params: "
@@ -451,16 +398,11 @@ class StudentModel(nn.Module):
             out = out + (psa_out - f4)
         return out
 
-    def _pool_features(self, f4):
-        if self.pooling_type == "gap":
-            return F.adaptive_avg_pool2d(f4, 1).flatten(1)
-        return self.pooling(f4)
-
     def forward(self, x):
         features = self.backbone(x)
         f4 = features[-1]
         self._log_f4_shape_once(f4)
         f4 = self._apply_feature_adapters(f4)
-        desc = self._pool_features(f4)
+        desc = F.adaptive_avg_pool2d(f4, 1).flatten(1)
         desc = self.neck(desc)
         return F.normalize(desc, dim=1)

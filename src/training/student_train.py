@@ -1621,12 +1621,7 @@ def format_adapter_gamma_state(name, module):
     if module is None or not hasattr(module, "gamma"):
         return None
     gamma = module.gamma.detach().float()
-    text = f"{name}_gamma={gamma.item():.6f}"
-    gamma_cap = getattr(module, "gamma_cap", None)
-    if gamma_cap is not None:
-        scale = float(gamma_cap) * torch.tanh(gamma).item()
-        text += f" | {name}_scale={scale:.6f}"
-    return text
+    return f"{name}_gamma={gamma.item():.6f}"
 
 
 def log_adapter_gamma_state(model):
@@ -2447,13 +2442,6 @@ def parse_args():
     parser.add_argument("--psa_num_heads", type=int, default=4)
     parser.add_argument("--psa_ffn_ratio", type=float, default=1.0)
     parser.add_argument("--adapter_gamma_init", type=float, default=0.0)
-    parser.add_argument("--gamma_cap", type=float, default=None)
-    parser.add_argument(
-        "--pooling_type",
-        type=str,
-        default="gap",
-        choices=StudentModel.POOLING_TYPES,
-    )
     parser.add_argument(
         "--adapter_fusion_mode",
         type=str,
@@ -2638,8 +2626,6 @@ def main():
         psa_ffn_ratio=args.psa_ffn_ratio,
         adapter_gamma_init=args.adapter_gamma_init,
         adapter_fusion_mode=args.adapter_fusion_mode,
-        gamma_cap=args.gamma_cap,
-        pooling_type=args.pooling_type,
     ).to(device)
     maybe_create_kd_projector(model, online_kd_state, device)
     maybe_create_local_attn_head(model, online_kd_state, device)
