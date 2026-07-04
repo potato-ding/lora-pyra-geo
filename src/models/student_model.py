@@ -10,10 +10,11 @@ from src.utils.rank_logging import rank0_print
 class LargeKernelDWAdapter(nn.Module):
     """7x7 depthwise adapter for the RepViT f4 feature map."""
 
-    def __init__(self, channels=None, gamma_init=0.0):
+    def __init__(self, channels=None, gamma_init=0.0, gamma_cap=None):
         super().__init__()
         self.channels = int(channels) if channels is not None else None
         self.gamma_init = float(gamma_init)
+        self.gamma_cap = None if gamma_cap is None else float(gamma_cap)
 
         if self.channels is not None:
             self._build(self.channels)
@@ -78,7 +79,11 @@ class LargeKernelDWAdapter(nn.Module):
         out = self.act(out)
         out = self.pwconv(out)
         out = self.pw_bn(out)
-        return x + self.gamma * out
+        if self.gamma_cap is None:
+            scale = self.gamma
+        else:
+            scale = self.gamma_cap * torch.tanh(self.gamma)
+        return x + scale * out
 
 
 class PSATiny(nn.Module):
@@ -91,6 +96,7 @@ class PSATiny(nn.Module):
         num_heads=4,
         ffn_ratio=1.0,
         gamma_init=0.0,
+        gamma_cap=None,
     ):
         super().__init__()
         self.channels = int(channels) if channels is not None else None
@@ -98,6 +104,7 @@ class PSATiny(nn.Module):
         self.num_heads = int(num_heads)
         self.ffn_ratio = float(ffn_ratio)
         self.gamma_init = float(gamma_init)
+        self.gamma_cap = None if gamma_cap is None else float(gamma_cap)
 
         if self.channels is not None:
             self._build(self.channels)
@@ -258,7 +265,11 @@ class PSATiny(nn.Module):
             width,
         )
         mixed = torch.cat([x_bypass, x_attn_out], dim=1)
-        return x + self.gamma * (mixed - x)
+        if self.gamma_cap is None:
+            scale = self.gamma
+        else:
+            scale = self.gamma_cap * torch.tanh(self.gamma)
+        return x + scale * (mixed - x)
 
 
 class StudentModel(nn.Module):
@@ -278,6 +289,7 @@ class StudentModel(nn.Module):
         psa_ffn_ratio=1.0,
         adapter_gamma_init=0.0,
         adapter_fusion_mode="sequential",
+        gamma_cap=None,
     ):
         super().__init__()
         self.embedding_dim = 512
@@ -294,6 +306,7 @@ class StudentModel(nn.Module):
         self.psa_num_heads = int(psa_num_heads)
         self.psa_ffn_ratio = float(psa_ffn_ratio)
         self.adapter_gamma_init = float(adapter_gamma_init)
+        self.gamma_cap = None if gamma_cap is None else float(gamma_cap)
         self._f4_shape_logged = False
 
         self.backbone = RepViTBackbone(ckpt_path=ckpt_path)
@@ -301,6 +314,7 @@ class StudentModel(nn.Module):
             self.lk_adapter = LargeKernelDWAdapter(
                 channels=self.embedding_dim,
                 gamma_init=self.adapter_gamma_init,
+                gamma_cap=self.gamma_cap,
             )
         else:
             self.lk_adapter = None
@@ -311,6 +325,7 @@ class StudentModel(nn.Module):
                 num_heads=self.psa_num_heads,
                 ffn_ratio=self.psa_ffn_ratio,
                 gamma_init=self.adapter_gamma_init,
+                gamma_cap=self.gamma_cap,
             )
         else:
             self.psa_tiny = None
@@ -332,6 +347,7 @@ class StudentModel(nn.Module):
         rank0_print(f"  psa_num_heads: {self.psa_num_heads}")
         rank0_print(f"  psa_ffn_ratio: {self.psa_ffn_ratio:g}")
         rank0_print(f"  adapter_gamma_init: {self.adapter_gamma_init:g}")
+        rank0_print(f"  gamma_cap: {self.gamma_cap}")
         total_params = sum(param.numel() for param in self.parameters())
         rank0_print(
             "  total_params: "

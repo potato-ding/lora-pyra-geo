@@ -1617,6 +1617,37 @@ def print_trainable_parameter_summary(model):
     )
 
 
+def format_adapter_gamma_state(name, module):
+    if module is None or not hasattr(module, "gamma"):
+        return None
+    gamma = module.gamma.detach().float()
+    text = f"{name}_gamma={gamma.item():.6f}"
+    gamma_cap = getattr(module, "gamma_cap", None)
+    if gamma_cap is not None:
+        scale = float(gamma_cap) * torch.tanh(gamma).item()
+        text += f" | {name}_scale={scale:.6f}"
+    return text
+
+
+def log_adapter_gamma_state(model):
+    if not is_main_process():
+        return
+    raw_model = get_raw_model(model)
+    parts = [
+        format_adapter_gamma_state(
+            "lk_adapter",
+            getattr(raw_model, "lk_adapter", None),
+        ),
+        format_adapter_gamma_state(
+            "psa_tiny",
+            getattr(raw_model, "psa_tiny", None),
+        ),
+    ]
+    parts = [part for part in parts if part is not None]
+    if parts:
+        print("[AdapterGamma] " + " | ".join(parts))
+
+
 def format_optional_float(value, precision=4):
     if value is None:
         return "N/A"
@@ -2164,6 +2195,7 @@ def train(
             f" | world_size={get_world_size()}"
         )
         print(train_text)
+        log_adapter_gamma_state(model)
 
         if args.save_last:
             save_model_only_checkpoint(
@@ -2306,6 +2338,7 @@ def train_deepspeed(
                 f"world_size={get_world_size()}"
             )
             print(train_text)
+            log_adapter_gamma_state(model_engine)
 
         if args.save_last:
             save_model_only_checkpoint(
@@ -2414,6 +2447,7 @@ def parse_args():
     parser.add_argument("--psa_num_heads", type=int, default=4)
     parser.add_argument("--psa_ffn_ratio", type=float, default=1.0)
     parser.add_argument("--adapter_gamma_init", type=float, default=0.0)
+    parser.add_argument("--gamma_cap", type=float, default=None)
     parser.add_argument(
         "--adapter_fusion_mode",
         type=str,
@@ -2598,6 +2632,7 @@ def main():
         psa_ffn_ratio=args.psa_ffn_ratio,
         adapter_gamma_init=args.adapter_gamma_init,
         adapter_fusion_mode=args.adapter_fusion_mode,
+        gamma_cap=args.gamma_cap,
     ).to(device)
     maybe_create_kd_projector(model, online_kd_state, device)
     maybe_create_local_attn_head(model, online_kd_state, device)

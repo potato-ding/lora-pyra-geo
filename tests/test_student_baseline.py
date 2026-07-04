@@ -69,6 +69,22 @@ def test_large_kernel_dw_adapter_shape_params_and_macs():
     assert macs / 1e9 == pytest.approx(0.014, abs=0.001)
 
 
+def test_adapter_gamma_cap_smoke_shapes():
+    torch.manual_seed(19)
+    x = torch.randn(2, 512, 7, 7)
+
+    for gamma_cap in (None, 0.1):
+        lk_adapter = LargeKernelDWAdapter(gamma_cap=gamma_cap).eval()
+        psa_tiny = PSATiny(gamma_cap=gamma_cap).eval()
+
+        with torch.no_grad():
+            lk_out = lk_adapter(x)
+            psa_out = psa_tiny(x)
+
+        assert lk_out.shape == (2, 512, 7, 7)
+        assert psa_out.shape == (2, 512, 7, 7)
+
+
 def test_student_lk_adapter_is_only_registered_when_enabled():
     torch.manual_seed(23)
     baseline = StudentModel(ckpt_path=None)
@@ -253,6 +269,7 @@ def test_cli_defaults_to_clean_baseline(monkeypatch):
     assert args.local_kd_warmup_epochs == 0
     assert args.local_temperature == 0.5
     assert args.adapter_fusion_mode == "sequential"
+    assert args.gamma_cap is None
     assert student_train.is_online_kd_active(args) is False
 
     removed_attrs = [
