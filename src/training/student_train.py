@@ -2449,6 +2449,12 @@ def parse_args():
     parser.add_argument("--adapter_gamma_init", type=float, default=0.0)
     parser.add_argument("--gamma_cap", type=float, default=None)
     parser.add_argument(
+        "--pooling_type",
+        type=str,
+        default="gap",
+        choices=StudentModel.POOLING_TYPES,
+    )
+    parser.add_argument(
         "--adapter_fusion_mode",
         type=str,
         default="sequential",
@@ -2633,6 +2639,7 @@ def main():
         adapter_gamma_init=args.adapter_gamma_init,
         adapter_fusion_mode=args.adapter_fusion_mode,
         gamma_cap=args.gamma_cap,
+        pooling_type=args.pooling_type,
     ).to(device)
     maybe_create_kd_projector(model, online_kd_state, device)
     maybe_create_local_attn_head(model, online_kd_state, device)

@@ -11,7 +11,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from src.models.student_model import LargeKernelDWAdapter, PSATiny, StudentModel
+from src.models.student_model import GeM, LargeKernelDWAdapter, PSATiny, StudentModel
 import src.training.student_train as student_train
 from src.training.student_train import compute_student_batch_losses
 from src.utils.rank_logging import rank0_print
@@ -67,6 +67,19 @@ def test_large_kernel_dw_adapter_shape_params_and_macs():
     assert params / 1e6 == pytest.approx(0.289, abs=0.001)
     assert macs == 14074368
     assert macs / 1e9 == pytest.approx(0.014, abs=0.001)
+
+
+def test_pooling_necks_smoke_shapes():
+    torch.manual_seed(18)
+    x = torch.randn(2, 512, 7, 7)
+    gem = GeM().eval()
+
+    with torch.no_grad():
+        gap_out = F.adaptive_avg_pool2d(x, 1).flatten(1)
+        gem_out = gem(x)
+
+    assert gap_out.shape == (2, 512)
+    assert gem_out.shape == (2, 512)
 
 
 def test_adapter_gamma_cap_smoke_shapes():
@@ -270,6 +283,7 @@ def test_cli_defaults_to_clean_baseline(monkeypatch):
     assert args.local_temperature == 0.5
     assert args.adapter_fusion_mode == "sequential"
     assert args.gamma_cap is None
+    assert args.pooling_type == "gap"
     assert student_train.is_online_kd_active(args) is False
 
     removed_attrs = [
