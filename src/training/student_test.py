@@ -29,6 +29,17 @@ from src.utils.train_eval_utils import (
 SUPPORTED_DATASETS = ("1652", "GTA-UAV", "SUES-200")
 
 
+def str2bool(value):
+    if isinstance(value, bool):
+        return value
+    value = value.lower()
+    if value in {"1", "true", "t", "yes", "y"}:
+        return True
+    if value in {"0", "false", "f", "no", "n"}:
+        return False
+    raise argparse.ArgumentTypeError("expected a boolean value")
+
+
 def is_main_process():
     return not dist.is_available() or not dist.is_initialized() or dist.get_rank() == 0
 
@@ -186,11 +197,35 @@ def parse_args():
     parser.add_argument("--img_size", type=int, default=224)
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--temperature", type=float, default=0.07)
+    parser.add_argument(
+        "--enable_lk_adapter",
+        type=str2bool,
+        nargs="?",
+        const=True,
+        default=False,
+    )
+    parser.add_argument(
+        "--enable_psa_tiny",
+        type=str2bool,
+        nargs="?",
+        const=True,
+        default=False,
+    )
+    parser.add_argument("--psa_ratio", type=float, default=0.25)
+    parser.add_argument("--psa_num_heads", type=int, default=4)
+    parser.add_argument("--psa_ffn_ratio", type=float, default=1.0)
+    parser.add_argument("--adapter_gamma_init", type=float, default=0.0)
     parser.add_argument("--output_json", type=str, default=None, help="Ignored; student tests are print-only.")
     parser.add_argument("--strict", dest="strict", action="store_true", default=True)
     parser.add_argument("--no_strict", dest="strict", action="store_false")
     parser.add_argument("--local_rank", type=int, default=0)
     args = parser.parse_args()
+    if args.psa_ratio <= 0.0:
+        parser.error("--psa_ratio must be greater than 0")
+    if args.psa_num_heads <= 0:
+        parser.error("--psa_num_heads must be greater than 0")
+    if args.psa_ffn_ratio <= 0.0:
+        parser.error("--psa_ffn_ratio must be greater than 0")
     args.checkpoint = resolve_checkpoint_path(args.checkpoint)
     return args
 
@@ -209,7 +244,16 @@ def main():
     loaders = build_loaders_for_dataset(args.dataset, args)
     distributed_barrier(local_rank)
 
-    model = StudentModel(ckpt_path=None, temperature=args.temperature).to(device)
+    model = StudentModel(
+        ckpt_path=None,
+        temperature=args.temperature,
+        enable_lk_adapter=args.enable_lk_adapter,
+        enable_psa_tiny=args.enable_psa_tiny,
+        psa_ratio=args.psa_ratio,
+        psa_num_heads=args.psa_num_heads,
+        psa_ffn_ratio=args.psa_ffn_ratio,
+        adapter_gamma_init=args.adapter_gamma_init,
+    ).to(device)
     load_student_checkpoint(model, args.checkpoint, strict=args.strict)
     model.eval()
 
