@@ -22,6 +22,8 @@ def test_student_forward_outputs_normalized_512d_embedding():
     model = StudentModel(ckpt_path=None).eval()
     x = torch.randn(3, 3, 224, 224)
 
+    assert model.adapter_fusion_mode == "sequential"
+
     with torch.no_grad():
         embedding = model(x)
 
@@ -125,6 +127,71 @@ def test_student_psa_tiny_is_only_registered_when_enabled():
     assert embedding.shape == (1, 512)
 
 
+def test_student_sequential_adapter_fusion_identity_passthrough():
+    model = StudentModel.__new__(StudentModel)
+    nn.Module.__init__(model)
+    model.adapter_fusion_mode = "sequential"
+    model.lk_adapter = nn.Identity()
+    model.psa_tiny = nn.Identity()
+
+    x = torch.randn(1, 512, 7, 7)
+    out = StudentModel._apply_feature_adapters(model, x)
+
+    assert out is x
+
+
+def test_student_parallel_adapter_fusion_uses_original_f4_for_each_branch():
+    class RecordingScale(nn.Module):
+        def __init__(self, scale):
+            super().__init__()
+            self.scale = float(scale)
+            self.inputs = []
+
+        def forward(self, x):
+            self.inputs.append(x.detach().clone())
+            return x * self.scale
+
+    model = StudentModel.__new__(StudentModel)
+    nn.Module.__init__(model)
+    model.adapter_fusion_mode = "parallel"
+    model.lk_adapter = RecordingScale(2.0)
+    model.psa_tiny = RecordingScale(3.0)
+
+    x = torch.randn(2, 512, 7, 7)
+    out = StudentModel._apply_feature_adapters(model, x)
+
+    assert out.shape == (2, 512, 7, 7)
+    torch.testing.assert_close(out, x * 4.0)
+    torch.testing.assert_close(model.lk_adapter.inputs[0], x)
+    torch.testing.assert_close(model.psa_tiny.inputs[0], x)
+
+
+def test_student_sequential_adapter_fusion_keeps_old_order():
+    class RecordingScale(nn.Module):
+        def __init__(self, scale):
+            super().__init__()
+            self.scale = float(scale)
+            self.inputs = []
+
+        def forward(self, x):
+            self.inputs.append(x.detach().clone())
+            return x * self.scale
+
+    model = StudentModel.__new__(StudentModel)
+    nn.Module.__init__(model)
+    model.adapter_fusion_mode = "sequential"
+    model.lk_adapter = RecordingScale(2.0)
+    model.psa_tiny = RecordingScale(3.0)
+
+    x = torch.randn(2, 512, 7, 7)
+    out = StudentModel._apply_feature_adapters(model, x)
+
+    assert out.shape == (2, 512, 7, 7)
+    torch.testing.assert_close(out, x * 6.0)
+    torch.testing.assert_close(model.lk_adapter.inputs[0], x)
+    torch.testing.assert_close(model.psa_tiny.inputs[0], x * 2.0)
+
+
 def test_student_batch_loss_is_only_symmetric_infonce():
     class IdentityFeatureModel(nn.Module):
         def __init__(self):
@@ -185,6 +252,7 @@ def test_cli_defaults_to_clean_baseline(monkeypatch):
     assert args.local_desc_weight == 0.0
     assert args.local_kd_warmup_epochs == 0
     assert args.local_temperature == 0.5
+    assert args.adapter_fusion_mode == "sequential"
     assert student_train.is_online_kd_active(args) is False
 
     removed_attrs = [

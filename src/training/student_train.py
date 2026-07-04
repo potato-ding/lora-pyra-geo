@@ -2415,6 +2415,12 @@ def parse_args():
     parser.add_argument("--psa_ffn_ratio", type=float, default=1.0)
     parser.add_argument("--adapter_gamma_init", type=float, default=0.0)
     parser.add_argument(
+        "--adapter_fusion_mode",
+        type=str,
+        default="sequential",
+        choices=StudentModel.ADAPTER_FUSION_MODES,
+    )
+    parser.add_argument(
         "--enable_online_kd",
         type=str2bool,
         nargs="?",
@@ -2591,6 +2597,7 @@ def main():
         psa_num_heads=args.psa_num_heads,
         psa_ffn_ratio=args.psa_ffn_ratio,
         adapter_gamma_init=args.adapter_gamma_init,
+        adapter_fusion_mode=args.adapter_fusion_mode,
     ).to(device)
     maybe_create_kd_projector(model, online_kd_state, device)
     maybe_create_local_attn_head(model, online_kd_state, device)

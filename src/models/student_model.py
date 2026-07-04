@@ -265,6 +265,7 @@ class StudentModel(nn.Module):
     """RepViT-M1.5 baseline descriptor."""
 
     BACKBONE_NAME = "RepViT-M1.5"
+    ADAPTER_FUSION_MODES = ("sequential", "parallel")
 
     def __init__(
         self,
@@ -276,11 +277,19 @@ class StudentModel(nn.Module):
         psa_num_heads=4,
         psa_ffn_ratio=1.0,
         adapter_gamma_init=0.0,
+        adapter_fusion_mode="sequential",
     ):
         super().__init__()
         self.embedding_dim = 512
         self.enable_lk_adapter = bool(enable_lk_adapter)
         self.enable_psa_tiny = bool(enable_psa_tiny)
+        adapter_fusion_mode = str(adapter_fusion_mode)
+        if adapter_fusion_mode not in self.ADAPTER_FUSION_MODES:
+            raise ValueError(
+                "adapter_fusion_mode must be one of "
+                f"{self.ADAPTER_FUSION_MODES}, got {adapter_fusion_mode!r}"
+            )
+        self.adapter_fusion_mode = adapter_fusion_mode
         self.psa_ratio = float(psa_ratio)
         self.psa_num_heads = int(psa_num_heads)
         self.psa_ffn_ratio = float(psa_ffn_ratio)
@@ -316,12 +325,18 @@ class StudentModel(nn.Module):
         rank0_print("  architecture: RepViT-M1.5 backbone only")
         rank0_print("  descriptor: f4 -> GAP -> BatchNorm1d(512) -> L2")
         rank0_print(f"  embedding_dim: {self.embedding_dim}")
+        rank0_print(f"  adapter_fusion_mode: {self.adapter_fusion_mode}")
         rank0_print(f"  enable_lk_adapter: {self.enable_lk_adapter}")
         rank0_print(f"  enable_psa_tiny: {self.enable_psa_tiny}")
         rank0_print(f"  psa_ratio: {self.psa_ratio:g}")
         rank0_print(f"  psa_num_heads: {self.psa_num_heads}")
         rank0_print(f"  psa_ffn_ratio: {self.psa_ffn_ratio:g}")
         rank0_print(f"  adapter_gamma_init: {self.adapter_gamma_init:g}")
+        total_params = sum(param.numel() for param in self.parameters())
+        rank0_print(
+            "  total_params: "
+            f"{total_params} ({total_params / 1e6:.3f}M)"
+        )
         if self.lk_adapter is not None:
             params = self.lk_adapter.parameter_count()
             macs = LargeKernelDWAdapter.estimate_macs((1, self.embedding_dim, 7, 7))
@@ -366,12 +381,26 @@ class StudentModel(nn.Module):
             return f4
         return self.psa_tiny(f4)
 
+    def _apply_feature_adapters(self, f4):
+        if self.adapter_fusion_mode == "sequential":
+            f4 = self._apply_lk_adapter(f4)
+            f4 = self._apply_psa_tiny(f4)
+            return f4
+
+        out = f4
+        if self.lk_adapter is not None:
+            lk_out = self.lk_adapter(f4)
+            out = out + (lk_out - f4)
+        if self.psa_tiny is not None:
+            psa_out = self.psa_tiny(f4)
+            out = out + (psa_out - f4)
+        return out
+
     def forward(self, x):
         features = self.backbone(x)
         f4 = features[-1]
         self._log_f4_shape_once(f4)
-        f4 = self._apply_lk_adapter(f4)
-        f4 = self._apply_psa_tiny(f4)
+        f4 = self._apply_feature_adapters(f4)
         desc = F.adaptive_avg_pool2d(f4, 1).flatten(1)
         desc = self.neck(desc)
         return F.normalize(desc, dim=1)
