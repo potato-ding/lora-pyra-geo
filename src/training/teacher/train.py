@@ -23,7 +23,10 @@ from src.loss.identity_losses import (
 )
 from src.utils.initdist import try_init_dist
 from src.utils.gather_features_and_labels_and_views import gather_features_and_labels_and_views 
-from src.utils.train_eval_utils import getdist_1652_val_and_get_recall
+from src.utils.train_eval_utils import (
+    getdist_1652_val_and_get_recall,
+    select_model_descriptor,
+)
 from src.dataset.teacher.datasets import create_1652_teacher_train_dataloaders
 from src.dataset.teacher.val_dataloaders import build_1652_val_dataloaders
 from src.models.teacher.checkpoint_guard import (
@@ -1195,13 +1198,7 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
         for batch_idx, batch in enumerate(epoch_dataloader):
             imgs, labels, views, batch_meta = unpack_training_batch(batch, effective_mode, amp_device)
             
-            # TeacherModel returns (deep, fused, debug_info); training always uses fused.
-            model_output = model_engine(imgs)
-            if not isinstance(model_output, (tuple, list)) or len(model_output) < 2:
-                raise RuntimeError(
-                    "TeacherModel must return (deep, fused, debug_info)"
-                )
-            final_feats = model_output[1]
+            final_feats = select_model_descriptor(model_engine(imgs))
 
             # 跨卡特征聚合
             all_feats, all_labels, all_views = gather_features_and_labels_and_views(final_feats, labels, views)
@@ -1384,7 +1381,6 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                     g_loader_d2s,
                     amp_device,
                     task_name="D2S",
-                    feature_name="fused",
                 )
                 rank_log(f"[Eval] Epoch {cur_epoch}/{args.epochs} D2S done")
                 clear_memory_cache()
@@ -1395,7 +1391,6 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                     g_loader_s2d,
                     amp_device,
                     task_name="S2D",
-                    feature_name="fused",
                 )
                 rank_log(f"[Eval] Epoch {cur_epoch}/{args.epochs} S2D done")
             finally:

@@ -153,26 +153,24 @@ class TeacherFusionModesTest(unittest.TestCase):
         torch.manual_seed(7)
         self.images = torch.randn(2, 3, 8, 8)
 
-    def test_none_returns_global_descriptor_for_deep_and_fused(self):
+    def test_none_returns_global_descriptor_tensor(self):
         model = make_lightweight_teacher(FUSION_MODE_NONE).train()
-        deep, fused, debug = model(self.images)
+        features = model(self.images)
 
         expected = F.normalize(
             model.backbone.model.final_cls.expand(self.images.size(0), -1),
             dim=-1,
         )
-        self.assertTrue(torch.allclose(deep, expected, atol=1e-6))
-        self.assertTrue(torch.allclose(fused, expected, atol=1e-6))
-        self.assertEqual(debug, {})
+        self.assertTrue(torch.allclose(features, expected, atol=1e-6))
         self.assertFalse(hasattr(model, "pool19"))
-        (fused * torch.tensor([1.0, -0.5, 0.25, 0.75])).sum().backward()
+        (features * torch.tensor([1.0, -0.5, 0.25, 0.75])).sum().backward()
         self.assertIsNotNone(model.backbone.model.final_cls.grad)
 
     def test_layerwise_forward_matches_three_independent_branches(self):
         model = make_lightweight_teacher(
             FUSION_MODE_LAYERWISE_SOFT_ORTH
         ).train()
-        deep, fused, debug = model(self.images)
+        features = model(self.images)
 
         backbone = model.backbone.model
         batch_size = self.images.size(0)
@@ -221,13 +219,12 @@ class TeacherFusionModesTest(unittest.TestCase):
             dim=-1,
         )
 
-        self.assertTrue(torch.allclose(deep.norm(dim=-1), torch.ones(2)))
-        self.assertTrue(torch.allclose(fused, expected, atol=1e-6))
+        self.assertTrue(torch.allclose(features, expected, atol=1e-6))
         self.assertEqual(model.pool19.call_count, 1)
         self.assertEqual(model.pool27.call_count, 1)
         self.assertEqual(model.pool36.call_count, 1)
         self.assertEqual(
-            set(debug),
+            set(model._fusion_runtime_stats),
             {
                 "cos_global_fused",
                 "cos_global_detail",
@@ -247,9 +244,9 @@ class TeacherFusionModesTest(unittest.TestCase):
         model = make_lightweight_teacher(
             FUSION_MODE_LAYERWISE_SOFT_ORTH
         ).train()
-        _, fused, _ = model(self.images)
-        target = F.normalize(torch.randn_like(fused), dim=-1)
-        loss = (fused - target).square().mean()
+        features = model(self.images)
+        target = F.normalize(torch.randn_like(features), dim=-1)
+        loss = (features - target).square().mean()
         loss.backward()
 
         for name in (
@@ -318,18 +315,13 @@ class TeacherFusionModesTest(unittest.TestCase):
         for mode in (FUSION_MODE_NONE, FUSION_MODE_LAYERWISE_SOFT_ORTH):
             model = make_lightweight_teacher(mode).eval()
             with torch.no_grad():
-                deep, fused, debug = model(self.images)
-            self.assertEqual(deep.shape, (2, 4))
-            self.assertEqual(fused.shape, (2, 4))
+                features = model(self.images)
+            self.assertEqual(features.shape, (2, 4))
             self.assertTrue(
-                torch.allclose(deep.norm(dim=-1), torch.ones(2), atol=1e-6)
+                torch.allclose(features.norm(dim=-1), torch.ones(2), atol=1e-6)
             )
-            self.assertTrue(
-                torch.allclose(fused.norm(dim=-1), torch.ones(2), atol=1e-6)
-            )
-            self.assertIsInstance(debug, dict)
 
-    def test_eval_feature_deep_and_fused_produce_d2s_and_s2d_metrics(self):
+    def test_legacy_eval_feature_option_accepts_tensor_output(self):
         loader = DataLoader(
             TinyTeacherEvalDataset(),
             batch_size=2,

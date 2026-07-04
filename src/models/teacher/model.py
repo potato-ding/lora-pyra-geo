@@ -630,7 +630,7 @@ class TeacherModel(nn.Module):
         self._require_finite("deep_feats", deep_feats)
 
         if self.fusion_mode == FUSION_MODE_NONE:
-            return deep_feats, deep_feats, {}
+            return deep_feats
 
         layer_tokens = {}
         for layer_idx in self.detail_layers + [self.semantic_layer]:
@@ -755,8 +755,4 @@ class TeacherModel(nn.Module):
             detail_update,
             semantic_update,
         )
-        debug_info = {
-            name: value.detach()
-            for name, value in self._fusion_runtime_stats.items()
-        }
-        return deep_feats, fused_feats, debug_info
+        return fused_feats

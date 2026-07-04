@@ -289,8 +289,7 @@ def extract_teacher_features(teacher_output):
     if torch.is_tensor(teacher_output):
         return teacher_output
     raise RuntimeError(
-        "Teacher forward must return a feature tensor or "
-        "(deep_feats, teacher_feats, debug_info)."
+        "Teacher forward must return a feature tensor or a legacy descriptor tuple/list."
     )
 
 

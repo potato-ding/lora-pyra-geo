@@ -422,7 +422,7 @@ def parse_args():
         type=str,
         choices=["deep", "fused"],
         default="fused",
-        help="Teacher descriptor used for retrieval evaluation.",
+        help="Legacy tuple-output descriptor selector; tensor-output teachers ignore it.",
     )
 
     parser.add_argument("--lora_start_block", type=int, default=None)

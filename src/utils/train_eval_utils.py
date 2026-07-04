@@ -211,7 +211,7 @@ def select_model_descriptor(model_output, feature_name=None):
         return model_output
     if not isinstance(model_output, (tuple, list)) or not model_output:
         raise RuntimeError(
-            "model output must be a descriptor tensor or a non-empty tuple/list"
+            "model output must be a descriptor tensor or a non-empty legacy tuple/list"
         )
     if feature_name in (None, "deep"):
         descriptor = model_output[0]
