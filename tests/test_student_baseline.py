@@ -11,12 +11,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from src.models.student_model import (
-    LargeKernelDWAdapter,
-    PSATiny,
-    SafeF3F4ConcatHead,
-    StudentModel,
-)
+from src.models.student_model import LargeKernelDWAdapter, PSATiny, StudentModel
 import src.training.student_train as student_train
 from src.training.student_train import compute_student_batch_losses
 from src.utils.rank_logging import rank0_print
@@ -53,84 +48,6 @@ def test_student_forward_matches_f4_gap_bn_l2_path():
         expected = F.normalize(model.neck(desc), dim=1)
 
     torch.testing.assert_close(embedding, expected, atol=1e-6, rtol=1e-6)
-
-
-def test_student_baseline_sanity_log_confirms_baseline_head(capsys):
-    StudentModel(ckpt_path=None).eval()
-
-    output = capsys.readouterr().out
-    assert "[Sanity][Baseline] enable_f3_f4_fusion=False" in output
-    assert "[Sanity][Baseline] using baseline head" in output
-    assert "[Sanity][Baseline] forward: f4 -> GAP -> BN -> L2" in output
-
-
-def test_backbone_return_intermediate_keeps_default_outputs():
-    torch.manual_seed(14)
-    model = StudentModel(ckpt_path=None).eval()
-    x = torch.randn(2, 3, 64, 64)
-
-    with torch.no_grad():
-        features = model.backbone(x)
-        f3, f4 = model.backbone(x, return_intermediate=True)
-
-    assert len(features) == 4
-    torch.testing.assert_close(f3, features[-2])
-    torch.testing.assert_close(f4, features[-1])
-
-
-def test_safe_f3_f4_concat_head_identity_zero_initialization():
-    torch.manual_seed(15)
-    head = SafeF3F4ConcatHead(c3=256, c4=512, out_dim=512).eval()
-    f3 = torch.randn(2, 256, 8, 8)
-    f4 = torch.randn(2, 512, 4, 4)
-
-    status = head.identity_zero_status()
-    assert status["front_identity"] is True
-    assert status["tail_zero"] is True
-    assert status["bias_zero"] is True
-
-    with torch.no_grad():
-        d3 = head.f3_proj(head.pool(f3).flatten(1))
-        d4 = head.pool(f4).flatten(1)
-        z = torch.cat([d4, d3], dim=1)
-        desc_pre_bn = head.fusion(z)
-        embedding = head(f3, f4)
-        expected = F.normalize(head.bn(d4), dim=1)
-
-    torch.testing.assert_close(desc_pre_bn, d4, atol=1e-7, rtol=0.0)
-    torch.testing.assert_close(embedding, expected, atol=1e-6, rtol=1e-6)
-
-
-def test_student_f3_f4_fusion_initially_matches_f4_descriptor_path(capsys):
-    torch.manual_seed(16)
-    model = StudentModel(
-        ckpt_path=None,
-        enable_f3_f4_fusion=True,
-        fusion_type="safe_concat",
-        fusion_init="identity_zero",
-    ).eval()
-    x = torch.randn(2, 3, 64, 64)
-
-    with torch.no_grad():
-        embedding = model(x)
-        _f3, f4 = model.backbone(x, return_intermediate=True)
-        d4 = F.adaptive_avg_pool2d(f4, 1).flatten(1)
-        expected = F.normalize(model.fusion_head.bn(d4), dim=1)
-
-    torch.testing.assert_close(embedding, expected, atol=1e-6, rtol=1e-6)
-    output = capsys.readouterr().out
-    assert "enable_f3_f4_fusion: True" in output
-    assert "fusion weight d4 part identity: True" in output
-    assert "fusion weight d3 part zero: True" in output
-    assert "fusion bias zero: True" in output
-    assert "f3 shape:" in output
-    assert "f4 shape:" in output
-    assert "d3 shape: [2, 512]" in output
-    assert "d4 shape: [2, 512]" in output
-    assert "concat shape: [2, 1024]" in output
-    assert "desc_pre_bn shape: [2, 512]" in output
-    assert "desc shape: [2, 512]" in output
-    assert "max_abs_diff(desc_pre_bn, d4): 0" in output
 
 
 def test_large_kernel_dw_adapter_shape_params_and_macs():
@@ -336,9 +253,6 @@ def test_cli_defaults_to_clean_baseline(monkeypatch):
     assert args.local_kd_warmup_epochs == 0
     assert args.local_temperature == 0.5
     assert args.adapter_fusion_mode == "sequential"
-    assert args.enable_f3_f4_fusion is False
-    assert args.fusion_type == "none"
-    assert args.fusion_init == "identity_zero"
     assert student_train.is_online_kd_active(args) is False
 
     removed_attrs = [
@@ -347,6 +261,9 @@ def test_cli_defaults_to_clean_baseline(monkeypatch):
         "pro" + "xy_scale",
         "pro" + "xy_label_smoothing",
         "num_" + "train_" + "ids",
+        "enable_" + "f3_" + "f4_" + "fusion",
+        "fusion_" + "type",
+        "fusion_" + "init",
     ]
     for attr in removed_attrs:
         assert not hasattr(args, attr)
@@ -1302,36 +1219,14 @@ def test_removed_student_experiment_flags_are_rejected(monkeypatch):
         "--" + "pro" + "xy_scale",
         "--" + "pro" + "xy_label_smoothing",
         "--num_" + "train_" + "ids",
+        "--enable_" + "f3_" + "f4_" + "fusion",
+        "--fusion_" + "type",
+        "--fusion_" + "init",
     ]
     for flag in removed_flags:
         monkeypatch.setattr(sys, "argv", ["student_train.py", flag])
         with pytest.raises(SystemExit):
             student_train.parse_args()
-
-
-def test_f3_f4_fusion_cli_accepts_safe_concat(monkeypatch):
-    monkeypatch.setattr(sys, "argv", [
-        "student_train.py",
-        "--enable_f3_f4_fusion",
-        "--fusion_type",
-        "safe_concat",
-        "--fusion_init",
-        "identity_zero",
-    ])
-    args = student_train.parse_args()
-
-    assert args.enable_f3_f4_fusion is True
-    assert args.fusion_type == "safe_concat"
-    assert args.fusion_init == "identity_zero"
-
-
-def test_f3_f4_fusion_cli_rejects_enabled_none(monkeypatch):
-    monkeypatch.setattr(sys, "argv", [
-        "student_train.py",
-        "--enable_f3_f4_fusion",
-    ])
-    with pytest.raises(SystemExit):
-        student_train.parse_args()
 
 
 def test_student_source_has_no_removed_experiment_strings():
@@ -1342,6 +1237,13 @@ def test_student_source_has_no_removed_experiment_strings():
         "loss_" + "local" + "_align",
         "gamma" + "_raw",
         "lambda" + "_raw",
+        "Safe" + "F3" + "F4" + "ConcatHead",
+        "enable_" + "f3_" + "f4_" + "fusion",
+        "fusion_" + "type",
+        "fusion_" + "init",
+        "identity_" + "zero",
+        "f3" + "_proj",
+        "desc_" + "pre_" + "bn",
         "dual" + "_path",
         "preserve" + "_loss",
         "pro" + "xy",

@@ -221,25 +221,6 @@ def parse_args():
         default="sequential",
         choices=StudentModel.ADAPTER_FUSION_MODES,
     )
-    parser.add_argument(
-        "--enable_f3_f4_fusion",
-        type=str2bool,
-        nargs="?",
-        const=True,
-        default=False,
-    )
-    parser.add_argument(
-        "--fusion_type",
-        type=str,
-        default="none",
-        choices=StudentModel.FUSION_TYPES,
-    )
-    parser.add_argument(
-        "--fusion_init",
-        type=str,
-        default="identity_zero",
-        choices=StudentModel.FUSION_INITS,
-    )
     parser.add_argument("--output_json", type=str, default=None, help="Ignored; student tests are print-only.")
     parser.add_argument("--strict", dest="strict", action="store_true", default=True)
     parser.add_argument("--no_strict", dest="strict", action="store_false")
@@ -251,10 +232,6 @@ def parse_args():
         parser.error("--psa_num_heads must be greater than 0")
     if args.psa_ffn_ratio <= 0.0:
         parser.error("--psa_ffn_ratio must be greater than 0")
-    if args.enable_f3_f4_fusion and args.fusion_type != "safe_concat":
-        parser.error(
-            "--enable_f3_f4_fusion requires --fusion_type safe_concat"
-        )
     args.checkpoint = resolve_checkpoint_path(args.checkpoint)
     return args
 
@@ -283,9 +260,6 @@ def main():
         psa_ffn_ratio=args.psa_ffn_ratio,
         adapter_gamma_init=args.adapter_gamma_init,
         adapter_fusion_mode=args.adapter_fusion_mode,
-        enable_f3_f4_fusion=args.enable_f3_f4_fusion,
-        fusion_type=args.fusion_type,
-        fusion_init=args.fusion_init,
     ).to(device)
     load_student_checkpoint(model, args.checkpoint, strict=args.strict)
     model.eval()

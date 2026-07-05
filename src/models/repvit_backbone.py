@@ -120,12 +120,10 @@ class RepViTBackbone(nn.Module):
                 "or whether the checkpoint key prefix is unexpected."
             )
 
-    def forward(self, x, return_intermediate=False):
+    def forward(self, x):
         outs = []
         for i, block in enumerate(self.features):
             x = block(x)
             if i in self.out_indices:
                 outs.append(x)
-        if return_intermediate:
-            return outs[-2], outs[-1]
         return outs   # [f1, f2, f3, f4]

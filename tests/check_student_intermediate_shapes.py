@@ -19,12 +19,11 @@ def main():
 
     with torch.no_grad():
         default_desc = model(x)
-        _, _, f3, f4 = model.backbone(x)
+        f4 = model.backbone(x)[-1]
 
     assert f4.shape[1] == 512
 
     print(f"default desc shape: {tuple(default_desc.shape)}")
-    print(f"f3 shape: {tuple(f3.shape)}")
     print(f"f4 shape: {tuple(f4.shape)}")
 
 

@@ -2448,25 +2448,6 @@ def parse_args():
         choices=StudentModel.ADAPTER_FUSION_MODES,
     )
     parser.add_argument(
-        "--enable_f3_f4_fusion",
-        type=str2bool,
-        nargs="?",
-        const=True,
-        default=False,
-    )
-    parser.add_argument(
-        "--fusion_type",
-        type=str,
-        default="none",
-        choices=StudentModel.FUSION_TYPES,
-    )
-    parser.add_argument(
-        "--fusion_init",
-        type=str,
-        default="identity_zero",
-        choices=StudentModel.FUSION_INITS,
-    )
-    parser.add_argument(
         "--enable_online_kd",
         type=str2bool,
         nargs="?",
@@ -2538,10 +2519,6 @@ def parse_args():
         parser.error("--psa_num_heads must be greater than 0")
     if args.psa_ffn_ratio <= 0.0:
         parser.error("--psa_ffn_ratio must be greater than 0")
-    if args.enable_f3_f4_fusion and args.fusion_type != "safe_concat":
-        parser.error(
-            "--enable_f3_f4_fusion requires --fusion_type safe_concat"
-        )
     if args.local_teacher_layer < 0:
         parser.error("--local_teacher_layer must be non-negative")
     if args.teacher_num_register_tokens < 0:
@@ -2648,9 +2625,6 @@ def main():
         psa_ffn_ratio=args.psa_ffn_ratio,
         adapter_gamma_init=args.adapter_gamma_init,
         adapter_fusion_mode=args.adapter_fusion_mode,
-        enable_f3_f4_fusion=args.enable_f3_f4_fusion,
-        fusion_type=args.fusion_type,
-        fusion_init=args.fusion_init,
     ).to(device)
     maybe_create_kd_projector(model, online_kd_state, device)
     maybe_create_local_attn_head(model, online_kd_state, device)
