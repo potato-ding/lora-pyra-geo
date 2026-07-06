@@ -2448,6 +2448,28 @@ def parse_args():
         choices=StudentModel.ADAPTER_FUSION_MODES,
     )
     parser.add_argument(
+        "--pooling",
+        type=str,
+        default="gap",
+        choices=("gap", "gem", "lpn"),
+        help="f4 global pooling: gap (baseline, default), gem, or lpn ring partition",
+    )
+    parser.add_argument("--gem_p", type=float, default=3.0)
+    parser.add_argument(
+        "--lpn_rings",
+        type=int,
+        default=4,
+        help="number of LPN concentric square rings (7x7 f4 -> 4 is the natural choice)",
+    )
+    parser.add_argument(
+        "--lpn_gem",
+        type=str2bool,
+        nargs="?",
+        const=True,
+        default=True,
+        help="use GeM pooling per ring for LPN (default true)",
+    )
+    parser.add_argument(
         "--enable_online_kd",
         type=str2bool,
         nargs="?",
@@ -2625,6 +2647,10 @@ def main():
         psa_ffn_ratio=args.psa_ffn_ratio,
         adapter_gamma_init=args.adapter_gamma_init,
         adapter_fusion_mode=args.adapter_fusion_mode,
+        pooling=args.pooling,
+        gem_p=args.gem_p,
+        lpn_rings=args.lpn_rings,
+        lpn_gem=args.lpn_gem,
     ).to(device)
     maybe_create_kd_projector(model, online_kd_state, device)
     maybe_create_local_attn_head(model, online_kd_state, device)

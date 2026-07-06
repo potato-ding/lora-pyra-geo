@@ -7,6 +7,88 @@ from src.models.repvit_backbone import RepViTBackbone
 from src.utils.rank_logging import rank0_print
 
 
+class GeMPool(nn.Module):
+    """Generalized-Mean pooling (learnable p). Falls back to GAP when p=1."""
+
+    def __init__(self, p=3.0, eps=1e-6, learn_p=True):
+        super().__init__()
+        if learn_p:
+            self.p = nn.Parameter(torch.ones(1) * float(p))
+        else:
+            self.register_buffer("p", torch.ones(1) * float(p))
+        self.eps = float(eps)
+
+    def forward(self, x):
+        # x: [B, C, H, W] -> [B, C]
+        p = self.p.clamp(min=1e-1, max=6.0)
+        pooled = F.adaptive_avg_pool2d(x.clamp(min=self.eps).pow(p), 1)
+        return pooled.pow(1.0 / p).flatten(1)
+
+
+class LPNPool(nn.Module):
+    """
+    LPN square-ring partition pooling.
+
+    Splits an [B, C, H, W] feature map into `num_rings` concentric square rings
+    (by Chebyshev distance from the center), pools each ring independently, and
+    returns a list of `num_rings` per-ring descriptors, each [B, C].
+
+    Ring pooling is masked average pooling, or masked GeM pooling when use_gem.
+    """
+
+    def __init__(self, num_rings=3, use_gem=True, gem_p=3.0, eps=1e-6):
+        super().__init__()
+        if int(num_rings) < 1:
+            raise ValueError(f"num_rings must be >= 1, got {num_rings}")
+        self.num_rings = int(num_rings)
+        self.use_gem = bool(use_gem)
+        self.eps = float(eps)
+        if self.use_gem:
+            # one learnable p per ring
+            self.p = nn.Parameter(torch.ones(self.num_rings) * float(gem_p))
+        self._mask_cache = {}
+
+    def _build_ring_masks(self, height, width, device):
+        key = (int(height), int(width))
+        cached = self._mask_cache.get(key)
+        if cached is not None and cached.device == device:
+            return cached
+        ys = torch.arange(height, dtype=torch.float32).view(height, 1)
+        xs = torch.arange(width, dtype=torch.float32).view(1, width)
+        cy = (height - 1) / 2.0
+        cx = (width - 1) / 2.0
+        dy = (ys - cy).abs() / max(cy, 1e-6)
+        dx = (xs - cx).abs() / max(cx, 1e-6)
+        dist = torch.maximum(dy, dx)  # [H, W] Chebyshev distance in [0, 1]
+        ring_idx = torch.clamp(
+            (dist * self.num_rings).long(), max=self.num_rings - 1
+        )  # [H, W] in [0, num_rings-1]
+        masks = torch.stack(
+            [(ring_idx == r).float() for r in range(self.num_rings)], dim=0
+        )  # [num_rings, H, W]
+        masks = masks.to(device)
+        self._mask_cache[key] = masks
+        return masks
+
+    def forward(self, x):
+        if x.dim() != 4:
+            raise ValueError(f"LPNPool expects [B, C, H, W], got {tuple(x.shape)}")
+        b, c, h, w = x.shape
+        masks = self._build_ring_masks(h, w, x.device).to(x.dtype)  # [R, H, W]
+        descriptors = []
+        for r in range(self.num_rings):
+            mask = masks[r].view(1, 1, h, w)  # [1,1,H,W]
+            denom = mask.sum().clamp_min(1.0)
+            if self.use_gem:
+                p = self.p[r].clamp(min=1e-1, max=6.0)
+                pooled = (x.clamp(min=self.eps).pow(p) * mask).sum(dim=(2, 3)) / denom
+                pooled = pooled.pow(1.0 / p)
+            else:
+                pooled = (x * mask).sum(dim=(2, 3)) / denom
+            descriptors.append(pooled)  # [B, C]
+        return descriptors  # list of num_rings tensors, each [B, C]
+
+
 class LargeKernelDWAdapter(nn.Module):
     """7x7 depthwise adapter for the RepViT f4 feature map."""
 
@@ -280,9 +362,27 @@ class StudentModel(nn.Module):
         psa_ffn_ratio=1.0,
         adapter_gamma_init=0.0,
         adapter_fusion_mode="sequential",
+        pooling="gap",
+        gem_p=3.0,
+        lpn_rings=4,
+        lpn_gem=True,
     ):
         super().__init__()
-        self.embedding_dim = 512
+        self.feat_channels = 512
+        pooling = str(pooling).lower()
+        if pooling not in ("gap", "gem", "lpn"):
+            raise ValueError(
+                f"pooling must be 'gap', 'gem' or 'lpn', got {pooling!r}"
+            )
+        self.pooling = pooling
+        self.gem_p = float(gem_p)
+        self.lpn_rings = int(lpn_rings)
+        self.lpn_gem = bool(lpn_gem)
+        # descriptor dim: gap/gem -> 512, lpn -> rings * 512
+        if self.pooling == "lpn":
+            self.embedding_dim = self.feat_channels * self.lpn_rings
+        else:
+            self.embedding_dim = self.feat_channels
         self.enable_lk_adapter = bool(enable_lk_adapter)
         self.enable_psa_tiny = bool(enable_psa_tiny)
         adapter_fusion_mode = str(adapter_fusion_mode)
@@ -301,14 +401,14 @@ class StudentModel(nn.Module):
         self.backbone = RepViTBackbone(ckpt_path=ckpt_path)
         if self.enable_lk_adapter:
             self.lk_adapter = LargeKernelDWAdapter(
-                channels=self.embedding_dim,
+                channels=self.feat_channels,
                 gamma_init=self.adapter_gamma_init,
             )
         else:
             self.lk_adapter = None
         if self.enable_psa_tiny:
             self.psa_tiny = PSATiny(
-                channels=self.embedding_dim,
+                channels=self.feat_channels,
                 ratio=self.psa_ratio,
                 num_heads=self.psa_num_heads,
                 ffn_ratio=self.psa_ffn_ratio,
@@ -316,7 +416,22 @@ class StudentModel(nn.Module):
             )
         else:
             self.psa_tiny = None
-        self.neck = nn.BatchNorm1d(self.embedding_dim)
+        self.gem_pool = GeMPool(p=self.gem_p) if self.pooling == "gem" else None
+        if self.pooling == "lpn":
+            self.lpn_pool = LPNPool(
+                num_rings=self.lpn_rings,
+                use_gem=self.lpn_gem,
+                gem_p=self.gem_p,
+            )
+            # one BatchNorm neck per ring
+            self.ring_necks = nn.ModuleList(
+                [nn.BatchNorm1d(self.feat_channels) for _ in range(self.lpn_rings)]
+            )
+            self.neck = None
+        else:
+            self.lpn_pool = None
+            self.ring_necks = None
+            self.neck = nn.BatchNorm1d(self.feat_channels)
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / temperature))
 
         self._print_config()
@@ -326,6 +441,10 @@ class StudentModel(nn.Module):
         rank0_print(f"  student_backbone: {self.BACKBONE_NAME}")
         rank0_print("  architecture: RepViT-M1.5 backbone only")
         rank0_print("  descriptor: f4 -> GAP -> BatchNorm1d(512) -> L2")
+        rank0_print(f"  pooling: {self.pooling}")
+        if self.pooling == "lpn":
+            rank0_print(f"  lpn_rings: {self.lpn_rings}")
+            rank0_print(f"  lpn_gem: {self.lpn_gem}")
         rank0_print(f"  embedding_dim: {self.embedding_dim}")
         rank0_print(f"  adapter_fusion_mode: {self.adapter_fusion_mode}")
         rank0_print(f"  enable_lk_adapter: {self.enable_lk_adapter}")
@@ -341,7 +460,7 @@ class StudentModel(nn.Module):
         )
         if self.lk_adapter is not None:
             params = self.lk_adapter.parameter_count()
-            macs = LargeKernelDWAdapter.estimate_macs((1, self.embedding_dim, 7, 7))
+            macs = LargeKernelDWAdapter.estimate_macs((1, self.feat_channels, 7, 7))
             rank0_print(
                 "  lk_adapter_params: "
                 f"{params} ({params / 1e6:.3f}M)"
@@ -353,7 +472,7 @@ class StudentModel(nn.Module):
         if self.psa_tiny is not None:
             params = self.psa_tiny.parameter_count()
             macs = PSATiny.estimate_macs(
-                (1, self.embedding_dim, 7, 7),
+                (1, self.feat_channels, 7, 7),
                 ratio=self.psa_ratio,
                 num_heads=self.psa_num_heads,
                 ffn_ratio=self.psa_ffn_ratio,
@@ -403,6 +522,17 @@ class StudentModel(nn.Module):
         f4 = features[-1]
         self._log_f4_shape_once(f4)
         f4 = self._apply_feature_adapters(f4)
-        desc = F.adaptive_avg_pool2d(f4, 1).flatten(1)
+        if self.lpn_pool is not None:
+            ring_descs = self.lpn_pool(f4)  # list of [B, C], one per ring
+            parts = []
+            for neck, ring_desc in zip(self.ring_necks, ring_descs):
+                part = F.normalize(neck(ring_desc), dim=1)  # per-ring L2
+                parts.append(part)
+            desc = torch.cat(parts, dim=1)  # [B, rings*C]
+            return F.normalize(desc, dim=1)  # overall L2 -> mean-of-rings cosine
+        if self.gem_pool is not None:
+            desc = self.gem_pool(f4)
+        else:
+            desc = F.adaptive_avg_pool2d(f4, 1).flatten(1)
         desc = self.neck(desc)
         return F.normalize(desc, dim=1)
