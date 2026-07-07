@@ -17,12 +17,13 @@ def _safe_torch_load(path, map_location):
 
 class DINOv3Backbone(nn.Module):
 	"""
-	DINOv3-7B 主干网络加载与推理基类。
-	支持加载官方 dinov3-main 仓库权重，并可设置为 bfloat16 推理。
+	DINOv3-7B backbone loader.
+
+	Loads the local dinov3-main implementation and official checkpoint.
 	"""
 	def __init__(self, repo_dir: str, ckpt_path: str, device: str = 'cuda', dtype: str = 'bfloat16'):
 		super().__init__()
-		# 现在 dinov3 代码和权重都在 src/models/DINOV3 下
+		# DINOv3 code and weights live under src/models by default.
 		self.repo_dir = Path(repo_dir) if repo_dir else Path(__file__).parent / 'dinov3_main'
 		model_root = Path(__file__).resolve().parents[1]
 		self.repo_dir = Path(repo_dir) if repo_dir else model_root
@@ -40,13 +41,13 @@ class DINOv3Backbone(nn.Module):
 		if dinov3_main_dir not in sys.path:
 			sys.path.insert(0, dinov3_main_dir)
 			
-		# 把定义模型的函数导进来
+		# Import the local DINOv3 model definition.
 		from dinov3_main.dinov3.hub.backbones import dinov3_vit7b16
-		# 使用 pretrained=False，从本地权重加载
+		# Use pretrained=False because weights are loaded from the local checkpoint.
 		model = dinov3_vit7b16(pretrained=False)
 		rank0_print(f"[DINOv3Base] loading checkpoint: {self.ckpt_path}")
 		checkpoint = _safe_torch_load(self.ckpt_path, map_location='cpu')
-		# 扒出真正的权重字典
+		# Extract the actual state dict from common checkpoint wrappers.
 		if 'model' in checkpoint:
 			state_dict = checkpoint['model']
 		elif 'teacher' in checkpoint:
@@ -55,7 +56,7 @@ class DINOv3Backbone(nn.Module):
 			state_dict = checkpoint
 			
 		msg = model.load_state_dict(state_dict, strict=True)
-		# 先改成 strict=False，让它能塞多少塞多少，并把没塞进去的清单返回
+		# Strict loading catches any mismatch between the model and checkpoint.
 		
 		if self.device.type == "cuda":
 			model = model.to(device=self.device, dtype=torch.bfloat16)
@@ -69,6 +70,6 @@ class DINOv3Backbone(nn.Module):
 		return model
 
 	def forward(self, x):
-		# 输入需为已转到 self.device 且 dtype 匹配的 tensor
+		# Input should already be on self.device with a compatible dtype.
 		with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
 			return self.model(x)

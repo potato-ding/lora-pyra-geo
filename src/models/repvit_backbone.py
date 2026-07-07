@@ -11,8 +11,8 @@ class RepViTBackbone(nn.Module):
     def __init__(self, ckpt_path=None, min_feature_load_ratio=0.95):
         super().__init__()
 
-        # Build the official RepViT-M1.5 structure first, then load pretrained weights.
-        full_model = repvit_m1_5(num_classes=1000, distillation=True)
+        # Build the RepViT-M1.5 feature extractor first, then load pretrained weights.
+        full_model = repvit_m1_5()
 
         if ckpt_path is not None:
             self._load_pretrained_weights(
@@ -116,8 +116,8 @@ class RepViTBackbone(nn.Module):
             raise RuntimeError(
                 "RepViT-M1.5 backbone weight load ratio is too low: "
                 f"{len(loaded_feature_keys)}/{len(feature_keys)} ({feature_load_ratio:.2%}). "
-                "Please check whether the checkpoint is repvit_m1_5_distill_450e.pth "
-                "or whether the checkpoint key prefix is unexpected."
+                "Please check whether the checkpoint contains RepViT-M1.5 "
+                "feature weights or whether the checkpoint key prefix is unexpected."
             )
 
     def forward(self, x):

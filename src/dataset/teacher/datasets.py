@@ -261,7 +261,7 @@ class IdentityU1652Dataset(Dataset):
             raise ValueError("drone_per_id must be greater than 0")
         if sat_per_id <= 0:
             raise ValueError("sat_per_id must be greater than 0")
-        if sampling_mode != "identity":
+        if sampling_mode not in {"identity", "identity_hard"}:
             raise ValueError(f"unsupported identity sampling_mode: {sampling_mode}")
 
         self.data_dir = data_dir
@@ -272,6 +272,8 @@ class IdentityU1652Dataset(Dataset):
         self.seed = seed
         self.epoch = 0
         self.sampling_mode = sampling_mode
+        self.hard_pool_paths = {}
+        self._hard_sampling_stats = self._new_hard_sampling_stats()
 
         self.satellite_dir = os.path.join(self.data_dir, "satellite")
         self.drone_dir = os.path.join(self.data_dir, "drone")
@@ -295,6 +297,7 @@ class IdentityU1652Dataset(Dataset):
 
     def set_epoch(self, epoch):
         self.epoch = epoch
+        self._hard_sampling_stats = self._new_hard_sampling_stats()
 
     def __len__(self):
         return len(self.pids)
@@ -321,6 +324,68 @@ class IdentityU1652Dataset(Dataset):
             return rng.sample(paths, count)
         return rng.choices(paths, k=count)
 
+    @staticmethod
+    def _new_hard_sampling_stats():
+        return {
+            "hard_requested": 0,
+            "hard_from_pool": 0,
+            "hard_fallback": 0,
+            "missing_hard_pool_ids": 0,
+            "short_hard_pool_ids": 0,
+            "random_requested": 0,
+        }
+
+    def set_hard_pool(self, hard_pool):
+        normalized = {}
+        for pid, samples in hard_pool.items():
+            paths = []
+            for sample in samples:
+                if isinstance(sample, str):
+                    path = sample
+                elif isinstance(sample, dict):
+                    path = sample.get("image_path")
+                else:
+                    path = None
+                if path:
+                    paths.append(path)
+            if paths:
+                normalized[str(pid)] = paths
+        self.hard_pool_paths = normalized
+
+    def has_hard_pool(self):
+        return bool(self.hard_pool_paths)
+
+    def get_hard_sampling_stats(self):
+        return dict(self._hard_sampling_stats)
+
+    def _sample_drone_paths(self, pid, paths, count, rng):
+        if self.sampling_mode != "identity_hard":
+            self._hard_sampling_stats["random_requested"] += count
+            return self._sample_paths(paths, count, rng)
+
+        self._hard_sampling_stats["hard_requested"] += count
+        hard_paths = [
+            path
+            for path in self.hard_pool_paths.get(str(pid), [])
+            if path in paths
+        ]
+        if not hard_paths:
+            self._hard_sampling_stats["missing_hard_pool_ids"] += 1
+            self._hard_sampling_stats["hard_fallback"] += count
+            return self._sample_paths(paths, count, rng)
+
+        selected = hard_paths[:count]
+        self._hard_sampling_stats["hard_from_pool"] += len(selected)
+        if len(selected) < count:
+            self._hard_sampling_stats["short_hard_pool_ids"] += 1
+            fallback_count = count - len(selected)
+            fallback_pool = [path for path in paths if path not in set(selected)]
+            if not fallback_pool:
+                fallback_pool = paths
+            selected.extend(self._sample_paths(fallback_pool, fallback_count, rng))
+            self._hard_sampling_stats["hard_fallback"] += fallback_count
+        return selected
+
     def __getitem__(self, idx):
         pid = self.pids[idx]
         data = self.data_dict[pid]
@@ -328,7 +393,12 @@ class IdentityU1652Dataset(Dataset):
         rng = self._make_rng(pid)
 
         sat_paths = self._sample_paths(data["satellite"], self.sat_per_id, rng)
-        drone_paths = self._sample_paths(data["drone"], self.drone_per_id, rng)
+        drone_paths = self._sample_drone_paths(
+            pid,
+            data["drone"],
+            self.drone_per_id,
+            rng,
+        )
 
         images = []
         labels = []
@@ -507,7 +577,7 @@ def create_identity_1652_train_dataset(args, sampling_mode="identity"):
         std=[0.229, 0.224, 0.225],
     )
 
-    if sampling_mode != "identity":
+    if sampling_mode not in {"identity", "identity_hard"}:
         raise ValueError(f"unsupported identity sampling_mode: {sampling_mode}")
     drone_per_id = int(getattr(args, "identity_drone_per_id", 4))
 
@@ -549,6 +619,11 @@ def create_1652_teacher_train_dataloaders(args):
             args,
             sampling_mode="identity",
         )
+        if getattr(args, "enable_hard_pool_stage", False):
+            datasets["identity_hard"], samplers["identity_hard"], loaders["identity_hard"] = create_identity_1652_train_dataset(
+                args,
+                sampling_mode="identity_hard",
+            )
 
     return datasets, samplers, loaders
 

@@ -1,5 +1,5 @@
 # train.py
-# 专门用于根据参数配置进行训练的脚本
+# Teacher training entrypoint.
 import sys
 import os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
@@ -48,25 +48,25 @@ def safe_torch_load(path, map_location):
 class LiteEMA:
     def __init__(self, model, decay=0.999):
         self.decay = decay
-        self.shadow = {} # 存放平滑后的影子权重
-        self.backup = {} # 考试前用来备份原权重的临时仓库
+        self.shadow = {}  # EMA weights for trainable parameters.
+        self.backup = {}  # Temporary weights saved before EMA evaluation.
         
-        # 初始化：只拷贝【有梯度】的参数（LoRA和门控），彻底放过 7B 主干！
+        # Track only trainable parameters, such as LoRA and unfrozen final blocks.
         for name, param in model.named_parameters():
             if param.requires_grad:
                 self.shadow[name] = param.detach().float().clone()
 
     @torch.no_grad()
     def update(self, model):
-        # 每次 Batch 后更新：只算有梯度的参数
+        # Update EMA after each batch for trainable parameters only.
         for name, param in model.named_parameters():
             if param.requires_grad:
-                # EMA 公式: shadow = decay * shadow + (1 - decay) * param
+                # shadow = decay * shadow + (1 - decay) * param
                 self.shadow[name].mul_(self.decay).add_(param.detach().float(), alpha=1.0 - self.decay)
 
     @torch.no_grad()
     def apply_shadow(self, model):
-        # 把原模型对应的参数备份，然后把影子权重覆盖上去
+        # Swap EMA weights into the model for evaluation.
         for name, param in model.named_parameters():
             if param.requires_grad:
                 self.backup[name] = param.data.clone().detach()
@@ -74,18 +74,39 @@ class LiteEMA:
 
     @torch.no_grad()
     def restore(self, model):
-        # 考试后：把原模型的权重还给它，准备继续训练
+        # Restore training weights after evaluation.
         for name, param in model.named_parameters():
             if param.requires_grad:
                 param.data.copy_(self.backup[name])
-        self.backup = {} # 清空备份
+        self.backup = {}
+def is_teacher_delta_checkpoint_param(name):
+    # Save every trainable teacher delta, including logit_scale, for strict resume.
+    return True
+
+
+def collect_teacher_delta_state(state_dict):
+    return {
+        name: value.cpu()
+        for name, value in state_dict.items()
+        if is_teacher_delta_checkpoint_param(name)
+    }
+
+
+def get_required_teacher_delta_keys(model):
+    return {
+        name
+        for name, param in model.named_parameters()
+        if param.requires_grad and is_teacher_delta_checkpoint_param(name)
+    }
+
+
 def get_base_model(model_or_engine):
     return model_or_engine.module if hasattr(model_or_engine, "module") else model_or_engine
 
 def get_logit_scale(model_or_engine):
     base_model = get_base_model(model_or_engine)
     logit_scale = getattr(base_model, "logit_scale", None)
-    assert logit_scale is not None, "模型中没有找到 logit_scale"
+    assert logit_scale is not None, "logit_scale was not found in the model"
     return logit_scale
 
 
@@ -179,30 +200,30 @@ def load_teacher_init_checkpoint(model, checkpoint_path, device, strict_trainabl
     missing, load_unexpected = model.load_state_dict(mapped_state, strict=False)
     model.to(device)
 
-    trainable_keys = {name for name, param in model.named_parameters() if param.requires_grad}
-    loaded_trainable = trainable_keys & set(mapped_state.keys())
-    missing_trainable = sorted(trainable_keys - loaded_trainable)
-    missing_nontrainable = sorted(set(missing) - trainable_keys)
+    required_keys = get_required_teacher_delta_keys(model)
+    loaded_required = required_keys & set(mapped_state.keys())
+    missing_required = sorted(required_keys - loaded_required)
+    missing_nonrequired = sorted(set(missing) - required_keys)
 
     if is_main_process():
         print(f"[TeacherInitDelta] loaded: {checkpoint_path}")
         print(
             f"[TeacherInitDelta] matched={len(mapped_state)} | "
-            f"trainable_covered={len(loaded_trainable)}/{len(trainable_keys)} | "
-            f"missing_nontrainable={len(missing_nontrainable)} | "
+            f"delta_covered={len(loaded_required)}/{len(required_keys)} | "
+            f"missing_nonrequired={len(missing_nonrequired)} | "
             f"unexpected={len(unexpected) + len(load_unexpected)} | "
             f"incompatible={len(incompatible)}"
         )
-        if not missing_trainable and not incompatible:
+        if not missing_required and not incompatible:
             print(
-                "[TeacherInitDelta] coverage OK: all trainable teacher "
-                "parameters were restored; missing non-trainable keys keep "
-                "their pretrained DINOv3/base initialization."
+                "[TeacherInitDelta] coverage OK: all saved teacher delta "
+                "parameters were restored; other keys keep their current "
+                "initialization."
             )
-        if missing_trainable:
+        if missing_required:
             print(
-                "[TeacherInitDelta][WARN] missing trainable keys examples: "
-                f"{missing_trainable[:5]}"
+                "[TeacherInitDelta][WARN] missing teacher delta keys examples: "
+                f"{missing_required[:5]}"
             )
         if unexpected:
             print(
@@ -220,10 +241,10 @@ def load_teacher_init_checkpoint(model, checkpoint_path, device, strict_trainabl
                 f"{incompatible[:3]}"
             )
 
-    if strict_trainable and (missing_trainable or incompatible):
+    if strict_trainable and (missing_required or incompatible):
         raise RuntimeError(
-            "init checkpoint did not fully cover the current trainable teacher parameters; "
-            f"missing_trainable={len(missing_trainable)}, incompatible={len(incompatible)}. "
+            "init checkpoint did not fully cover the current teacher delta parameters; "
+            f"missing_delta={len(missing_required)}, incompatible={len(incompatible)}. "
             "Use --init_checkpoint_strict_trainable false only for intentional architecture changes."
         )
 
@@ -270,11 +291,15 @@ def get_training_mode_desc(dataset, args):
             f"{len(getattr(dataset, 'pairs', []))} sat-drone pairs, "
             "unique PID per global batch"
         )
-    if mode == "identity":
+    if mode in {"identity", "identity_hard"}:
+        hard_text = ""
+        if mode == "identity_hard":
+            hard_text = f", hard_pool_ids={len(getattr(dataset, 'hard_pool_paths', {}))}"
         return mode, (
             f"{len(getattr(dataset, 'pids', []))} identities, "
             f"sat_per_id={getattr(dataset, 'sat_per_id', 'unknown')}, "
             f"drone_per_id={getattr(dataset, 'drone_per_id', 'unknown')}"
+            f"{hard_text}"
         )
     return mode, "Sample4Geo dataloader expected"
 
@@ -284,6 +309,8 @@ def get_training_mode(epoch, args):
         return "sample4geo"
     if epoch <= args.stage1_end_epoch:
         return "sample4geo"
+    if getattr(args, "enable_hard_pool_stage", False) and epoch > args.stage2_end_epoch:
+        return "identity_hard"
     return "identity"
 
 
@@ -349,11 +376,11 @@ def validate_loss_weights(args):
     ]
     for name in weight_names:
         if getattr(args, name) < 0:
-            raise ValueError(f"{name} 不能为负数")
+            raise ValueError(f"{name} must be non-negative")
     if args.triplet_margin <= 0:
-        raise ValueError("triplet_margin 必须大于 0")
+        raise ValueError("triplet_margin must be greater than 0")
     if args.identity_temperature <= 0:
-        raise ValueError("identity_temperature 必须大于 0")
+        raise ValueError("identity_temperature must be greater than 0")
 
     sample4geo_loss_enabled = args.triplet_weight > 0 or args.infonce_weight > 0
     identity_loss_enabled = (
@@ -366,14 +393,14 @@ def validate_loss_weights(args):
     will_use_identity = args.enable_identity_stage and args.epochs > args.stage1_end_epoch
 
     if will_use_sample4geo and not sample4geo_loss_enabled:
-        raise ValueError("所有 loss 大类权重都为 0，训练不会产生有效梯度")
+        raise ValueError("all Sample4Geo loss weights are 0; training would have no gradient")
     if will_use_identity and not identity_loss_enabled:
-        raise ValueError("identity 阶段 loss 权重都为 0，训练不会产生有效梯度")
+        raise ValueError("all identity-stage loss weights are 0; training would have no gradient")
 
 
 def validate_scheduler_args(args):
     if args.warmup_ratio < 0 or args.warmup_ratio >= 1:
-        raise ValueError("warmup_ratio 必须在 [0, 1) 范围内")
+        raise ValueError("warmup_ratio must be in [0, 1)")
 
 
 def validate_identity_training_args(args):
@@ -384,7 +411,40 @@ def validate_identity_training_args(args):
     ]
     for name in positive_int_args:
         if getattr(args, name) <= 0:
-            raise ValueError(f"{name} 必须大于 0")
+            raise ValueError(f"{name} must be greater than 0")
+
+
+def normalize_hard_pool_args(args):
+    if getattr(args, "training_stage", "auto") == "identity_hard":
+        args.enable_identity_stage = True
+        args.enable_hard_pool_stage = True
+        args.stage1_end_epoch = 0
+        args.stage2_end_epoch = 0
+
+    if not getattr(args, "enable_hard_pool_stage", False):
+        return
+
+    args.enable_identity_stage = True
+    if getattr(args, "build_hard_pool_epoch", None) is None:
+        args.build_hard_pool_epoch = int(getattr(args, "stage2_end_epoch", 0))
+
+    if args.hard_pool_topk <= 0:
+        raise ValueError("hard_pool_topk must be greater than 0")
+    if args.hard_pool_topneg_k <= 0:
+        raise ValueError("hard_pool_topneg_k must be greater than 0")
+    if args.stage2_end_epoch < args.stage1_end_epoch:
+        raise ValueError("stage2_end_epoch must be >= stage1_end_epoch")
+    if (
+        args.stage2_end_epoch <= 0
+        and not args.load_hard_pool_path
+        and not args.build_hard_pool_before_train
+    ):
+        raise ValueError(
+            "identity_hard from epoch 1 requires --load_hard_pool_path "
+            "or --build_hard_pool_before_train"
+        )
+
+
 def normalize_explicit_training_stage(args):
     stage = getattr(args, "training_stage", "auto")
     if stage in (None, "auto"):
@@ -402,6 +462,13 @@ def normalize_explicit_training_stage(args):
         args.stage1_end_epoch = 0
         return
 
+    if stage == "identity_hard":
+        args.enable_identity_stage = True
+        args.enable_hard_pool_stage = True
+        args.stage1_end_epoch = 0
+        args.stage2_end_epoch = 0
+        return
+
     raise ValueError(f"unsupported training_stage: {stage}")
 
 
@@ -413,7 +480,7 @@ def should_run_validation(cur_epoch, args):
     if mode == "sample4geo":
         return True
 
-    if mode == "identity":
+    if mode in {"identity", "identity_hard"}:
         stage_start = int(getattr(args, "stage1_end_epoch", 10)) + 1
         stage_end = args.epochs
     else:
@@ -591,7 +658,7 @@ def compute_hard_pool_from_features(satellite_records, drone_records, args, epoc
 
     proto_pids = sorted(satellite_proto.keys())
     if len(proto_pids) < 2:
-        raise RuntimeError("hard_pool 至少需要 2 个带 satellite prototype 的 ID 才能计算 negative similarity")
+        raise RuntimeError("hard_pool needs at least 2 IDs with satellite prototypes to compute negative similarity")
 
     proto_mat = torch.stack([satellite_proto[pid] for pid in proto_pids], dim=0)
     pid_to_proto_idx = {pid: idx for idx, pid in enumerate(proto_pids)}
@@ -671,7 +738,7 @@ def load_hard_pool_payload(path):
         meta = {}
 
     if not isinstance(hard_pool, dict):
-        raise ValueError(f"hard_pool 文件格式错误: {path}")
+        raise ValueError(f"invalid hard_pool file format: {path}")
 
     return {
         "meta": meta,
@@ -752,8 +819,8 @@ def ensure_identity_hard_ready(epoch, stage_mode, effective_mode, dataloader, ar
         and effective_mode != "identity_hard"
     ):
         raise RuntimeError(
-            f"Epoch {epoch} 请求进入 identity_hard，但没有可用的 identity_hard dataloader；"
-            "请确认 enable_hard_pool_stage=True 时已创建 identity_hard dataloader"
+            f"Epoch {epoch} requested identity_hard, but no identity_hard "
+            "dataloader is available. Check --enable_hard_pool_stage."
         )
 
     if (
@@ -762,10 +829,10 @@ def ensure_identity_hard_ready(epoch, stage_mode, effective_mode, dataloader, ar
         and not dataloader_has_hard_pool(dataloader)
     ):
         raise RuntimeError(
-            f"Epoch {epoch} 进入 identity_hard，但 hard_pool 尚未加载或构建。"
+            f"Epoch {epoch} entered identity_hard, but hard_pool is not ready."
             f" hard_pool_loaded={hard_pool_loaded}; "
-            "请确认 --build_hard_pool_epoch <= --stage2_end_epoch，"
-            "或使用 --load_hard_pool_path 指向已有 hard_pool JSON"
+            "Use --load_hard_pool_path or build the pool no later than "
+            "--stage2_end_epoch."
         )
 
 
@@ -777,15 +844,6 @@ HARD_SAMPLING_STAT_KEYS = (
     "short_hard_pool_ids",
     "random_requested",
 )
-
-
-def new_hard_sampling_stats():
-    return {key: 0 for key in HARD_SAMPLING_STAT_KEYS}
-
-
-def update_hard_sampling_stats(total_stats, batch_stats):
-    for key in HARD_SAMPLING_STAT_KEYS:
-        total_stats[key] += int(batch_stats.get(key, 0))
 
 
 def reduce_hard_sampling_stats(stats, device):
@@ -875,7 +933,7 @@ def build_hard_pool_with_model(model_engine, ema, train_loaders, args, epoch, de
 
     reference_dataset = get_hard_pool_reference_dataset(train_loaders)
     if reference_dataset is None:
-        raise RuntimeError("无法找到包含 pids/satellite_dict/drone_dict 的训练集，不能构建 hard_pool")
+        raise RuntimeError("cannot build hard_pool without a dataset containing pids/satellite_dict/drone_dict")
 
     val_transform = get_sample4geo_val_transforms(
         img_size=[args.img_size, args.img_size],
@@ -992,7 +1050,7 @@ def unpack_training_batch(batch, training_mode, device):
         }
         return imgs, labels, views, meta
 
-    if training_mode == "identity":
+    if training_mode in {"identity", "identity_hard"}:
         imgs = batch["images"].to(device).to(torch.bfloat16)
         labels = batch["labels"].to(device)
         views = batch["view_type"].to(device)
@@ -1006,7 +1064,7 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
     
     amp_device = args.device
 
-    # 当前训练固定使用三元组损失和对比损失，具体比例由命令行权重控制。
+    # Loss terms are enabled and weighted by command-line arguments.
     triplet_criterion = IntraDomainTripletLoss()
     infonce_criterion = infonce(loss_function=torch.nn.CrossEntropyLoss())
     identity_contrast_criterion = CrossDomainIdentityContrastiveLoss(
@@ -1019,7 +1077,7 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
         temperature=args.identity_temperature,
         repr_mode=args.s4g_anchor_repr,
     )
-    # 4. deepspeed 初始化
+    # Initialize DeepSpeed.
     import deepspeed
 
     model_engine, optimizer, _, scheduler = deepspeed.initialize(
@@ -1028,9 +1086,10 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
         lr_scheduler=scheduler,
         config=ds_config if ds_config is not None else args.deepspeed_config
     )
-    # 开始训练循环
-    # 构建保存目录名
+    # Prepare the training run directory.
     save_dir = get_save_pth(args)
+    if getattr(args, "save_hard_pool_path", None) is None:
+        args.save_hard_pool_path = os.path.join(save_dir, "hard_pool_epoch{epoch}.json")
     if is_main_process():
         os.makedirs(save_dir, exist_ok=True)
         save_training_record(
@@ -1044,6 +1103,15 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
     distributed_barrier_with_log("[Checkpoint] initial training record saved", local_rank)
 
     ema = LiteEMA(get_base_model(model_engine), decay=args.ema_decay)
+    hard_pool_loaded = load_initial_hard_pool_if_needed(args, dataloader)
+    hard_pool_loaded = build_initial_hard_pool_if_needed(
+        model_engine,
+        ema,
+        dataloader,
+        args,
+        amp_device,
+        hard_pool_loaded,
+    )
     best_r1_sum = -1.0
     best_epoch = 0
     best_metrics = None
@@ -1052,6 +1120,14 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
     for epoch in range(1, args.epochs + 1):
         stage_mode = get_training_mode(epoch, args)
         epoch_dataloader, _, effective_mode = select_epoch_dataloader(train_loaders, epoch, args)
+        ensure_identity_hard_ready(
+            epoch,
+            stage_mode,
+            effective_mode,
+            epoch_dataloader,
+            args,
+            hard_pool_loaded,
+        )
         set_epoch_on_dataloader(epoch_dataloader, epoch)
         model_engine.train()
         mode_name, mode_desc = get_training_mode_desc(epoch_dataloader.dataset, args)
@@ -1097,7 +1173,7 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
             
             final_feats = select_model_descriptor(model_engine(imgs))
 
-            # 跨卡特征聚合
+            # Gather features across distributed ranks.
             all_feats, all_labels, all_views = gather_features_and_labels_and_views(final_feats, labels, views)
             loss_terms = []
             loss_values = {}
@@ -1125,7 +1201,7 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                     total_infonce_loss = args.infonce_weight * infonce_loss
                     loss_terms.append(total_infonce_loss)
                     loss_values["infonce"] = total_infonce_loss.item()
-            elif effective_mode == "identity":
+            elif effective_mode in {"identity", "identity_hard"}:
                 if is_main_process() and batch_idx == 0:
                     print(
                         f"[TrainMode] {effective_mode} loss batch | "
@@ -1153,7 +1229,7 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
             else:
                 raise ValueError(f"unsupported effective_mode: {effective_mode}")
                 
-            # 7. 反向传播与优化 (干净利落，一次到位！)
+            # Backpropagation and optimizer step.
             loss = sum(loss_terms) if loss_terms else None
             if torch.is_tensor(loss):
                 model_engine.backward(loss)
@@ -1172,7 +1248,7 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
             else:
                 continue
                 
-            # 8. 打印日志，仅 rank 0
+            # Log progress on rank 0 only.
             step = batch_idx + 1
             should_log = (
                 is_main_process()
@@ -1208,6 +1284,17 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                     f"lr={lr:.2e} | scale={debug_values.get('scale', 0.0):.3f} | "
                     f"elapsed={elapsed_min:.1f}m"
                 )
+        hard_sampler_summary = None
+        if effective_mode == "identity_hard" and hasattr(
+            epoch_dataloader.dataset,
+            "get_hard_sampling_stats",
+        ):
+            stat_device = next(get_base_model(model_engine).parameters()).device
+            hard_stats = reduce_hard_sampling_stats(
+                epoch_dataloader.dataset.get_hard_sampling_stats(),
+                stat_device,
+            )
+            hard_sampler_summary = format_hard_sampler_epoch_summary(hard_stats)
         if is_main_process():
             elapsed_min = (time.time() - epoch_start_time) / 60.0
             avg_parts = []
@@ -1219,13 +1306,15 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                 f"[Train] Epoch {epoch}/{args.epochs} done | mode={mode_name} | "
                 f"updates={loss_counts['total']} | {avg_text} | time={elapsed_min:.1f}m"
             )
-            last_state = {name: value.cpu() for name, value in ema.shadow.items()}
+            if hard_sampler_summary is not None:
+                print(f"[HardPoolSampler] Epoch {epoch} | {hard_sampler_summary}")
+            last_state = collect_teacher_delta_state(ema.shadow)
             if teacher_verbose_eval_log():
                 rank_log(f"[Checkpoint] last_model.pth save start | epoch={epoch}")
             torch.save(last_state, os.path.join(save_dir, "last_model.pth"))
             if teacher_verbose_eval_log():
                 rank_log(f"[Checkpoint] last_model.pth save done | epoch={epoch}")
-                rank_log(f"[Checkpoint] bset_metricis.json save start | epoch={epoch}")
+                rank_log(f"[Checkpoint] best_metrics.json save start | epoch={epoch}")
             save_training_record(
                 save_dir=save_dir,
                 args=args,
@@ -1234,7 +1323,7 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                 last_completed_epoch=epoch,
             )
             if teacher_verbose_eval_log():
-                rank_log(f"[Checkpoint] bset_metricis.json save done | epoch={epoch}")
+                rank_log(f"[Checkpoint] best_metrics.json save done | epoch={epoch}")
                 print(
                     f"[Checkpoint] Saved last_model.pth | epoch={epoch}",
                     flush=True,
@@ -1304,7 +1393,7 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                 local_rank,
             )
             if is_main_process():
-                trainable_state = {k: v.cpu() for k, v in ema.shadow.items()}
+                trainable_state = collect_teacher_delta_state(ema.shadow)
                 current_metrics = build_validation_metrics(
                     cur_epoch,
                     (d2s_r1, d2s_r5, d2s_r10, d2s_map),
@@ -1327,7 +1416,7 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                         rank_log(f"[Checkpoint] best_model.pth save done | epoch={cur_epoch}")
 
                 if verbose_eval:
-                    rank_log(f"[Checkpoint] bset_metricis.json save start | epoch={cur_epoch} after eval")
+                    rank_log(f"[Checkpoint] best_metrics.json save start | epoch={cur_epoch} after eval")
                 save_training_record(
                     save_dir=save_dir,
                     args=args,
@@ -1336,7 +1425,7 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                     last_completed_epoch=cur_epoch,
                 )
                 if verbose_eval:
-                    rank_log(f"[Checkpoint] bset_metricis.json save done | epoch={cur_epoch} after eval")
+                    rank_log(f"[Checkpoint] best_metrics.json save done | epoch={cur_epoch} after eval")
 
                 print(
                     f"[Eval] Epoch {cur_epoch}/{args.epochs} done | "
@@ -1354,10 +1443,20 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                 local_rank,
             )
 
-        # 7. 分布式同步：让所有显卡等 Rank 0 写完再进下一个 Epoch
+        if should_build_hard_pool(epoch, args, hard_pool_loaded):
+            hard_pool_loaded = build_save_and_apply_hard_pool(
+                model_engine,
+                ema,
+                train_loaders,
+                args,
+                epoch,
+                amp_device,
+            )
+
+        # Synchronize all ranks before the next epoch.
         distributed_barrier_with_log(f"[Train] epoch={epoch} end", local_rank)
     if not dist.is_initialized() or local_rank == 0:
-        print("训练完成！")
+        print("[Train] done")
 
 def build_deepspeed_runtime_config(ds_config_path, args, world_size):
     with open(ds_config_path, "r") as f:
@@ -1367,11 +1466,11 @@ def build_deepspeed_runtime_config(ds_config_path, args, world_size):
     grad_accum_steps = int(getattr(args, "grad_accum_steps", 1))
 
     if micro_batch_size <= 0:
-        raise ValueError("batch_size 必须大于 0")
+        raise ValueError("batch_size must be greater than 0")
     if grad_accum_steps <= 0:
-        raise ValueError("grad_accum_steps 必须大于 0")
+        raise ValueError("grad_accum_steps must be greater than 0")
     if world_size <= 0:
-        raise ValueError("world_size 必须大于 0")
+        raise ValueError("world_size must be greater than 0")
 
     train_batch_size = micro_batch_size * world_size * grad_accum_steps
     ds_config["train_micro_batch_size_per_gpu"] = micro_batch_size
@@ -1404,20 +1503,21 @@ def main():
     args = parse_args()
     try:
         normalize_explicit_training_stage(args)
+        normalize_hard_pool_args(args)
         validate_loss_weights(args)
         validate_scheduler_args(args)
         validate_identity_training_args(args)
         device, rank, local_rank, world_size = try_init_dist()
-        # 构建训练集
+        # Build training dataloaders.
         train_dataset, train_sampler, train_loader = create_1652_teacher_train_dataloaders(args)
-        # 构建测试集
+        # Build validation dataloaders.
         val_loaders = build_1652_val_dataloaders(
             data_dir=args.data_dir,
             img_size=[args.img_size, args.img_size],
             batch_size=getattr(args, "val_batch_size", 32),
             num_workers=args.num_workers
         )
-        # 构建模型
+        # Build teacher model.
         model = TeacherModel(args)
         model = model.to(device)
         load_teacher_init_checkpoint(
@@ -1426,7 +1526,7 @@ def main():
             device,
             strict_trainable=getattr(args, "init_checkpoint_strict_trainable", True),
         )
-        # 获取可训练参数并构建优化器和学习率调度器
+        # Build optimizer and scheduler for trainable parameters.
         optimizer = build_optimizer_and_scale(model, args)
         ds_config, grad_accum_steps = build_deepspeed_runtime_config(
             args.deepspeed_config,

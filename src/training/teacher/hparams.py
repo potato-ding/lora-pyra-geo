@@ -3,7 +3,7 @@ import os
 import sys
 
 
-TRAINING_RECORD_FILENAME = "bset_metricis.json"
+TRAINING_RECORD_FILENAME = "best_metrics.json"
 
 
 def _json_safe_value(value):

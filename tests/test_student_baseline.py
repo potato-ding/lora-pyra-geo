@@ -12,6 +12,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from src.models.student_model import StudentModel
+from src.models.repvit_module import repvit_m1_5
 import src.training.student_train as student_train
 from src.training.student_train import compute_student_batch_losses
 
@@ -61,6 +62,13 @@ def test_student_model_has_no_experiment_branches():
         "teacher_local_proj",
     ):
         assert not hasattr(model, name)
+
+
+def test_repvit_m15_is_feature_extractor_only():
+    model = repvit_m1_5()
+
+    assert hasattr(model, "features")
+    assert not hasattr(model, "classifier")
 
 
 def test_student_batch_loss_is_only_symmetric_infonce():

@@ -125,6 +125,19 @@ def _strip_module_prefix(key):
     return key[7:] if key.startswith("module.") else key
 
 
+def is_teacher_delta_checkpoint_param(name):
+    # Require every trainable teacher delta, including logit_scale.
+    return True
+
+
+def get_required_teacher_delta_keys(model):
+    return {
+        name
+        for name, param in model.named_parameters()
+        if param.requires_grad and is_teacher_delta_checkpoint_param(name)
+    }
+
+
 def load_teacher_checkpoint(model, checkpoint_path, device):
     if not os.path.isfile(checkpoint_path):
         raise FileNotFoundError(f"checkpoint not found: {checkpoint_path}")
@@ -154,30 +167,29 @@ def load_teacher_checkpoint(model, checkpoint_path, device):
     missing, load_unexpected = model.load_state_dict(mapped_state, strict=False)
     model.to(device)
 
-    trainable_keys = {name for name, param in model.named_parameters() if param.requires_grad}
-    loaded_trainable = trainable_keys & set(mapped_state.keys())
-    missing_trainable = sorted(trainable_keys - loaded_trainable)
-    missing_nontrainable = sorted(set(missing) - trainable_keys)
+    required_keys = get_required_teacher_delta_keys(model)
+    loaded_required = required_keys & set(mapped_state.keys())
+    missing_required = sorted(required_keys - loaded_required)
+    missing_nonrequired = sorted(set(missing) - required_keys)
 
     if is_main_process():
         print(f"[TeacherDelta] loaded: {checkpoint_path}")
         print(
             f"[TeacherDelta] matched={len(mapped_state)} | "
-            f"trainable_covered={len(loaded_trainable)}/{len(trainable_keys)} | "
-            f"missing_nontrainable={len(missing_nontrainable)} | "
+            f"delta_covered={len(loaded_required)}/{len(required_keys)} | "
+            f"missing_nonrequired={len(missing_nonrequired)} | "
             f"unexpected={len(unexpected) + len(load_unexpected)} | "
             f"incompatible={len(incompatible)}"
         )
-        if not missing_trainable and not incompatible:
+        if not missing_required and not incompatible:
             print(
-                "[TeacherDelta] coverage OK: all trainable teacher parameters "
-                "were restored; missing non-trainable keys keep their "
-                "pretrained DINOv3/base initialization."
+                "[TeacherDelta] coverage OK: all saved teacher delta parameters "
+                "were restored; other keys keep their current initialization."
             )
-        if missing_trainable:
+        if missing_required:
             print(
-                "[TeacherDelta][WARN] missing trainable keys examples: "
-                f"{missing_trainable[:5]}"
+                "[TeacherDelta][WARN] missing teacher delta keys examples: "
+                f"{missing_required[:5]}"
             )
         if unexpected:
             print(
@@ -195,10 +207,10 @@ def load_teacher_checkpoint(model, checkpoint_path, device):
                 f"{incompatible[:3]}"
             )
 
-    if missing_trainable or incompatible:
+    if missing_required or incompatible:
         raise RuntimeError(
-            f"checkpoint did not cover all trainable teacher parameters; "
-            f"missing={len(missing_trainable)}, incompatible={len(incompatible)}. "
+            f"checkpoint did not cover all teacher delta parameters; "
+            f"missing={len(missing_required)}, incompatible={len(incompatible)}. "
             "Check that the evaluation hyperparameters match the training run, "
             f"or keep {TRAINING_RECORD_FILENAME} next to the checkpoint."
         )
