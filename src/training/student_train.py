@@ -275,24 +275,50 @@ def build_student_validation_metrics(epoch, result):
     }
 
 
-def build_student_best_metrics_payload(best_metrics, validation_history):
+def _json_safe_value(value):
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_value(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _json_safe_value(item) for key, item in value.items()}
+    return str(value)
+
+
+def build_student_hparam_record(args):
+    if args is None:
+        return {}
+    return {
+        "command": " ".join(sys.argv),
+        "argv": list(sys.argv),
+        "hyperparameters": {
+            key: _json_safe_value(value)
+            for key, value in sorted(vars(args).items())
+        },
+    }
+
+
+def build_student_best_metrics_payload(best_metrics, validation_history, args=None):
+    record = build_student_hparam_record(args)
     if best_metrics is None:
-        return {
+        record.update({
             "epoch": None,
             "selection_metric": "D2S_R@1+S2D_R@1",
             "best_R@1_sum": None,
             "D2S": None,
             "S2D": None,
             "validation_history": validation_history,
-        }
-    return {
+        })
+        return record
+    record.update({
         "epoch": best_metrics["epoch"],
         "selection_metric": best_metrics["selection_metric"],
         "best_R@1_sum": best_metrics["R@1_sum"],
         "D2S": best_metrics["D2S"],
         "S2D": best_metrics["S2D"],
         "validation_history": validation_history,
-    }
+    })
+    return record
 
 
 def print_trainable_parameter_summary(model):
@@ -522,7 +548,7 @@ def train(
     save_metrics_json(
         args.output_dir,
         "best_metrics.json",
-        build_student_best_metrics_payload(None, validation_history),
+        build_student_best_metrics_payload(None, validation_history, args),
     )
 
     for epoch in range(1, args.epochs + 1):
@@ -582,7 +608,7 @@ def train(
             save_metrics_json(
                 args.output_dir,
                 "best_metrics.json",
-                build_student_best_metrics_payload(best_metrics, validation_history),
+                build_student_best_metrics_payload(best_metrics, validation_history, args),
             )
             print(
                 f"[Best] best_epoch="
@@ -594,7 +620,7 @@ def train(
     save_metrics_json(
         args.output_dir,
         "best_metrics.json",
-        build_student_best_metrics_payload(best_metrics, validation_history),
+        build_student_best_metrics_payload(best_metrics, validation_history, args),
     )
 
 
@@ -611,7 +637,7 @@ def train_deepspeed(
         save_metrics_json(
             args.output_dir,
             "best_metrics.json",
-            build_student_best_metrics_payload(None, []),
+            build_student_best_metrics_payload(None, [], args),
         )
     distributed_barrier()
 
@@ -679,6 +705,7 @@ def train_deepspeed(
                     build_student_best_metrics_payload(
                         best_metrics,
                         validation_history,
+                        args,
                     ),
                 )
         distributed_barrier()
@@ -687,7 +714,7 @@ def train_deepspeed(
         save_metrics_json(
             args.output_dir,
             "best_metrics.json",
-            build_student_best_metrics_payload(best_metrics, validation_history),
+            build_student_best_metrics_payload(best_metrics, validation_history, args),
         )
     distributed_barrier()
 
@@ -820,7 +847,6 @@ def main():
             train_loader,
             val_loaders,
             criterion,
-            optimizer,
             device,
             args,
         )

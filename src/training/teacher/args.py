@@ -47,7 +47,6 @@ def build_arg_parser():
     parser.add_argument("--scheduler", default="cosine", type=str)
     parser.add_argument("--warmup_ratio", default=0.05, type=float)
     parser.add_argument("--lr_end", default=1e-5, type=float)
-    parser.add_argument("--ema_decay", type=float, default=0.999)
     parser.add_argument("--log_interval", type=int, default=200)
 
     parser.add_argument(
@@ -79,13 +78,6 @@ def build_arg_parser():
     parser.add_argument("--save_hard_pool_path", type=str, default=None)
     parser.add_argument("--hard_pool_topk", type=int, default=4)
     parser.add_argument("--hard_pool_topneg_k", type=int, default=10)
-    parser.add_argument(
-        "--use_ema_for_hard_pool",
-        type=str2bool,
-        nargs="?",
-        const=True,
-        default=True,
-    )
 
     parser.add_argument("--lora_start_block", type=int, default=None)
     parser.add_argument("--lora_end_block", type=int, default=None)

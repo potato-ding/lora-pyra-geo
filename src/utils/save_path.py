@@ -19,7 +19,7 @@ def get_save_pth(args):
 
 
 def get_student_save_pth(args):
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    timestamp = datetime.now().strftime("%m%d_%H%M")
     return os.path.join(
         getattr(args, "output_root", "src/checkpoint/student"),
         timestamp,

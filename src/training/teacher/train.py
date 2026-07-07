@@ -45,50 +45,19 @@ def safe_torch_load(path, map_location):
     return torch.load(path, **load_kwargs)
 
 
-class LiteEMA:
-    def __init__(self, model, decay=0.999):
-        self.decay = decay
-        self.shadow = {}  # EMA weights for trainable parameters.
-        self.backup = {}  # Temporary weights saved before EMA evaluation.
-        
-        # Track only trainable parameters, such as LoRA and unfrozen final blocks.
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                self.shadow[name] = param.detach().float().clone()
-
-    @torch.no_grad()
-    def update(self, model):
-        # Update EMA after each batch for trainable parameters only.
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                # shadow = decay * shadow + (1 - decay) * param
-                self.shadow[name].mul_(self.decay).add_(param.detach().float(), alpha=1.0 - self.decay)
-
-    @torch.no_grad()
-    def apply_shadow(self, model):
-        # Swap EMA weights into the model for evaluation.
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                self.backup[name] = param.data.clone().detach()
-                param.data.copy_(self.shadow[name].to(dtype=param.dtype))
-
-    @torch.no_grad()
-    def restore(self, model):
-        # Restore training weights after evaluation.
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                param.data.copy_(self.backup[name])
-        self.backup = {}
 def is_teacher_delta_checkpoint_param(name):
     # Save every trainable teacher delta, including logit_scale, for strict resume.
     return True
 
 
-def collect_teacher_delta_state(state_dict):
+def collect_teacher_delta_state(model_or_engine):
+    # Collect the raw trainable teacher delta weights (LoRA + unfrozen final
+    # blocks + logit_scale) directly from the live model.
+    base_model = get_base_model(model_or_engine)
     return {
-        name: value.cpu()
-        for name, value in state_dict.items()
-        if is_teacher_delta_checkpoint_param(name)
+        name: param.detach().cpu()
+        for name, param in base_model.named_parameters()
+        if param.requires_grad and is_teacher_delta_checkpoint_param(name)
     }
 
 
@@ -891,7 +860,7 @@ def load_initial_hard_pool_if_needed(args, train_loaders):
     return True
 
 
-def build_initial_hard_pool_if_needed(model_engine, ema, train_loaders, args, device, hard_pool_loaded):
+def build_initial_hard_pool_if_needed(model_engine, train_loaders, args, device, hard_pool_loaded):
     if not getattr(args, "build_hard_pool_before_train", False):
         return hard_pool_loaded
 
@@ -911,7 +880,6 @@ def build_initial_hard_pool_if_needed(model_engine, ema, train_loaders, args, de
         print(f"[HardPool] pre-train build requested | save_epoch_label={pool_epoch}")
     return build_save_and_apply_hard_pool(
         model_engine,
-        ema,
         train_loaders,
         args,
         pool_epoch,
@@ -928,7 +896,7 @@ def should_build_hard_pool(epoch, args, hard_pool_loaded):
     )
 
 
-def build_hard_pool_with_model(model_engine, ema, train_loaders, args, epoch, device):
+def build_hard_pool_with_model(model_engine, train_loaders, args, epoch, device):
     from src.dataset.teacher.transforms import get_sample4geo_val_transforms
 
     reference_dataset = get_hard_pool_reference_dataset(train_loaders)
@@ -942,15 +910,10 @@ def build_hard_pool_with_model(model_engine, ema, train_loaders, args, epoch, de
     )
     sat_samples = build_hard_pool_image_samples(reference_dataset, "satellite")
     drone_samples = build_hard_pool_image_samples(reference_dataset, "drone")
-    model_source = "ema" if getattr(args, "use_ema_for_hard_pool", True) else "current"
+    model_source = "current"
 
-    eval_model = get_base_model(model_engine)
     was_training = getattr(model_engine, "training", True)
-    ema_applied = False
     try:
-        if getattr(args, "use_ema_for_hard_pool", True):
-            ema.apply_shadow(eval_model)
-            ema_applied = True
         model_engine.eval()
         with torch.no_grad():
             satellite_records = extract_hard_pool_features(
@@ -977,8 +940,6 @@ def build_hard_pool_with_model(model_engine, ema, train_loaders, args, epoch, de
                 model_source=model_source,
             )
     finally:
-        if ema_applied:
-            ema.restore(eval_model)
         if was_training:
             model_engine.train()
         else:
@@ -988,18 +949,16 @@ def build_hard_pool_with_model(model_engine, ema, train_loaders, args, epoch, de
     return payload
 
 
-def build_save_and_apply_hard_pool(model_engine, ema, train_loaders, args, epoch, device):
+def build_save_and_apply_hard_pool(model_engine, train_loaders, args, epoch, device):
     save_path = resolve_hard_pool_path(args.save_hard_pool_path, epoch)
 
     if is_main_process():
         print(
             f"[HardPool] Build start | epoch={epoch} | "
-            f"use_ema={getattr(args, 'use_ema_for_hard_pool', True)} | "
             f"topk={args.hard_pool_topk} | topneg_k={args.hard_pool_topneg_k}"
         )
         payload = build_hard_pool_with_model(
             model_engine,
-            ema,
             train_loaders,
             args,
             epoch,
@@ -1102,11 +1061,9 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
         print(f"[Checkpoint] Save directory: {save_dir}")
     distributed_barrier_with_log("[Checkpoint] initial training record saved", local_rank)
 
-    ema = LiteEMA(get_base_model(model_engine), decay=args.ema_decay)
     hard_pool_loaded = load_initial_hard_pool_if_needed(args, dataloader)
     hard_pool_loaded = build_initial_hard_pool_if_needed(
         model_engine,
-        ema,
         dataloader,
         args,
         amp_device,
@@ -1164,7 +1121,7 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                 f"[Train] Epoch {epoch}/{args.epochs} start | "
                 f"mode={mode_name} ({mode_desc}) | "
                 f"batches={num_batches} | local_pid_batch={local_pid_batch} | "
-                f"global_pid_batch={local_pid_batch * world_size} | ema_decay={args.ema_decay} | "
+                f"global_pid_batch={local_pid_batch * world_size} | "
                 f"loss_weights={get_loss_weight_desc(args)}"
             )
 
@@ -1238,7 +1195,6 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                     base_model = get_base_model(model_engine)
                     if hasattr(base_model, "logit_scale") and base_model.logit_scale is not None:
                         base_model.logit_scale.clamp_(max=4.6)
-                ema.update(model_engine.module if hasattr(model_engine, "module") else model_engine)
                 loss_item = loss.item()
                 loss_sums["total"] += loss_item
                 loss_counts["total"] += 1
@@ -1308,7 +1264,7 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
             )
             if hard_sampler_summary is not None:
                 print(f"[HardPoolSampler] Epoch {epoch} | {hard_sampler_summary}")
-            last_state = collect_teacher_delta_state(ema.shadow)
+            last_state = collect_teacher_delta_state(model_engine)
             if teacher_verbose_eval_log():
                 rank_log(f"[Checkpoint] last_model.pth save start | epoch={epoch}")
             torch.save(last_state, os.path.join(save_dir, "last_model.pth"))
@@ -1336,20 +1292,12 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
         if val_loaders is not None and should_run_validation(cur_epoch, args):
             verbose_eval = teacher_verbose_eval_log()
             if verbose_eval:
-                rank_log(f"[Eval] Epoch {cur_epoch}/{args.epochs} enter | weights=EMA")
+                rank_log(f"[Eval] Epoch {cur_epoch}/{args.epochs} enter | weights=current")
             distributed_barrier_with_log(
                 f"[Eval] epoch={cur_epoch} before validation",
                 local_rank,
             )
-            eval_model = get_base_model(model_engine)
-            ema_applied = False
             try:
-                if verbose_eval:
-                    rank_log(f"[Eval] Epoch {cur_epoch}/{args.epochs} apply EMA start")
-                ema.apply_shadow(eval_model)
-                ema_applied = True
-                if verbose_eval:
-                    rank_log(f"[Eval] Epoch {cur_epoch}/{args.epochs} apply EMA done")
                 model_engine.eval()
                 q_loader_d2s, g_loader_d2s = val_loaders["D2S"]
                 q_loader_s2d, g_loader_s2d = val_loaders["S2D"]
@@ -1379,12 +1327,6 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                 if verbose_eval:
                     rank_log(f"[Eval] Epoch {cur_epoch}/{args.epochs} S2D done")
             finally:
-                if ema_applied:
-                    if verbose_eval:
-                        rank_log(f"[Eval] Epoch {cur_epoch}/{args.epochs} restore EMA start")
-                    ema.restore(eval_model)
-                    if verbose_eval:
-                        rank_log(f"[Eval] Epoch {cur_epoch}/{args.epochs} restore EMA done")
                 model_engine.train()
                 clear_memory_cache()
 
@@ -1393,7 +1335,7 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                 local_rank,
             )
             if is_main_process():
-                trainable_state = collect_teacher_delta_state(ema.shadow)
+                trainable_state = collect_teacher_delta_state(model_engine)
                 current_metrics = build_validation_metrics(
                     cur_epoch,
                     (d2s_r1, d2s_r5, d2s_r10, d2s_map),
@@ -1446,7 +1388,6 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
         if should_build_hard_pool(epoch, args, hard_pool_loaded):
             hard_pool_loaded = build_save_and_apply_hard_pool(
                 model_engine,
-                ema,
                 train_loaders,
                 args,
                 epoch,
