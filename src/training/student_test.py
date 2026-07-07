@@ -197,41 +197,11 @@ def parse_args():
     parser.add_argument("--img_size", type=int, default=224)
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--temperature", type=float, default=0.07)
-    parser.add_argument(
-        "--enable_lk_adapter",
-        type=str2bool,
-        nargs="?",
-        const=True,
-        default=False,
-    )
-    parser.add_argument(
-        "--enable_psa_tiny",
-        type=str2bool,
-        nargs="?",
-        const=True,
-        default=False,
-    )
-    parser.add_argument("--psa_ratio", type=float, default=0.25)
-    parser.add_argument("--psa_num_heads", type=int, default=4)
-    parser.add_argument("--psa_ffn_ratio", type=float, default=1.0)
-    parser.add_argument("--adapter_gamma_init", type=float, default=0.0)
-    parser.add_argument(
-        "--adapter_fusion_mode",
-        type=str,
-        default="sequential",
-        choices=StudentModel.ADAPTER_FUSION_MODES,
-    )
     parser.add_argument("--output_json", type=str, default=None, help="Ignored; student tests are print-only.")
     parser.add_argument("--strict", dest="strict", action="store_true", default=True)
     parser.add_argument("--no_strict", dest="strict", action="store_false")
     parser.add_argument("--local_rank", type=int, default=0)
     args = parser.parse_args()
-    if args.psa_ratio <= 0.0:
-        parser.error("--psa_ratio must be greater than 0")
-    if args.psa_num_heads <= 0:
-        parser.error("--psa_num_heads must be greater than 0")
-    if args.psa_ffn_ratio <= 0.0:
-        parser.error("--psa_ffn_ratio must be greater than 0")
     args.checkpoint = resolve_checkpoint_path(args.checkpoint)
     return args
 
@@ -253,13 +223,6 @@ def main():
     model = StudentModel(
         ckpt_path=None,
         temperature=args.temperature,
-        enable_lk_adapter=args.enable_lk_adapter,
-        enable_psa_tiny=args.enable_psa_tiny,
-        psa_ratio=args.psa_ratio,
-        psa_num_heads=args.psa_num_heads,
-        psa_ffn_ratio=args.psa_ffn_ratio,
-        adapter_gamma_init=args.adapter_gamma_init,
-        adapter_fusion_mode=args.adapter_fusion_mode,
     ).to(device)
     load_student_checkpoint(model, args.checkpoint, strict=args.strict)
     model.eval()

@@ -1,47 +1,59 @@
-# 项目说明
+# LoRA Pyra Geo
 
-本项目采用分层结构，便于数据管理、代码维护和实验复现。
+This repository is being cleaned around the current teacher/student training
+plan.
 
-- data/：数据目录，建议用软链接指向大数据文件夹。
-- src/：主代码目录，包含数据处理、模型、训练、工具等模块。
-- configs/：YAML配置文件。
-- notebooks/：Jupyter分析与可视化。
-- outputs/：模型权重、日志、结果等输出，建议 .gitignore。
+## Current Model Plan
 
-详细结构见 README 顶部注释。
+Teacher:
 
-## 数据软链接建议
+- DINOv3-7B backbone.
+- LoRA on middle transformer blocks, default `[20, 36)`.
+- Full fine-tuning on the last four blocks, default `[36, 40)`.
+- Sample4Geo paired sampling with InfoNCE.
+- Optional identity-level contrast training and hard-pool ordering.
+- DeepSpeed multi-GPU training.
 
-如数据集较大，建议用软链接方式引用，避免重复拷贝：
+Student:
+
+- RepViT-M1.5 baseline.
+- `Input -> RepViT-M1.5 -> f4 -> GAP -> BN -> L2`.
+- Sample4Geo paired sampling with InfoNCE.
+- DeepSpeed multi-GPU training.
+
+## Main Entrypoints
+
+Teacher training:
 
 ```bash
-ln -s /your/real/data/path/university_1652 ./data/university_1652
+deepspeed --num_gpus=8 src/training/teacher/train.py --deepspeed_config ds_config.json
 ```
 
-## 常用命令示例
+Teacher evaluation:
 
-### 训练（多卡）
 ```bash
-python -m torch.distributed.run --nproc_per_node=2 src/training/train_teacher.py
+python src/training/teacher/evaluate.py --checkpoint path/to/teacher_checkpoint.pth
 ```
 
-### 推理/评估
+Student training:
+
 ```bash
-python src/inference/inference_dinov3_u1652.py --help
-python src/inference/teacher_dinov3_u1652_no_grad.py --help
+deepspeed --num_gpus=8 src/training/student_train.py --deepspeed --deepspeed_config configs/ds_student_baseline.json
 ```
 
-### 依赖安装
+Student evaluation:
+
+```bash
+python src/training/student_test.py --checkpoint path/to/student_checkpoint.pth
+```
+
+## Dependencies
+
 ```bash
 pip install -r requirements.txt
 ```
 
-## 目录结构说明
-- data/：数据目录（建议软链接）
-- src/：主代码目录
-- configs/：YAML配置
-- notebooks/：分析与可视化
-- outputs/：模型、日志、结果
-- requirements.txt：依赖
-- README.md：说明
-- .gitignore：忽略规则
+## Notes
+
+- The active loss implementations live in `src/loss/`.
+- Current entrypoints are the source of truth for new training and evaluation.

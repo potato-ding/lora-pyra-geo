@@ -3,7 +3,6 @@ import argparse
 import inspect
 import json
 import os
-import re
 import sys
 from pathlib import Path
 
@@ -17,11 +16,6 @@ from src.dataset.teacher.val_dataloaders import (
     build_1652_val_dataloaders,
     build_gta_val_dataloaders,
     build_sues200_val_dataloaders,
-)
-from src.models.teacher.checkpoint_guard import (
-    reject_removed_fusion_hparams,
-    reject_removed_fusion_state_dict,
-    validate_fusion_state_matches_model,
 )
 from src.models.teacher.model import TeacherModel
 from src.training.teacher.hparams import TRAINING_RECORD_FILENAME
@@ -39,19 +33,6 @@ MODEL_HPARAM_KEYS = {
     "lora_alpha",
     "lora_dropout",
     "lora_target_names",
-    "fusion_mode",
-    "detail_layers",
-    "semantic_layer",
-    "lambda19_init",
-    "lambda27_init",
-    "soft_orth_detach_global",
-    "gate19_init",
-    "gate27_init",
-    "gate36_init",
-    "gamma_detail_max",
-    "gamma_sem_max",
-    "gamma_detail_init",
-    "gamma_sem_init",
 }
 
 SUPPORTED_DATASETS = ("1652", "GTA-UAV", "SUES-200")
@@ -126,7 +107,6 @@ def load_checkpoint_hparams(args, parser_defaults, cli_args):
         payload = json.load(f)
 
     hparams = payload.get("hyperparameters", payload)
-    reject_removed_fusion_hparams(hparams, str(hparam_path))
     for key in MODEL_HPARAM_KEYS:
         cli_name = f"--{key}"
         if cli_name in cli_args:
@@ -145,10 +125,6 @@ def _strip_module_prefix(key):
     return key[7:] if key.startswith("module.") else key
 
 
-def _insert_checkpoint_wrapper_module(key):
-    return re.sub(r"(backbone\.model\.blocks\.\d+\.)(?!module\.)", r"\1module.", key)
-
-
 def load_teacher_checkpoint(model, checkpoint_path, device):
     if not os.path.isfile(checkpoint_path):
         raise FileNotFoundError(f"checkpoint not found: {checkpoint_path}")
@@ -157,8 +133,6 @@ def load_teacher_checkpoint(model, checkpoint_path, device):
     state_dict = checkpoint.get("state_dict", checkpoint.get("model", checkpoint))
     if not isinstance(state_dict, dict):
         raise RuntimeError(f"checkpoint payload is not a state dict: {checkpoint_path}")
-    reject_removed_fusion_state_dict(state_dict, checkpoint_path)
-    validate_fusion_state_matches_model(state_dict, model, checkpoint_path)
 
     model_state = model.state_dict()
     mapped_state = {}
@@ -167,11 +141,6 @@ def load_teacher_checkpoint(model, checkpoint_path, device):
 
     for raw_key, value in state_dict.items():
         key = _strip_module_prefix(raw_key)
-        if key not in model_state:
-            wrapped_key = _insert_checkpoint_wrapper_module(key)
-            if wrapped_key in model_state:
-                key = wrapped_key
-
         if key not in model_state:
             unexpected.append(raw_key)
             continue
@@ -302,7 +271,6 @@ def evaluate_pair(model, loaders, device, dataset, task_name, args=None):
             g_loader,
             device,
             task_name=task_name,
-            feature_name=args.eval_feature,
         )
         return {
             "R@1": r1,
@@ -317,7 +285,6 @@ def evaluate_pair(model, loaders, device, dataset, task_name, args=None):
             q_loader,
             g_loader,
             device,
-            feature_name=args.eval_feature,
         )
     if dataset == "SUES-200":
         return run_sues_val_and_get_metrics(
@@ -326,7 +293,6 @@ def evaluate_pair(model, loaders, device, dataset, task_name, args=None):
             g_loader,
             device,
             horizontal_flip=bool(getattr(args, "sues_horizontal_flip", False)),
-            feature_name=args.eval_feature,
         )
 
     raise ValueError(f"unsupported dataset: {dataset}")
@@ -374,7 +340,6 @@ def write_results(args, results):
         "dataset": args.dataset,
         "img_size": args.img_size,
         "batch_size": args.batch_size,
-        "eval_feature": args.eval_feature,
         "results": results,
     }
     if args.dataset == "GTA-UAV":
@@ -417,14 +382,6 @@ def parse_args():
     parser.add_argument("--output_json", type=str, default=None)
     parser.add_argument("--no_checkpoint_hparams", action="store_true")
     parser.add_argument("--local_rank", type=int, default=0)
-    parser.add_argument(
-        "--eval_feature",
-        type=str,
-        choices=["deep", "fused"],
-        default="fused",
-        help="Legacy tuple-output descriptor selector; tensor-output teachers ignore it.",
-    )
-
     parser.add_argument("--lora_start_block", type=int, default=None)
     parser.add_argument("--lora_end_block", type=int, default=None)
     parser.add_argument("--full_finetune_start_block", type=int, default=None)
@@ -435,25 +392,6 @@ def parse_args():
     parser.add_argument("--lora_alpha", type=int, default=16)
     parser.add_argument("--lora_dropout", type=float, default=0.1)
     parser.add_argument("--lora_target_names", type=str, default="qkv,proj")
-    parser.add_argument(
-        "--fusion_mode",
-        type=str,
-        choices=["none", "layerwise_soft_orth"],
-        default="none",
-    )
-    parser.add_argument("--detail_layers", type=int, nargs=2, default=[19, 27])
-    parser.add_argument("--semantic_layer", type=int, default=36)
-    parser.add_argument("--lambda19_init", type=float, default=0.8)
-    parser.add_argument("--lambda27_init", type=float, default=0.8)
-    parser.add_argument("--soft_orth_detach_global", type=str2bool, nargs="?", const=True, default=True)
-    parser.add_argument("--gate19_init", type=float, default=0.5)
-    parser.add_argument("--gate27_init", type=float, default=0.5)
-    parser.add_argument("--gate36_init", type=float, default=0.5)
-    parser.add_argument("--gamma_detail_max", type=float, default=0.02)
-    parser.add_argument("--gamma_sem_max", type=float, default=0.02)
-    parser.add_argument("--gamma_detail_init", type=float, default=0.005)
-    parser.add_argument("--gamma_sem_init", type=float, default=0.005)
-
     defaults = {action.dest: action.default for action in parser._actions}
     args = parser.parse_args()
     args.checkpoint = resolve_checkpoint_path(args.checkpoint)

@@ -1,40 +1,45 @@
-# 创建多卡并实例化
+"""Distributed runtime initialization."""
+
 import os
+
 import torch
 import torch.distributed as dist
 
-# 定义初始化分布式环境的函数
+
 def try_init_dist():
     if dist.is_available() and not dist.is_initialized():
-        if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
-            rank = int(os.environ['RANK'])
-            world_size = int(os.environ['WORLD_SIZE'])
-            local_rank = int(os.environ.get('LOCAL_RANK', 0))
+        if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+            rank = int(os.environ["RANK"])
+            world_size = int(os.environ["WORLD_SIZE"])
+            local_rank = int(os.environ.get("LOCAL_RANK", 0))
 
-            torch.cuda.set_device(local_rank)
+            if torch.cuda.is_available():
+                torch.cuda.set_device(local_rank)
+                backend = "nccl"
+                device = torch.device(f"cuda:{local_rank}")
+            else:
+                backend = "gloo"
+                device = torch.device("cpu")
 
             dist.init_process_group(
-                backend='nccl',
-                init_method='env://',
+                backend=backend,
+                init_method="env://",
                 rank=rank,
-                world_size=world_size
+                world_size=world_size,
             )
-
-            device = torch.device(f"cuda:{local_rank}")
 
             if rank == 0:
                 print(
-                    f"[Distributed] Initialized: "
-                    f"rank={rank}, world_size={world_size}, local_rank={local_rank}"
+                    "[Distributed] Initialized: "
+                    f"backend={backend}, rank={rank}, "
+                    f"world_size={world_size}, local_rank={local_rank}"
                 )
 
             return device, rank, local_rank, world_size
 
-    # 单卡情况
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    rank = 0
-    local_rank = 0
-    world_size = 1
-
     print("[Distributed] Not running in distributed mode.")
-    return device, rank, local_rank, world_size
+    return device, 0, 0, 1
+
+
+__all__ = ["try_init_dist"]

@@ -13,12 +13,11 @@ try:
     import albumentations  # noqa: F401
 except ModuleNotFoundError:
     sys.modules.setdefault("cv2", types.ModuleType("cv2"))
-    fake_transforms = types.ModuleType("src.dataset.transforms")
-    fake_transforms.get_train_transforms = lambda *args, **kwargs: (None, None, None)
+    fake_transforms = types.ModuleType("src.dataset.teacher.transforms")
     fake_transforms.get_sample4geo_train_transforms = lambda *args, **kwargs: (None, None)
-    sys.modules.setdefault("src.dataset.transforms", fake_transforms)
+    sys.modules.setdefault("src.dataset.teacher.transforms", fake_transforms)
 
-from src.dataset.datasets import Sample4GeoBatchSampler
+from src.dataset.teacher.datasets import Sample4GeoBatchSampler
 import src.dataset.teacher.datasets as teacher_datasets
 
 

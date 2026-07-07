@@ -1,20 +1,8 @@
-"""Optimizer compatibility layer."""
+"""Student optimizer construction."""
 
 import torch
 
 from src.utils.rank_logging import rank0_print
-
-
-def build_optimizer_and_scale(*args, **kwargs):
-    from src.utils.teacher.optimizer import build_optimizer_and_scale as _build_optimizer_and_scale
-
-    return _build_optimizer_and_scale(*args, **kwargs)
-
-
-def build_teacher_optimizer(*args, **kwargs):
-    from src.utils.teacher.optimizer import build_teacher_optimizer as _build_teacher_optimizer
-
-    return _build_teacher_optimizer(*args, **kwargs)
 
 
 def build_student_optimizer(
@@ -23,8 +11,6 @@ def build_student_optimizer(
     weight_decay=1e-4,
     betas=(0.9, 0.999),
 ):
-    """Build AdamW for all trainable RepViT student parameters."""
-
     decay = []
     no_decay = []
 
@@ -39,21 +25,21 @@ def build_student_optimizer(
             or "bn" in name_lower
             or "norm" in name_lower
         )
-
         if is_no_decay:
             no_decay.append(param)
         else:
             decay.append(param)
 
-    param_groups = [
-        {"params": decay, "name": "decay", "lr": lr, "weight_decay": weight_decay},
-        {"params": no_decay, "name": "no_decay", "lr": lr, "weight_decay": 0.0},
-    ]
-
     if not decay and not no_decay:
         raise ValueError("No trainable student parameters found.")
 
-    optimizer = torch.optim.AdamW(param_groups, betas=betas)
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": decay, "name": "decay", "lr": lr, "weight_decay": weight_decay},
+            {"params": no_decay, "name": "no_decay", "lr": lr, "weight_decay": 0.0},
+        ],
+        betas=betas,
+    )
 
     rank0_print("[Optimizer] student decay params   :", len(decay))
     rank0_print("[Optimizer] student no_decay params:", len(no_decay))
@@ -61,12 +47,7 @@ def build_student_optimizer(
         f"[Optimizer] student lr={lr:g} | "
         f"weight_decay={weight_decay:g} | optimizer=AdamW"
     )
-
     return optimizer
 
 
-__all__ = [
-    "build_optimizer_and_scale",
-    "build_student_optimizer",
-    "build_teacher_optimizer",
-]
+__all__ = ["build_student_optimizer"]

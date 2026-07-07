@@ -31,34 +31,9 @@ def strip_module_prefix(state_dict):
 def load_student_checkpoint(model, checkpoint_path, strict=True):
     ckpt = safe_torch_load(checkpoint_path, map_location="cpu")
     state_dict = strip_module_prefix(unwrap_state_dict(ckpt))
-    training_only_keys = [
-        key for key in state_dict
-        if (
-            key.startswith("kd_projector.")
-            or key.startswith("local_attn_head.")
-            or key.startswith("student_local_proj.")
-            or key.startswith("teacher_local_proj.")
-        )
-    ]
-    if training_only_keys:
-        state_dict = {
-            key: value
-            for key, value in state_dict.items()
-            if (
-                not key.startswith("kd_projector.")
-                and not key.startswith("local_attn_head.")
-                and not key.startswith("student_local_proj.")
-                and not key.startswith("teacher_local_proj.")
-            )
-        }
     msg = model.load_state_dict(state_dict, strict=strict)
     print(f"[Eval] loaded checkpoint: {checkpoint_path}")
     print(f"[Eval] strict load: {strict}")
-    if training_only_keys:
-        print(
-            "[Eval] ignored training-only KD keys: "
-            f"{len(training_only_keys)}"
-        )
     if not strict:
         print(f"[Eval] missing keys: {len(msg.missing_keys)}")
         print(f"[Eval] unexpected keys: {len(msg.unexpected_keys)}")

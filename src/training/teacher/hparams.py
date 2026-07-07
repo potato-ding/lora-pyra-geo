@@ -1,18 +1,9 @@
 import json
 import os
-import shutil
 import sys
-
-from src.models.teacher.checkpoint_guard import removed_fusion_hparam_keys
 
 
 TRAINING_RECORD_FILENAME = "bset_metricis.json"
-LEGACY_TRAINING_ARTIFACTS = (
-    "hyperparameters.json",
-    "best_metrics.json",
-    "final_model.pth",
-    "validation_results.json",
-)
 
 
 def _json_safe_value(value):
@@ -35,11 +26,9 @@ def build_training_record(
     best_metrics,
     last_completed_epoch,
 ):
-    removed_keys = removed_fusion_hparam_keys()
     hyperparameters = {
         key: _json_safe_value(value)
         for key, value in sorted(vars(args).items())
-        if key not in removed_keys
     }
     return {
         "save_dir": save_dir,
@@ -70,18 +59,3 @@ def save_training_record(
     with open(path, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2, ensure_ascii=False)
     return path
-
-
-def remove_legacy_training_artifacts(save_dir):
-    removed = []
-    for filename in LEGACY_TRAINING_ARTIFACTS:
-        path = os.path.join(save_dir, filename)
-        if os.path.isfile(path):
-            os.remove(path)
-            removed.append(path)
-
-    validation_dir = os.path.join(save_dir, "validation_results")
-    if os.path.isdir(validation_dir):
-        shutil.rmtree(validation_dir)
-        removed.append(validation_dir)
-    return removed

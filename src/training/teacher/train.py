@@ -12,7 +12,6 @@ import torch.distributed as dist
 import gc
 import inspect
 import json
-import re
 from torch.utils.data import Dataset, DataLoader
 from src.loss.tripletloss import IntraDomainTripletLoss
 from src.loss.blocks_infoNCE import infonce
@@ -29,16 +28,9 @@ from src.utils.train_eval_utils import (
 )
 from src.dataset.teacher.datasets import create_1652_teacher_train_dataloaders
 from src.dataset.teacher.val_dataloaders import build_1652_val_dataloaders
-from src.models.teacher.checkpoint_guard import (
-    reject_removed_fusion_state_dict,
-    validate_fusion_state_matches_model,
-)
 from src.models.teacher.model import TeacherModel
 from src.training.teacher.args import parse_args
-from src.training.teacher.hparams import (
-    remove_legacy_training_artifacts,
-    save_training_record,
-)
+from src.training.teacher.hparams import save_training_record
 from src.utils.teacher.optimizer import build_optimizer_and_scale
 from src.utils.teacher.scheduler import get_scheduler
 from src.utils.save_path import get_save_pth
@@ -159,10 +151,6 @@ def _strip_module_prefix(key):
     return key[7:] if key.startswith("module.") else key
 
 
-def _insert_checkpoint_wrapper_module(key):
-    return re.sub(r"(backbone\.model\.blocks\.\d+\.)(?!module\.)", r"\1module.", key)
-
-
 def load_teacher_init_checkpoint(model, checkpoint_path, device, strict_trainable=True):
     if not checkpoint_path:
         return
@@ -171,8 +159,6 @@ def load_teacher_init_checkpoint(model, checkpoint_path, device, strict_trainabl
 
     checkpoint = safe_torch_load(checkpoint_path, map_location="cpu")
     state_dict = checkpoint.get("state_dict", checkpoint.get("model", checkpoint))
-    reject_removed_fusion_state_dict(state_dict, checkpoint_path)
-    validate_fusion_state_matches_model(state_dict, model, checkpoint_path)
     model_state = model.state_dict()
     mapped_state = {}
     unexpected = []
@@ -180,11 +166,6 @@ def load_teacher_init_checkpoint(model, checkpoint_path, device, strict_trainabl
 
     for raw_key, value in state_dict.items():
         key = _strip_module_prefix(raw_key)
-        if key not in model_state:
-            wrapped_key = _insert_checkpoint_wrapper_module(key)
-            if wrapped_key in model_state:
-                key = wrapped_key
-
         if key not in model_state:
             unexpected.append(raw_key)
             continue
@@ -341,84 +322,7 @@ def get_model_debug_values(model_or_engine):
     with torch.no_grad():
         if hasattr(base_model, "logit_scale"):
             values["scale"] = base_model.logit_scale.exp().item()
-        if hasattr(base_model, "get_fusion_runtime_values"):
-            values.update(base_model.get_fusion_runtime_values())
     return values
-
-
-def print_teacher_feature_fusion_config(model_or_engine):
-    if not is_main_process():
-        return
-
-    base_model = get_base_model(model_or_engine)
-    if not hasattr(base_model, "get_feature_fusion_config"):
-        return
-
-    config = base_model.get_feature_fusion_config()
-    print(
-        f"[TeacherFusion] fusion_mode={config.get('fusion_mode', 'none')} | "
-        f"detail_layers={config['detail_layers']} | "
-        f"semantic_layer={config['semantic_layer']}"
-    )
-    for item in config["layer_regions"]:
-        print(f"[TeacherFusion] layer {item['layer']}: {item['region']}")
-    if config.get("fusion_mode") == "layerwise_soft_orth":
-        print(
-            f"[TeacherFusion] lambda19_init={config['lambda19_init']:.6f} | "
-            f"lambda27_init={config['lambda27_init']:.6f} | "
-            f"gamma_detail={config['gamma_detail_init']:.6f}/"
-            f"{config['gamma_detail_max']:.6f} | "
-            f"gamma_sem={config['gamma_sem_init']:.6f}/"
-            f"{config['gamma_sem_max']:.6f} | "
-            f"gate36_init={config['gate36_init']:.6f} | "
-            f"detach_global={config['soft_orth_detach_global']}"
-        )
-
-
-def format_layerwise_fusion_runtime(values):
-    if values.get("fusion_mode") != "layerwise_soft_orth":
-        return None
-    text = (
-        f"lambda19={values.get('lambda19', float('nan')):.6f} | "
-        f"lambda27={values.get('lambda27', float('nan')):.6f} | "
-        f"gamma_detail={values.get('gamma_detail', float('nan')):.6f} | "
-        f"gamma_sem={values.get('gamma_sem', float('nan')):.6f} | "
-        f"gate19={values.get('gate19', float('nan')):.6f} | "
-        f"gate27={values.get('gate27', float('nan')):.6f} | "
-        f"gate36={values.get('gate36', float('nan')):.6f} | "
-        f"norm_global={values.get('norm_global', float('nan')):.4f} | "
-        f"norm_local19={values.get('norm_local19', float('nan')):.4f} | "
-        f"norm_local27={values.get('norm_local27', float('nan')):.4f} | "
-        f"norm_local36={values.get('norm_local36', float('nan')):.4f} | "
-        f"norm_detail={values.get('norm_detail', float('nan')):.4f} | "
-        f"norm_semantic={values.get('norm_semantic', float('nan')):.4f} | "
-        f"norm_gamma_detail_detail="
-        f"{values.get('norm_gamma_detail_detail', float('nan')):.6f} | "
-        f"norm_gamma_sem_semantic="
-        f"{values.get('norm_gamma_sem_semantic', float('nan')):.6f} | "
-        f"cos_global_fused={values.get('cos_global_fused', float('nan')):.6f} | "
-        f"cos_global_detail={values.get('cos_global_detail', float('nan')):.4f} | "
-        f"cos_global_semantic36="
-        f"{values.get('cos_global_semantic36', float('nan')):.4f}"
-    )
-    return text
-
-
-def warn_if_fusion_rotation_is_large(values, epoch, step=None):
-    cosine = values.get("cos_global_fused")
-    if cosine is None or not math.isfinite(float(cosine)):
-        return
-    if float(cosine) >= 0.98:
-        return
-    location = f"epoch={epoch}"
-    if step is not None:
-        location += f" batch={step}"
-    print(
-        "[FusionLayerwise][WARNING] "
-        f"{location} | cos_global_fused={float(cosine):.6f} < 0.98 | "
-        "the fused descriptor is rotating too far from the global descriptor",
-        flush=True,
-    )
 
 
 def format_optional_metric(name, value):
@@ -573,9 +477,7 @@ def clear_memory_cache():
         torch.cuda.empty_cache()
 
 
-# Deprecated, isolated teacher-sampling helpers.
-# No command-line option, dataset factory, or training-loop path references
-# this block. It remains temporarily for old checkpoint tooling compatibility.
+# Hard-pool feature extraction and ranking helpers for identity-stage training.
 class HardPoolImageDataset(Dataset):
     def __init__(self, samples, transform):
         self.samples = samples
@@ -1126,19 +1028,11 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
         lr_scheduler=scheduler,
         config=ds_config if ds_config is not None else args.deepspeed_config
     )
-    print_teacher_feature_fusion_config(model_engine)
     # 开始训练循环
     # 构建保存目录名
     save_dir = get_save_pth(args)
     if is_main_process():
         os.makedirs(save_dir, exist_ok=True)
-        removed_artifacts = remove_legacy_training_artifacts(save_dir)
-        if removed_artifacts:
-            print(
-                "[Checkpoint] Removed legacy training artifacts: "
-                + ", ".join(os.path.basename(path) for path in removed_artifacts),
-                flush=True,
-            )
         save_training_record(
             save_dir=save_dir,
             args=args,
@@ -1190,21 +1084,6 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                 f"[Sampler] Epoch {epoch}/{args.epochs} | "
                 f"mode={effective_mode} | {get_sampler_debug_desc(epoch_dataloader)}"
             )
-            fusion_values = get_model_debug_values(model_engine)
-            print(
-                f"[Fusion] Epoch {epoch}/{args.epochs} | "
-                f"fusion_mode={fusion_values.get('fusion_mode', 'none')}"
-            )
-            layerwise_runtime = format_layerwise_fusion_runtime(fusion_values)
-            if layerwise_runtime is not None:
-                print(
-                    f"[FusionLayerwise] Epoch {epoch}/{args.epochs} | "
-                    f"{layerwise_runtime}"
-                )
-                warn_if_fusion_rotation_is_large(
-                    fusion_values,
-                    epoch=epoch,
-                )
             print(
                 f"[Train] Epoch {epoch}/{args.epochs} start | "
                 f"mode={mode_name} ({mode_desc}) | "
@@ -1329,18 +1208,6 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                     f"lr={lr:.2e} | scale={debug_values.get('scale', 0.0):.3f} | "
                     f"elapsed={elapsed_min:.1f}m"
                 )
-                layerwise_runtime = format_layerwise_fusion_runtime(debug_values)
-                if layerwise_runtime is not None:
-                    print(
-                        f"[FusionLayerwise] Epoch {epoch}/{args.epochs} | "
-                        f"batch {step}/{num_batches} | {layerwise_runtime}"
-                    )
-                    warn_if_fusion_rotation_is_large(
-                        debug_values,
-                        epoch=epoch,
-                        step=step,
-                    )
-
         if is_main_process():
             elapsed_min = (time.time() - epoch_start_time) / 60.0
             avg_parts = []
