@@ -80,11 +80,12 @@ class Sample4GeoLoss(nn.Module):
                 f"{query_features.size(0)} vs {reference_features.size(0)}"
             )
 
-        query_features = F.normalize(query_features, p=2, dim=1)
-        reference_features = F.normalize(reference_features, p=2, dim=1)
+        query_features = F.normalize(query_features.float(), p=2, dim=1)
+        reference_features = F.normalize(reference_features.float(), p=2, dim=1)
 
         logits = query_features @ reference_features.t()
-        logits = logits * logit_scale
+        if logit_scale is not None:
+            logits = logits * logit_scale.float()
         labels = torch.arange(logits.size(0), device=logits.device)
 
         loss_q2r = F.cross_entropy(logits, labels, label_smoothing=self.label_smoothing)

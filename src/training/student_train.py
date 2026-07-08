@@ -181,6 +181,13 @@ def compute_student_batch_losses(model, images, pair_batch_size, criterion):
     }
 
 
+def cast_images_to_model_dtype(model, images):
+    param = next(get_raw_model(model).parameters())
+    if param.is_floating_point() and images.is_floating_point():
+        return images.to(dtype=param.dtype)
+    return images
+
+
 def save_model_only_checkpoint(model, epoch, save_path):
     if not is_main_process():
         return
@@ -450,6 +457,7 @@ def train_one_epoch_deepspeed(
     for step, batch in enumerate(train_loader):
         data_time.update(time.time() - end)
         images, meta = unpack_sample4geo_batch(batch, device)
+        images = cast_images_to_model_dtype(model_engine, images)
         pair_batch_size = meta["pair_batch_size"]
 
         batch_losses = compute_student_batch_losses(
