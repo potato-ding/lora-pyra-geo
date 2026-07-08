@@ -2,7 +2,9 @@
 # Teacher training entrypoint.
 import sys
 import os
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 os.environ["NO_ALBUMENTATIONS_UPDATE"] = "1"
 import time
 import torch
