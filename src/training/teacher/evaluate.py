@@ -34,6 +34,11 @@ MODEL_HPARAM_KEYS = {
     "lora_dropout",
     "lora_target_names",
 }
+CHECKPOINT_HPARAM_KEYS = MODEL_HPARAM_KEYS | {"img_size"}
+CHECKPOINT_FILENAMES = {
+    "best": "best_model.pth",
+    "last": "last_model.pth",
+}
 
 SUPPORTED_DATASETS = ("1652", "GTA-UAV", "SUES-200")
 
@@ -78,16 +83,20 @@ def default_dataset_dir(dataset, data_root):
     return os.path.join(data_root, defaults[dataset])
 
 
-def resolve_checkpoint_path(checkpoint):
+def cli_has_option(cli_args, name):
+    option = f"--{name}"
+    return any(arg == option or arg.startswith(f"{option}=") for arg in cli_args)
+
+
+def resolve_checkpoint_path(checkpoint, checkpoint_select="best"):
     checkpoint_path = Path(checkpoint)
     if checkpoint_path.is_dir():
-        for filename in ("best_model.pth", "last_model.pth"):
-            candidate = checkpoint_path / filename
-            if candidate.is_file():
-                return str(candidate)
+        filename = CHECKPOINT_FILENAMES[checkpoint_select]
+        candidate = checkpoint_path / filename
+        if candidate.is_file():
+            return str(candidate)
         raise FileNotFoundError(
-            f"checkpoint directory does not contain best_model.pth or last_model.pth: "
-            f"{checkpoint_path}"
+            f"checkpoint directory does not contain {filename}: {checkpoint_path}"
         )
     return str(checkpoint_path)
 
@@ -96,26 +105,28 @@ def load_checkpoint_hparams(args, parser_defaults, cli_args):
     if args.no_checkpoint_hparams:
         return
 
-    hparam_path = (
-        Path(args.checkpoint).resolve().parent
-        / TRAINING_RECORD_FILENAME
-    )
+    hparam_path = Path(args.checkpoint).resolve().parent / TRAINING_RECORD_FILENAME
     if not hparam_path.is_file():
-        return
+        raise FileNotFoundError(
+            f"{TRAINING_RECORD_FILENAME} is required next to the checkpoint: "
+            f"{hparam_path}"
+        )
 
     with hparam_path.open("r", encoding="utf-8") as f:
         payload = json.load(f)
 
-    hparams = payload.get("hyperparameters", payload)
-    for key in MODEL_HPARAM_KEYS:
-        cli_name = f"--{key}"
-        if cli_name in cli_args:
+    hparams = payload.get("hyperparameters")
+    if not isinstance(hparams, dict):
+        raise RuntimeError(
+            f"{TRAINING_RECORD_FILENAME} must contain a hyperparameters object: "
+            f"{hparam_path}"
+        )
+
+    for key in CHECKPOINT_HPARAM_KEYS:
+        if cli_has_option(cli_args, key):
             continue
         if key in hparams and getattr(args, key, parser_defaults.get(key)) == parser_defaults.get(key):
             setattr(args, key, hparams[key])
-
-    if "--img_size" not in cli_args and "img_size" in hparams:
-        args.img_size = int(hparams["img_size"])
 
     if is_main_process():
         print(f"[HParams] loaded model/test defaults from {hparam_path}")
@@ -375,6 +386,13 @@ def parse_args():
         help="Path to a run directory, best_model.pth, or last_model.pth.",
     )
     parser.add_argument(
+        "--checkpoint_select",
+        type=str,
+        default="best",
+        choices=tuple(CHECKPOINT_FILENAMES.keys()),
+        help="When --checkpoint is a run directory, choose best_model.pth or last_model.pth.",
+    )
+    parser.add_argument(
         "--dataset",
         type=str,
         default="1652",
@@ -406,7 +424,7 @@ def parse_args():
     parser.add_argument("--lora_target_names", type=str, default="qkv,proj")
     defaults = {action.dest: action.default for action in parser._actions}
     args = parser.parse_args()
-    args.checkpoint = resolve_checkpoint_path(args.checkpoint)
+    args.checkpoint = resolve_checkpoint_path(args.checkpoint, args.checkpoint_select)
     load_checkpoint_hparams(args, defaults, sys.argv[1:])
     return args
 

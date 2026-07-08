@@ -13,15 +13,15 @@ def test_student_save_path_uses_timestamp_folder(monkeypatch):
             return FixedDateTime()
 
         def strftime(self, fmt):
-            assert fmt == "%Y-%m-%d_%H-%M-%S"
-            return "2026-06-27_16-42-10"
+            assert fmt == "%m%d_%H%M"
+            return "0708_1425"
 
     monkeypatch.setattr(save_path_module, "datetime", FixedDateTime)
     args = SimpleNamespace(output_root=os.path.join("checkpoints", "student"))
 
     assert get_student_save_pth(args) == os.path.join(
         args.output_root,
-        "2026-06-27_16-42-10",
+        "0708_1425",
     )
 
 

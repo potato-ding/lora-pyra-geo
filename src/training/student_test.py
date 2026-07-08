@@ -1,6 +1,7 @@
 """Evaluate a trained RepViT student checkpoint on U1652, GTA-UAV, or SUES-200."""
 
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
@@ -27,6 +28,15 @@ from src.utils.train_eval_utils import (
 
 
 SUPPORTED_DATASETS = ("1652", "GTA-UAV", "SUES-200")
+TRAINING_RECORD_FILENAME = "best_metrics.json"
+CHECKPOINT_FILENAMES = {
+    "best": "best_model.pth",
+    "last": "last_model.pth",
+}
+MODEL_HPARAM_KEYS = {
+    "img_size",
+    "temperature",
+}
 
 
 def str2bool(value):
@@ -62,18 +72,53 @@ def default_dataset_dir(dataset, data_root):
     return os.path.join(data_root, defaults[dataset])
 
 
-def resolve_checkpoint_path(checkpoint):
+def cli_has_option(cli_args, name):
+    option = f"--{name}"
+    return any(arg == option or arg.startswith(f"{option}=") for arg in cli_args)
+
+
+def resolve_checkpoint_path(checkpoint, checkpoint_select="best"):
     checkpoint_path = Path(checkpoint)
     if checkpoint_path.is_dir():
-        for filename in ("best_model.pth", "last_model.pth"):
-            candidate = checkpoint_path / filename
-            if candidate.is_file():
-                return str(candidate)
+        filename = CHECKPOINT_FILENAMES[checkpoint_select]
+        candidate = checkpoint_path / filename
+        if candidate.is_file():
+            return str(candidate)
         raise FileNotFoundError(
-            f"checkpoint directory does not contain best_model.pth or last_model.pth: "
-            f"{checkpoint_path}"
+            f"checkpoint directory does not contain {filename}: {checkpoint_path}"
         )
     return str(checkpoint_path)
+
+
+def load_checkpoint_hparams(args, parser_defaults, cli_args):
+    if args.no_checkpoint_hparams:
+        return
+
+    hparam_path = Path(args.checkpoint).resolve().parent / TRAINING_RECORD_FILENAME
+    if not hparam_path.is_file():
+        raise FileNotFoundError(
+            f"{TRAINING_RECORD_FILENAME} is required next to the checkpoint: "
+            f"{hparam_path}"
+        )
+
+    with hparam_path.open("r", encoding="utf-8") as f:
+        payload = json.load(f)
+
+    hparams = payload.get("hyperparameters")
+    if not isinstance(hparams, dict):
+        raise RuntimeError(
+            f"{TRAINING_RECORD_FILENAME} must contain a hyperparameters object: "
+            f"{hparam_path}"
+        )
+
+    for key in MODEL_HPARAM_KEYS:
+        if cli_has_option(cli_args, key):
+            continue
+        if key in hparams and getattr(args, key, parser_defaults.get(key)) == parser_defaults.get(key):
+            setattr(args, key, hparams[key])
+
+    if is_main_process():
+        print(f"[StudentEval] loaded model/test defaults from {hparam_path}")
 
 
 def build_loaders_for_dataset(dataset, args):
@@ -185,6 +230,13 @@ def parse_args():
         required=True,
         help="Path to a student run directory, best_model.pth, or last_model.pth.",
     )
+    parser.add_argument(
+        "--checkpoint_select",
+        type=str,
+        default="best",
+        choices=tuple(CHECKPOINT_FILENAMES.keys()),
+        help="When --checkpoint is a run directory, choose best_model.pth or last_model.pth.",
+    )
     parser.add_argument("--dataset", type=str, default="1652", choices=SUPPORTED_DATASETS)
     parser.add_argument("--data_root", type=str, default="data")
     parser.add_argument("--data_dir", type=str, default=None, help="Override data dir for selected dataset.")
@@ -200,9 +252,12 @@ def parse_args():
     parser.add_argument("--output_json", type=str, default=None, help="Ignored; student tests are print-only.")
     parser.add_argument("--strict", dest="strict", action="store_true", default=True)
     parser.add_argument("--no_strict", dest="strict", action="store_false")
+    parser.add_argument("--no_checkpoint_hparams", action="store_true")
     parser.add_argument("--local_rank", type=int, default=0)
+    defaults = {action.dest: action.default for action in parser._actions}
     args = parser.parse_args()
-    args.checkpoint = resolve_checkpoint_path(args.checkpoint)
+    args.checkpoint = resolve_checkpoint_path(args.checkpoint, args.checkpoint_select)
+    load_checkpoint_hparams(args, defaults, sys.argv[1:])
     return args
 
 
