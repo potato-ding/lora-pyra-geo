@@ -479,383 +479,6 @@ def negative_aware_cross_view_ranking_kd(
     return 0.5 * (loss_d2s + loss_s2d)
 
 
-def should_debug_negrank_kd(args, teacher_model, epoch, step):
-    return (
-        bool(getattr(args, "use_negrank_kd", False))
-        and bool(getattr(args, "debug_negrank_kd", False))
-        and teacher_model is not None
-        and epoch == 1
-        and step == 0
-    )
-
-
-def _shape_tuple(tensor):
-    return tuple(tensor.shape)
-
-
-def should_debug_precision(args, epoch, step):
-    return bool(getattr(args, "debug_negrank_kd", False)) and epoch == 1 and step == 0
-
-
-def first_floating_parameter(module):
-    raw_module = get_raw_model(module)
-    for param in raw_module.parameters():
-        if param.is_floating_point():
-            return param
-    raise RuntimeError(f"{raw_module.__class__.__name__} has no floating parameters")
-
-
-def model_input_reference_parameter(module):
-    raw_module = get_raw_model(module)
-    backbone = getattr(raw_module, "backbone", None)
-    if backbone is not None:
-        for param in backbone.parameters():
-            if param.is_floating_point():
-                return param
-    return first_floating_parameter(raw_module)
-
-
-def precision_assert(condition, message):
-    if not condition:
-        raise RuntimeError(f"[PRECISION DEBUG] {message}")
-
-
-def tensor_precision_summary(tensor):
-    return {
-        "dtype": tensor.dtype,
-        "device": tensor.device,
-        "shape": _shape_tuple(tensor),
-        "requires_grad": bool(tensor.requires_grad),
-    }
-
-
-def raw_batch_precision_info(batch):
-    if len(batch) != 4:
-        return {}
-    drone, satellite, _, _ = batch
-    return {
-        "raw drone image": tensor_precision_summary(drone),
-        "raw satellite image": tensor_precision_summary(satellite),
-    }
-
-
-def print_precision_debug_record(name, record):
-    print(f"[PRECISION DEBUG] {name}:")
-    for key, value in record.items():
-        print(f"[PRECISION DEBUG]     {key}={value}")
-
-
-def build_negrank_kd_debug_info(
-    student_drone_feat,
-    student_sat_feat,
-    teacher_drone_feat,
-    teacher_sat_feat,
-    temperature,
-):
-    student_drone_fp32 = student_drone_feat.float()
-    student_sat_fp32 = student_sat_feat.float()
-    teacher_drone_fp32 = teacher_drone_feat.detach().float()
-    teacher_sat_fp32 = teacher_sat_feat.detach().float()
-    student_drone_norm = F.normalize(student_drone_fp32, dim=1)
-    student_sat_norm = F.normalize(student_sat_fp32, dim=1)
-    teacher_drone_norm = F.normalize(teacher_drone_fp32, dim=1)
-    teacher_sat_norm = F.normalize(teacher_sat_fp32, dim=1)
-
-    sim_s_d2s = student_drone_norm @ student_sat_norm.t()
-    sim_t_d2s = teacher_drone_norm @ teacher_sat_norm.t()
-    sim_s_s2d = sim_s_d2s.t()
-    sim_t_s2d = sim_t_d2s.t()
-
-    batch_size = sim_s_d2s.size(0)
-    if batch_size <= 1:
-        raise RuntimeError(
-            "NegRankKD debug requires batch_size > 1 to validate negatives"
-        )
-    mask = ~torch.eye(batch_size, dtype=torch.bool, device=sim_s_d2s.device)
-    expected_neg_shape = (batch_size, batch_size - 1)
-    mask_true_count = int(mask.sum().item())
-    expected_negative_count = batch_size * (batch_size - 1)
-    if mask_true_count != expected_negative_count:
-        raise RuntimeError(
-            "NegRankKD debug mask did not remove only diagonal positives: "
-            f"mask_true_count={mask_true_count}, "
-            f"expected={expected_negative_count}"
-        )
-
-    student_neg_d2s = sim_s_d2s[mask].view(*expected_neg_shape)
-    teacher_neg_d2s = sim_t_d2s.detach()[mask].view(*expected_neg_shape)
-    student_neg_s2d = sim_s_s2d[mask].view(*expected_neg_shape)
-    teacher_neg_s2d = sim_t_s2d.detach()[mask].view(*expected_neg_shape)
-
-    for name, tensor in (
-        ("student_neg_d2s", student_neg_d2s),
-        ("teacher_neg_d2s", teacher_neg_d2s),
-        ("student_neg_s2d", student_neg_s2d),
-        ("teacher_neg_s2d", teacher_neg_s2d),
-    ):
-        if tuple(tensor.shape) != expected_neg_shape:
-            raise RuntimeError(
-                f"NegRankKD debug expected {name}.shape={expected_neg_shape}, "
-                f"got {tuple(tensor.shape)}"
-            )
-
-    teacher_prob_d2s = F.softmax(teacher_neg_d2s / temperature, dim=1).detach()
-    student_log_prob_d2s = F.log_softmax(student_neg_d2s / temperature, dim=1)
-    loss_d2s = F.kl_div(
-        student_log_prob_d2s,
-        teacher_prob_d2s,
-        reduction="batchmean",
-    )
-    teacher_prob_s2d = F.softmax(teacher_neg_s2d / temperature, dim=1).detach()
-    student_log_prob_s2d = F.log_softmax(student_neg_s2d / temperature, dim=1)
-    loss_s2d = F.kl_div(
-        student_log_prob_s2d,
-        teacher_prob_s2d,
-        reduction="batchmean",
-    )
-    teacher_prob_d2s_row_sum = teacher_prob_d2s.sum(dim=1)
-
-    return {
-        "student_drone_fp32.dtype": student_drone_fp32.dtype,
-        "student_sat_fp32.dtype": student_sat_fp32.dtype,
-        "teacher_drone_fp32.dtype": teacher_drone_fp32.dtype,
-        "teacher_sat_fp32.dtype": teacher_sat_fp32.dtype,
-        "normalized_student_drone.dtype": student_drone_norm.dtype,
-        "normalized_student_sat.dtype": student_sat_norm.dtype,
-        "normalized_teacher_drone.dtype": teacher_drone_norm.dtype,
-        "normalized_teacher_sat.dtype": teacher_sat_norm.dtype,
-        "sim_s_d2s.shape": _shape_tuple(sim_s_d2s),
-        "sim_s_d2s.dtype": sim_s_d2s.dtype,
-        "sim_t_d2s.shape": _shape_tuple(sim_t_d2s),
-        "sim_t_d2s.dtype": sim_t_d2s.dtype,
-        "sim_s_s2d.shape": _shape_tuple(sim_s_s2d),
-        "sim_s_s2d.dtype": sim_s_s2d.dtype,
-        "sim_t_s2d.shape": _shape_tuple(sim_t_s2d),
-        "sim_t_s2d.dtype": sim_t_s2d.dtype,
-        "batch_size": batch_size,
-        "mask.shape": _shape_tuple(mask),
-        "mask_true_count": mask_true_count,
-        "expected_negative_count": expected_negative_count,
-        "student_neg_d2s.shape": _shape_tuple(student_neg_d2s),
-        "student_neg_d2s.dtype": student_neg_d2s.dtype,
-        "teacher_neg_d2s.shape": _shape_tuple(teacher_neg_d2s),
-        "teacher_neg_d2s.dtype": teacher_neg_d2s.dtype,
-        "student_neg_s2d.shape": _shape_tuple(student_neg_s2d),
-        "student_neg_s2d.dtype": student_neg_s2d.dtype,
-        "teacher_neg_s2d.shape": _shape_tuple(teacher_neg_s2d),
-        "teacher_neg_s2d.dtype": teacher_neg_s2d.dtype,
-        "teacher_prob_d2s.shape": _shape_tuple(teacher_prob_d2s),
-        "teacher_prob_d2s.dtype": teacher_prob_d2s.dtype,
-        "teacher_prob_d2s.requires_grad": bool(teacher_prob_d2s.requires_grad),
-        "student_log_prob_d2s.shape": _shape_tuple(student_log_prob_d2s),
-        "student_log_prob_d2s.dtype": student_log_prob_d2s.dtype,
-        "teacher_prob_d2s_row_sum_mean": float(teacher_prob_d2s_row_sum.mean().item()),
-        "teacher_prob_d2s_row_sum_min": float(teacher_prob_d2s_row_sum.min().item()),
-        "teacher_prob_d2s_row_sum_max": float(teacher_prob_d2s_row_sum.max().item()),
-        "loss_negrank_d2s": float(loss_d2s.detach().item()),
-        "loss_negrank_s2d": float(loss_s2d.detach().item()),
-    }
-
-
-def print_negrank_kd_debug(args, teacher_model, debug_info):
-    teacher_param_count = sum(param.numel() for param in teacher_model.parameters())
-    teacher_trainable_param_count = sum(
-        param.numel()
-        for param in teacher_model.parameters()
-        if param.requires_grad
-    )
-    teacher_params_requires_grad_any = any(
-        param.requires_grad
-        for param in teacher_model.parameters()
-    )
-
-    print("=" * 80)
-    print("[NegRankKD Debug] Runtime validation at first training batch")
-    print(f"[NegRankKD Debug] teacher_model_dir = {args.teacher_model_dir}")
-    print(f"[NegRankKD Debug] teacher_ckpt_type = {args.teacher_ckpt_type}")
-    print(f"[NegRankKD Debug] teacher_checkpoint_path = {args.teacher_checkpoint_path}")
-    print(f"[NegRankKD Debug] teacher.training = {teacher_model.training}")
-    print(f"[NegRankKD Debug] teacher_param_count = {teacher_param_count}")
-    print(
-        "[NegRankKD Debug] teacher_trainable_param_count = "
-        f"{teacher_trainable_param_count}"
-    )
-    print(
-        "[NegRankKD Debug] teacher_params_requires_grad_any = "
-        f"{teacher_params_requires_grad_any}"
-    )
-    for key in (
-        "student_drone_feat.shape",
-        "student_sat_feat.shape",
-        "teacher_drone_feat.shape",
-        "teacher_sat_feat.shape",
-        "student_drone_feat.requires_grad",
-        "student_sat_feat.requires_grad",
-        "teacher_drone_feat.requires_grad",
-        "teacher_sat_feat.requires_grad",
-        "student_drone_feat.dtype/device",
-        "teacher_drone_feat.dtype/device",
-        "sim_s_d2s.shape",
-        "sim_t_d2s.shape",
-        "sim_s_s2d.shape",
-        "sim_t_s2d.shape",
-        "batch_size",
-        "mask.shape",
-        "mask_true_count",
-        "expected_negative_count",
-        "student_neg_d2s.shape",
-        "teacher_neg_d2s.shape",
-        "student_neg_s2d.shape",
-        "teacher_neg_s2d.shape",
-        "temperature",
-        "teacher_prob_d2s.shape",
-        "student_log_prob_d2s.shape",
-        "teacher_prob_d2s_row_sum_mean",
-        "teacher_prob_d2s_row_sum_min",
-        "teacher_prob_d2s_row_sum_max",
-        "loss_retrieval",
-        "loss_negrank_d2s",
-        "loss_negrank_s2d",
-        "loss_negrank",
-        "rank_kd_weight_base",
-        "current_rank_kd_weight",
-        "loss_total",
-    ):
-        print(f"[NegRankKD Debug] {key} = {debug_info[key]}")
-    print("=" * 80)
-
-
-def build_infonce_precision_debug(model, student_drone_feat, student_sat_feat):
-    query_features = F.normalize(student_drone_feat.float(), p=2, dim=1)
-    reference_features = F.normalize(student_sat_feat.float(), p=2, dim=1)
-    logits = query_features @ reference_features.t()
-    logit_scale = get_raw_model(model).logit_scale.exp()
-    logits = logits * logit_scale.float()
-    return {
-        "normalized student descriptor dtype": query_features.dtype,
-        "InfoNCE similarity/logits dtype": logits.dtype,
-        "InfoNCE similarity/logits shape": _shape_tuple(logits),
-    }
-
-
-def assert_precision_safety(precision_info):
-    teacher_input = precision_info.get("teacher input")
-    teacher_param = precision_info.get("teacher input reference parameter")
-    teacher_all_frozen = precision_info.get("teacher all parameters frozen")
-    if teacher_input is not None and teacher_param is not None:
-        precision_assert(
-            teacher_input["dtype"] == teacher_param["dtype"],
-            "teacher input dtype does not match teacher input reference parameter dtype: "
-            f"{teacher_input['dtype']} vs {teacher_param['dtype']}",
-        )
-        precision_assert(
-            teacher_input["device"] == teacher_param["device"],
-            "teacher input device does not match teacher input reference parameter device: "
-            f"{teacher_input['device']} vs {teacher_param['device']}",
-        )
-        precision_assert(
-            not teacher_param["requires_grad"],
-            "teacher input reference parameter unexpectedly requires grad",
-        )
-        precision_assert(
-            bool(teacher_all_frozen),
-            "not all teacher parameters are frozen",
-        )
-
-    for key in ("student drone descriptor", "student satellite descriptor"):
-        if key in precision_info:
-            precision_assert(
-                precision_info[key]["requires_grad"],
-                f"{key} should require grad",
-            )
-    for key in ("teacher drone descriptor", "teacher satellite descriptor"):
-        if key in precision_info:
-            precision_assert(
-                not precision_info[key]["requires_grad"],
-                f"{key} should not require grad",
-            )
-
-    fp32_scalar_keys = (
-        "student descriptor after FP32 cast dtype",
-        "teacher descriptor after FP32 cast dtype",
-        "normalized student descriptor dtype",
-        "normalized teacher descriptor dtype",
-        "InfoNCE similarity/logits dtype",
-        "NegRankKD student similarity dtype",
-        "NegRankKD teacher similarity dtype",
-        "student KD logits dtype",
-        "teacher KD logits dtype",
-        "student log_softmax dtype",
-        "teacher softmax dtype",
-        "NegRankKD loss dtype",
-        "retrieval loss dtype",
-        "KD loss dtype",
-        "total loss dtype",
-    )
-    for key in fp32_scalar_keys:
-        if key in precision_info:
-            precision_assert(
-                precision_info[key] == torch.float32,
-                f"{key} expected torch.float32, got {precision_info[key]}",
-            )
-
-    if "teacher softmax requires_grad" in precision_info:
-        precision_assert(
-            not precision_info["teacher softmax requires_grad"],
-            "teacher softmax target unexpectedly requires grad",
-        )
-    if "retrieval loss requires_grad" in precision_info:
-        precision_assert(
-            precision_info["retrieval loss requires_grad"],
-            "retrieval loss should require grad",
-        )
-    if "NegRankKD loss requires_grad" in precision_info:
-        precision_assert(
-            precision_info["NegRankKD loss requires_grad"],
-            "NegRankKD loss should require grad through student similarities",
-        )
-    if "KD loss requires_grad" in precision_info:
-        precision_assert(
-            precision_info["KD loss requires_grad"],
-            "KD loss should require grad through student similarities",
-        )
-    if "total loss requires_grad" in precision_info:
-        precision_assert(
-            precision_info["total loss requires_grad"],
-            "total loss should require grad",
-        )
-
-
-def print_precision_debug(precision_info):
-    if not is_main_process():
-        return
-    print("=" * 80)
-    print("[PRECISION DEBUG] Runtime precision validation at first training batch")
-    for key, value in precision_info.items():
-        if isinstance(value, dict):
-            print_precision_debug_record(key, value)
-        else:
-            print(f"[PRECISION DEBUG] {key}={value}")
-    print("=" * 80)
-
-
-def check_teacher_grad_after_backward(teacher_model):
-    teacher_grad_param_count = sum(
-        param.grad is not None
-        for param in teacher_model.parameters()
-    )
-    if is_main_process():
-        print(
-            "[NegRankKD Debug] teacher_grad_param_count_after_backward = "
-            f"{teacher_grad_param_count}"
-        )
-    if teacher_grad_param_count != 0:
-        raise RuntimeError(
-            "NegRankKD teacher received gradients during backward: "
-            f"{teacher_grad_param_count} parameters have grad"
-        )
-
-
 def current_rank_kd_weight(args, epoch):
     base_weight = float(getattr(args, "rank_kd_weight", 0.0))
     if base_weight <= 0.0:
@@ -886,14 +509,8 @@ def compute_teacher_paired_features(
     teacher_model,
     images,
     pair_batch_size,
-    return_precision_info=False,
 ):
     teacher_images = cast_images_to_model_dtype(teacher_model, images)
-    precision_info = None
-    if return_precision_info:
-        precision_info = {
-            "teacher input": tensor_precision_summary(teacher_images),
-        }
     with torch.inference_mode():
         teacher_output = teacher_model(teacher_images)
         local_teacher_features = select_model_descriptor(teacher_output)
@@ -903,8 +520,6 @@ def compute_teacher_paired_features(
         pair_batch_size,
         with_grad=False,
     )
-    if return_precision_info:
-        return teacher_features.detach(), global_pair_batch_size, precision_info
     return teacher_features.detach(), global_pair_batch_size
 
 
@@ -916,22 +531,7 @@ def compute_student_batch_losses(
     teacher_model=None,
     rank_kd_weight_current=0.0,
     rank_kd_temperature=0.2,
-    debug_negrank_kd=False,
-    debug_precision=False,
-    args=None,
-    raw_precision_info=None,
 ):
-    precision_info = {}
-    if debug_precision:
-        precision_info.update(raw_precision_info or {})
-        student_param = first_floating_parameter(model)
-        precision_info["student first parameter"] = {
-            "dtype": student_param.dtype,
-            "device": student_param.device,
-            "requires_grad": bool(student_param.requires_grad),
-        }
-        precision_info["student input"] = tensor_precision_summary(images)
-
     local_features = model(images)
     features, global_pair_batch_size = gather_paired_views(
         local_features,
@@ -948,57 +548,13 @@ def compute_student_batch_losses(
     loss_negrank = None
     student_drone_feat = None
     student_sat_feat = None
-    if debug_precision:
-        student_drone_feat, student_sat_feat = split_paired_features(
-            features,
-            global_pair_batch_size,
-        )
-        precision_info["student drone descriptor"] = tensor_precision_summary(
-            student_drone_feat
-        )
-        precision_info["student satellite descriptor"] = tensor_precision_summary(
-            student_sat_feat
-        )
-        precision_info.update(
-            build_infonce_precision_debug(
-                model,
-                student_drone_feat,
-                student_sat_feat,
-            )
-        )
-        precision_info["retrieval loss dtype"] = loss_infonce.dtype
-        precision_info["retrieval loss requires_grad"] = bool(
-            loss_infonce.requires_grad
-        )
 
     if teacher_model is not None and rank_kd_weight_current > 0.0:
-        teacher_result = compute_teacher_paired_features(
+        teacher_features, teacher_global_pair_batch_size = compute_teacher_paired_features(
             teacher_model,
             images,
             pair_batch_size,
-            return_precision_info=debug_precision,
         )
-        if debug_precision:
-            teacher_features, teacher_global_pair_batch_size, teacher_precision = teacher_result
-            precision_info.update(teacher_precision)
-            teacher_param = first_floating_parameter(teacher_model)
-            teacher_input_ref_param = model_input_reference_parameter(teacher_model)
-            precision_info["teacher first parameter"] = {
-                "dtype": teacher_param.dtype,
-                "device": teacher_param.device,
-                "requires_grad": bool(teacher_param.requires_grad),
-            }
-            precision_info["teacher input reference parameter"] = {
-                "dtype": teacher_input_ref_param.dtype,
-                "device": teacher_input_ref_param.device,
-                "requires_grad": bool(teacher_input_ref_param.requires_grad),
-            }
-            precision_info["teacher all parameters frozen"] = all(
-                not param.requires_grad
-                for param in teacher_model.parameters()
-            )
-        else:
-            teacher_features, teacher_global_pair_batch_size = teacher_result
 
         if teacher_global_pair_batch_size != global_pair_batch_size:
             raise RuntimeError(
@@ -1015,13 +571,6 @@ def compute_student_batch_losses(
             teacher_features,
             teacher_global_pair_batch_size,
         )
-        if debug_precision:
-            precision_info["teacher drone descriptor"] = tensor_precision_summary(
-                teacher_drone_feat
-            )
-            precision_info["teacher satellite descriptor"] = tensor_precision_summary(
-                teacher_sat_feat
-            )
         loss_negrank = negative_aware_cross_view_ranking_kd(
             student_drone_feat,
             student_sat_feat,
@@ -1030,76 +579,6 @@ def compute_student_batch_losses(
             rank_kd_temperature,
         )
         loss = loss + float(rank_kd_weight_current) * loss_negrank
-        if debug_negrank_kd or debug_precision:
-            if not bool(torch.isfinite(loss_negrank).item()):
-                raise RuntimeError(
-                    f"NegRankKD loss is not finite: {loss_negrank.item()}"
-                )
-            debug_info = build_negrank_kd_debug_info(
-                student_drone_feat,
-                student_sat_feat,
-                teacher_drone_feat,
-                teacher_sat_feat,
-                rank_kd_temperature,
-            )
-        if debug_precision:
-            precision_info.update({
-                "student descriptor after FP32 cast dtype": debug_info["student_drone_fp32.dtype"],
-                "teacher descriptor after FP32 cast dtype": debug_info["teacher_drone_fp32.dtype"],
-                "normalized student descriptor dtype": debug_info["normalized_student_drone.dtype"],
-                "normalized teacher descriptor dtype": debug_info["normalized_teacher_drone.dtype"],
-                "NegRankKD student similarity dtype": debug_info["sim_s_d2s.dtype"],
-                "NegRankKD student similarity shape": debug_info["sim_s_d2s.shape"],
-                "NegRankKD teacher similarity dtype": debug_info["sim_t_d2s.dtype"],
-                "NegRankKD teacher similarity shape": debug_info["sim_t_d2s.shape"],
-                "student KD logits dtype": debug_info["student_neg_d2s.dtype"],
-                "teacher KD logits dtype": debug_info["teacher_neg_d2s.dtype"],
-                "temperature value": float(rank_kd_temperature),
-                "temperature python type": type(rank_kd_temperature).__name__,
-                "student log_softmax dtype": debug_info["student_log_prob_d2s.dtype"],
-                "teacher softmax dtype": debug_info["teacher_prob_d2s.dtype"],
-                "teacher softmax requires_grad": debug_info["teacher_prob_d2s.requires_grad"],
-                "NegRankKD loss dtype": loss_negrank.dtype,
-                "NegRankKD loss requires_grad": bool(loss_negrank.requires_grad),
-                "KD loss dtype": loss_negrank.dtype,
-                "KD loss requires_grad": bool(loss_negrank.requires_grad),
-                "total loss dtype": loss.dtype,
-                "total loss requires_grad": bool(loss.requires_grad),
-            })
-            assert_precision_safety(precision_info)
-            print_precision_debug(precision_info)
-
-        if debug_negrank_kd:
-            debug_info.update({
-                "student_drone_feat.shape": _shape_tuple(student_drone_feat),
-                "student_sat_feat.shape": _shape_tuple(student_sat_feat),
-                "teacher_drone_feat.shape": _shape_tuple(teacher_drone_feat),
-                "teacher_sat_feat.shape": _shape_tuple(teacher_sat_feat),
-                "student_drone_feat.requires_grad": student_drone_feat.requires_grad,
-                "student_sat_feat.requires_grad": student_sat_feat.requires_grad,
-                "teacher_drone_feat.requires_grad": teacher_drone_feat.requires_grad,
-                "teacher_sat_feat.requires_grad": teacher_sat_feat.requires_grad,
-                "student_drone_feat.dtype/device": (
-                    f"{student_drone_feat.dtype}/{student_drone_feat.device}"
-                ),
-                "teacher_drone_feat.dtype/device": (
-                    f"{teacher_drone_feat.dtype}/{teacher_drone_feat.device}"
-                ),
-                "temperature": float(rank_kd_temperature),
-                "loss_retrieval": float(loss_infonce.detach().item()),
-                "loss_negrank": float(loss_negrank.detach().item()),
-                "rank_kd_weight_base": float(getattr(args, "rank_kd_weight", 0.0)),
-                "current_rank_kd_weight": float(rank_kd_weight_current),
-                "loss_total": float(loss.detach().item()),
-            })
-            if is_main_process():
-                print_negrank_kd_debug(args, teacher_model, debug_info)
-
-    elif debug_precision:
-        precision_info["total loss dtype"] = loss.dtype
-        precision_info["total loss requires_grad"] = bool(loss.requires_grad)
-        assert_precision_safety(precision_info)
-        print_precision_debug(precision_info)
 
     result = {
         "loss": loss_infonce,
@@ -1111,8 +590,6 @@ def compute_student_batch_losses(
         result["loss_negrank"] = loss_negrank
         result["rank_kd_weight_current"] = float(rank_kd_weight_current)
         result["rank_kd_temperature"] = float(rank_kd_temperature)
-        if debug_negrank_kd:
-            result["debug_negrank_kd"] = True
     return result
 
 
@@ -1316,19 +793,11 @@ def train_one_epoch(
     use_amp = amp_is_enabled(args, device)
     for step, batch in enumerate(train_loader):
         data_time.update(time.time() - end)
-        debug_precision = should_debug_precision(args, epoch, step)
-        raw_precision = raw_batch_precision_info(batch) if debug_precision else None
         images, meta = unpack_sample4geo_batch(batch, device)
         pair_batch_size = meta["pair_batch_size"]
 
         optimizer.zero_grad(set_to_none=True)
         rank_kd_weight_current = current_rank_kd_weight(args, epoch)
-        debug_negrank_kd = should_debug_negrank_kd(
-            args,
-            teacher_model,
-            epoch,
-            step,
-        )
         with autocast(device_type="cuda", enabled=use_amp):
             batch_losses = compute_student_batch_losses(
                 model,
@@ -1338,17 +807,11 @@ def train_one_epoch(
                 teacher_model=teacher_model,
                 rank_kd_weight_current=rank_kd_weight_current,
                 rank_kd_temperature=args.rank_kd_temperature,
-                debug_negrank_kd=debug_negrank_kd,
-                debug_precision=debug_precision,
-                args=args,
-                raw_precision_info=raw_precision,
             )
             loss = batch_losses["loss"]
 
         if scaler.is_enabled():
             scaler.scale(loss).backward()
-            if batch_losses.get("debug_negrank_kd", False):
-                check_teacher_grad_after_backward(teacher_model)
             if args.grad_clip > 0:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
@@ -1359,8 +822,6 @@ def train_one_epoch(
                 scheduler.step()
         else:
             loss.backward()
-            if batch_losses.get("debug_negrank_kd", False):
-                check_teacher_grad_after_backward(teacher_model)
             if args.grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             optimizer.step()
@@ -1437,19 +898,11 @@ def train_one_epoch_deepspeed(
 
     for step, batch in enumerate(train_loader):
         data_time.update(time.time() - end)
-        debug_precision = should_debug_precision(args, epoch, step)
-        raw_precision = raw_batch_precision_info(batch) if debug_precision else None
         images, meta = unpack_sample4geo_batch(batch, device)
         images = cast_images_to_model_dtype(model_engine, images)
         pair_batch_size = meta["pair_batch_size"]
 
         rank_kd_weight_current = current_rank_kd_weight(args, epoch)
-        debug_negrank_kd = should_debug_negrank_kd(
-            args,
-            teacher_model,
-            epoch,
-            step,
-        )
         batch_losses = compute_student_batch_losses(
             model_engine,
             images,
@@ -1458,15 +911,9 @@ def train_one_epoch_deepspeed(
             teacher_model=teacher_model,
             rank_kd_weight_current=rank_kd_weight_current,
             rank_kd_temperature=args.rank_kd_temperature,
-            debug_negrank_kd=debug_negrank_kd,
-            debug_precision=debug_precision,
-            args=args,
-            raw_precision_info=raw_precision,
         )
         loss = batch_losses["loss"]
         model_engine.backward(loss)
-        if batch_losses.get("debug_negrank_kd", False):
-            check_teacher_grad_after_backward(teacher_model)
         if args.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model_engine.parameters(), args.grad_clip)
         model_engine.step()
@@ -1808,7 +1255,6 @@ def parse_args(argv=None):
     parser.add_argument("--save_last", dest="save_last", action="store_true", default=True)
     parser.add_argument("--no_save_last", dest="save_last", action="store_false")
     parser.add_argument("--use_negrank_kd", action="store_true", default=False)
-    parser.add_argument("--debug_negrank_kd", action="store_true", default=False)
     parser.add_argument("--teacher_model_dir", type=str, default=None)
     parser.add_argument(
         "--teacher_ckpt_type",

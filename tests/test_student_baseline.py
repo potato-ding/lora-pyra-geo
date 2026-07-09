@@ -280,31 +280,6 @@ def test_cast_images_to_model_dtype_prefers_backbone_dtype():
     assert cast_images.dtype == torch.bfloat16
 
 
-def test_precision_assert_uses_backbone_reference_for_teacher_input():
-    class TeacherLikeDtypeModel(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.logit_scale = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
-            self.backbone = nn.Linear(2, 2).to(dtype=torch.bfloat16)
-            for param in self.parameters():
-                param.requires_grad_(False)
-
-    teacher = TeacherLikeDtypeModel()
-    teacher_input = torch.randn(2, 2, dtype=torch.bfloat16)
-    ref_param = student_train.model_input_reference_parameter(teacher)
-
-    assert ref_param.dtype == torch.bfloat16
-    student_train.assert_precision_safety({
-        "teacher input": student_train.tensor_precision_summary(teacher_input),
-        "teacher input reference parameter": {
-            "dtype": ref_param.dtype,
-            "device": ref_param.device,
-            "requires_grad": bool(ref_param.requires_grad),
-        },
-        "teacher all parameters frozen": True,
-    })
-
-
 def test_negrank_teacher_run_file_validation_and_hparam_loading(tmp_path):
     teacher_dir = tmp_path / "teacher"
     teacher_dir.mkdir()
