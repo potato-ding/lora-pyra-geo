@@ -181,6 +181,24 @@ def test_negative_aware_kd_uses_both_cross_view_directions():
     torch.testing.assert_close(loss, expected)
 
 
+def test_negative_aware_kd_math_runs_in_fp32_for_bf16_descriptors():
+    torch.manual_seed(17)
+    student_drone = torch.randn(4, 3, dtype=torch.bfloat16)
+    student_sat = torch.randn(4, 3, dtype=torch.bfloat16)
+    teacher_drone = torch.randn(4, 5, dtype=torch.bfloat16)
+    teacher_sat = torch.randn(4, 5, dtype=torch.bfloat16)
+
+    loss = student_train.negative_aware_cross_view_ranking_kd(
+        student_drone,
+        student_sat,
+        teacher_drone,
+        teacher_sat,
+        temperature=0.2,
+    )
+
+    assert loss.dtype == torch.float32
+
+
 def test_compute_student_batch_losses_adds_only_weighted_negrank_kd():
     class IdentityFeatureModel(nn.Module):
         def __init__(self):
@@ -244,6 +262,22 @@ def test_rank_kd_weight_warmup_and_optional_decay():
     args.rank_kd_decay = True
     assert student_train.current_rank_kd_weight(args, 5) == 0.01
     assert student_train.current_rank_kd_weight(args, 10) == 0.0
+
+
+def test_cast_images_to_model_dtype_prefers_backbone_dtype():
+    class TeacherLikeDtypeModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.logit_scale = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
+            self.backbone = nn.Linear(2, 2).to(dtype=torch.bfloat16)
+
+    images = torch.randn(2, 2, dtype=torch.float32)
+    cast_images = student_train.cast_images_to_model_dtype(
+        TeacherLikeDtypeModel(),
+        images,
+    )
+
+    assert cast_images.dtype == torch.bfloat16
 
 
 def test_negrank_teacher_run_file_validation_and_hparam_loading(tmp_path):
