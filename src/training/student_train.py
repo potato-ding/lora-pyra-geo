@@ -505,6 +505,16 @@ def first_floating_parameter(module):
     raise RuntimeError(f"{raw_module.__class__.__name__} has no floating parameters")
 
 
+def model_input_reference_parameter(module):
+    raw_module = get_raw_model(module)
+    backbone = getattr(raw_module, "backbone", None)
+    if backbone is not None:
+        for param in backbone.parameters():
+            if param.is_floating_point():
+                return param
+    return first_floating_parameter(raw_module)
+
+
 def precision_assert(condition, message):
     if not condition:
         raise RuntimeError(f"[PRECISION DEBUG] {message}")
@@ -730,22 +740,22 @@ def build_infonce_precision_debug(model, student_drone_feat, student_sat_feat):
 
 def assert_precision_safety(precision_info):
     teacher_input = precision_info.get("teacher input")
-    teacher_param = precision_info.get("teacher first parameter")
+    teacher_param = precision_info.get("teacher input reference parameter")
     teacher_all_frozen = precision_info.get("teacher all parameters frozen")
     if teacher_input is not None and teacher_param is not None:
         precision_assert(
             teacher_input["dtype"] == teacher_param["dtype"],
-            "teacher input dtype does not match teacher first parameter dtype: "
+            "teacher input dtype does not match teacher input reference parameter dtype: "
             f"{teacher_input['dtype']} vs {teacher_param['dtype']}",
         )
         precision_assert(
             teacher_input["device"] == teacher_param["device"],
-            "teacher input device does not match teacher first parameter device: "
+            "teacher input device does not match teacher input reference parameter device: "
             f"{teacher_input['device']} vs {teacher_param['device']}",
         )
         precision_assert(
             not teacher_param["requires_grad"],
-            "teacher first parameter unexpectedly requires grad",
+            "teacher input reference parameter unexpectedly requires grad",
         )
         precision_assert(
             bool(teacher_all_frozen),
@@ -972,10 +982,16 @@ def compute_student_batch_losses(
             teacher_features, teacher_global_pair_batch_size, teacher_precision = teacher_result
             precision_info.update(teacher_precision)
             teacher_param = first_floating_parameter(teacher_model)
+            teacher_input_ref_param = model_input_reference_parameter(teacher_model)
             precision_info["teacher first parameter"] = {
                 "dtype": teacher_param.dtype,
                 "device": teacher_param.device,
                 "requires_grad": bool(teacher_param.requires_grad),
+            }
+            precision_info["teacher input reference parameter"] = {
+                "dtype": teacher_input_ref_param.dtype,
+                "device": teacher_input_ref_param.device,
+                "requires_grad": bool(teacher_input_ref_param.requires_grad),
             }
             precision_info["teacher all parameters frozen"] = all(
                 not param.requires_grad
