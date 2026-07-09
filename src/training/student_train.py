@@ -1,4 +1,5 @@
 import argparse
+import inspect
 import json
 import math
 import os
@@ -11,6 +12,7 @@ if ROOT not in sys.path:
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from torch.amp import GradScaler, autocast
 
 from src.loss.blocks_infoNCE import Sample4GeoLoss
@@ -20,7 +22,10 @@ from src.utils.initdist import try_init_dist
 from src.utils.optimizer_and_scale import build_student_optimizer
 from src.utils.save_path import get_student_save_pth
 from src.utils.scheduler import build_student_scheduler
-from src.utils.train_eval_utils import getdist_1652_val_and_get_recall
+from src.utils.train_eval_utils import (
+    getdist_1652_val_and_get_recall,
+    select_model_descriptor,
+)
 
 if "OMP_NUM_THREADS" not in os.environ:
     os.environ["OMP_NUM_THREADS"] = "4"
@@ -47,6 +52,24 @@ def distributed_barrier():
         dist.barrier()
 
 
+NEGRANK_TEACHER_METRICS_FILENAME = "best_metrics.json"
+NEGRANK_TEACHER_CHECKPOINTS = {
+    "best": "best_model.pth",
+    "last": "last_model.pth",
+}
+
+
+def str2bool(value):
+    if isinstance(value, bool):
+        return value
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"invalid boolean value: {value}")
+
+
 class AverageMeter:
     def __init__(self):
         self.reset()
@@ -62,6 +85,116 @@ class AverageMeter:
         self.sum += float(val) * int(n)
         self.count += int(n)
         self.avg = self.sum / max(1, self.count)
+
+
+def safe_torch_load(path, map_location):
+    load_kwargs = {"map_location": map_location}
+    if "weights_only" in inspect.signature(torch.load).parameters:
+        load_kwargs["weights_only"] = True
+    return torch.load(path, **load_kwargs)
+
+
+def _strip_module_prefix(key):
+    return key[len("module."):] if key.startswith("module.") else key
+
+
+def unwrap_checkpoint_state_dict(checkpoint):
+    if not isinstance(checkpoint, dict):
+        return checkpoint
+    for key in ("state_dict", "model", "module", "teacher", "student", "net"):
+        value = checkpoint.get(key)
+        if isinstance(value, dict):
+            return value
+    return checkpoint
+
+
+def get_required_trainable_keys(model):
+    return {
+        name
+        for name, param in model.named_parameters()
+        if param.requires_grad
+    }
+
+
+def load_model_checkpoint_compatible(
+    model,
+    checkpoint_path,
+    device,
+    *,
+    require_trainable=True,
+    log_prefix="[Checkpoint]",
+):
+    if not os.path.isfile(checkpoint_path):
+        raise FileNotFoundError(f"checkpoint not found: {checkpoint_path}")
+
+    checkpoint = safe_torch_load(checkpoint_path, map_location="cpu")
+    state_dict = unwrap_checkpoint_state_dict(checkpoint)
+    if not isinstance(state_dict, dict):
+        raise RuntimeError(f"checkpoint payload is not a state dict: {checkpoint_path}")
+
+    model_state = model.state_dict()
+    mapped_state = {}
+    unexpected = []
+    incompatible = []
+    non_tensor = []
+
+    for raw_key, value in state_dict.items():
+        if not torch.is_tensor(value):
+            non_tensor.append(raw_key)
+            continue
+        key = _strip_module_prefix(raw_key)
+        if key not in model_state:
+            unexpected.append(raw_key)
+            continue
+        if tuple(model_state[key].shape) != tuple(value.shape):
+            incompatible.append((raw_key, tuple(value.shape), tuple(model_state[key].shape)))
+            continue
+        mapped_state[key] = value
+
+    missing, load_unexpected = model.load_state_dict(mapped_state, strict=False)
+    model.to(device)
+
+    required_keys = get_required_trainable_keys(model) if require_trainable else set()
+    loaded_required = required_keys & set(mapped_state.keys())
+    missing_required = sorted(required_keys - loaded_required)
+    missing_nonrequired = sorted(set(missing) - required_keys)
+
+    if is_main_process():
+        print(f"{log_prefix} loaded: {checkpoint_path}")
+        print(
+            f"{log_prefix} matched={len(mapped_state)} | "
+            f"trainable_covered={len(loaded_required)}/{len(required_keys)} | "
+            f"missing_nonrequired={len(missing_nonrequired)} | "
+            f"unexpected={len(unexpected) + len(load_unexpected)} | "
+            f"incompatible={len(incompatible)} | "
+            f"non_tensor={len(non_tensor)}"
+        )
+        if missing_required:
+            print(f"{log_prefix}[WARN] missing trainable keys examples: {missing_required[:5]}")
+        if unexpected:
+            print(f"{log_prefix}[WARN] unexpected keys examples: {unexpected[:5]}")
+        if load_unexpected:
+            print(f"{log_prefix}[WARN] load unexpected keys examples: {load_unexpected[:5]}")
+        if incompatible:
+            print(f"{log_prefix}[WARN] incompatible shape examples: {incompatible[:3]}")
+
+    if require_trainable and (missing_required or incompatible):
+        raise RuntimeError(
+            "checkpoint did not cover all trainable teacher parameters; "
+            f"missing={len(missing_required)}, incompatible={len(incompatible)}. "
+            "Check that best_metrics.json matches the selected teacher checkpoint."
+        )
+    if not require_trainable and incompatible:
+        raise RuntimeError(
+            f"checkpoint contains incompatible tensors: {len(incompatible)}"
+        )
+
+    return {
+        "matched": len(mapped_state),
+        "missing_required": missing_required,
+        "unexpected": unexpected + list(load_unexpected),
+        "incompatible": incompatible,
+    }
 
 
 def unpack_sample4geo_batch(batch, device):
@@ -88,6 +221,134 @@ def unpack_sample4geo_batch(batch, device):
         "pair_batch_size": drone.size(0),
         "effective_batch": images.size(0),
     }
+
+
+def get_teacher_metrics_path(teacher_model_dir):
+    return os.path.join(teacher_model_dir, NEGRANK_TEACHER_METRICS_FILENAME)
+
+
+def get_teacher_checkpoint_path(teacher_model_dir, teacher_ckpt_type):
+    filename = NEGRANK_TEACHER_CHECKPOINTS[teacher_ckpt_type]
+    return os.path.join(teacher_model_dir, filename)
+
+
+def validate_negrank_kd_files(args, parser=None):
+    if not getattr(args, "use_negrank_kd", False):
+        args.teacher_checkpoint_path = None
+        return
+
+    if not args.teacher_model_dir:
+        message = "--teacher_model_dir is required when --use_negrank_kd is enabled"
+        if parser is not None:
+            parser.error(message)
+        raise ValueError(message)
+
+    if not os.path.isdir(args.teacher_model_dir):
+        message = f"teacher_model_dir does not exist: {args.teacher_model_dir}"
+        if parser is not None:
+            parser.error(message)
+        raise FileNotFoundError(message)
+
+    metrics_path = get_teacher_metrics_path(args.teacher_model_dir)
+    if not os.path.isfile(metrics_path):
+        message = f"teacher metrics file not found: {metrics_path}"
+        if parser is not None:
+            parser.error(message)
+        raise FileNotFoundError(message)
+
+    checkpoint_path = get_teacher_checkpoint_path(
+        args.teacher_model_dir,
+        args.teacher_ckpt_type,
+    )
+    if not os.path.isfile(checkpoint_path):
+        message = f"teacher checkpoint not found: {checkpoint_path}"
+        if parser is not None:
+            parser.error(message)
+        raise FileNotFoundError(message)
+
+    args.teacher_checkpoint_path = checkpoint_path
+
+
+def _find_hparam_record(payload):
+    for key in ("hyperparameters", "args", "config", "model_config"):
+        value = payload.get(key)
+        if isinstance(value, dict):
+            return value
+    return payload
+
+
+def load_teacher_hparams(metrics_path):
+    with open(metrics_path, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"{metrics_path} must contain a JSON object")
+
+    hparams = _find_hparam_record(payload)
+    if not isinstance(hparams, dict):
+        raise RuntimeError(
+            f"{metrics_path} must contain teacher hyperparameters"
+        )
+    return hparams, payload
+
+
+def build_teacher_args_from_metrics(metrics_path, device):
+    from src.training.teacher.args import build_arg_parser
+
+    parser = build_arg_parser()
+    try:
+        teacher_args = parser.parse_args([])
+    except SystemExit as exc:
+        raise RuntimeError(
+            "Unable to construct default teacher args from the existing parser"
+        ) from exc
+
+    hparams, _ = load_teacher_hparams(metrics_path)
+    for key, value in hparams.items():
+        setattr(teacher_args, key, value)
+
+    teacher_args.device = str(device)
+    if hasattr(teacher_args, "local_rank"):
+        teacher_args.local_rank = get_rank()
+    return teacher_args
+
+
+def freeze_model(model):
+    for param in model.parameters():
+        param.requires_grad_(False)
+    model.eval()
+    return model
+
+
+def build_frozen_teacher_from_run(args, device):
+    from src.models.teacher.model import TeacherModel
+
+    metrics_path = get_teacher_metrics_path(args.teacher_model_dir)
+    teacher_args = build_teacher_args_from_metrics(metrics_path, device)
+    teacher = TeacherModel(teacher_args)
+    teacher.to(device)
+    load_model_checkpoint_compatible(
+        teacher,
+        args.teacher_checkpoint_path,
+        device,
+        require_trainable=True,
+        log_prefix="[NegRankKD][Teacher]",
+    )
+    freeze_model(teacher)
+
+    frozen = all(not param.requires_grad for param in teacher.parameters())
+    if is_main_process():
+        print("[NegRankKD] enabled")
+        print(f"[NegRankKD] teacher_model_dir = {args.teacher_model_dir}")
+        print(f"[NegRankKD] teacher_ckpt_type = {args.teacher_ckpt_type}")
+        print(f"[NegRankKD] teacher_checkpoint = {args.teacher_checkpoint_path}")
+        print(f"[NegRankKD] rank_kd_weight = {args.rank_kd_weight}")
+        print(f"[NegRankKD] temperature = {args.rank_kd_temperature}")
+        print(f"[NegRankKD] warmup_epochs = {args.rank_kd_warmup_epochs}")
+        print(f"[NegRankKD] teacher frozen = {frozen}")
+
+    if not frozen:
+        raise RuntimeError("NegRankKD teacher must be fully frozen")
+    return teacher
 
 
 @torch.no_grad()
@@ -135,6 +396,15 @@ def gather_tensor_with_grad(tensor):
     return torch.cat(GatherLayer.apply(tensor), dim=0)
 
 
+@torch.no_grad()
+def gather_tensor_no_grad(tensor):
+    if not is_distributed():
+        return tensor.detach()
+    gathered = [torch.zeros_like(tensor) for _ in range(get_world_size())]
+    dist.all_gather(gathered, tensor.contiguous())
+    return torch.cat(gathered, dim=0)
+
+
 def gather_paired_views(tensor, pair_batch_size, with_grad=True):
     """Gather paired views as [all_drone, all_satellite]."""
 
@@ -144,12 +414,14 @@ def gather_paired_views(tensor, pair_batch_size, with_grad=True):
             f"got {tensor.size(0)}"
         )
     if not with_grad:
-        raise ValueError("Student baseline gathering must preserve gradients.")
+        gather_fn = gather_tensor_no_grad
+    else:
+        gather_fn = gather_tensor_with_grad
 
     local_drone = tensor[:pair_batch_size]
     local_satellite = tensor[pair_batch_size:pair_batch_size * 2]
-    global_drone = gather_tensor_with_grad(local_drone)
-    global_satellite = gather_tensor_with_grad(local_satellite)
+    global_drone = gather_fn(local_drone)
+    global_satellite = gather_fn(local_satellite)
     if global_drone.size(0) != global_satellite.size(0):
         raise RuntimeError(
             "Distributed paired gather produced unequal view sizes: "
@@ -161,7 +433,287 @@ def gather_paired_views(tensor, pair_batch_size, with_grad=True):
     )
 
 
-def compute_student_batch_losses(model, images, pair_batch_size, criterion):
+def neg_rank_kl(student_sim, teacher_sim, temperature):
+    if student_sim.shape != teacher_sim.shape:
+        raise ValueError(
+            "student and teacher similarity matrices must have the same shape, "
+            f"got student={tuple(student_sim.shape)} teacher={tuple(teacher_sim.shape)}"
+        )
+    if student_sim.ndim != 2 or student_sim.size(0) != student_sim.size(1):
+        raise ValueError(
+            f"expected square similarity matrices, got {tuple(student_sim.shape)}"
+        )
+    batch_size = student_sim.size(0)
+    if batch_size <= 1:
+        return student_sim.new_zeros(())
+
+    mask = ~torch.eye(batch_size, dtype=torch.bool, device=student_sim.device)
+    student_neg = student_sim[mask].view(batch_size, batch_size - 1)
+    teacher_neg = teacher_sim.detach()[mask].view(batch_size, batch_size - 1)
+
+    teacher_prob = F.softmax(teacher_neg / temperature, dim=1).detach()
+    student_log_prob = F.log_softmax(student_neg / temperature, dim=1)
+    return F.kl_div(student_log_prob, teacher_prob, reduction="batchmean")
+
+
+def negative_aware_cross_view_ranking_kd(
+    student_drone_feat,
+    student_sat_feat,
+    teacher_drone_feat,
+    teacher_sat_feat,
+    temperature,
+):
+    student_drone_feat = F.normalize(student_drone_feat, dim=1)
+    student_sat_feat = F.normalize(student_sat_feat, dim=1)
+    teacher_drone_feat = F.normalize(teacher_drone_feat.detach(), dim=1)
+    teacher_sat_feat = F.normalize(teacher_sat_feat.detach(), dim=1)
+
+    sim_s_d2s = student_drone_feat @ student_sat_feat.t()
+    sim_t_d2s = teacher_drone_feat @ teacher_sat_feat.t()
+
+    loss_d2s = neg_rank_kl(sim_s_d2s, sim_t_d2s, temperature)
+    loss_s2d = neg_rank_kl(sim_s_d2s.t(), sim_t_d2s.t(), temperature)
+    return 0.5 * (loss_d2s + loss_s2d)
+
+
+def should_debug_negrank_kd(args, teacher_model, epoch, step):
+    return (
+        bool(getattr(args, "use_negrank_kd", False))
+        and bool(getattr(args, "debug_negrank_kd", False))
+        and teacher_model is not None
+        and epoch == 1
+        and step == 0
+    )
+
+
+def _shape_tuple(tensor):
+    return tuple(tensor.shape)
+
+
+def build_negrank_kd_debug_info(
+    student_drone_feat,
+    student_sat_feat,
+    teacher_drone_feat,
+    teacher_sat_feat,
+    temperature,
+):
+    student_drone_norm = F.normalize(student_drone_feat, dim=1)
+    student_sat_norm = F.normalize(student_sat_feat, dim=1)
+    teacher_drone_norm = F.normalize(teacher_drone_feat.detach(), dim=1)
+    teacher_sat_norm = F.normalize(teacher_sat_feat.detach(), dim=1)
+
+    sim_s_d2s = student_drone_norm @ student_sat_norm.t()
+    sim_t_d2s = teacher_drone_norm @ teacher_sat_norm.t()
+    sim_s_s2d = sim_s_d2s.t()
+    sim_t_s2d = sim_t_d2s.t()
+
+    batch_size = sim_s_d2s.size(0)
+    if batch_size <= 1:
+        raise RuntimeError(
+            "NegRankKD debug requires batch_size > 1 to validate negatives"
+        )
+    mask = ~torch.eye(batch_size, dtype=torch.bool, device=sim_s_d2s.device)
+    expected_neg_shape = (batch_size, batch_size - 1)
+    mask_true_count = int(mask.sum().item())
+    expected_negative_count = batch_size * (batch_size - 1)
+    if mask_true_count != expected_negative_count:
+        raise RuntimeError(
+            "NegRankKD debug mask did not remove only diagonal positives: "
+            f"mask_true_count={mask_true_count}, "
+            f"expected={expected_negative_count}"
+        )
+
+    student_neg_d2s = sim_s_d2s[mask].view(*expected_neg_shape)
+    teacher_neg_d2s = sim_t_d2s.detach()[mask].view(*expected_neg_shape)
+    student_neg_s2d = sim_s_s2d[mask].view(*expected_neg_shape)
+    teacher_neg_s2d = sim_t_s2d.detach()[mask].view(*expected_neg_shape)
+
+    for name, tensor in (
+        ("student_neg_d2s", student_neg_d2s),
+        ("teacher_neg_d2s", teacher_neg_d2s),
+        ("student_neg_s2d", student_neg_s2d),
+        ("teacher_neg_s2d", teacher_neg_s2d),
+    ):
+        if tuple(tensor.shape) != expected_neg_shape:
+            raise RuntimeError(
+                f"NegRankKD debug expected {name}.shape={expected_neg_shape}, "
+                f"got {tuple(tensor.shape)}"
+            )
+
+    teacher_prob_d2s = F.softmax(teacher_neg_d2s / temperature, dim=1).detach()
+    student_log_prob_d2s = F.log_softmax(student_neg_d2s / temperature, dim=1)
+    loss_d2s = F.kl_div(
+        student_log_prob_d2s,
+        teacher_prob_d2s,
+        reduction="batchmean",
+    )
+    teacher_prob_s2d = F.softmax(teacher_neg_s2d / temperature, dim=1).detach()
+    student_log_prob_s2d = F.log_softmax(student_neg_s2d / temperature, dim=1)
+    loss_s2d = F.kl_div(
+        student_log_prob_s2d,
+        teacher_prob_s2d,
+        reduction="batchmean",
+    )
+    teacher_prob_d2s_row_sum = teacher_prob_d2s.sum(dim=1)
+
+    return {
+        "sim_s_d2s.shape": _shape_tuple(sim_s_d2s),
+        "sim_t_d2s.shape": _shape_tuple(sim_t_d2s),
+        "sim_s_s2d.shape": _shape_tuple(sim_s_s2d),
+        "sim_t_s2d.shape": _shape_tuple(sim_t_s2d),
+        "batch_size": batch_size,
+        "mask.shape": _shape_tuple(mask),
+        "mask_true_count": mask_true_count,
+        "expected_negative_count": expected_negative_count,
+        "student_neg_d2s.shape": _shape_tuple(student_neg_d2s),
+        "teacher_neg_d2s.shape": _shape_tuple(teacher_neg_d2s),
+        "student_neg_s2d.shape": _shape_tuple(student_neg_s2d),
+        "teacher_neg_s2d.shape": _shape_tuple(teacher_neg_s2d),
+        "teacher_prob_d2s.shape": _shape_tuple(teacher_prob_d2s),
+        "student_log_prob_d2s.shape": _shape_tuple(student_log_prob_d2s),
+        "teacher_prob_d2s_row_sum_mean": float(teacher_prob_d2s_row_sum.mean().item()),
+        "teacher_prob_d2s_row_sum_min": float(teacher_prob_d2s_row_sum.min().item()),
+        "teacher_prob_d2s_row_sum_max": float(teacher_prob_d2s_row_sum.max().item()),
+        "loss_negrank_d2s": float(loss_d2s.detach().item()),
+        "loss_negrank_s2d": float(loss_s2d.detach().item()),
+    }
+
+
+def print_negrank_kd_debug(args, teacher_model, debug_info):
+    teacher_param_count = sum(param.numel() for param in teacher_model.parameters())
+    teacher_trainable_param_count = sum(
+        param.numel()
+        for param in teacher_model.parameters()
+        if param.requires_grad
+    )
+    teacher_params_requires_grad_any = any(
+        param.requires_grad
+        for param in teacher_model.parameters()
+    )
+
+    print("=" * 80)
+    print("[NegRankKD Debug] Runtime validation at first training batch")
+    print(f"[NegRankKD Debug] teacher_model_dir = {args.teacher_model_dir}")
+    print(f"[NegRankKD Debug] teacher_ckpt_type = {args.teacher_ckpt_type}")
+    print(f"[NegRankKD Debug] teacher_checkpoint_path = {args.teacher_checkpoint_path}")
+    print(f"[NegRankKD Debug] teacher.training = {teacher_model.training}")
+    print(f"[NegRankKD Debug] teacher_param_count = {teacher_param_count}")
+    print(
+        "[NegRankKD Debug] teacher_trainable_param_count = "
+        f"{teacher_trainable_param_count}"
+    )
+    print(
+        "[NegRankKD Debug] teacher_params_requires_grad_any = "
+        f"{teacher_params_requires_grad_any}"
+    )
+    for key in (
+        "student_drone_feat.shape",
+        "student_sat_feat.shape",
+        "teacher_drone_feat.shape",
+        "teacher_sat_feat.shape",
+        "student_drone_feat.requires_grad",
+        "student_sat_feat.requires_grad",
+        "teacher_drone_feat.requires_grad",
+        "teacher_sat_feat.requires_grad",
+        "student_drone_feat.dtype/device",
+        "teacher_drone_feat.dtype/device",
+        "sim_s_d2s.shape",
+        "sim_t_d2s.shape",
+        "sim_s_s2d.shape",
+        "sim_t_s2d.shape",
+        "batch_size",
+        "mask.shape",
+        "mask_true_count",
+        "expected_negative_count",
+        "student_neg_d2s.shape",
+        "teacher_neg_d2s.shape",
+        "student_neg_s2d.shape",
+        "teacher_neg_s2d.shape",
+        "temperature",
+        "teacher_prob_d2s.shape",
+        "student_log_prob_d2s.shape",
+        "teacher_prob_d2s_row_sum_mean",
+        "teacher_prob_d2s_row_sum_min",
+        "teacher_prob_d2s_row_sum_max",
+        "loss_retrieval",
+        "loss_negrank_d2s",
+        "loss_negrank_s2d",
+        "loss_negrank",
+        "rank_kd_weight_base",
+        "current_rank_kd_weight",
+        "loss_total",
+    ):
+        print(f"[NegRankKD Debug] {key} = {debug_info[key]}")
+    print("=" * 80)
+
+
+def check_teacher_grad_after_backward(teacher_model):
+    teacher_grad_param_count = sum(
+        param.grad is not None
+        for param in teacher_model.parameters()
+    )
+    if is_main_process():
+        print(
+            "[NegRankKD Debug] teacher_grad_param_count_after_backward = "
+            f"{teacher_grad_param_count}"
+        )
+    if teacher_grad_param_count != 0:
+        raise RuntimeError(
+            "NegRankKD teacher received gradients during backward: "
+            f"{teacher_grad_param_count} parameters have grad"
+        )
+
+
+def current_rank_kd_weight(args, epoch):
+    base_weight = float(getattr(args, "rank_kd_weight", 0.0))
+    if base_weight <= 0.0:
+        return 0.0
+
+    warmup_epochs = int(getattr(args, "rank_kd_warmup_epochs", 0))
+    if warmup_epochs > 0 and epoch <= warmup_epochs:
+        return base_weight * float(epoch) / float(warmup_epochs)
+
+    if getattr(args, "rank_kd_decay", False):
+        total_epochs = max(int(getattr(args, "epochs", epoch)), 1)
+        decay_start = max(warmup_epochs, 0)
+        decay_epochs = max(total_epochs - decay_start, 1)
+        decay_progress = min(max(epoch - decay_start, 0), decay_epochs)
+        return base_weight * (1.0 - float(decay_progress) / float(decay_epochs))
+
+    return base_weight
+
+
+def split_paired_features(features, pair_batch_size):
+    return (
+        features[:pair_batch_size],
+        features[pair_batch_size:pair_batch_size * 2],
+    )
+
+
+def compute_teacher_paired_features(teacher_model, images, pair_batch_size):
+    teacher_images = cast_images_to_model_dtype(teacher_model, images)
+    with torch.no_grad():
+        teacher_output = teacher_model(teacher_images)
+        local_teacher_features = select_model_descriptor(teacher_output)
+    teacher_features, global_pair_batch_size = gather_paired_views(
+        local_teacher_features.detach(),
+        pair_batch_size,
+        with_grad=False,
+    )
+    return teacher_features.detach(), global_pair_batch_size
+
+
+def compute_student_batch_losses(
+    model,
+    images,
+    pair_batch_size,
+    criterion,
+    teacher_model=None,
+    rank_kd_weight_current=0.0,
+    rank_kd_temperature=0.2,
+    debug_negrank_kd=False,
+    args=None,
+):
     local_features = model(images)
     features, global_pair_batch_size = gather_paired_views(
         local_features,
@@ -174,11 +726,86 @@ def compute_student_batch_losses(model, images, pair_batch_size, criterion):
         criterion,
         global_pair_batch_size,
     )
-    return {
+    loss = loss_infonce
+    loss_negrank = None
+    if teacher_model is not None and rank_kd_weight_current > 0.0:
+        teacher_features, teacher_global_pair_batch_size = compute_teacher_paired_features(
+            teacher_model,
+            images,
+            pair_batch_size,
+        )
+        if teacher_global_pair_batch_size != global_pair_batch_size:
+            raise RuntimeError(
+                "Teacher/student global pair batch mismatch: "
+                f"teacher={teacher_global_pair_batch_size} "
+                f"student={global_pair_batch_size}"
+            )
+        student_drone_feat, student_sat_feat = split_paired_features(
+            features,
+            global_pair_batch_size,
+        )
+        teacher_drone_feat, teacher_sat_feat = split_paired_features(
+            teacher_features,
+            teacher_global_pair_batch_size,
+        )
+        loss_negrank = negative_aware_cross_view_ranking_kd(
+            student_drone_feat,
+            student_sat_feat,
+            teacher_drone_feat,
+            teacher_sat_feat,
+            rank_kd_temperature,
+        )
+        loss = loss + float(rank_kd_weight_current) * loss_negrank
+        if debug_negrank_kd:
+            if not bool(torch.isfinite(loss_negrank).item()):
+                raise RuntimeError(
+                    f"NegRankKD loss is not finite: {loss_negrank.item()}"
+                )
+            debug_info = build_negrank_kd_debug_info(
+                student_drone_feat,
+                student_sat_feat,
+                teacher_drone_feat,
+                teacher_sat_feat,
+                rank_kd_temperature,
+            )
+            debug_info.update({
+                "student_drone_feat.shape": _shape_tuple(student_drone_feat),
+                "student_sat_feat.shape": _shape_tuple(student_sat_feat),
+                "teacher_drone_feat.shape": _shape_tuple(teacher_drone_feat),
+                "teacher_sat_feat.shape": _shape_tuple(teacher_sat_feat),
+                "student_drone_feat.requires_grad": student_drone_feat.requires_grad,
+                "student_sat_feat.requires_grad": student_sat_feat.requires_grad,
+                "teacher_drone_feat.requires_grad": teacher_drone_feat.requires_grad,
+                "teacher_sat_feat.requires_grad": teacher_sat_feat.requires_grad,
+                "student_drone_feat.dtype/device": (
+                    f"{student_drone_feat.dtype}/{student_drone_feat.device}"
+                ),
+                "teacher_drone_feat.dtype/device": (
+                    f"{teacher_drone_feat.dtype}/{teacher_drone_feat.device}"
+                ),
+                "temperature": float(rank_kd_temperature),
+                "loss_retrieval": float(loss_infonce.detach().item()),
+                "loss_negrank": float(loss_negrank.detach().item()),
+                "rank_kd_weight_base": float(getattr(args, "rank_kd_weight", 0.0)),
+                "current_rank_kd_weight": float(rank_kd_weight_current),
+                "loss_total": float(loss.detach().item()),
+            })
+            if is_main_process():
+                print_negrank_kd_debug(args, teacher_model, debug_info)
+
+    result = {
         "loss": loss_infonce,
         "main_loss": loss_infonce,
         "global_pair_batch_size": global_pair_batch_size,
     }
+    if loss_negrank is not None:
+        result["loss"] = loss
+        result["loss_negrank"] = loss_negrank
+        result["rank_kd_weight_current"] = float(rank_kd_weight_current)
+        result["rank_kd_temperature"] = float(rank_kd_temperature)
+        if debug_negrank_kd:
+            result["debug_negrank_kd"] = True
+    return result
 
 
 def cast_images_to_model_dtype(model, images):
@@ -361,12 +988,17 @@ def train_one_epoch(
     device,
     args,
     epoch,
+    teacher_model=None,
 ):
     model.train()
+    if teacher_model is not None:
+        teacher_model.eval()
     batch_time = AverageMeter()
     data_time = AverageMeter()
     loss_total_meter = AverageMeter()
     loss_retrieval_meter = AverageMeter()
+    loss_negrank_meter = AverageMeter()
+    kd_weight_meter = AverageMeter()
     end = time.time()
 
     if hasattr(train_loader.batch_sampler, "set_epoch"):
@@ -381,17 +1013,31 @@ def train_one_epoch(
         pair_batch_size = meta["pair_batch_size"]
 
         optimizer.zero_grad(set_to_none=True)
+        rank_kd_weight_current = current_rank_kd_weight(args, epoch)
+        debug_negrank_kd = should_debug_negrank_kd(
+            args,
+            teacher_model,
+            epoch,
+            step,
+        )
         with autocast(device_type="cuda", enabled=use_amp):
             batch_losses = compute_student_batch_losses(
                 model,
                 images,
                 pair_batch_size,
                 criterion,
+                teacher_model=teacher_model,
+                rank_kd_weight_current=rank_kd_weight_current,
+                rank_kd_temperature=args.rank_kd_temperature,
+                debug_negrank_kd=debug_negrank_kd,
+                args=args,
             )
             loss = batch_losses["loss"]
 
         if scaler.is_enabled():
             scaler.scale(loss).backward()
+            if batch_losses.get("debug_negrank_kd", False):
+                check_teacher_grad_after_backward(teacher_model)
             if args.grad_clip > 0:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
@@ -402,6 +1048,8 @@ def train_one_epoch(
                 scheduler.step()
         else:
             loss.backward()
+            if batch_losses.get("debug_negrank_kd", False):
+                check_teacher_grad_after_backward(teacher_model)
             if args.grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             optimizer.step()
@@ -412,10 +1060,21 @@ def train_one_epoch(
         raw_model.logit_scale.data.clamp_(0, math.log(100))
         loss_total_meter.update(loss.item(), images.size(0))
         loss_retrieval_meter.update(batch_losses["main_loss"].item(), images.size(0))
+        if "loss_negrank" in batch_losses:
+            loss_negrank_meter.update(batch_losses["loss_negrank"].item(), images.size(0))
+            kd_weight_meter.update(rank_kd_weight_current, images.size(0))
         batch_time.update(time.time() - end)
         end = time.time()
 
         if (step + 1) % args.print_freq == 0 or step == len(train_loader) - 1:
+            negrank_text = ""
+            if teacher_model is not None:
+                negrank_text = (
+                    f"loss_negrank {loss_negrank_meter.val:.4f} "
+                    f"({loss_negrank_meter.avg:.4f}) | "
+                    f"rank_kd_weight_current {rank_kd_weight_current:.6f} | "
+                    f"rank_kd_temperature {args.rank_kd_temperature:.4f} | "
+                )
             print(
                 f"Epoch [{epoch}/{args.epochs}] "
                 f"Step [{step + 1}/{len(train_loader)}] | "
@@ -424,16 +1083,22 @@ def train_one_epoch(
                 f"world_size {get_world_size()} | "
                 f"retrieval_loss {loss_retrieval_meter.val:.4f} "
                 f"({loss_retrieval_meter.avg:.4f}) | "
+                f"{negrank_text}"
                 f"total_loss {loss_total_meter.val:.4f} "
                 f"({loss_total_meter.avg:.4f}) | "
                 f"logit_scale {raw_model.logit_scale.exp().item():.3f} | "
                 f"lr {optimizer.param_groups[0]['lr']:.8f}"
             )
 
-    return {
+    stats = {
         "total_loss": loss_total_meter.avg,
         "loss_retrieval": loss_retrieval_meter.avg,
     }
+    if teacher_model is not None:
+        stats["loss_negrank"] = loss_negrank_meter.avg
+        stats["rank_kd_weight_current"] = kd_weight_meter.avg
+        stats["rank_kd_temperature"] = float(args.rank_kd_temperature)
+    return stats
 
 
 def train_one_epoch_deepspeed(
@@ -443,13 +1108,18 @@ def train_one_epoch_deepspeed(
     device,
     args,
     epoch,
+    teacher_model=None,
 ):
     model_engine.train()
+    if teacher_model is not None:
+        teacher_model.eval()
     if hasattr(train_loader.batch_sampler, "set_epoch"):
         train_loader.batch_sampler.set_epoch(epoch)
 
     loss_total_meter = AverageMeter()
     loss_retrieval_meter = AverageMeter()
+    loss_negrank_meter = AverageMeter()
+    kd_weight_meter = AverageMeter()
     batch_time = AverageMeter()
     data_time = AverageMeter()
     end = time.time()
@@ -460,14 +1130,28 @@ def train_one_epoch_deepspeed(
         images = cast_images_to_model_dtype(model_engine, images)
         pair_batch_size = meta["pair_batch_size"]
 
+        rank_kd_weight_current = current_rank_kd_weight(args, epoch)
+        debug_negrank_kd = should_debug_negrank_kd(
+            args,
+            teacher_model,
+            epoch,
+            step,
+        )
         batch_losses = compute_student_batch_losses(
             model_engine,
             images,
             pair_batch_size,
             criterion,
+            teacher_model=teacher_model,
+            rank_kd_weight_current=rank_kd_weight_current,
+            rank_kd_temperature=args.rank_kd_temperature,
+            debug_negrank_kd=debug_negrank_kd,
+            args=args,
         )
         loss = batch_losses["loss"]
         model_engine.backward(loss)
+        if batch_losses.get("debug_negrank_kd", False):
+            check_teacher_grad_after_backward(teacher_model)
         if args.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model_engine.parameters(), args.grad_clip)
         model_engine.step()
@@ -476,12 +1160,23 @@ def train_one_epoch_deepspeed(
         raw_model.logit_scale.data.clamp_(0, math.log(100))
         loss_total_meter.update(loss.item(), images.size(0))
         loss_retrieval_meter.update(batch_losses["main_loss"].item(), images.size(0))
+        if "loss_negrank" in batch_losses:
+            loss_negrank_meter.update(batch_losses["loss_negrank"].item(), images.size(0))
+            kd_weight_meter.update(rank_kd_weight_current, images.size(0))
         batch_time.update(time.time() - end)
         end = time.time()
 
         if is_main_process() and (
             (step + 1) % args.print_freq == 0 or step == len(train_loader) - 1
         ):
+            negrank_text = ""
+            if teacher_model is not None:
+                negrank_text = (
+                    f"loss_negrank {loss_negrank_meter.val:.4f} "
+                    f"({loss_negrank_meter.avg:.4f}) | "
+                    f"rank_kd_weight_current {rank_kd_weight_current:.6f} | "
+                    f"rank_kd_temperature {args.rank_kd_temperature:.4f} | "
+                )
             print(
                 f"Epoch [{epoch}/{args.epochs}] "
                 f"Step [{step + 1}/{len(train_loader)}] | "
@@ -490,15 +1185,21 @@ def train_one_epoch_deepspeed(
                 f"world_size {get_world_size()} | "
                 f"retrieval_loss {loss_retrieval_meter.val:.4f} "
                 f"({loss_retrieval_meter.avg:.4f}) | "
+                f"{negrank_text}"
                 f"total_loss {loss_total_meter.val:.4f} "
                 f"({loss_total_meter.avg:.4f}) | "
                 f"logit_scale {raw_model.logit_scale.exp().item():.3f}"
             )
 
-    return {
+    stats = {
         "total_loss": loss_total_meter.avg,
         "loss_retrieval": loss_retrieval_meter.avg,
     }
+    if teacher_model is not None:
+        stats["loss_negrank"] = loss_negrank_meter.avg
+        stats["rank_kd_weight_current"] = kd_weight_meter.avg
+        stats["rank_kd_temperature"] = float(args.rank_kd_temperature)
+    return stats
 
 
 def log_validation_result(epoch, result):
@@ -545,6 +1246,7 @@ def train(
     scheduler,
     device,
     args,
+    teacher_model=None,
 ):
     os.makedirs(args.output_dir, exist_ok=True)
     scaler = GradScaler("cuda", enabled=amp_is_enabled(args, device))
@@ -570,11 +1272,23 @@ def train(
             device,
             args,
             epoch,
+            teacher_model=teacher_model,
         )
+        negrank_text = ""
+        if teacher_model is not None:
+            negrank_text = (
+                f" | loss_negrank={train_stats['loss_negrank']:.4f}"
+                f" | rank_kd_weight_current={train_stats['rank_kd_weight_current']:.6f}"
+                f" | rank_kd_temperature={train_stats['rank_kd_temperature']:.4f}"
+            )
         print(
             f"[Train] Epoch {epoch}/{args.epochs} | "
             f"retrieval_loss={train_stats['loss_retrieval']:.4f} | "
             f"total_loss={train_stats['total_loss']:.4f} | "
+            f"teacher_model_dir={args.teacher_model_dir if teacher_model is not None else 'N/A'} | "
+            f"teacher_ckpt_type={args.teacher_ckpt_type if teacher_model is not None else 'N/A'} | "
+            f"teacher_checkpoint_path={args.teacher_checkpoint_path if teacher_model is not None else 'N/A'}"
+            f"{negrank_text} | "
             f"world_size={get_world_size()}"
         )
 
@@ -639,6 +1353,7 @@ def train_deepspeed(
     criterion,
     device,
     args,
+    teacher_model=None,
 ):
     if is_main_process():
         os.makedirs(args.output_dir, exist_ok=True)
@@ -663,12 +1378,24 @@ def train_deepspeed(
             device,
             args,
             epoch,
+            teacher_model=teacher_model,
         )
         if is_main_process():
+            negrank_text = ""
+            if teacher_model is not None:
+                negrank_text = (
+                    f" | loss_negrank={train_stats['loss_negrank']:.4f}"
+                    f" | rank_kd_weight_current={train_stats['rank_kd_weight_current']:.6f}"
+                    f" | rank_kd_temperature={train_stats['rank_kd_temperature']:.4f}"
+                )
             print(
                 f"[Train] Epoch {epoch}/{args.epochs} | "
                 f"retrieval_loss={train_stats['loss_retrieval']:.4f} | "
                 f"total_loss={train_stats['total_loss']:.4f} | "
+                f"teacher_model_dir={args.teacher_model_dir if teacher_model is not None else 'N/A'} | "
+                f"teacher_ckpt_type={args.teacher_ckpt_type if teacher_model is not None else 'N/A'} | "
+                f"teacher_checkpoint_path={args.teacher_checkpoint_path if teacher_model is not None else 'N/A'}"
+                f"{negrank_text} | "
                 f"world_size={get_world_size()}"
             )
 
@@ -765,8 +1492,28 @@ def parse_args(argv=None):
     parser.add_argument("--best_metric_name", type=str, default="R1_sum")
     parser.add_argument("--save_last", dest="save_last", action="store_true", default=True)
     parser.add_argument("--no_save_last", dest="save_last", action="store_false")
+    parser.add_argument("--use_negrank_kd", action="store_true", default=False)
+    parser.add_argument("--debug_negrank_kd", action="store_true", default=False)
+    parser.add_argument("--teacher_model_dir", type=str, default=None)
+    parser.add_argument(
+        "--teacher_ckpt_type",
+        type=str,
+        default="best",
+        choices=tuple(NEGRANK_TEACHER_CHECKPOINTS.keys()),
+    )
+    parser.add_argument("--rank_kd_weight", type=float, default=0.01)
+    parser.add_argument("--rank_kd_temperature", type=float, default=0.2)
+    parser.add_argument("--rank_kd_warmup_epochs", type=int, default=5)
+    parser.add_argument(
+        "--rank_kd_decay",
+        type=str2bool,
+        nargs="?",
+        const=True,
+        default=False,
+    )
 
     args = parser.parse_args(argv)
+    args.teacher_checkpoint_path = None
     if args.print_freq <= 0:
         parser.error("--print_freq must be greater than 0")
     if args.batch_size <= 0:
@@ -777,12 +1524,19 @@ def parse_args(argv=None):
         parser.error("--temperature must be greater than 0")
     if args.grad_clip < 0.0:
         parser.error("--grad_clip must be non-negative")
+    if args.rank_kd_weight < 0.0:
+        parser.error("--rank_kd_weight must be non-negative")
+    if args.rank_kd_temperature <= 0.0:
+        parser.error("--rank_kd_temperature must be greater than 0")
+    if args.rank_kd_warmup_epochs < 0:
+        parser.error("--rank_kd_warmup_epochs must be non-negative")
     if args.best_metric_name != "R1_sum":
         print(
             f"[Best] overriding best_metric_name="
             f"{args.best_metric_name!r} to 'R1_sum'"
         )
         args.best_metric_name = "R1_sum"
+    validate_negrank_kd_files(args, parser=parser)
     return args
 
 
@@ -834,6 +1588,9 @@ def main():
     )
 
     print_trainable_parameter_summary(model)
+    teacher_model = None
+    if args.use_negrank_kd:
+        teacher_model = build_frozen_teacher_from_run(args, device)
 
     if args.deepspeed:
         import deepspeed
@@ -857,6 +1614,7 @@ def main():
             criterion,
             device,
             args,
+            teacher_model=teacher_model,
         )
         return
 
@@ -869,6 +1627,7 @@ def main():
         scheduler,
         device,
         args,
+        teacher_model=teacher_model,
     )
 
 
