@@ -20,6 +20,7 @@ from src.models.student_model import StudentModel
 from src.utils.gather_features_and_labels_and_views import GatherLayer
 from src.utils.initdist import try_init_dist
 from src.utils.optimizer_and_scale import build_student_optimizer
+from src.utils.run_logging import resolve_shared_output_dir, setup_rank0_run_log
 from src.utils.save_path import get_student_save_pth
 from src.utils.scheduler import build_student_scheduler
 from src.utils.train_eval_utils import (
@@ -1319,8 +1320,12 @@ def main():
             "Use torchrun/deepspeed with multiple processes."
         )
 
-    if args.output_dir is None:
-        args.output_dir = get_student_save_pth(args)
+    resolve_shared_output_dir(
+        args,
+        get_student_save_pth,
+        is_main_process(),
+    )
+    setup_rank0_run_log(args.output_dir, is_main_process())
 
     if is_main_process():
         print(f"[StudentTrain] device={device} | world_size={world_size}")

@@ -35,6 +35,7 @@ from src.training.teacher.args import parse_args
 from src.training.teacher.hparams import save_training_record
 from src.utils.teacher.optimizer import build_optimizer_and_scale
 from src.utils.teacher.scheduler import get_scheduler
+from src.utils.run_logging import resolve_shared_output_dir, setup_rank0_run_log
 from src.utils.save_path import get_save_pth
 if 'OMP_NUM_THREADS' not in os.environ:
     os.environ['OMP_NUM_THREADS'] = '4'
@@ -1451,6 +1452,12 @@ def main():
         validate_scheduler_args(args)
         validate_identity_training_args(args)
         device, rank, local_rank, world_size = try_init_dist()
+        resolve_shared_output_dir(
+            args,
+            get_save_pth,
+            is_main_process(),
+        )
+        setup_rank0_run_log(args.output_dir, is_main_process())
         # Build training dataloaders.
         train_dataset, train_sampler, train_loader = create_1652_teacher_train_dataloaders(args)
         # Build validation dataloaders.
