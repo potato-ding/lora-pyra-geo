@@ -245,6 +245,65 @@ def test_compute_student_batch_losses_adds_only_weighted_negrank_kd():
     torch.testing.assert_close(losses["loss"], expected_total)
     assert losses["rank_kd_weight_current"] == 0.25
     assert losses["rank_kd_temperature"] == 0.2
+    torch.testing.assert_close(
+        losses["loss_negrank_weighted"],
+        losses["loss_negrank"].detach() * 0.25,
+    )
+    assert not losses["loss_negrank_weighted"].requires_grad
+
+
+def test_negative_rank_behavior_stats_are_detached_and_consistent():
+    teacher_drone = torch.eye(4, requires_grad=True)
+    teacher_sat = torch.tensor(
+        [
+            [1.0, 0.2, 0.1, 0.0],
+            [0.0, 1.0, 0.3, 0.1],
+            [0.1, 0.0, 1.0, 0.4],
+            [0.2, 0.1, 0.0, 1.0],
+        ],
+        requires_grad=True,
+    )
+    student_drone = teacher_drone.detach().clone().requires_grad_(True)
+    student_sat = teacher_sat.detach().clone().requires_grad_(True)
+
+    stats = student_train.negative_rank_behavior_stats(
+        student_drone,
+        student_sat,
+        teacher_drone,
+        teacher_sat,
+    )
+
+    assert stats["valid_ranking_pair_count"] > 0
+    assert stats["total_possible_ranking_pair_count"] == 24
+    assert 0.0 < stats["kd_coverage_ratio"] <= 1.0
+    assert stats["ranking_agreement"] == 1.0
+    assert stats["violation_ratio"] == 0.0
+    assert student_drone.grad is None
+    assert student_sat.grad is None
+    assert teacher_drone.grad is None
+    assert teacher_sat.grad is None
+
+
+def test_teacher_gradient_audit_reports_fully_frozen_teacher():
+    teacher = nn.Linear(3, 2)
+    student_train.freeze_model(teacher)
+
+    assert student_train.teacher_gradient_counts(teacher, aggregate=False) == (0, 0)
+
+
+def test_clean_student_audit_allows_teacher_only_for_negrank_kd(monkeypatch):
+    model = StudentModel(ckpt_path=None)
+    criterion = student_train.Sample4GeoLoss()
+    teacher = nn.Linear(2, 2)
+    student_train.freeze_model(teacher)
+    monkeypatch.setattr(student_train, "is_main_process", lambda: False)
+
+    student_train.audit_clean_student_runtime(
+        model,
+        criterion,
+        teacher,
+        use_negrank_kd=True,
+    )
 
 
 def test_rank_kd_weight_warmup_and_optional_decay():

@@ -63,6 +63,7 @@ NEGRANK_TEACHER_CHECKPOINTS = {
     "last": "last_model.pth",
 }
 B0_EXPERIMENT_ID = "B0-3090"
+D1_A_EXPERIMENT_ID = "D1-A-3090"
 
 
 def _dtype_name(dtype):
@@ -92,7 +93,11 @@ def _git_commit(project_root):
         return "unavailable"
 
 
-def print_b0_experiment_configuration(
+def experiment_id(args):
+    return D1_A_EXPERIMENT_ID if args.use_negrank_kd else B0_EXPERIMENT_ID
+
+
+def print_experiment_configuration(
     args,
     rank,
     local_rank,
@@ -120,7 +125,13 @@ def print_b0_experiment_configuration(
 
     print("=" * 80)
     print("[EXPERIMENT CONFIGURATION]")
-    print(f"Experiment ID={B0_EXPERIMENT_ID}")
+    print(f"Experiment ID={experiment_id(args)}")
+    print(
+        "KD type=Negative Rank KD"
+        if args.use_negrank_kd
+        else "KD type=None"
+    )
+    print(f"KD enabled={bool(args.use_negrank_kd)}")
     print(f"started_at={started_at}")
     print(f"command={shlex.join(str(part) for part in command_parts)}")
     print(f"git_commit={_git_commit(ROOT)}")
@@ -424,17 +435,23 @@ def build_frozen_teacher_from_run(args, device):
     freeze_model(teacher)
 
     frozen = all(not param.requires_grad for param in teacher.parameters())
+    teacher_total_params = sum(param.numel() for param in teacher.parameters())
+    teacher_trainable_params = sum(
+        param.numel() for param in teacher.parameters() if param.requires_grad
+    )
     if is_main_process():
-        print("[NegRankKD] enabled")
-        print(f"[NegRankKD] teacher_model_dir = {args.teacher_model_dir}")
-        print(f"[NegRankKD] teacher_ckpt_type = {args.teacher_ckpt_type}")
-        print(f"[NegRankKD] teacher_checkpoint = {args.teacher_checkpoint_path}")
-        print(f"[NegRankKD] rank_kd_weight = {args.rank_kd_weight}")
-        print(f"[NegRankKD] temperature = {args.rank_kd_temperature}")
-        print(f"[NegRankKD] warmup_epochs = {args.rank_kd_warmup_epochs}")
-        print(f"[NegRankKD] teacher frozen = {frozen}")
+        print("[NegRankKD] KD type = Negative Rank KD")
+        print("[NegRankKD] KD enabled = True")
+        print(f"[NegRankKD] teacher_checkpoint_path = {args.teacher_checkpoint_path}")
+        print(f"[NegRankKD] teacher_checkpoint_selection = {args.teacher_ckpt_type}")
+        print(f"[NegRankKD] teacher_eval_mode = {not teacher.training}")
+        print(f"[NegRankKD] teacher_total_params = {teacher_total_params}")
+        print(f"[NegRankKD] teacher_trainable_params = {teacher_trainable_params}")
+        print(f"[NegRankKD] neg_rank_kd_weight_target = {args.rank_kd_weight}")
+        print(f"[NegRankKD] neg_rank_kd_temperature = {args.rank_kd_temperature}")
+        print(f"[NegRankKD] neg_rank_kd_warmup_epochs = {args.rank_kd_warmup_epochs}")
 
-    if not frozen:
+    if not frozen or teacher_trainable_params != 0:
         raise RuntimeError("NegRankKD teacher must be fully frozen")
     return teacher
 
@@ -471,7 +488,12 @@ def get_raw_model(model):
     return model.module if hasattr(model, "module") else model
 
 
-def audit_clean_student_runtime(model, criterion, teacher_model):
+def audit_clean_student_runtime(
+    model,
+    criterion,
+    teacher_model,
+    use_negrank_kd=False,
+):
     raw_model = get_raw_model(model)
     student_class = f"{raw_model.__class__.__module__}.{raw_model.__class__.__name__}"
     backbone_class = (
@@ -503,8 +525,11 @@ def audit_clean_student_runtime(model, criterion, teacher_model):
         errors.append(f"embedding_dim={getattr(raw_model, 'embedding_dim', None)}, expected 512")
     if not isinstance(criterion, Sample4GeoLoss):
         errors.append(f"criterion is not Sample4GeoLoss: {type(criterion)}")
-    if teacher_present:
-        errors.append("teacher is present in clean B0 baseline")
+    if teacher_present != bool(use_negrank_kd):
+        errors.append(
+            "teacher presence does not match Negative Rank KD configuration: "
+            f"teacher_present={teacher_present}, use_negrank_kd={use_negrank_kd}"
+        )
     if extra_student_module_present:
         errors.append(f"unexpected top-level student modules: {extra_child_modules}")
 
@@ -526,13 +551,13 @@ def audit_clean_student_runtime(model, criterion, teacher_model):
         print(f"extra_student_module_present={extra_student_module_present}")
         if extra_child_modules:
             print(f"extra_student_modules={extra_child_modules}")
-        print(f"clean_baseline_valid={not errors}")
+        print(f"clean_student_structure_valid={not errors}")
         for error in errors:
-            print(f"[B0 AUDIT][ERROR] {error}")
+            print(f"[STUDENT AUDIT][ERROR] {error}")
         print("=" * 80)
 
     if errors:
-        raise RuntimeError("B0 clean baseline runtime audit failed: " + "; ".join(errors))
+        raise RuntimeError("Clean student runtime audit failed: " + "; ".join(errors))
 
 
 def sample4geo_loss(model, features, criterion, pair_batch_size):
@@ -616,6 +641,7 @@ def negative_aware_cross_view_ranking_kd(
     teacher_drone_feat,
     teacher_sat_feat,
     temperature,
+    return_audit=False,
 ):
     student_drone_feat = F.normalize(student_drone_feat.float(), dim=1)
     student_sat_feat = F.normalize(student_sat_feat.float(), dim=1)
@@ -627,7 +653,82 @@ def negative_aware_cross_view_ranking_kd(
 
     loss_d2s = neg_rank_kl(sim_s_d2s, sim_t_d2s, temperature)
     loss_s2d = neg_rank_kl(sim_s_d2s.t(), sim_t_d2s.t(), temperature)
-    return 0.5 * (loss_d2s + loss_s2d)
+    loss = 0.5 * (loss_d2s + loss_s2d)
+    if not return_audit:
+        return loss
+    return loss, {
+        "student_ranking_tensor_dtype": sim_s_d2s.dtype,
+        "teacher_ranking_tensor_dtype": sim_t_d2s.dtype,
+        "negative_rank_kd_loss_dtype": loss.dtype,
+    }
+
+
+@torch.no_grad()
+def negative_rank_behavior_stats(
+    student_drone_feat,
+    student_sat_feat,
+    teacher_drone_feat,
+    teacher_sat_feat,
+):
+    """Detached ranking diagnostics; never contributes to the training graph."""
+    student_drone = F.normalize(student_drone_feat.detach().float(), dim=1)
+    student_sat = F.normalize(student_sat_feat.detach().float(), dim=1)
+    teacher_drone = F.normalize(teacher_drone_feat.detach().float(), dim=1)
+    teacher_sat = F.normalize(teacher_sat_feat.detach().float(), dim=1)
+
+    student_d2s = student_drone @ student_sat.t()
+    teacher_d2s = teacher_drone @ teacher_sat.t()
+    batch_size = student_d2s.size(0)
+    if batch_size <= 2:
+        return {
+            "valid_ranking_pair_count": 0,
+            "total_possible_ranking_pair_count": 0,
+            "kd_coverage_ratio": 0.0,
+            "ranking_agreement": 0.0,
+            "violation_ratio": 0.0,
+        }
+
+    negative_mask = ~torch.eye(
+        batch_size,
+        dtype=torch.bool,
+        device=student_d2s.device,
+    )
+    pair_mask = torch.triu(
+        torch.ones(
+            batch_size - 1,
+            batch_size - 1,
+            dtype=torch.bool,
+            device=student_d2s.device,
+        ),
+        diagonal=1,
+    )
+
+    valid_count = 0
+    agreement_count = 0
+    total_possible = 0
+    for student_sim, teacher_sim in (
+        (student_d2s, teacher_d2s),
+        (student_d2s.t(), teacher_d2s.t()),
+    ):
+        student_neg = student_sim[negative_mask].view(batch_size, batch_size - 1)
+        teacher_neg = teacher_sim[negative_mask].view(batch_size, batch_size - 1)
+        student_delta = student_neg.unsqueeze(2) - student_neg.unsqueeze(1)
+        teacher_delta = teacher_neg.unsqueeze(2) - teacher_neg.unsqueeze(1)
+        valid = pair_mask.unsqueeze(0) & teacher_delta.ne(0)
+        agreements = valid & (torch.sign(student_delta) == torch.sign(teacher_delta))
+        valid_count += int(valid.sum().item())
+        agreement_count += int(agreements.sum().item())
+        total_possible += batch_size * int(pair_mask.sum().item())
+
+    coverage = float(valid_count) / float(total_possible) if total_possible else 0.0
+    agreement = float(agreement_count) / float(valid_count) if valid_count else 0.0
+    return {
+        "valid_ranking_pair_count": valid_count,
+        "total_possible_ranking_pair_count": total_possible,
+        "kd_coverage_ratio": coverage,
+        "ranking_agreement": agreement,
+        "violation_ratio": 1.0 - agreement if valid_count else 0.0,
+    }
 
 
 def current_rank_kd_weight(args, epoch):
@@ -649,6 +750,56 @@ def current_rank_kd_weight(args, epoch):
     return base_weight
 
 
+def print_epoch_kd_configuration(args, epoch):
+    if not (is_main_process() and args.use_negrank_kd):
+        return
+    print(
+        f"[NegRankKD][Epoch Start] epoch={epoch} | "
+        f"target_kd_weight={float(args.rank_kd_weight):.6f} | "
+        f"effective_kd_weight={current_rank_kd_weight(args, epoch):.6f}"
+    )
+
+
+def teacher_gradient_counts(teacher_model, aggregate=True):
+    grad_tensor_count = 0
+    grad_nonzero_count = 0
+    for param in teacher_model.parameters():
+        if param.grad is None:
+            continue
+        grad_tensor_count += 1
+        if torch.count_nonzero(param.grad.detach()).item() > 0:
+            grad_nonzero_count += 1
+
+    if aggregate and is_distributed():
+        device = next(teacher_model.parameters()).device
+        counts = torch.tensor(
+            [grad_tensor_count, grad_nonzero_count],
+            dtype=torch.long,
+            device=device,
+        )
+        dist.all_reduce(counts, op=dist.ReduceOp.SUM)
+        grad_tensor_count, grad_nonzero_count = map(int, counts.cpu().tolist())
+    return grad_tensor_count, grad_nonzero_count
+
+
+def audit_teacher_gradients_after_backward(teacher_model):
+    if teacher_model is None or getattr(teacher_model, "_d1_grad_audit_done", False):
+        return
+    grad_tensor_count, grad_nonzero_count = teacher_gradient_counts(teacher_model)
+    if is_main_process():
+        print(
+            "[NegRankKD][Teacher Gradient Audit] "
+            f"teacher_grad_tensor_count={grad_tensor_count} | "
+            f"teacher_grad_nonzero_count={grad_nonzero_count}"
+        )
+    teacher_model._d1_grad_audit_done = True
+    if grad_tensor_count != 0 or grad_nonzero_count != 0:
+        raise RuntimeError(
+            "Frozen teacher unexpectedly received gradients: "
+            f"tensor_count={grad_tensor_count}, nonzero_count={grad_nonzero_count}"
+        )
+
+
 def split_paired_features(features, pair_batch_size):
     return (
         features[:pair_batch_size],
@@ -660,6 +811,7 @@ def compute_teacher_paired_features(
     teacher_model,
     images,
     pair_batch_size,
+    audit_runtime=False,
 ):
     teacher_images = cast_images_to_model_dtype(teacher_model, images)
     with torch.inference_mode():
@@ -671,7 +823,46 @@ def compute_teacher_paired_features(
         pair_batch_size,
         with_grad=False,
     )
-    return teacher_features.detach(), global_pair_batch_size
+    runtime_audit = None
+    if audit_runtime:
+        local_drone, local_satellite = split_paired_features(
+            local_teacher_features,
+            pair_batch_size,
+        )
+        global_drone, global_satellite = split_paired_features(
+            teacher_features,
+            global_pair_batch_size,
+        )
+        teacher_forward_audit = (
+            getattr(teacher_model, "_runtime_forward_audit", None) or {}
+        )
+        teacher_backbone = getattr(teacher_model, "backbone", teacher_model)
+        teacher_backbone_param = next(
+            (
+                param
+                for param in teacher_backbone.parameters()
+                if param.is_floating_point()
+            ),
+            None,
+        )
+        runtime_audit = {
+            "local_drone_shape": tuple(local_drone.shape),
+            "local_satellite_shape": tuple(local_satellite.shape),
+            "global_drone_shape": tuple(global_drone.shape),
+            "global_satellite_shape": tuple(global_satellite.shape),
+            "input_dtype": teacher_images.dtype,
+            "backbone_parameter_dtype": (
+                teacher_backbone_param.dtype
+                if teacher_backbone_param is not None
+                else None
+            ),
+            "descriptor_dtype": local_teacher_features.dtype,
+            "gathered_descriptor_dtype": global_drone.dtype,
+            "backbone_output_dtype": teacher_forward_audit.get(
+                "backbone_output_dtype_value"
+            ),
+        }
+    return teacher_features.detach(), global_pair_batch_size, runtime_audit
 
 
 def compute_student_batch_losses(
@@ -683,6 +874,7 @@ def compute_student_batch_losses(
     rank_kd_weight_current=0.0,
     rank_kd_temperature=0.2,
     audit_runtime=False,
+    collect_kd_stats=False,
 ):
     local_features = model(images)
     features, global_pair_batch_size = gather_paired_views(
@@ -700,12 +892,20 @@ def compute_student_batch_losses(
     loss_negrank = None
     student_drone_feat = None
     student_sat_feat = None
+    teacher_runtime_audit = None
+    kd_runtime_audit = None
+    kd_behavior_stats = None
 
     if teacher_model is not None and rank_kd_weight_current > 0.0:
-        teacher_features, teacher_global_pair_batch_size = compute_teacher_paired_features(
+        (
+            teacher_features,
+            teacher_global_pair_batch_size,
+            teacher_runtime_audit,
+        ) = compute_teacher_paired_features(
             teacher_model,
             images,
             pair_batch_size,
+            audit_runtime=audit_runtime,
         )
 
         if teacher_global_pair_batch_size != global_pair_batch_size:
@@ -723,14 +923,26 @@ def compute_student_batch_losses(
             teacher_features,
             teacher_global_pair_batch_size,
         )
-        loss_negrank = negative_aware_cross_view_ranking_kd(
+        negrank_output = negative_aware_cross_view_ranking_kd(
             student_drone_feat,
             student_sat_feat,
             teacher_drone_feat,
             teacher_sat_feat,
             rank_kd_temperature,
+            return_audit=audit_runtime,
         )
+        if audit_runtime:
+            loss_negrank, kd_runtime_audit = negrank_output
+        else:
+            loss_negrank = negrank_output
         loss = loss + float(rank_kd_weight_current) * loss_negrank
+        if collect_kd_stats:
+            kd_behavior_stats = negative_rank_behavior_stats(
+                student_drone_feat,
+                student_sat_feat,
+                teacher_drone_feat,
+                teacher_sat_feat,
+            )
 
     result = {
         "loss": loss_infonce,
@@ -755,16 +967,23 @@ def compute_student_batch_losses(
             "global_satellite_dtype": global_satellite.dtype,
             "global_drone_finite": tensor_nonfinite_counts(global_drone),
             "global_satellite_finite": tensor_nonfinite_counts(global_satellite),
+            "teacher": teacher_runtime_audit,
+            "kd": kd_runtime_audit,
         }
     if loss_negrank is not None:
         result["loss"] = loss
         result["loss_negrank"] = loss_negrank
+        result["loss_negrank_weighted"] = (
+            loss_negrank.detach() * float(rank_kd_weight_current)
+        )
         result["rank_kd_weight_current"] = float(rank_kd_weight_current)
         result["rank_kd_temperature"] = float(rank_kd_temperature)
+        if kd_behavior_stats is not None:
+            result["kd_behavior_stats"] = kd_behavior_stats
     return result
 
 
-def print_first_b0_runtime_audit(model, criterion, batch_meta, images, batch_losses):
+def print_first_runtime_audit(model, criterion, batch_meta, images, batch_losses):
     if not is_main_process():
         return
 
@@ -772,6 +991,8 @@ def print_first_b0_runtime_audit(model, criterion, batch_meta, images, batch_los
     forward_audit = getattr(raw_model, "_runtime_forward_audit", None) or {}
     loss_audit = getattr(criterion, "last_runtime_audit", None) or {}
     gather_audit = batch_losses.get("runtime_audit", {})
+    teacher_audit = gather_audit.get("teacher") or {}
+    kd_audit = gather_audit.get("kd") or {}
     raw_drone = batch_meta.get("raw_drone_tensor")
     raw_satellite = batch_meta.get("raw_satellite_tensor")
     local_pair_count = int(batch_meta["pair_batch_size"])
@@ -786,7 +1007,7 @@ def print_first_b0_runtime_audit(model, criterion, batch_meta, images, batch_los
     )
 
     print("=" * 80)
-    print("[RUNTIME DTYPE AUDIT] source=first_real_student_training_forward")
+    print("[RUNTIME DTYPE AUDIT] source=first_real_training_forward")
     print(f"raw drone image dtype={_dtype_name(getattr(raw_drone, 'dtype', None))}")
     print(f"raw satellite image dtype={_dtype_name(getattr(raw_satellite, 'dtype', None))}")
     print(f"student forward input dtype={_dtype_name(forward_audit.get('student_forward_input_dtype'))}")
@@ -802,6 +1023,31 @@ def print_first_b0_runtime_audit(model, criterion, batch_meta, images, batch_los
     print(f"similarity/logits dtype={_dtype_name(loss_audit.get('similarity_logits_dtype'))}")
     print(f"D2S loss dtype={_dtype_name(loss_audit.get('d2s_loss_dtype'))}")
     print(f"S2D loss dtype={_dtype_name(loss_audit.get('s2d_loss_dtype'))}")
+    print(f"base InfoNCE dtype={_dtype_name(batch_losses['main_loss'].dtype)}")
+    if teacher_audit:
+        print(f"teacher input dtype={_dtype_name(teacher_audit.get('input_dtype'))}")
+        print(
+            "teacher representative backbone parameter dtype="
+            f"{_dtype_name(teacher_audit.get('backbone_parameter_dtype'))}"
+        )
+        print(f"teacher backbone output dtype={_dtype_name(teacher_audit.get('backbone_output_dtype'))}")
+        print(f"teacher descriptor dtype={_dtype_name(teacher_audit.get('descriptor_dtype'))}")
+        print(
+            "teacher gathered descriptor dtype="
+            f"{_dtype_name(teacher_audit.get('gathered_descriptor_dtype'))}"
+        )
+        print(
+            "student ranking tensor dtype="
+            f"{_dtype_name(kd_audit.get('student_ranking_tensor_dtype'))}"
+        )
+        print(
+            "teacher ranking tensor dtype="
+            f"{_dtype_name(kd_audit.get('teacher_ranking_tensor_dtype'))}"
+        )
+        print(
+            "Negative Rank KD loss dtype="
+            f"{_dtype_name(kd_audit.get('negative_rank_kd_loss_dtype'))}"
+        )
     print(f"total loss dtype={_dtype_name(batch_losses['loss'].dtype)}")
     print(f"actual_f4_shape={forward_audit.get('f4_shape', 'unavailable')}")
     f4_shape = forward_audit.get("f4_shape")
@@ -820,6 +1066,18 @@ def print_first_b0_runtime_audit(model, criterion, batch_meta, images, batch_los
     print(f"D2S candidate pool size={global_pair_count}")
     print(f"S2D candidate pool size={global_pair_count}")
     print(f"cross-GPU gather actually effective={cross_gpu_effective}")
+    if teacher_audit:
+        print("[ONLINE DISTILLATION AUDIT]")
+        print(f"teacher local drone descriptor shape={teacher_audit['local_drone_shape']}")
+        print(f"teacher local satellite descriptor shape={teacher_audit['local_satellite_shape']}")
+        print(f"teacher global drone descriptor shape={teacher_audit['global_drone_shape']}")
+        print(f"teacher global satellite descriptor shape={teacher_audit['global_satellite_shape']}")
+        print(f"student global candidate pool size={global_pair_count}")
+        print(f"teacher global candidate pool size={teacher_audit['global_drone_shape'][0]}")
+        print(f"Negative Rank KD candidate pool size={global_pair_count}")
+        print("online_teacher_forward=True")
+        print("offline_teacher_cache=False")
+        print("same_current_augmented_images=True")
 
     finite_reports = {
         "raw drone image": tensor_nonfinite_counts(raw_drone),
@@ -839,7 +1097,7 @@ def print_first_b0_runtime_audit(model, criterion, batch_meta, images, batch_los
     print("=" * 80)
 
     if not cross_gpu_effective:
-        raise RuntimeError("B0 cross-GPU descriptor gather audit failed")
+        raise RuntimeError("Cross-GPU descriptor gather audit failed")
 
 
 def cast_images_to_model_dtype(model, images):
@@ -1177,6 +1435,7 @@ def train_one_epoch_deepspeed(
     model_engine.train()
     if teacher_model is not None:
         teacher_model.eval()
+    print_epoch_kd_configuration(args, epoch)
     if hasattr(train_loader.batch_sampler, "set_epoch"):
         train_loader.batch_sampler.set_epoch(epoch)
 
@@ -1185,7 +1444,13 @@ def train_one_epoch_deepspeed(
     loss_d2s_meter = AverageMeter()
     loss_s2d_meter = AverageMeter()
     loss_negrank_meter = AverageMeter()
+    loss_negrank_weighted_meter = AverageMeter()
     kd_weight_meter = AverageMeter()
+    valid_ranking_pair_meter = AverageMeter()
+    total_ranking_pair_meter = AverageMeter()
+    kd_coverage_meter = AverageMeter()
+    ranking_agreement_meter = AverageMeter()
+    violation_ratio_meter = AverageMeter()
     batch_time = AverageMeter()
     data_time = AverageMeter()
     end = time.time()
@@ -1194,7 +1459,7 @@ def train_one_epoch_deepspeed(
     last_grad_norm = None
     last_grad_norm_source = "unavailable"
     runtime_audit_printed = bool(
-        getattr(get_raw_model(model_engine), "_b0_runtime_audit_printed", False)
+        getattr(get_raw_model(model_engine), "_runtime_audit_printed", False)
     )
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats(torch.cuda.current_device())
@@ -1204,6 +1469,9 @@ def train_one_epoch_deepspeed(
         images, meta = unpack_sample4geo_batch(batch, device)
         images = cast_images_to_model_dtype(model_engine, images)
         pair_batch_size = meta["pair_batch_size"]
+        should_print = (
+            (step + 1) % args.print_freq == 0 or step == len(train_loader) - 1
+        )
 
         rank_kd_weight_current = current_rank_kd_weight(args, epoch)
         batch_losses = compute_student_batch_losses(
@@ -1215,19 +1483,21 @@ def train_one_epoch_deepspeed(
             rank_kd_weight_current=rank_kd_weight_current,
             rank_kd_temperature=args.rank_kd_temperature,
             audit_runtime=not runtime_audit_printed,
+            collect_kd_stats=bool(teacher_model is not None and should_print),
         )
         loss = batch_losses["loss"]
         if not runtime_audit_printed:
-            print_first_b0_runtime_audit(
+            print_first_runtime_audit(
                 model_engine,
                 criterion,
                 meta,
                 images,
                 batch_losses,
             )
-            get_raw_model(model_engine)._b0_runtime_audit_printed = True
+            get_raw_model(model_engine)._runtime_audit_printed = True
             runtime_audit_printed = True
         model_engine.backward(loss)
+        audit_teacher_gradients_after_backward(teacher_model)
         if args.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model_engine.parameters(), args.grad_clip)
         model_engine.step()
@@ -1246,13 +1516,24 @@ def train_one_epoch_deepspeed(
             inf_loss_count += 1
         if "loss_negrank" in batch_losses:
             loss_negrank_meter.update(batch_losses["loss_negrank"].item(), images.size(0))
+            loss_negrank_weighted_meter.update(
+                batch_losses["loss_negrank_weighted"].item(),
+                images.size(0),
+            )
             kd_weight_meter.update(rank_kd_weight_current, images.size(0))
+        behavior = batch_losses.get("kd_behavior_stats")
+        if behavior is not None:
+            valid_ranking_pair_meter.update(behavior["valid_ranking_pair_count"])
+            total_ranking_pair_meter.update(
+                behavior["total_possible_ranking_pair_count"]
+            )
+            kd_coverage_meter.update(behavior["kd_coverage_ratio"])
+            ranking_agreement_meter.update(behavior["ranking_agreement"])
+            violation_ratio_meter.update(behavior["violation_ratio"])
         batch_time.update(time.time() - end)
         end = time.time()
 
-        if is_main_process() and (
-            (step + 1) % args.print_freq == 0 or step == len(train_loader) - 1
-        ):
+        if is_main_process() and should_print:
             negrank_text = ""
             if teacher_model is not None:
                 negrank_text = (
@@ -1260,6 +1541,12 @@ def train_one_epoch_deepspeed(
                     f"({loss_negrank_meter.avg:.4f}) | "
                     f"rank_kd_weight_current {rank_kd_weight_current:.6f} | "
                     f"rank_kd_temperature {args.rank_kd_temperature:.4f} | "
+                    f"weighted_loss_negrank {batch_losses['loss_negrank_weighted'].item():.4f} | "
+                    f"valid_ranking_pair_count {behavior['valid_ranking_pair_count']} | "
+                    f"total_possible_ranking_pair_count {behavior['total_possible_ranking_pair_count']} | "
+                    f"kd_coverage_ratio {behavior['kd_coverage_ratio']:.6f} | "
+                    f"ranking_agreement {behavior['ranking_agreement']:.6f} | "
+                    f"violation_ratio {behavior['violation_ratio']:.6f} | "
                 )
             memory = gpu_memory_snapshot()
             grad_norm_text = (
@@ -1306,8 +1593,19 @@ def train_one_epoch_deepspeed(
     }
     if teacher_model is not None:
         stats["loss_negrank"] = loss_negrank_meter.avg
+        stats["loss_negrank_weighted"] = loss_negrank_weighted_meter.avg
         stats["rank_kd_weight_current"] = kd_weight_meter.avg
         stats["rank_kd_temperature"] = float(args.rank_kd_temperature)
+        stats["valid_ranking_pair_count"] = valid_ranking_pair_meter.avg
+        stats["total_possible_ranking_pair_count"] = total_ranking_pair_meter.avg
+        stats["kd_coverage_ratio"] = kd_coverage_meter.avg
+        stats["ranking_agreement"] = ranking_agreement_meter.avg
+        stats["violation_ratio"] = violation_ratio_meter.avg
+        teacher_grad_tensor_count, teacher_grad_nonzero_count = teacher_gradient_counts(
+            teacher_model
+        )
+        stats["teacher_grad_tensor_count"] = teacher_grad_tensor_count
+        stats["teacher_grad_nonzero_count"] = teacher_grad_nonzero_count
     return stats
 
 
@@ -1495,8 +1793,11 @@ def train_deepspeed(
             if teacher_model is not None:
                 negrank_text = (
                     f" | loss_negrank={train_stats['loss_negrank']:.4f}"
+                    f" | weighted_loss_negrank={train_stats['loss_negrank_weighted']:.4f}"
                     f" | rank_kd_weight_current={train_stats['rank_kd_weight_current']:.6f}"
                     f" | rank_kd_temperature={train_stats['rank_kd_temperature']:.4f}"
+                    f" | ranking_agreement={train_stats['ranking_agreement']:.6f}"
+                    f" | violation_ratio={train_stats['violation_ratio']:.6f}"
                 )
             print(
                 f"[Train] Epoch {epoch}/{args.epochs} | "
@@ -1571,6 +1872,37 @@ def train_deepspeed(
             print(f"average InfoNCE loss={train_stats['loss_retrieval']:.6f}")
             print(f"average D2S loss={train_stats['loss_d2s']:.6f}")
             print(f"average S2D loss={train_stats['loss_s2d']:.6f}")
+            if teacher_model is not None:
+                print(f"average raw Negative Rank KD loss={train_stats['loss_negrank']:.6f}")
+                print(
+                    "average weighted Negative Rank KD loss="
+                    f"{train_stats['loss_negrank_weighted']:.6f}"
+                )
+                print(
+                    "average valid ranking pair count="
+                    f"{train_stats['valid_ranking_pair_count']:.2f}"
+                )
+                print(
+                    "average total possible ranking pair count="
+                    f"{train_stats['total_possible_ranking_pair_count']:.2f}"
+                )
+                print(f"average KD coverage ratio={train_stats['kd_coverage_ratio']:.6f}")
+                print(f"average ranking agreement={train_stats['ranking_agreement']:.6f}")
+                print(f"average violation ratio={train_stats['violation_ratio']:.6f}")
+                print(
+                    "teacher gradient count | "
+                    f"teacher_grad_tensor_count={train_stats['teacher_grad_tensor_count']} | "
+                    f"teacher_grad_nonzero_count={train_stats['teacher_grad_nonzero_count']}"
+                )
+            grad_norm_summary = (
+                f"{train_stats['last_grad_norm']:.6f}"
+                if train_stats["last_grad_norm"] is not None
+                else "unavailable"
+            )
+            print(
+                f"student grad norm summary={grad_norm_summary} | "
+                f"source={train_stats['last_grad_norm_source']}"
+            )
             print(
                 f"NaN/Inf summary | nan_loss_count={train_stats['nan_loss_count']} | "
                 f"inf_loss_count={train_stats['inf_loss_count']} | "
@@ -1730,7 +2062,7 @@ def main():
         is_main_process(),
     )
     setup_rank0_run_log(args.output_dir, is_main_process())
-    print_b0_experiment_configuration(
+    print_experiment_configuration(
         args,
         rank,
         local_rank,
@@ -1768,7 +2100,12 @@ def main():
     teacher_model = None
     if args.use_negrank_kd:
         teacher_model = build_frozen_teacher_from_run(args, device)
-    audit_clean_student_runtime(model, criterion, teacher_model)
+    audit_clean_student_runtime(
+        model,
+        criterion,
+        teacher_model,
+        use_negrank_kd=args.use_negrank_kd,
+    )
 
     if args.deepspeed:
         import deepspeed
