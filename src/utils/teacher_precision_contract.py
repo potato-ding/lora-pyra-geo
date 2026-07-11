@@ -11,10 +11,10 @@ PRECISION_CONTRACT_NAME = "T0-v1.0"
 # This is the single source of truth for the verified teacher precision path.
 EXPECTED_DTYPES = {
     "raw_image": torch.float32,
-    "teacher_input": torch.float16,
-    "backbone_param": torch.float16,
-    "lora_runtime": torch.float16,
-    "backbone_output": torch.float16,
+    "teacher_input": torch.bfloat16,
+    "backbone_param": torch.bfloat16,
+    "lora_runtime": torch.bfloat16,
+    "backbone_output": torch.bfloat16,
     "descriptor": torch.float32,
     "gathered_descriptor": torch.float32,
     "logits": torch.float32,
@@ -51,7 +51,7 @@ def precision_contract_log_fields():
 
     return {
         "precision_contract": PRECISION_CONTRACT_NAME,
-        "precision_mode": "fp16_backbone_fp32_retrieval",
+        "precision_mode": "bf16_backbone_fp32_retrieval",
         "teacher_compute_dtype": dtype_name(EXPECTED_DTYPES["teacher_input"]),
         "descriptor_dtype": dtype_name(EXPECTED_DTYPES["descriptor"]),
         "gather_dtype": dtype_name(EXPECTED_DTYPES["gathered_descriptor"]),
