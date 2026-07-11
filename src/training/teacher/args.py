@@ -19,6 +19,7 @@ def build_arg_parser():
         description="Train the DINOv3-7B teacher with LoRA and final-block finetuning."
     )
 
+    parser.add_argument("--experiment_id", type=str, default="T0-3090")
     parser.add_argument("--epochs", "--max_epochs", dest="epochs", type=int, default=22)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--local_rank", type=int, default=0)

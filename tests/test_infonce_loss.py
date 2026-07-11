@@ -46,6 +46,21 @@ class InfonceLossTest(unittest.TestCase):
         self.assertIsNotNone(drone_feats.grad)
         self.assertIsNotNone(logit_scale.grad)
 
+    def test_directional_runtime_telemetry_does_not_change_returned_loss(self):
+        criterion = infonce()
+        sat_feats = torch.eye(4, dtype=torch.float32)
+        drone_feats = sat_feats.clone()
+        logit_scale = torch.tensor(math.log(10.0), dtype=torch.float32)
+
+        loss = criterion(sat_feats, drone_feats, logit_scale)
+
+        self.assertIsNotNone(criterion.last_loss_d2s)
+        self.assertIsNotNone(criterion.last_loss_s2d)
+        expected = (criterion.last_loss_d2s + criterion.last_loss_s2d) / 2.0
+        self.assertTrue(torch.allclose(loss.detach(), expected))
+        self.assertEqual(criterion.last_runtime_audit["similarity_logits_dtype"], "float32")
+        self.assertEqual(criterion.last_runtime_audit["similarity_logits_shape"], (4, 4))
+
 
 if __name__ == "__main__":
     unittest.main()

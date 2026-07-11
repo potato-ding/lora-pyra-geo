@@ -110,6 +110,7 @@ class TeacherModel(nn.Module):
         super().__init__()
         self.device = args.device
         self.lora_injector = None
+        self._runtime_forward_audit = None
 
         self.backbone = DINOv3Backbone(
             repo_dir,
@@ -216,5 +217,20 @@ class TeacherModel(nn.Module):
 
         _, final_cls = self._split_intermediate_output(features[0])
         descriptor = F.normalize(final_cls.float(), p=2, dim=-1, eps=1e-6)
+        if self._runtime_forward_audit is None:
+            self._runtime_forward_audit = {
+                "teacher_forward_input_dtype": str(x.dtype).replace("torch.", ""),
+                "backbone_output_dtype": str(final_cls.dtype).replace("torch.", ""),
+                "descriptor_dtype": str(descriptor.dtype).replace("torch.", ""),
+                "teacher_forward_input_shape": tuple(x.shape),
+                "backbone_output_shape": tuple(final_cls.shape),
+                "descriptor_shape": tuple(descriptor.shape),
+                "teacher_forward_input_nan": int(torch.isnan(x.detach()).sum().item()),
+                "teacher_forward_input_inf": int(torch.isinf(x.detach()).sum().item()),
+                "backbone_output_nan": int(torch.isnan(final_cls.detach()).sum().item()),
+                "backbone_output_inf": int(torch.isinf(final_cls.detach()).sum().item()),
+                "descriptor_nan": int(torch.isnan(descriptor.detach()).sum().item()),
+                "descriptor_inf": int(torch.isinf(descriptor.detach()).sum().item()),
+            }
         self._require_finite("teacher_descriptor", descriptor)
         return descriptor

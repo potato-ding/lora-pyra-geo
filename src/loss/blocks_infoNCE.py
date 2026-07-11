@@ -39,6 +39,9 @@ class infonce(nn.Module):
     def __init__(self, loss_function=None):
         super().__init__()
         self.loss_function = loss_function if loss_function is not None else nn.CrossEntropyLoss()
+        self.last_runtime_audit = None
+        self.last_loss_d2s = None
+        self.last_loss_s2d = None
 
     @staticmethod
     def _zero_loss(sat_feats, drone_feats):
@@ -63,6 +66,21 @@ class infonce(nn.Module):
 
         loss_d2s = self.loss_function(logits, targets)
         loss_s2d = self.loss_function(logits.t(), targets)
+        self.last_loss_d2s = loss_d2s.detach()
+        self.last_loss_s2d = loss_s2d.detach()
+        if self.last_runtime_audit is None:
+            self.last_runtime_audit = {
+                "similarity_logits_dtype": str(logits.dtype).replace("torch.", ""),
+                "similarity_logits_shape": tuple(logits.shape),
+                "d2s_loss_dtype": str(loss_d2s.dtype).replace("torch.", ""),
+                "s2d_loss_dtype": str(loss_s2d.dtype).replace("torch.", ""),
+                "logits_nan": int(torch.isnan(logits.detach()).sum().item()),
+                "logits_inf": int(torch.isinf(logits.detach()).sum().item()),
+                "d2s_loss_nan": int(torch.isnan(loss_d2s.detach()).sum().item()),
+                "d2s_loss_inf": int(torch.isinf(loss_d2s.detach()).sum().item()),
+                "s2d_loss_nan": int(torch.isnan(loss_s2d.detach()).sum().item()),
+                "s2d_loss_inf": int(torch.isinf(loss_s2d.detach()).sum().item()),
+            }
         return (loss_d2s + loss_s2d) / 2.0
 
 

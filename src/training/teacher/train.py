@@ -14,6 +14,7 @@ import torch.distributed as dist
 import gc
 import inspect
 import json
+from datetime import datetime
 from torch.utils.data import Dataset, DataLoader
 from src.loss.tripletloss import IntraDomainTripletLoss
 from src.loss.blocks_infoNCE import infonce
@@ -35,6 +36,14 @@ from src.training.teacher.args import parse_args
 from src.training.teacher.hparams import save_training_record
 from src.utils.teacher.optimizer import build_optimizer_and_scale
 from src.utils.teacher.scheduler import get_scheduler
+from src.utils.teacher_experiment_audit import (
+    audit_teacher_runtime_structure,
+    get_runtime_parameter_dtypes,
+    gpu_memory_snapshot,
+    print_experiment_configuration,
+    read_deepspeed_grad_norm,
+    tensor_nonfinite_counts,
+)
 from src.utils.run_logging import resolve_shared_output_dir, setup_rank0_run_log
 from src.utils.save_path import get_save_pth
 if 'OMP_NUM_THREADS' not in os.environ:
@@ -326,6 +335,158 @@ def get_model_debug_values(model_or_engine):
 
 def format_optional_metric(name, value):
     return f"{name}={value:.4f}" if value is not None else None
+
+
+def _dtype_name(dtype):
+    return str(dtype).replace("torch.", "") if dtype is not None else "unavailable"
+
+
+def print_runtime_dtype_audit_once(
+    model_engine,
+    infonce_criterion,
+    batch_meta,
+    final_feats,
+    sat_feats,
+    drone_feats,
+    total_loss,
+):
+    """Print dtypes and finite checks from the first real Sample4Geo forward."""
+
+    base_model = get_base_model(model_engine)
+    forward_audit = getattr(base_model, "_runtime_forward_audit", None) or {}
+    loss_audit = getattr(infonce_criterion, "last_runtime_audit", None) or {}
+    parameter_dtypes = get_runtime_parameter_dtypes(model_engine)
+    raw_sat = batch_meta.get("raw_satellite_tensor")
+    raw_drone = batch_meta.get("raw_drone_tensor")
+
+    actual_dtypes = {
+        "raw batch drone image dtype": _dtype_name(getattr(raw_drone, "dtype", None)),
+        "raw batch satellite image dtype": _dtype_name(getattr(raw_sat, "dtype", None)),
+        "teacher forward input dtype": forward_audit.get(
+            "teacher_forward_input_dtype", "unavailable"
+        ),
+        "backbone parameter dtype": parameter_dtypes["backbone_parameter_dtype"],
+        "representative LoRA A dtype": parameter_dtypes["lora_A_dtype"],
+        "representative LoRA B dtype": parameter_dtypes["lora_B_dtype"],
+        "backbone output dtype": forward_audit.get("backbone_output_dtype", "unavailable"),
+        "descriptor dtype": forward_audit.get("descriptor_dtype", _dtype_name(final_feats.dtype)),
+        "gathered drone descriptor dtype": _dtype_name(drone_feats.dtype),
+        "gathered satellite descriptor dtype": _dtype_name(sat_feats.dtype),
+        "similarity/logits dtype": loss_audit.get(
+            "similarity_logits_dtype", "unavailable"
+        ),
+        "D2S loss dtype": loss_audit.get("d2s_loss_dtype", "unavailable"),
+        "S2D loss dtype": loss_audit.get("s2d_loss_dtype", "unavailable"),
+        "total loss dtype": _dtype_name(total_loss.dtype),
+    }
+    expected_dtypes = {
+        "raw batch drone image dtype": "float32",
+        "raw batch satellite image dtype": "float32",
+        "teacher forward input dtype": "bfloat16",
+        "backbone parameter dtype": "bfloat16",
+        "representative LoRA A dtype": "bfloat16",
+        "representative LoRA B dtype": "bfloat16",
+        "backbone output dtype": "bfloat16",
+        "descriptor dtype": "float32",
+        "gathered drone descriptor dtype": "float32",
+        "gathered satellite descriptor dtype": "float32",
+        "similarity/logits dtype": "float32",
+        "D2S loss dtype": "float32",
+        "S2D loss dtype": "float32",
+        "total loss dtype": "float32",
+    }
+
+    print("=" * 80)
+    print("[RUNTIME DTYPE AUDIT] source=first_real_sample4geo_forward")
+    for name, actual in actual_dtypes.items():
+        print(f"{name}={actual}")
+        if actual != expected_dtypes[name]:
+            print(
+                f"[EXPERIMENT_AUDIT][WARNING] {name} expected "
+                f"{expected_dtypes[name]}, got {actual}"
+            )
+
+    finite_reports = {}
+    if torch.is_tensor(raw_sat):
+        finite_reports["raw satellite batch"] = tensor_nonfinite_counts(raw_sat)
+    if torch.is_tensor(raw_drone):
+        finite_reports["raw drone batch"] = tensor_nonfinite_counts(raw_drone)
+    finite_reports["local descriptor"] = tensor_nonfinite_counts(final_feats)
+    finite_reports["gathered satellite descriptor"] = tensor_nonfinite_counts(sat_feats)
+    finite_reports["gathered drone descriptor"] = tensor_nonfinite_counts(drone_feats)
+    finite_reports["total loss"] = tensor_nonfinite_counts(total_loss)
+
+    for prefix in ("teacher_forward_input", "backbone_output", "descriptor"):
+        if f"{prefix}_nan" in forward_audit:
+            finite_reports[prefix.replace("_", " ")] = {
+                "nan": forward_audit[f"{prefix}_nan"],
+                "inf": forward_audit[f"{prefix}_inf"],
+            }
+    for prefix in ("logits", "d2s_loss", "s2d_loss"):
+        if f"{prefix}_nan" in loss_audit:
+            finite_reports[prefix.replace("_", " ")] = {
+                "nan": loss_audit[f"{prefix}_nan"],
+                "inf": loss_audit[f"{prefix}_inf"],
+            }
+
+    for name, counts in finite_reports.items():
+        print(f"finite_check | tensor={name} | nan={counts['nan']} | inf={counts['inf']}")
+        if counts["nan"] or counts["inf"]:
+            print(
+                f"[EXPERIMENT_AUDIT][ERROR] non-finite values in {name}: "
+                f"nan={counts['nan']}, inf={counts['inf']}"
+            )
+    print("=" * 80)
+
+
+def print_distributed_descriptor_audit_once(
+    local_feats,
+    local_views,
+    gathered_sat_feats,
+    gathered_drone_feats,
+):
+    dist_initialized = dist.is_available() and dist.is_initialized()
+    world_size = dist.get_world_size() if dist_initialized else 1
+    local_sat_shape = tuple(local_feats[local_views == 0].shape)
+    local_drone_shape = tuple(local_feats[local_views == 1].shape)
+    global_sat_shape = tuple(gathered_sat_feats.shape)
+    global_drone_shape = tuple(gathered_drone_feats.shape)
+    local_pair_count = min(local_sat_shape[0], local_drone_shape[0])
+    global_pair_count = min(global_sat_shape[0], global_drone_shape[0])
+    cross_gpu_gather_effective = bool(
+        dist_initialized
+        and world_size > 1
+        and global_sat_shape[0] == local_sat_shape[0] * world_size
+        and global_drone_shape[0] == local_drone_shape[0] * world_size
+    )
+
+    print("=" * 80)
+    print("[DISTRIBUTED DESCRIPTOR AUDIT] source=first_real_distributed_gather")
+    print(f"distributed initialized={dist_initialized}")
+    print(f"world size={world_size}")
+    print(f"local drone descriptor shape={local_drone_shape}")
+    print(f"local satellite descriptor shape={local_sat_shape}")
+    print(f"gathered global drone descriptor shape={global_drone_shape}")
+    print(f"gathered global satellite descriptor shape={global_sat_shape}")
+    print(f"local pair count={local_pair_count}")
+    print(f"global pair count={global_pair_count}")
+    print(f"D2S candidate pool size={global_sat_shape[0]}")
+    print(f"S2D candidate pool size={global_drone_shape[0]}")
+    print(f"cross-GPU gather actually effective={cross_gpu_gather_effective}")
+
+    expected_values = {
+        "world size": (world_size, 8),
+        "local pair count": (local_pair_count, 4),
+        "global pair count": (global_pair_count, 32),
+        "D2S candidate pool size": (global_sat_shape[0], 32),
+        "S2D candidate pool size": (global_drone_shape[0], 32),
+    }
+    for name, (actual, expected) in expected_values.items():
+        if actual != expected:
+            print(f"[EXPERIMENT_AUDIT][WARNING] {name} expected {expected}, got {actual}")
+    if not cross_gpu_gather_effective:
+        print("[EXPERIMENT_AUDIT][ERROR] cross-GPU descriptor gather was not effective")
+    print("=" * 80)
 
 
 def get_loss_weight_desc(args):
@@ -1009,6 +1170,10 @@ def unpack_training_batch(batch, training_mode, device):
             "pids": pids,
             "sat_views_per_id": sat_views_per_id,
             "drone_views_per_id": drone_views_per_id,
+            # References are retained only until this batch finishes so the
+            # first runtime audit can inspect the real pre-cast tensors.
+            "raw_satellite_tensor": sat_tensors,
+            "raw_drone_tensor": drone_tensors,
         }
         return imgs, labels, views, meta
 
@@ -1048,6 +1213,14 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
         lr_scheduler=scheduler,
         config=ds_config if ds_config is not None else args.deepspeed_config
     )
+    runtime_dtype_audit_printed = False
+    distributed_descriptor_audit_printed = False
+    if is_main_process():
+        print(
+            "[GradientAudit] exact global NaN/Inf gradient element counts are unavailable "
+            "without gathering ZeRO-2 partitioned gradients; fields will be reported as "
+            "unavailable rather than fabricated."
+        )
     # Prepare the training run directory.
     save_dir = get_save_pth(args)
     if getattr(args, "save_hard_pool_path", None) is None:
@@ -1090,6 +1263,8 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
         )
         set_epoch_on_dataloader(epoch_dataloader, epoch)
         model_engine.train()
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats(torch.cuda.current_device())
         mode_name, mode_desc = get_training_mode_desc(epoch_dataloader.dataset, args)
         num_batches = len(epoch_dataloader)
         world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
@@ -1099,8 +1274,15 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
             else getattr(args, "identity_ids_per_batch", args.batch_size)
         )
         epoch_start_time = time.time()
+        epoch_validation_metrics = None
+        nan_loss_count = 0
+        inf_loss_count = 0
+        last_grad_norm = None
+        last_grad_norm_source = "unavailable"
         loss_log_keys = (
             "total",
+            "d2s_loss",
+            "s2d_loss",
             "tri_drone",
             "tri_sat",
             "infonce",
@@ -1146,6 +1328,15 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
             sat_feats = all_feats[sat_mask]
             drone_feats = all_feats[drone_mask]
 
+            if is_main_process() and not distributed_descriptor_audit_printed:
+                print_distributed_descriptor_audit_once(
+                    final_feats,
+                    views,
+                    sat_feats,
+                    drone_feats,
+                )
+                distributed_descriptor_audit_printed = True
+
             if effective_mode == "sample4geo":
                 if args.triplet_weight > 0:
                     tri_drone, tri_sat = triplet_criterion(drone_feats, drone_labels, sat_feats, sat_labels)
@@ -1161,6 +1352,18 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                     total_infonce_loss = args.infonce_weight * infonce_loss
                     loss_terms.append(total_infonce_loss)
                     loss_values["infonce"] = total_infonce_loss.item()
+                    if (
+                        infonce_criterion.last_loss_d2s is not None
+                        and infonce_criterion.last_loss_s2d is not None
+                    ):
+                        directional_losses = torch.stack(
+                            [
+                                infonce_criterion.last_loss_d2s,
+                                infonce_criterion.last_loss_s2d,
+                            ]
+                        ).float().cpu().tolist()
+                        loss_values["d2s_loss"] = directional_losses[0]
+                        loss_values["s2d_loss"] = directional_losses[1]
             elif effective_mode in {"identity", "identity_hard"}:
                 if is_main_process() and batch_idx == 0:
                     print(
@@ -1192,6 +1395,21 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
             # Backpropagation and optimizer step.
             loss = sum(loss_terms) if loss_terms else None
             if torch.is_tensor(loss):
+                if (
+                    is_main_process()
+                    and effective_mode == "sample4geo"
+                    and not runtime_dtype_audit_printed
+                ):
+                    print_runtime_dtype_audit_once(
+                        model_engine,
+                        infonce_criterion,
+                        batch_meta,
+                        final_feats,
+                        sat_feats,
+                        drone_feats,
+                        loss,
+                    )
+                    runtime_dtype_audit_printed = True
                 model_engine.backward(loss)
                 model_engine.step()
                 with torch.no_grad():
@@ -1199,6 +1417,10 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                     if hasattr(base_model, "logit_scale") and base_model.logit_scale is not None:
                         base_model.logit_scale.clamp_(max=4.6)
                 loss_item = loss.item()
+                if math.isnan(loss_item):
+                    nan_loss_count += 1
+                if math.isinf(loss_item):
+                    inf_loss_count += 1
                 loss_sums["total"] += loss_item
                 loss_counts["total"] += 1
                 for key, value in loss_values.items():
@@ -1218,6 +1440,7 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                 )
             )
             if should_log:
+                last_grad_norm, last_grad_norm_source = read_deepspeed_grad_norm(model_engine)
                 avg_total = loss_sums["total"] / max(loss_counts["total"], 1)
                 progress = 100.0 * step / max(num_batches, 1)
                 elapsed_min = (time.time() - epoch_start_time) / 60.0
@@ -1225,7 +1448,7 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                 debug_values = get_model_debug_values(model_engine)
 
                 metric_keys = (
-                    ("tri_drone", "tri_sat", "infonce")
+                    ("d2s_loss", "s2d_loss", "tri_drone", "tri_sat", "infonce")
                     if effective_mode == "sample4geo"
                     else ("cross_id", "same_triplet", "weak_s4g")
                 )
@@ -1235,12 +1458,22 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                 ]
                 metric_parts = [part for part in metric_parts if part is not None]
                 metric_text = " | ".join(metric_parts) if metric_parts else "loss_parts=none"
+                memory = gpu_memory_snapshot()
+                grad_norm_text = (
+                    f"{last_grad_norm:.6g}" if last_grad_norm is not None else "unavailable"
+                )
 
                 print(
                     f"[Train] Epoch {epoch}/{args.epochs} | mode={mode_name} | "
                     f"batch {step}/{num_batches} ({progress:.1f}%) | "
                     f"loss={loss_item:.4f} avg={avg_total:.4f} | {metric_text} | "
                     f"lr={lr:.2e} | scale={debug_values.get('scale', 0.0):.3f} | "
+                    f"grad_norm={grad_norm_text} | grad_norm_source={last_grad_norm_source} | "
+                    f"gpu_allocated={memory['allocated_gib']:.3f}GiB | "
+                    f"gpu_reserved={memory['reserved_gib']:.3f}GiB | "
+                    f"gpu_peak_allocated={memory['peak_allocated_gib']:.3f}GiB | "
+                    f"nan_loss_count={nan_loss_count} | inf_loss_count={inf_loss_count} | "
+                    "nan_gradient_count=unavailable | inf_gradient_count=unavailable | "
                     f"elapsed={elapsed_min:.1f}m"
                 )
         hard_sampler_summary = None
@@ -1256,6 +1489,7 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
             hard_sampler_summary = format_hard_sampler_epoch_summary(hard_stats)
         if is_main_process():
             elapsed_min = (time.time() - epoch_start_time) / 60.0
+            memory = gpu_memory_snapshot()
             avg_parts = []
             for key in loss_log_keys:
                 if loss_counts[key] > 0:
@@ -1263,7 +1497,11 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
             avg_text = " | ".join(avg_parts) if avg_parts else "no_update"
             print(
                 f"[Train] Epoch {epoch}/{args.epochs} done | mode={mode_name} | "
-                f"updates={loss_counts['total']} | {avg_text} | time={elapsed_min:.1f}m"
+                f"updates={loss_counts['total']} | {avg_text} | "
+                f"nan_loss_count={nan_loss_count} | inf_loss_count={inf_loss_count} | "
+                "nan_gradient_count=unavailable | inf_gradient_count=unavailable | "
+                f"peak_gpu_allocated={memory['peak_allocated_gib']:.3f}GiB | "
+                f"time={elapsed_min:.1f}m"
             )
             if hard_sampler_summary is not None:
                 print(f"[HardPoolSampler] Epoch {epoch} | {hard_sampler_summary}")
@@ -1344,6 +1582,7 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                     (d2s_r1, d2s_r5, d2s_r10, d2s_map),
                     (s2d_r1, s2d_r5, s2d_r10, s2d_map),
                 )
+                epoch_validation_metrics = current_metrics
                 r1_sum = current_metrics["R@1_sum"]
                 is_best = best_metrics is None or r1_sum > best_r1_sum
                 history_record = dict(current_metrics)
@@ -1397,6 +1636,50 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                 amp_device,
             )
 
+        if is_main_process():
+            memory = gpu_memory_snapshot()
+            avg_total = loss_sums["total"] / max(loss_counts["total"], 1)
+            avg_d2s = (
+                loss_sums["d2s_loss"] / loss_counts["d2s_loss"]
+                if loss_counts["d2s_loss"] > 0
+                else None
+            )
+            avg_s2d = (
+                loss_sums["s2d_loss"] / loss_counts["s2d_loss"]
+                if loss_counts["s2d_loss"] > 0
+                else None
+            )
+            validation_text = (
+                json.dumps(epoch_validation_metrics, ensure_ascii=False, sort_keys=True)
+                if epoch_validation_metrics is not None
+                else "not_run"
+            )
+            best_metric_text = f"{best_r1_sum:.6f}" if best_metrics is not None else "unavailable"
+            best_epoch_text = str(best_epoch) if best_metrics is not None else "unavailable"
+            print("=" * 80)
+            print(f"[EPOCH AUDIT SUMMARY] epoch={epoch}/{args.epochs}")
+            print(f"average total loss={avg_total:.6f}")
+            print(
+                "average D2S loss="
+                + (f"{avg_d2s:.6f}" if avg_d2s is not None else "unavailable")
+            )
+            print(
+                "average S2D loss="
+                + (f"{avg_s2d:.6f}" if avg_s2d is not None else "unavailable")
+            )
+            print(
+                f"NaN/Inf summary | nan_loss_count={nan_loss_count} | "
+                f"inf_loss_count={inf_loss_count} | "
+                "nan_gradient_count=unavailable | inf_gradient_count=unavailable"
+            )
+            print(f"peak GPU allocated memory={memory['peak_allocated_gib']:.3f}GiB")
+            print(f"validation metrics={validation_text}")
+            print(f"current best metric (D2S_R@1+S2D_R@1)={best_metric_text}")
+            print(f"current best epoch={best_epoch_text}")
+            print(f"current checkpoint path={os.path.join(save_dir, 'last_model.pth')}")
+            print(f"current best checkpoint path={os.path.join(save_dir, 'best_model.pth')}")
+            print("=" * 80)
+
         # Synchronize all ranks before the next epoch.
         distributed_barrier_with_log(f"[Train] epoch={epoch} end", local_rank)
     if not dist.is_initialized() or local_rank == 0:
@@ -1444,6 +1727,7 @@ def print_deepspeed_batch_config(ds_config, args, world_size):
 
 def main():
     import traceback
+    run_started_at = datetime.now().astimezone().isoformat(timespec="microseconds")
     args = parse_args()
     try:
         normalize_explicit_training_stage(args)
@@ -1458,6 +1742,24 @@ def main():
             is_main_process(),
         )
         setup_rank0_run_log(args.output_dir, is_main_process())
+        ds_config, grad_accum_steps = build_deepspeed_runtime_config(
+            args.deepspeed_config,
+            args,
+            world_size
+        )
+        experiment_config_audit = print_experiment_configuration(
+            args,
+            ds_config,
+            rank,
+            local_rank,
+            world_size,
+            PROJECT_ROOT,
+            started_at=run_started_at,
+        )
+        if is_main_process() and experiment_config_audit is not None:
+            args.runtime_experiment_configuration_valid = experiment_config_audit["valid"]
+        print_deepspeed_batch_config(ds_config, args, world_size)
+
         # Build training dataloaders.
         train_dataset, train_sampler, train_loader = create_1652_teacher_train_dataloaders(args)
         # Build validation dataloaders.
@@ -1476,15 +1778,11 @@ def main():
             device,
             strict_trainable=getattr(args, "init_checkpoint_strict_trainable", True),
         )
+        if is_main_process():
+            structure_audit = audit_teacher_runtime_structure(model)
+            args.runtime_teacher_structure_valid = structure_audit["valid"]
         # Build optimizer and scheduler for trainable parameters.
         optimizer = build_optimizer_and_scale(model, args)
-        ds_config, grad_accum_steps = build_deepspeed_runtime_config(
-            args.deepspeed_config,
-            args,
-            world_size
-        )
-        print_deepspeed_batch_config(ds_config, args, world_size)
-
         scheduler_plan = build_scheduler_plan(
             train_loader,
             train_sampler,
