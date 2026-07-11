@@ -83,6 +83,9 @@ class LoRALayer(nn.Module):
 
         lora_dtype = self.lora_A.weight.dtype
         x_lora = x.to(lora_dtype)
+        # Runtime evidence for T0 checks. Do not alter this compute path without
+        # declaring a new experiment variable / precision contract.
+        self._runtime_input_dtype = x_lora.dtype
         lora_out = self.lora_B(self.lora_A(self.dropout(x_lora))) * self.scaling
         return self.base(x) + lora_out.to(base_dtype)
 

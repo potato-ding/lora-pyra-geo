@@ -13,6 +13,7 @@ import torch
 import torch.distributed as dist
 
 from src.models.teacher.peft_lora import LoRALayer
+from src.utils.teacher_precision_contract import precision_contract_log_fields
 
 
 T0_EXPERIMENT_ID = "T0-3090"
@@ -295,7 +296,8 @@ def print_experiment_configuration(
     global_pair_batch = local_pair_batch * int(world_size)
     effective_pair_batch = global_pair_batch * grad_accum_steps
     visible_gpu_count = torch.cuda.device_count()
-    precision_mode = _precision_mode(ds_config)
+    deepspeed_precision_mode = _precision_mode(ds_config)
+    precision_fields = precision_contract_log_fields()
 
     print("=" * 80)
     print("[EXPERIMENT CONFIGURATION]")
@@ -319,7 +321,9 @@ def print_experiment_configuration(
     print(f"train data path={os.path.abspath(os.path.join(args.data_dir, 'train'))}")
     print(f"output directory={os.path.abspath(args.output_dir)}")
     print(f"DeepSpeed config path={os.path.abspath(args.deepspeed_config)}")
-    print(f"precision mode={precision_mode}")
+    print(f"DeepSpeed precision config={deepspeed_precision_mode}")
+    for name, value in precision_fields.items():
+        print(f"{name}={value}")
 
     mismatches = []
     if getattr(args, "experiment_id", None) != T0_EXPERIMENT_ID:
@@ -346,9 +350,6 @@ def print_experiment_configuration(
         mismatches.append(
             f"training_stage expected sample4geo, got {getattr(args, 'training_stage', None)}"
         )
-    if precision_mode != "BF16":
-        mismatches.append(f"precision expected BF16, got {precision_mode}")
-
     if mismatches:
         for mismatch in mismatches:
             print(f"[EXPERIMENT_AUDIT][WARNING] {mismatch}")
@@ -364,7 +365,9 @@ def print_experiment_configuration(
         "global_pair_batch": global_pair_batch,
         "effective_pair_batch": effective_pair_batch,
         "gpu_models_by_rank": gpu_models_by_rank,
-        "precision_mode": precision_mode,
+        "precision_mode": precision_fields["precision_mode"],
+        "precision_contract": precision_fields["precision_contract"],
+        "deepspeed_precision_config": deepspeed_precision_mode,
     }
 
 
@@ -380,6 +383,8 @@ def get_runtime_parameter_dtypes(model_or_engine):
         "backbone_parameter_dtype": _dtype_name(backbone_dtype),
         "lora_A_dtype": _dtype_name(first_lora.lora_A.weight.dtype if first_lora else None),
         "lora_B_dtype": _dtype_name(first_lora.lora_B.weight.dtype if first_lora else None),
+        "backbone_parameter_dtype_value": backbone_dtype,
+        "lora_runtime_dtype_value": getattr(first_lora, "_runtime_input_dtype", None),
     }
 
 

@@ -68,19 +68,28 @@ class infonce(nn.Module):
         loss_s2d = self.loss_function(logits.t(), targets)
         self.last_loss_d2s = loss_d2s.detach()
         self.last_loss_s2d = loss_s2d.detach()
-        if self.last_runtime_audit is None:
-            self.last_runtime_audit = {
+        # Retain current dtypes for the T0 first-batch-per-epoch guard.
+        first_runtime_audit = self.last_runtime_audit is None
+        runtime_audit = self.last_runtime_audit or {}
+        runtime_audit.update({
                 "similarity_logits_dtype": str(logits.dtype).replace("torch.", ""),
+                "similarity_logits_dtype_value": logits.dtype,
                 "similarity_logits_shape": tuple(logits.shape),
                 "d2s_loss_dtype": str(loss_d2s.dtype).replace("torch.", ""),
+                "d2s_loss_dtype_value": loss_d2s.dtype,
                 "s2d_loss_dtype": str(loss_s2d.dtype).replace("torch.", ""),
+                "s2d_loss_dtype_value": loss_s2d.dtype,
+        })
+        if first_runtime_audit:
+            runtime_audit.update({
                 "logits_nan": int(torch.isnan(logits.detach()).sum().item()),
                 "logits_inf": int(torch.isinf(logits.detach()).sum().item()),
                 "d2s_loss_nan": int(torch.isnan(loss_d2s.detach()).sum().item()),
                 "d2s_loss_inf": int(torch.isinf(loss_d2s.detach()).sum().item()),
                 "s2d_loss_nan": int(torch.isnan(loss_s2d.detach()).sum().item()),
                 "s2d_loss_inf": int(torch.isinf(loss_s2d.detach()).sum().item()),
-            }
+            })
+        self.last_runtime_audit = runtime_audit
         return (loss_d2s + loss_s2d) / 2.0
 
 

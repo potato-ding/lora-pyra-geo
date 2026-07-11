@@ -46,6 +46,10 @@ from src.utils.teacher_experiment_audit import (
 )
 from src.utils.run_logging import resolve_shared_output_dir, setup_rank0_run_log
 from src.utils.save_path import get_save_pth
+from src.utils.teacher_precision_contract import (
+    PRECISION_CONTRACT_NAME,
+    require_contract_dtype,
+)
 if 'OMP_NUM_THREADS' not in os.environ:
     os.environ['OMP_NUM_THREADS'] = '4'
 
@@ -379,32 +383,29 @@ def print_runtime_dtype_audit_once(
         "S2D loss dtype": loss_audit.get("s2d_loss_dtype", "unavailable"),
         "total loss dtype": _dtype_name(total_loss.dtype),
     }
-    expected_dtypes = {
-        "raw batch drone image dtype": "float32",
-        "raw batch satellite image dtype": "float32",
-        "teacher forward input dtype": "bfloat16",
-        "backbone parameter dtype": "bfloat16",
-        "representative LoRA A dtype": "bfloat16",
-        "representative LoRA B dtype": "bfloat16",
-        "backbone output dtype": "bfloat16",
-        "descriptor dtype": "float32",
-        "gathered drone descriptor dtype": "float32",
-        "gathered satellite descriptor dtype": "float32",
-        "similarity/logits dtype": "float32",
-        "D2S loss dtype": "float32",
-        "S2D loss dtype": "float32",
-        "total loss dtype": "float32",
-    }
-
     print("=" * 80)
-    print("[RUNTIME DTYPE AUDIT] source=first_real_sample4geo_forward")
+    print(f"[RUNTIME DTYPE AUDIT] contract={PRECISION_CONTRACT_NAME} source=first_real_sample4geo_forward")
     for name, actual in actual_dtypes.items():
         print(f"{name}={actual}")
-        if actual != expected_dtypes[name]:
-            print(
-                f"[EXPERIMENT_AUDIT][WARNING] {name} expected "
-                f"{expected_dtypes[name]}, got {actual}"
-            )
+
+    # These assertions use real tensors/runtime observations and are fatal.
+    checks = (
+        ("raw_drone_image", getattr(raw_drone, "dtype", None), "raw_image"),
+        ("raw_satellite_image", getattr(raw_sat, "dtype", None), "raw_image"),
+        ("teacher_forward_input", forward_audit.get("teacher_forward_input_dtype_value"), "teacher_input"),
+        ("backbone_parameter", parameter_dtypes["backbone_parameter_dtype_value"], "backbone_param"),
+        ("lora_runtime", parameter_dtypes["lora_runtime_dtype_value"], "lora_runtime"),
+        ("backbone_output", forward_audit.get("backbone_output_dtype_value"), "backbone_output"),
+        ("descriptor", final_feats.dtype, "descriptor"),
+        ("gathered_drone_descriptor", drone_feats.dtype, "gathered_descriptor"),
+        ("gathered_satellite_descriptor", sat_feats.dtype, "gathered_descriptor"),
+        ("similarity_logits", loss_audit.get("similarity_logits_dtype_value"), "logits"),
+        ("d2s_loss", loss_audit.get("d2s_loss_dtype_value"), "d2s_loss"),
+        ("s2d_loss", loss_audit.get("s2d_loss_dtype_value"), "s2d_loss"),
+        ("total_loss", total_loss.dtype, "total_loss"),
+    )
+    for tensor_name, actual, expected_key in checks:
+        require_contract_dtype(tensor_name, actual, expected_key)
 
     finite_reports = {}
     if torch.is_tensor(raw_sat):
@@ -437,6 +438,23 @@ def print_runtime_dtype_audit_once(
                 f"nan={counts['nan']}, inf={counts['inf']}"
             )
     print("=" * 80)
+
+
+def enforce_epoch_first_batch_precision(model_engine, infonce_criterion, final_feats, total_loss):
+    """Lightweight fatal guard for the first valid Sample4Geo batch each epoch."""
+
+    base_model = get_base_model(model_engine)
+    forward_audit = getattr(base_model, "_runtime_forward_audit", None) or {}
+    loss_audit = getattr(infonce_criterion, "last_runtime_audit", None) or {}
+    checks = (
+        ("teacher_forward_input", forward_audit.get("teacher_forward_input_dtype_value"), "teacher_input"),
+        ("backbone_output", forward_audit.get("backbone_output_dtype_value"), "backbone_output"),
+        ("descriptor", final_feats.dtype, "descriptor"),
+        ("similarity_logits", loss_audit.get("similarity_logits_dtype_value"), "logits"),
+        ("total_loss", total_loss.dtype, "total_loss"),
+    )
+    for tensor_name, actual, expected_key in checks:
+        require_contract_dtype(tensor_name, actual, expected_key)
 
 
 def print_distributed_descriptor_audit_once(
@@ -1292,6 +1310,7 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
         )
         loss_sums = {key: 0.0 for key in loss_log_keys}
         loss_counts = {key: 0 for key in loss_log_keys}
+        epoch_precision_checked = False
         if is_main_process():
             fallback_note = " | fallback_to_sample4geo=True" if stage_mode != effective_mode else ""
             print(
@@ -1395,11 +1414,7 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
             # Backpropagation and optimizer step.
             loss = sum(loss_terms) if loss_terms else None
             if torch.is_tensor(loss):
-                if (
-                    is_main_process()
-                    and effective_mode == "sample4geo"
-                    and not runtime_dtype_audit_printed
-                ):
+                if effective_mode == "sample4geo" and not runtime_dtype_audit_printed:
                     print_runtime_dtype_audit_once(
                         model_engine,
                         infonce_criterion,
@@ -1410,6 +1425,11 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                         loss,
                     )
                     runtime_dtype_audit_printed = True
+                if effective_mode == "sample4geo" and not epoch_precision_checked:
+                    enforce_epoch_first_batch_precision(
+                        model_engine, infonce_criterion, final_feats, loss
+                    )
+                    epoch_precision_checked = True
                 model_engine.backward(loss)
                 model_engine.step()
                 with torch.no_grad():

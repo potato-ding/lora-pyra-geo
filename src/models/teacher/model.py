@@ -217,20 +217,31 @@ class TeacherModel(nn.Module):
 
         _, final_cls = self._split_intermediate_output(features[0])
         descriptor = F.normalize(final_cls.float(), p=2, dim=-1, eps=1e-6)
-        if self._runtime_forward_audit is None:
-            self._runtime_forward_audit = {
+        # Keep the latest real forward dtypes available for the first batch of
+        # every epoch. DO NOT CHANGE T0 PRECISION CONTRACT WITHOUT DECLARING A
+        # NEW EXPERIMENT VARIABLE.
+        first_runtime_audit = self._runtime_forward_audit is None
+        runtime_audit = self._runtime_forward_audit or {}
+        runtime_audit.update({
                 "teacher_forward_input_dtype": str(x.dtype).replace("torch.", ""),
+                "teacher_forward_input_dtype_value": x.dtype,
                 "backbone_output_dtype": str(final_cls.dtype).replace("torch.", ""),
+                "backbone_output_dtype_value": final_cls.dtype,
                 "descriptor_dtype": str(descriptor.dtype).replace("torch.", ""),
+                "descriptor_dtype_value": descriptor.dtype,
                 "teacher_forward_input_shape": tuple(x.shape),
                 "backbone_output_shape": tuple(final_cls.shape),
                 "descriptor_shape": tuple(descriptor.shape),
+        })
+        if first_runtime_audit:
+            runtime_audit.update({
                 "teacher_forward_input_nan": int(torch.isnan(x.detach()).sum().item()),
                 "teacher_forward_input_inf": int(torch.isinf(x.detach()).sum().item()),
                 "backbone_output_nan": int(torch.isnan(final_cls.detach()).sum().item()),
                 "backbone_output_inf": int(torch.isinf(final_cls.detach()).sum().item()),
                 "descriptor_nan": int(torch.isnan(descriptor.detach()).sum().item()),
                 "descriptor_inf": int(torch.isinf(descriptor.detach()).sum().item()),
-            }
+            })
+        self._runtime_forward_audit = runtime_audit
         self._require_finite("teacher_descriptor", descriptor)
         return descriptor
