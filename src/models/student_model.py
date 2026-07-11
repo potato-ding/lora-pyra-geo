@@ -26,6 +26,7 @@ class StudentModel(nn.Module):
         self.neck = nn.BatchNorm1d(self.feat_channels)
         self.logit_scale = nn.Parameter(torch.tensor(math.log(1 / temperature)))
         self._f4_shape_logged = False
+        self._runtime_forward_audit = None
 
         self._print_config()
 
@@ -49,6 +50,45 @@ class StudentModel(nn.Module):
         features = self.backbone(x)
         f4 = features[-1]
         self._log_f4_shape_once(f4)
-        desc = F.adaptive_avg_pool2d(f4, 1).flatten(1)
-        desc = self.neck(desc)
-        return F.normalize(desc, dim=1)
+        gap_output = F.adaptive_avg_pool2d(f4, 1).flatten(1)
+        bn_output = self.neck(gap_output)
+        descriptor = F.normalize(bn_output, dim=1)
+
+        if self._runtime_forward_audit is None:
+            backbone_param = next(
+                (param for param in self.backbone.parameters() if param.is_floating_point()),
+                None,
+            )
+
+            def finite_counts(tensor):
+                detached = tensor.detach()
+                return {
+                    "nan": int(torch.isnan(detached).sum().item()),
+                    "inf": int(torch.isinf(detached).sum().item()),
+                }
+
+            self._runtime_forward_audit = {
+                "student_forward_input_dtype": x.dtype,
+                "backbone_parameter_name": next(
+                    (
+                        name
+                        for name, param in self.backbone.named_parameters()
+                        if param is backbone_param
+                    ),
+                    "unavailable",
+                ),
+                "backbone_parameter_dtype": (
+                    backbone_param.dtype if backbone_param is not None else None
+                ),
+                "f4_shape": tuple(f4.shape),
+                "f4_dtype": f4.dtype,
+                "gap_output_dtype": gap_output.dtype,
+                "batchnorm_input_dtype": gap_output.dtype,
+                "batchnorm_output_dtype": bn_output.dtype,
+                "descriptor_shape": tuple(descriptor.shape),
+                "descriptor_dtype": descriptor.dtype,
+                "f4_finite": finite_counts(f4),
+                "descriptor_finite": finite_counts(descriptor),
+            }
+
+        return descriptor

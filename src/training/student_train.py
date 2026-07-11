@@ -3,8 +3,11 @@ import inspect
 import json
 import math
 import os
+import shlex
+import subprocess
 import sys
 import time
+from datetime import datetime
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 if ROOT not in sys.path:
@@ -59,6 +62,85 @@ NEGRANK_TEACHER_CHECKPOINTS = {
     "best": "best_model.pth",
     "last": "last_model.pth",
 }
+B0_EXPERIMENT_ID = "B0-3090"
+
+
+def _dtype_name(dtype):
+    return str(dtype).replace("torch.", "") if dtype is not None else "unavailable"
+
+
+def tensor_nonfinite_counts(tensor):
+    detached = tensor.detach()
+    return {
+        "nan": int(torch.isnan(detached).sum().item()),
+        "inf": int(torch.isinf(detached).sum().item()),
+    }
+
+
+def _git_commit(project_root):
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=project_root,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        return result.stdout.strip() or "unavailable"
+    except (OSError, subprocess.SubprocessError):
+        return "unavailable"
+
+
+def print_b0_experiment_configuration(
+    args,
+    rank,
+    local_rank,
+    world_size,
+    started_at,
+):
+    if torch.cuda.is_available():
+        local_gpu_model = torch.cuda.get_device_name(torch.cuda.current_device())
+    else:
+        local_gpu_model = "CUDA unavailable"
+
+    gpu_models_by_rank = [local_gpu_model]
+    if is_distributed():
+        gpu_models_by_rank = [None for _ in range(world_size)]
+        dist.all_gather_object(gpu_models_by_rank, local_gpu_model)
+
+    if not is_main_process():
+        return
+
+    local_pair_batch = int(args.batch_size)
+    global_pair_batch = local_pair_batch * int(world_size)
+    grad_accum_steps = int(args.grad_accum_steps)
+    effective_pair_batch = global_pair_batch * grad_accum_steps
+    command_parts = getattr(sys, "orig_argv", None) or sys.argv
+
+    print("=" * 80)
+    print("[EXPERIMENT CONFIGURATION]")
+    print(f"Experiment ID={B0_EXPERIMENT_ID}")
+    print(f"started_at={started_at}")
+    print(f"command={shlex.join(str(part) for part in command_parts)}")
+    print(f"git_commit={_git_commit(ROOT)}")
+    print(f"seed={args.seed}")
+    print(f"GPU model={local_gpu_model}")
+    print(f"GPU models by rank={gpu_models_by_rank}")
+    print(f"visible GPU count={torch.cuda.device_count()}")
+    print(f"world size={world_size}")
+    print(f"rank={rank}")
+    print(f"local rank={local_rank}")
+    print(f"local pair batch={local_pair_batch}")
+    print(f"global pair batch={global_pair_batch}")
+    print(f"gradient accumulation steps={grad_accum_steps}")
+    print(f"effective pair batch={effective_pair_batch}")
+    print(f"epochs={args.epochs}")
+    print(f"image size={args.img_size}x{args.img_size}")
+    print(f"train data path={os.path.abspath(args.train_data_dir)}")
+    print(f"output directory={os.path.abspath(args.output_dir)}")
+    print(f"DeepSpeed config path={os.path.abspath(args.deepspeed_config)}")
+    print("=" * 80)
 
 
 def str2bool(value):
@@ -204,6 +286,8 @@ def unpack_sample4geo_batch(batch, device):
         raise ValueError(f"Expected 4 fields from Sample4Geo batch, got {len(batch)}")
     drone, satellite, _, _ = batch
 
+    raw_drone = drone
+    raw_satellite = satellite
     drone = drone.to(device, non_blocking=True)
     satellite = satellite.to(device, non_blocking=True)
 
@@ -222,6 +306,8 @@ def unpack_sample4geo_batch(batch, device):
     return images, {
         "pair_batch_size": drone.size(0),
         "effective_batch": images.size(0),
+        "raw_drone_tensor": raw_drone,
+        "raw_satellite_tensor": raw_satellite,
     }
 
 
@@ -385,6 +471,70 @@ def get_raw_model(model):
     return model.module if hasattr(model, "module") else model
 
 
+def audit_clean_student_runtime(model, criterion, teacher_model):
+    raw_model = get_raw_model(model)
+    student_class = f"{raw_model.__class__.__module__}.{raw_model.__class__.__name__}"
+    backbone_class = (
+        f"{raw_model.backbone.__class__.__module__}."
+        f"{raw_model.backbone.__class__.__name__}"
+    )
+    actual_backbone_name = getattr(raw_model, "BACKBONE_NAME", "unavailable")
+    total_params = sum(param.numel() for param in raw_model.parameters())
+    trainable_params = sum(
+        param.numel() for param in raw_model.parameters() if param.requires_grad
+    )
+    frozen_params = total_params - trainable_params
+    teacher_present = teacher_model is not None
+    kd_loss_present = teacher_present
+    allowed_child_modules = {"backbone", "neck"}
+    extra_child_modules = sorted(set(raw_model._modules) - allowed_child_modules)
+    extra_student_module_present = bool(extra_child_modules)
+
+    errors = []
+    if not isinstance(raw_model, StudentModel):
+        errors.append(f"student object is not StudentModel: {student_class}")
+    if actual_backbone_name != "RepViT-M1.5":
+        errors.append(f"unexpected backbone name: {actual_backbone_name}")
+    if not isinstance(getattr(raw_model, "neck", None), torch.nn.BatchNorm1d):
+        errors.append("student neck is not BatchNorm1d")
+    elif raw_model.neck.num_features != 512:
+        errors.append(f"BatchNorm1d width is {raw_model.neck.num_features}, expected 512")
+    if getattr(raw_model, "embedding_dim", None) != 512:
+        errors.append(f"embedding_dim={getattr(raw_model, 'embedding_dim', None)}, expected 512")
+    if not isinstance(criterion, Sample4GeoLoss):
+        errors.append(f"criterion is not Sample4GeoLoss: {type(criterion)}")
+    if teacher_present:
+        errors.append("teacher is present in clean B0 baseline")
+    if extra_student_module_present:
+        errors.append(f"unexpected top-level student modules: {extra_child_modules}")
+
+    if is_main_process():
+        print("=" * 80)
+        print("[STUDENT RUNTIME STRUCTURE AUDIT]")
+        print(f"student_class={student_class}")
+        print(f"backbone_class={backbone_class}")
+        print(f"actual_backbone_name={actual_backbone_name}")
+        print("repvit_variant=RepViT-M1.5")
+        print(f"total_params={total_params}")
+        print(f"trainable_params={trainable_params}")
+        print(f"frozen_params={frozen_params}")
+        print("actual_f4_shape=pending_first_real_forward")
+        print("actual_f4_channel=pending_first_real_forward")
+        print("descriptor_pipeline=f4->GAP->BatchNorm1d(512)->L2")
+        print(f"teacher_present={teacher_present}")
+        print(f"kd_loss_present={kd_loss_present}")
+        print(f"extra_student_module_present={extra_student_module_present}")
+        if extra_child_modules:
+            print(f"extra_student_modules={extra_child_modules}")
+        print(f"clean_baseline_valid={not errors}")
+        for error in errors:
+            print(f"[B0 AUDIT][ERROR] {error}")
+        print("=" * 80)
+
+    if errors:
+        raise RuntimeError("B0 clean baseline runtime audit failed: " + "; ".join(errors))
+
+
 def sample4geo_loss(model, features, criterion, pair_batch_size):
     drone_feat = features[:pair_batch_size]
     satellite_feat = features[pair_batch_size:pair_batch_size * 2]
@@ -532,6 +682,7 @@ def compute_student_batch_losses(
     teacher_model=None,
     rank_kd_weight_current=0.0,
     rank_kd_temperature=0.2,
+    audit_runtime=False,
 ):
     local_features = model(images)
     features, global_pair_batch_size = gather_paired_views(
@@ -586,12 +737,109 @@ def compute_student_batch_losses(
         "main_loss": loss_infonce,
         "global_pair_batch_size": global_pair_batch_size,
     }
+    if audit_runtime:
+        local_drone, local_satellite = split_paired_features(
+            local_features,
+            pair_batch_size,
+        )
+        global_drone, global_satellite = split_paired_features(
+            features,
+            global_pair_batch_size,
+        )
+        result["runtime_audit"] = {
+            "local_drone_shape": tuple(local_drone.shape),
+            "local_satellite_shape": tuple(local_satellite.shape),
+            "global_drone_shape": tuple(global_drone.shape),
+            "global_satellite_shape": tuple(global_satellite.shape),
+            "global_drone_dtype": global_drone.dtype,
+            "global_satellite_dtype": global_satellite.dtype,
+            "global_drone_finite": tensor_nonfinite_counts(global_drone),
+            "global_satellite_finite": tensor_nonfinite_counts(global_satellite),
+        }
     if loss_negrank is not None:
         result["loss"] = loss
         result["loss_negrank"] = loss_negrank
         result["rank_kd_weight_current"] = float(rank_kd_weight_current)
         result["rank_kd_temperature"] = float(rank_kd_temperature)
     return result
+
+
+def print_first_b0_runtime_audit(model, criterion, batch_meta, images, batch_losses):
+    if not is_main_process():
+        return
+
+    raw_model = get_raw_model(model)
+    forward_audit = getattr(raw_model, "_runtime_forward_audit", None) or {}
+    loss_audit = getattr(criterion, "last_runtime_audit", None) or {}
+    gather_audit = batch_losses.get("runtime_audit", {})
+    raw_drone = batch_meta.get("raw_drone_tensor")
+    raw_satellite = batch_meta.get("raw_satellite_tensor")
+    local_pair_count = int(batch_meta["pair_batch_size"])
+    global_pair_count = int(batch_losses["global_pair_batch_size"])
+    distributed_initialized = is_distributed()
+    world_size = get_world_size()
+    cross_gpu_effective = (
+        distributed_initialized
+        and world_size > 1
+        and global_pair_count == local_pair_count * world_size
+        and global_pair_count > local_pair_count
+    )
+
+    print("=" * 80)
+    print("[RUNTIME DTYPE AUDIT] source=first_real_student_training_forward")
+    print(f"raw drone image dtype={_dtype_name(getattr(raw_drone, 'dtype', None))}")
+    print(f"raw satellite image dtype={_dtype_name(getattr(raw_satellite, 'dtype', None))}")
+    print(f"student forward input dtype={_dtype_name(forward_audit.get('student_forward_input_dtype'))}")
+    print(f"representative backbone parameter name={forward_audit.get('backbone_parameter_name', 'unavailable')}")
+    print(f"representative backbone parameter dtype={_dtype_name(forward_audit.get('backbone_parameter_dtype'))}")
+    print(f"f4 output dtype={_dtype_name(forward_audit.get('f4_dtype'))}")
+    print(f"GAP output dtype={_dtype_name(forward_audit.get('gap_output_dtype'))}")
+    print(f"BatchNorm1d input dtype={_dtype_name(forward_audit.get('batchnorm_input_dtype'))}")
+    print(f"BatchNorm1d output dtype={_dtype_name(forward_audit.get('batchnorm_output_dtype'))}")
+    print(f"normalized descriptor dtype={_dtype_name(forward_audit.get('descriptor_dtype'))}")
+    print(f"gathered drone descriptor dtype={_dtype_name(gather_audit.get('global_drone_dtype'))}")
+    print(f"gathered satellite descriptor dtype={_dtype_name(gather_audit.get('global_satellite_dtype'))}")
+    print(f"similarity/logits dtype={_dtype_name(loss_audit.get('similarity_logits_dtype'))}")
+    print(f"D2S loss dtype={_dtype_name(loss_audit.get('d2s_loss_dtype'))}")
+    print(f"S2D loss dtype={_dtype_name(loss_audit.get('s2d_loss_dtype'))}")
+    print(f"total loss dtype={_dtype_name(batch_losses['loss'].dtype)}")
+    print(f"actual_f4_shape={forward_audit.get('f4_shape', 'unavailable')}")
+    f4_shape = forward_audit.get("f4_shape")
+    print(f"actual_f4_channel={f4_shape[1] if f4_shape and len(f4_shape) > 1 else 'unavailable'}")
+    print(f"descriptor_shape={forward_audit.get('descriptor_shape', 'unavailable')}")
+
+    print("[DISTRIBUTED DESCRIPTOR AUDIT]")
+    print(f"distributed initialized={distributed_initialized}")
+    print(f"world size={world_size}")
+    print(f"local drone descriptor shape={gather_audit.get('local_drone_shape', 'unavailable')}")
+    print(f"local satellite descriptor shape={gather_audit.get('local_satellite_shape', 'unavailable')}")
+    print(f"gathered global drone descriptor shape={gather_audit.get('global_drone_shape', 'unavailable')}")
+    print(f"gathered global satellite descriptor shape={gather_audit.get('global_satellite_shape', 'unavailable')}")
+    print(f"local pair count={local_pair_count}")
+    print(f"global pair count={global_pair_count}")
+    print(f"D2S candidate pool size={global_pair_count}")
+    print(f"S2D candidate pool size={global_pair_count}")
+    print(f"cross-GPU gather actually effective={cross_gpu_effective}")
+
+    finite_reports = {
+        "raw drone image": tensor_nonfinite_counts(raw_drone),
+        "raw satellite image": tensor_nonfinite_counts(raw_satellite),
+        "f4 output": forward_audit.get("f4_finite", {"nan": "unavailable", "inf": "unavailable"}),
+        "descriptor": forward_audit.get("descriptor_finite", {"nan": "unavailable", "inf": "unavailable"}),
+        "gathered drone descriptor": gather_audit.get("global_drone_finite", {"nan": "unavailable", "inf": "unavailable"}),
+        "gathered satellite descriptor": gather_audit.get("global_satellite_finite", {"nan": "unavailable", "inf": "unavailable"}),
+        "logits": {"nan": loss_audit.get("logits_nan", "unavailable"), "inf": loss_audit.get("logits_inf", "unavailable")},
+        "D2S loss": {"nan": loss_audit.get("d2s_loss_nan", "unavailable"), "inf": loss_audit.get("d2s_loss_inf", "unavailable")},
+        "S2D loss": {"nan": loss_audit.get("s2d_loss_nan", "unavailable"), "inf": loss_audit.get("s2d_loss_inf", "unavailable")},
+        "total loss": tensor_nonfinite_counts(batch_losses["loss"]),
+    }
+    print("[FINITE CHECK]")
+    for name, counts in finite_reports.items():
+        print(f"{name} | nan={counts['nan']} | inf={counts['inf']}")
+    print("=" * 80)
+
+    if not cross_gpu_effective:
+        raise RuntimeError("B0 cross-GPU descriptor gather audit failed")
 
 
 def cast_images_to_model_dtype(model, images):
@@ -759,6 +1007,49 @@ def format_optional_float(value, precision=4):
     return f"{value:.{precision}f}"
 
 
+def gpu_memory_snapshot():
+    if not torch.cuda.is_available():
+        return {
+            "allocated_gib": 0.0,
+            "reserved_gib": 0.0,
+            "peak_allocated_gib": 0.0,
+        }
+    gib = float(1024 ** 3)
+    device = torch.cuda.current_device()
+    return {
+        "allocated_gib": torch.cuda.memory_allocated(device) / gib,
+        "reserved_gib": torch.cuda.memory_reserved(device) / gib,
+        "peak_allocated_gib": torch.cuda.max_memory_allocated(device) / gib,
+    }
+
+
+def read_deepspeed_grad_norm(model_engine):
+    candidates = [model_engine, getattr(model_engine, "optimizer", None)]
+    for owner in candidates:
+        if owner is None:
+            continue
+        for attr_name in ("_global_grad_norm", "global_grad_norm"):
+            value = getattr(owner, attr_name, None)
+            if value is None:
+                continue
+            if torch.is_tensor(value):
+                if value.numel() != 1:
+                    continue
+                value = value.detach().float().item()
+            try:
+                return float(value), f"{owner.__class__.__name__}.{attr_name}"
+            except (TypeError, ValueError):
+                continue
+    return None, "unavailable"
+
+
+def get_deepspeed_lr(model_engine):
+    optimizer = getattr(model_engine, "optimizer", None)
+    if optimizer is not None and optimizer.param_groups:
+        return float(optimizer.param_groups[0].get("lr", 0.0))
+    return 0.0
+
+
 def amp_is_enabled(args, device):
     return bool(args.amp) and torch.device(device).type == "cuda"
 
@@ -891,11 +1182,22 @@ def train_one_epoch_deepspeed(
 
     loss_total_meter = AverageMeter()
     loss_retrieval_meter = AverageMeter()
+    loss_d2s_meter = AverageMeter()
+    loss_s2d_meter = AverageMeter()
     loss_negrank_meter = AverageMeter()
     kd_weight_meter = AverageMeter()
     batch_time = AverageMeter()
     data_time = AverageMeter()
     end = time.time()
+    nan_loss_count = 0
+    inf_loss_count = 0
+    last_grad_norm = None
+    last_grad_norm_source = "unavailable"
+    runtime_audit_printed = bool(
+        getattr(get_raw_model(model_engine), "_b0_runtime_audit_printed", False)
+    )
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats(torch.cuda.current_device())
 
     for step, batch in enumerate(train_loader):
         data_time.update(time.time() - end)
@@ -912,17 +1214,36 @@ def train_one_epoch_deepspeed(
             teacher_model=teacher_model,
             rank_kd_weight_current=rank_kd_weight_current,
             rank_kd_temperature=args.rank_kd_temperature,
+            audit_runtime=not runtime_audit_printed,
         )
         loss = batch_losses["loss"]
+        if not runtime_audit_printed:
+            print_first_b0_runtime_audit(
+                model_engine,
+                criterion,
+                meta,
+                images,
+                batch_losses,
+            )
+            get_raw_model(model_engine)._b0_runtime_audit_printed = True
+            runtime_audit_printed = True
         model_engine.backward(loss)
         if args.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model_engine.parameters(), args.grad_clip)
         model_engine.step()
+        last_grad_norm, last_grad_norm_source = read_deepspeed_grad_norm(model_engine)
 
         raw_model = get_raw_model(model_engine)
         raw_model.logit_scale.data.clamp_(0, math.log(100))
         loss_total_meter.update(loss.item(), images.size(0))
         loss_retrieval_meter.update(batch_losses["main_loss"].item(), images.size(0))
+        loss_d2s_meter.update(criterion.last_loss_d2s.item(), images.size(0))
+        loss_s2d_meter.update(criterion.last_loss_s2d.item(), images.size(0))
+        loss_item = loss.item()
+        if math.isnan(loss_item):
+            nan_loss_count += 1
+        if math.isinf(loss_item):
+            inf_loss_count += 1
         if "loss_negrank" in batch_losses:
             loss_negrank_meter.update(batch_losses["loss_negrank"].item(), images.size(0))
             kd_weight_meter.update(rank_kd_weight_current, images.size(0))
@@ -940,6 +1261,10 @@ def train_one_epoch_deepspeed(
                     f"rank_kd_weight_current {rank_kd_weight_current:.6f} | "
                     f"rank_kd_temperature {args.rank_kd_temperature:.4f} | "
                 )
+            memory = gpu_memory_snapshot()
+            grad_norm_text = (
+                f"{last_grad_norm:.6f}" if last_grad_norm is not None else "unavailable"
+            )
             print(
                 f"Epoch [{epoch}/{args.epochs}] "
                 f"Step [{step + 1}/{len(train_loader)}] | "
@@ -948,15 +1273,36 @@ def train_one_epoch_deepspeed(
                 f"world_size {get_world_size()} | "
                 f"retrieval_loss {loss_retrieval_meter.val:.4f} "
                 f"({loss_retrieval_meter.avg:.4f}) | "
+                f"D2S_loss {loss_d2s_meter.val:.4f} "
+                f"({loss_d2s_meter.avg:.4f}) | "
+                f"S2D_loss {loss_s2d_meter.val:.4f} "
+                f"({loss_s2d_meter.avg:.4f}) | "
                 f"{negrank_text}"
                 f"total_loss {loss_total_meter.val:.4f} "
                 f"({loss_total_meter.avg:.4f}) | "
-                f"logit_scale {raw_model.logit_scale.exp().item():.3f}"
+                f"logit_scale {raw_model.logit_scale.exp().item():.3f} | "
+                f"lr {get_deepspeed_lr(model_engine):.8f} | "
+                f"grad_norm {grad_norm_text} | "
+                f"grad_norm_source {last_grad_norm_source} | "
+                f"gpu_allocated {memory['allocated_gib']:.3f}GiB | "
+                f"gpu_reserved {memory['reserved_gib']:.3f}GiB | "
+                f"peak_gpu_memory {memory['peak_allocated_gib']:.3f}GiB | "
+                f"nan_loss_count {nan_loss_count} | "
+                f"inf_loss_count {inf_loss_count} | "
+                "nan_gradient_count unavailable | inf_gradient_count unavailable"
             )
 
+    memory = gpu_memory_snapshot()
     stats = {
         "total_loss": loss_total_meter.avg,
         "loss_retrieval": loss_retrieval_meter.avg,
+        "loss_d2s": loss_d2s_meter.avg,
+        "loss_s2d": loss_s2d_meter.avg,
+        "nan_loss_count": nan_loss_count,
+        "inf_loss_count": inf_loss_count,
+        "peak_gpu_memory_gib": memory["peak_allocated_gib"],
+        "last_grad_norm": last_grad_norm,
+        "last_grad_norm_source": last_grad_norm_source,
     }
     if teacher_model is not None:
         stats["loss_negrank"] = loss_negrank_meter.avg
@@ -1143,6 +1489,7 @@ def train_deepspeed(
             epoch,
             teacher_model=teacher_model,
         )
+        epoch_validation_result = None
         if is_main_process():
             negrank_text = ""
             if teacher_model is not None:
@@ -1173,6 +1520,7 @@ def train_deepspeed(
             epoch % args.val_interval == 0 or epoch == args.epochs
         ):
             result = validate_u1652(model_engine, val_loaders)
+            epoch_validation_result = result
             (
                 is_best,
                 best_metric,
@@ -1206,6 +1554,61 @@ def train_deepspeed(
                         args,
                     ),
                 )
+
+        if is_main_process():
+            validation_text = (
+                json.dumps(epoch_validation_result, ensure_ascii=False, sort_keys=True)
+                if epoch_validation_result is not None
+                else "not_run"
+            )
+            best_metric_text = (
+                f"{best_metric:.6f}" if best_epoch is not None else "unavailable"
+            )
+            best_epoch_text = str(best_epoch) if best_epoch is not None else "unavailable"
+            print("=" * 80)
+            print(f"[EPOCH AUDIT SUMMARY] epoch={epoch}/{args.epochs}")
+            print(f"average total loss={train_stats['total_loss']:.6f}")
+            print(f"average InfoNCE loss={train_stats['loss_retrieval']:.6f}")
+            print(f"average D2S loss={train_stats['loss_d2s']:.6f}")
+            print(f"average S2D loss={train_stats['loss_s2d']:.6f}")
+            print(
+                f"NaN/Inf summary | nan_loss_count={train_stats['nan_loss_count']} | "
+                f"inf_loss_count={train_stats['inf_loss_count']} | "
+                "nan_gradient_count=unavailable | inf_gradient_count=unavailable"
+            )
+            print(f"peak GPU memory={train_stats['peak_gpu_memory_gib']:.3f}GiB")
+            print(f"validation metrics={validation_text}")
+            if epoch_validation_result is not None:
+                print(
+                    "D2S metrics | "
+                    f"R@1={epoch_validation_result['D2S_R1']:.6f} | "
+                    f"R@5={epoch_validation_result['D2S_R5']:.6f} | "
+                    f"R@10={epoch_validation_result['D2S_R10']:.6f} | "
+                    f"mAP={epoch_validation_result['D2S_mAP']:.6f}"
+                )
+                print(
+                    "S2D metrics | "
+                    f"R@1={epoch_validation_result['S2D_R1']:.6f} | "
+                    f"R@5={epoch_validation_result['S2D_R5']:.6f} | "
+                    f"R@10={epoch_validation_result['S2D_R10']:.6f} | "
+                    f"mAP={epoch_validation_result['S2D_mAP']:.6f}"
+                )
+                print(f"R@1 sum={epoch_validation_result['R1_sum']:.6f}")
+            else:
+                print("D2S metrics=not_run")
+                print("S2D metrics=not_run")
+                print("R@1 sum=not_run")
+            print(f"current best metric={best_metric_text}")
+            print(f"current best epoch={best_epoch_text}")
+            print(
+                "current best checkpoint path="
+                f"{os.path.join(args.output_dir, 'best_model.pth')}"
+            )
+            print(
+                "current last checkpoint path="
+                f"{os.path.join(args.output_dir, 'last_model.pth')}"
+            )
+            print("=" * 80)
         distributed_barrier()
 
     if is_main_process():
@@ -1303,6 +1706,7 @@ def parse_args(argv=None):
 
 
 def main():
+    run_started_at = datetime.now().astimezone().isoformat(timespec="microseconds")
     args = parse_args()
     from src.dataset.datasets import create_student_train_dataset_and_loader
     from src.dataset.teacher.val_dataloaders import build_1652_val_dataloaders
@@ -1326,6 +1730,13 @@ def main():
         is_main_process(),
     )
     setup_rank0_run_log(args.output_dir, is_main_process())
+    print_b0_experiment_configuration(
+        args,
+        rank,
+        local_rank,
+        world_size,
+        run_started_at,
+    )
 
     if is_main_process():
         print(f"[StudentTrain] device={device} | world_size={world_size}")
@@ -1357,6 +1768,7 @@ def main():
     teacher_model = None
     if args.use_negrank_kd:
         teacher_model = build_frozen_teacher_from_run(args, device)
+    audit_clean_student_runtime(model, criterion, teacher_model)
 
     if args.deepspeed:
         import deepspeed
