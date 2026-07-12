@@ -33,6 +33,11 @@ CHECKPOINT_FILENAMES = {
     "best": "best_model.pth",
     "last": "last_model.pth",
 }
+DEFAULT_RESULT_FILENAMES = {
+    "1652": "student_test_1652.json",
+    "GTA-UAV": "student_test_gta_uav.json",
+    "SUES-200": "student_test_sues200.json",
+}
 MODEL_HPARAM_KEYS = {
     "img_size",
     "temperature",
@@ -216,10 +221,31 @@ def write_results(args, results):
     if not is_main_process():
         return
 
-    if args.output_json:
-        print("[StudentEval] output_json is ignored; student tests are print-only.")
-    else:
-        print("[StudentEval] results were printed only.")
+    output_path = args.output_json
+    if not output_path:
+        output_path = os.path.join(
+            Path(args.checkpoint).resolve().parent,
+            DEFAULT_RESULT_FILENAMES[args.dataset],
+        )
+
+    payload = {
+        "checkpoint": args.checkpoint,
+        "dataset": args.dataset,
+        "img_size": args.img_size,
+        "batch_size": args.batch_size,
+        "results": results,
+    }
+    if args.dataset == "GTA-UAV":
+        payload["gta_split"] = args.gta_split
+        payload["gta_query_mode"] = args.gta_query_mode
+    if args.dataset == "SUES-200":
+        payload["sues_height"] = args.sues_height
+        payload["sues_horizontal_flip"] = args.sues_horizontal_flip
+
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+    print(f"[StudentEval] wrote {output_path}")
 
 
 def parse_args():
@@ -249,7 +275,12 @@ def parse_args():
     parser.add_argument("--img_size", type=int, default=224)
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--temperature", type=float, default=0.07)
-    parser.add_argument("--output_json", type=str, default=None, help="Ignored; student tests are print-only.")
+    parser.add_argument(
+        "--output_json",
+        type=str,
+        default=None,
+        help="Optional result JSON path; defaults to a dataset-specific file next to the checkpoint.",
+    )
     parser.add_argument("--strict", dest="strict", action="store_true", default=True)
     parser.add_argument("--no_strict", dest="strict", action="store_false")
     parser.add_argument("--no_checkpoint_hparams", action="store_true")
