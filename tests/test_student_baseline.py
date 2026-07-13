@@ -284,6 +284,26 @@ def test_margin_incidence_cli_and_experiment_ids():
     assert student_train.experiment_id(args) == "D1-B-MI50"
 
 
+def test_mi_deepspeed_epoch_log_does_not_require_legacy_agreement_keys():
+    text = student_train.format_deepspeed_epoch_negrank_text({
+        "loss_negrank": 0.17,
+        "loss_negrank_weighted": 0.0003,
+        "rank_kd_weight_current": 0.002,
+        "rank_kd_temperature": 0.2,
+        "rank_kd_selection_mode": "margin_incidence",
+        "rank_kd_keep_ratio": 0.5,
+        "mi_selected_count_per_anchor": 16,
+        "mi_actual_selected_ratio": 16 / 31,
+        "mi_D2S_selected_ranking_agreement": 0.71,
+        "mi_S2D_selected_ranking_agreement": 0.69,
+        "mi_combined_selected_ranking_agreement": 0.70,
+        "mi_combined_retained_teacher_probability_mass": 0.61,
+    })
+    assert "selected_count_per_anchor=16" in text
+    assert "combined_selected_ranking_agreement=0.700000" in text
+    assert "ranking_agreement=" in text
+
+
 def test_compute_student_batch_losses_adds_only_weighted_negrank_kd():
     class IdentityFeatureModel(nn.Module):
         def __init__(self):

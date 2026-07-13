@@ -2076,6 +2076,34 @@ def train(
     )
 
 
+def format_deepspeed_epoch_negrank_text(train_stats):
+    text = (
+        f" | loss_negrank={train_stats['loss_negrank']:.4f}"
+        f" | weighted_loss_negrank={train_stats['loss_negrank_weighted']:.4f}"
+        f" | rank_kd_weight_current={train_stats['rank_kd_weight_current']:.6f}"
+        f" | rank_kd_temperature={train_stats['rank_kd_temperature']:.4f}"
+    )
+    if train_stats["rank_kd_selection_mode"] == "margin_incidence":
+        return text + (
+            f" | rank_kd_selection_mode=margin_incidence"
+            f" | rank_kd_keep_ratio={train_stats['rank_kd_keep_ratio']:.6f}"
+            f" | selected_count_per_anchor={train_stats['mi_selected_count_per_anchor']}"
+            f" | actual_selected_ratio={train_stats['mi_actual_selected_ratio']:.6f}"
+            f" | D2S_selected_ranking_agreement="
+            f"{train_stats['mi_D2S_selected_ranking_agreement']:.6f}"
+            f" | S2D_selected_ranking_agreement="
+            f"{train_stats['mi_S2D_selected_ranking_agreement']:.6f}"
+            f" | combined_selected_ranking_agreement="
+            f"{train_stats['mi_combined_selected_ranking_agreement']:.6f}"
+            f" | combined_retained_teacher_probability_mass="
+            f"{train_stats['mi_combined_retained_teacher_probability_mass']:.6f}"
+        )
+    return text + (
+        f" | ranking_agreement={train_stats['ranking_agreement']:.6f}"
+        f" | violation_ratio={train_stats['violation_ratio']:.6f}"
+    )
+
+
 def train_deepspeed(
     model_engine,
     train_loader,
@@ -2114,14 +2142,7 @@ def train_deepspeed(
         if is_main_process():
             negrank_text = ""
             if teacher_model is not None:
-                negrank_text = (
-                    f" | loss_negrank={train_stats['loss_negrank']:.4f}"
-                    f" | weighted_loss_negrank={train_stats['loss_negrank_weighted']:.4f}"
-                    f" | rank_kd_weight_current={train_stats['rank_kd_weight_current']:.6f}"
-                    f" | rank_kd_temperature={train_stats['rank_kd_temperature']:.4f}"
-                    f" | ranking_agreement={train_stats['ranking_agreement']:.6f}"
-                    f" | violation_ratio={train_stats['violation_ratio']:.6f}"
-                )
+                negrank_text = format_deepspeed_epoch_negrank_text(train_stats)
             print(
                 f"[Train] Epoch {epoch}/{args.epochs} | "
                 f"retrieval_loss={train_stats['loss_retrieval']:.4f} | "
