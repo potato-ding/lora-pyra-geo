@@ -377,14 +377,21 @@ def get_runtime_parameter_dtypes(model_or_engine):
         (param.dtype for param in model.backbone.parameters() if param.is_floating_point()),
         None,
     )
-    lora_modules = [module for module in model.modules() if isinstance(module, LoRALayer)]
-    first_lora = lora_modules[0] if lora_modules else None
+    lora_modules = [
+        (name, module)
+        for name, module in model.named_modules()
+        if isinstance(module, LoRALayer)
+    ]
+    first_lora_name, first_lora = lora_modules[0] if lora_modules else (None, None)
     return {
         "backbone_parameter_dtype": _dtype_name(backbone_dtype),
         "lora_A_dtype": _dtype_name(first_lora.lora_A.weight.dtype if first_lora else None),
         "lora_B_dtype": _dtype_name(first_lora.lora_B.weight.dtype if first_lora else None),
         "backbone_parameter_dtype_value": backbone_dtype,
+        "lora_A_dtype_value": first_lora.lora_A.weight.dtype if first_lora else None,
+        "lora_B_dtype_value": first_lora.lora_B.weight.dtype if first_lora else None,
         "lora_runtime_dtype_value": getattr(first_lora, "_runtime_input_dtype", None),
+        "lora_module_name": first_lora_name,
     }
 
 

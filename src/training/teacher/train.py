@@ -159,7 +159,13 @@ def _strip_module_prefix(key):
 
 def load_teacher_init_checkpoint(model, checkpoint_path, device, strict_trainable=True):
     if not checkpoint_path:
-        return
+        return {
+            "loaded": False,
+            "checkpoint_path": None,
+            "trainable_coverage_pass": True,
+            "loaded_trainable": 0,
+            "required_trainable": len(get_required_teacher_delta_keys(model)),
+        }
     if not os.path.isfile(checkpoint_path):
         raise FileNotFoundError(f"init checkpoint not found: {checkpoint_path}")
 
@@ -232,6 +238,14 @@ def load_teacher_init_checkpoint(model, checkpoint_path, device, strict_trainabl
             f"missing_delta={len(missing_required)}, incompatible={len(incompatible)}. "
             "Use --init_checkpoint_strict_trainable false only for intentional architecture changes."
         )
+
+    return {
+        "loaded": True,
+        "checkpoint_path": checkpoint_path,
+        "trainable_coverage_pass": not missing_required and not incompatible,
+        "loaded_trainable": len(loaded_required),
+        "required_trainable": len(required_keys),
+    }
 
 
 def build_validation_metrics(epoch, d2s_metrics, s2d_metrics):
@@ -457,6 +471,916 @@ def enforce_epoch_first_batch_precision(model_engine, infonce_criterion, final_f
         require_contract_dtype(tensor_name, actual, expected_key)
 
 
+def audit_identity_runtime_precision_once(
+    model_engine,
+    batch_meta,
+    model_inputs,
+    local_views,
+    local_descriptors,
+    gathered_satellite_descriptors,
+    gathered_uav_descriptors,
+    identity_criterion,
+    triplet_criterion,
+    weak_criterion,
+    total_loss,
+    identity_enabled,
+    triplet_enabled,
+    weak_enabled,
+):
+    """Validate the first real explicit-Identity batch without changing tensors."""
+
+    base_model = get_base_model(model_engine)
+    forward_audit = getattr(base_model, "_runtime_forward_audit", None) or {}
+    identity_audit = getattr(identity_criterion, "last_runtime_audit", None) or {}
+    triplet_audit = getattr(triplet_criterion, "last_runtime_audit", None) or {}
+    weak_audit = getattr(weak_criterion, "last_runtime_audit", None) or {}
+    parameter_dtypes = get_runtime_parameter_dtypes(model_engine)
+
+    raw_images = batch_meta.get("images")
+    raw_views = batch_meta.get("view_type")
+    raw_uav = raw_images[raw_views == 1] if torch.is_tensor(raw_images) else None
+    raw_satellite = raw_images[raw_views == 0] if torch.is_tensor(raw_images) else None
+    local_uav = local_descriptors[local_views == 1]
+    local_satellite = local_descriptors[local_views == 0]
+
+    backbone_output_shape = forward_audit.get("backbone_output_shape")
+
+    def view_backbone_shape(view_descriptors):
+        if not backbone_output_shape:
+            return None
+        return (view_descriptors.size(0),) + tuple(backbone_output_shape[1:])
+
+    lora_module_name = parameter_dtypes.get("lora_module_name")
+    lora_module = dict(base_model.named_modules()).get(lora_module_name)
+    backbone_parameter = next(
+        (
+            parameter
+            for parameter in base_model.backbone.parameters()
+            if parameter.is_floating_point()
+        ),
+        None,
+    )
+
+    records = []
+    failures = []
+
+    def add_check(
+        name,
+        actual,
+        expected,
+        shape=None,
+        module_name=None,
+        enabled=True,
+        allow_missing=False,
+    ):
+        if not enabled:
+            records.append((name, "disabled", expected, shape, module_name, "SKIP"))
+            return
+        actual_dtype = actual.dtype if torch.is_tensor(actual) else actual
+        if shape is None and torch.is_tensor(actual):
+            shape = tuple(actual.shape)
+        if actual_dtype is None and allow_missing:
+            records.append((name, "not_produced", expected, shape, module_name, "SKIP"))
+            return
+        status = "PASS" if actual_dtype == expected else "FAIL"
+        records.append((name, actual_dtype, expected, shape, module_name, status))
+        if status == "FAIL":
+            failures.append(
+                f"{name}: actual={_dtype_name(actual_dtype)}, "
+                f"expected={_dtype_name(expected)}, module={module_name or 'n/a'}"
+            )
+
+    add_check("raw_uav_images", raw_uav, torch.float32)
+    add_check("raw_satellite_images", raw_satellite, torch.float32)
+    add_check("teacher_forward_uav_input", model_inputs[local_views == 1], torch.bfloat16)
+    add_check("teacher_forward_satellite_input", model_inputs[local_views == 0], torch.bfloat16)
+    add_check("representative_backbone_parameter", backbone_parameter, torch.bfloat16)
+    add_check(
+        "representative_LoRA_A_parameter",
+        getattr(getattr(lora_module, "lora_A", None), "weight", None),
+        torch.bfloat16,
+        module_name=lora_module_name,
+    )
+    add_check(
+        "representative_LoRA_B_parameter",
+        getattr(getattr(lora_module, "lora_B", None), "weight", None),
+        torch.bfloat16,
+        module_name=lora_module_name,
+    )
+    add_check(
+        "representative_LoRA_runtime_input",
+        parameter_dtypes.get("lora_runtime_dtype_value"),
+        torch.bfloat16,
+        module_name=lora_module_name,
+    )
+    add_check(
+        "backbone_output_uav",
+        forward_audit.get("backbone_output_dtype_value"),
+        torch.bfloat16,
+        shape=view_backbone_shape(local_uav),
+    )
+    add_check(
+        "backbone_output_satellite",
+        forward_audit.get("backbone_output_dtype_value"),
+        torch.bfloat16,
+        shape=view_backbone_shape(local_satellite),
+    )
+    add_check("descriptor_uav_before_gather", local_uav, torch.float32)
+    add_check("descriptor_satellite_before_gather", local_satellite, torch.float32)
+    add_check("descriptor_uav_after_gather", gathered_uav_descriptors, torch.float32)
+    add_check(
+        "descriptor_satellite_after_gather",
+        gathered_satellite_descriptors,
+        torch.float32,
+    )
+    add_check(
+        "identity_logits_d2s",
+        identity_audit.get("d2s_logits_dtype_value"),
+        torch.float32,
+        shape=identity_audit.get("d2s_logits_shape"),
+        enabled=identity_enabled,
+    )
+    add_check(
+        "identity_logits_s2d",
+        identity_audit.get("s2d_logits_dtype_value"),
+        torch.float32,
+        shape=identity_audit.get("s2d_logits_shape"),
+        enabled=identity_enabled,
+    )
+    add_check(
+        "identity_loss_d2s",
+        identity_audit.get("d2s_loss_dtype_value"),
+        torch.float32,
+        shape=identity_audit.get("d2s_loss_shape"),
+        enabled=identity_enabled,
+    )
+    add_check(
+        "identity_loss_s2d",
+        identity_audit.get("s2d_loss_dtype_value"),
+        torch.float32,
+        shape=identity_audit.get("s2d_loss_shape"),
+        enabled=identity_enabled,
+    )
+    add_check(
+        "identity_loss_total",
+        identity_audit.get("total_loss_dtype_value"),
+        torch.float32,
+        shape=identity_audit.get("total_loss_shape"),
+        enabled=identity_enabled,
+    )
+    add_check(
+        "uav_triplet_input",
+        triplet_audit.get("uav_input_dtype_value"),
+        torch.float32,
+        shape=triplet_audit.get("uav_input_shape"),
+        enabled=triplet_enabled,
+    )
+    add_check(
+        "uav_triplet_loss",
+        triplet_audit.get("uav_loss_dtype_value"),
+        torch.float32,
+        shape=triplet_audit.get("uav_loss_shape"),
+        enabled=triplet_enabled,
+        allow_missing=True,
+    )
+    add_check(
+        "satellite_triplet_input",
+        triplet_audit.get("satellite_input_dtype_value"),
+        torch.float32,
+        shape=triplet_audit.get("satellite_input_shape"),
+        enabled=triplet_enabled,
+    )
+    add_check(
+        "satellite_triplet_loss",
+        triplet_audit.get("satellite_loss_dtype_value"),
+        torch.float32,
+        shape=triplet_audit.get("satellite_loss_shape"),
+        enabled=triplet_enabled,
+        allow_missing=True,
+    )
+    add_check(
+        "weak_infonce_logits",
+        weak_audit.get("logits_dtype_value"),
+        torch.float32,
+        shape=weak_audit.get("logits_shape"),
+        enabled=weak_enabled,
+    )
+    add_check(
+        "weak_infonce_loss",
+        weak_audit.get("loss_dtype_value"),
+        torch.float32,
+        shape=weak_audit.get("loss_shape"),
+        enabled=weak_enabled,
+    )
+    add_check("total_loss", total_loss, torch.float32)
+
+    if is_main_process():
+        print("=" * 80)
+        print("[Identity Precision Audit] source=first_real_explicit_identity_batch")
+        print(f"representative_LoRA_module={lora_module_name or 'unavailable'}")
+        for name, actual, expected, shape, module_name, status in records:
+            module_text = f" | module={module_name}" if module_name else ""
+            print(
+                f"tensor={name} | actual={_dtype_name(actual)} | "
+                f"expected={_dtype_name(expected)} | shape={shape or 'n/a'} | "
+                f"status={status}{module_text}"
+            )
+        print("=" * 80)
+
+    if failures:
+        raise RuntimeError(
+            "[IDENTITY PRECISION CONTRACT VIOLATION]\n" + "\n".join(failures)
+        )
+
+
+def _diagnostic_stats(values):
+    if values.numel() == 0:
+        return None
+    values = values.detach().float()
+    return {
+        "min": values.min().item(),
+        "mean": values.mean().item(),
+        "max": values.max().item(),
+    }
+
+
+@torch.no_grad()
+def audit_identity_batch_contract_once(
+    args,
+    local_labels,
+    local_views,
+    all_labels,
+    all_views,
+    print_report=True,
+):
+    """Audit Identity batch semantics using tensors already gathered for the loss."""
+
+    local_labels = local_labels.detach()
+    local_views = local_views.detach()
+    all_labels = all_labels.detach()
+    all_views = all_views.detach()
+
+    local_uav_labels = local_labels[local_views == 1]
+    local_satellite_labels = local_labels[local_views == 0]
+    global_uav_labels = all_labels[all_views == 1]
+    global_satellite_labels = all_labels[all_views == 0]
+
+    def direction_candidate_semantics(anchor_labels, candidate_labels):
+        positive_mask = anchor_labels.unsqueeze(1).eq(candidate_labels.unsqueeze(0))
+        valid_anchor_mask = positive_mask.any(dim=1)
+        used_anchor_labels = anchor_labels[valid_anchor_mask]
+        used_positive_mask = positive_mask[valid_anchor_mask]
+        candidate_mask = torch.ones_like(used_positive_mask, dtype=torch.bool)
+        soft_targets = used_positive_mask.float()
+        soft_targets = soft_targets / soft_targets.sum(
+            dim=1, keepdim=True
+        ).clamp_min(1e-12)
+        actual_negative_mask = candidate_mask & soft_targets.eq(0)
+
+        anchor_pid_grid = used_anchor_labels.unsqueeze(1).expand_as(actual_negative_mask)
+        candidate_pid_grid = candidate_labels.unsqueeze(0).expand_as(actual_negative_mask)
+        negative_anchor_pids = anchor_pid_grid[actual_negative_mask]
+        negative_candidate_pids = candidate_pid_grid[actual_negative_mask]
+        same_pid_as_negative_count = int(
+            negative_anchor_pids.eq(negative_candidate_pids).sum().item()
+        )
+
+        negative_identity_counts = [
+            torch.unique(candidate_labels[actual_negative_mask[index]]).numel()
+            for index in range(used_anchor_labels.numel())
+        ]
+        return {
+            "positive_counts": used_positive_mask.sum(dim=1).float(),
+            "negative_counts": actual_negative_mask.sum(dim=1).float(),
+            "negative_identity_counts": negative_identity_counts,
+            "same_pid_as_negative_count": same_pid_as_negative_count,
+        }
+
+    d2s_semantics = direction_candidate_semantics(
+        global_uav_labels, global_satellite_labels
+    )
+    s2d_semantics = direction_candidate_semantics(
+        global_satellite_labels, global_uav_labels
+    )
+    uav_positive_counts = d2s_semantics["positive_counts"]
+    satellite_positive_counts = s2d_semantics["positive_counts"]
+    uav_negative_counts = d2s_semantics["negative_counts"]
+    satellite_negative_counts = s2d_semantics["negative_counts"]
+
+    negative_identity_counts = (
+        d2s_semantics["negative_identity_counts"]
+        + s2d_semantics["negative_identity_counts"]
+    )
+    negative_identity_counts = torch.tensor(
+        negative_identity_counts,
+        dtype=torch.float32,
+        device=all_labels.device,
+    )
+
+    d2s_same_pid_as_negative_count = d2s_semantics["same_pid_as_negative_count"]
+    s2d_same_pid_as_negative_count = s2d_semantics["same_pid_as_negative_count"]
+    same_pid_as_negative_count_total = (
+        d2s_same_pid_as_negative_count + s2d_same_pid_as_negative_count
+    )
+
+    metrics = {
+        "local_unique_pid_count": int(torch.unique(local_labels).numel()),
+        "global_unique_pid_count": int(torch.unique(all_labels).numel()),
+        "local_uav_count": int(local_uav_labels.numel()),
+        "local_satellite_count": int(local_satellite_labels.numel()),
+        "global_uav_count": int(global_uav_labels.numel()),
+        "global_satellite_count": int(global_satellite_labels.numel()),
+        "uav_positive_counts": _diagnostic_stats(uav_positive_counts),
+        "satellite_positive_counts": _diagnostic_stats(satellite_positive_counts),
+        "uav_negative_counts": _diagnostic_stats(uav_negative_counts),
+        "satellite_negative_counts": _diagnostic_stats(satellite_negative_counts),
+        "negative_identity_counts": _diagnostic_stats(negative_identity_counts),
+        "d2s_same_pid_as_negative_count": d2s_same_pid_as_negative_count,
+        "s2d_same_pid_as_negative_count": s2d_same_pid_as_negative_count,
+        "same_pid_as_negative_count_total": same_pid_as_negative_count_total,
+        "same_pid_as_negative_count": same_pid_as_negative_count_total,
+    }
+
+    rank, world_size = get_dist_rank_world()
+    if is_main_process() and print_report:
+        print("=" * 80)
+        print("[Identity Batch Contract]")
+        print(f"training_stage={getattr(args, 'training_stage', 'unavailable')}")
+        print(f"world_size={world_size}")
+        print(f"rank={rank}")
+        print(f"identity_drone_per_id={args.identity_drone_per_id}")
+        print(f"identity_sat_per_id={args.identity_sat_per_id}")
+        print(f"identity_ids_per_batch={args.identity_ids_per_batch}")
+        print(f"local_unique_pid_count={metrics['local_unique_pid_count']}")
+        print(f"global_unique_pid_count={metrics['global_unique_pid_count']}")
+        print(f"local_uav_count={metrics['local_uav_count']}")
+        print(f"local_satellite_count={metrics['local_satellite_count']}")
+        print(f"global_uav_count={metrics['global_uav_count']}")
+        print(f"global_satellite_count={metrics['global_satellite_count']}")
+        for name, values in (
+            ("uav_positive_count_per_anchor", uav_positive_counts),
+            ("satellite_positive_count_per_anchor", satellite_positive_counts),
+            ("uav_negative_sample_count_per_anchor", uav_negative_counts),
+            ("satellite_negative_sample_count_per_anchor", satellite_negative_counts),
+            ("negative_identity_count_per_anchor", negative_identity_counts),
+        ):
+            stats = _diagnostic_stats(values)
+            if stats is None:
+                print(f"{name}=unavailable")
+            else:
+                print(
+                    f"{name}: min={stats['min']:.2f} | "
+                    f"mean={stats['mean']:.2f} | max={stats['max']:.2f}"
+                )
+        print(f"d2s_same_pid_as_negative_count={d2s_same_pid_as_negative_count}")
+        print(f"s2d_same_pid_as_negative_count={s2d_same_pid_as_negative_count}")
+        print(f"same_pid_as_negative_count_total={same_pid_as_negative_count_total}")
+        print("=" * 80)
+
+    if same_pid_as_negative_count_total != 0:
+        raise RuntimeError(
+            "[IDENTITY BATCH CONTRACT VIOLATION] "
+            "same_pid_as_negative_count_total="
+            f"{same_pid_as_negative_count_total}, expected=0"
+        )
+    return metrics
+
+
+def _triplet_domain_diagnostics(feats, labels, margin):
+    if feats.numel() == 0:
+        return {"skipped": True, "reason": "no_domain_samples"}
+
+    feats = F.normalize(feats.detach().float(), p=2, dim=-1, eps=1e-6)
+    labels = labels.detach()
+    similarity = feats @ feats.t()
+    distance = torch.sqrt((2.0 - 2.0 * similarity).clamp_min(1e-12))
+    same_label = labels.unsqueeze(1).eq(labels.unsqueeze(0))
+    eye = torch.eye(labels.size(0), dtype=torch.bool, device=labels.device)
+    positive_mask = same_label & ~eye
+    negative_mask = ~same_label
+    has_positive = positive_mask.any(dim=1)
+    has_negative = negative_mask.any(dim=1)
+    valid_anchor = has_positive & has_negative
+
+    if not has_positive.any():
+        return {"skipped": True, "reason": "no_nonself_positive"}
+    if not has_negative.any():
+        return {"skipped": True, "reason": "no_negative"}
+    if not valid_anchor.any():
+        return {"skipped": True, "reason": "no_anchor_with_positive_and_negative"}
+
+    hardest_positive = distance.masked_fill(~positive_mask, -1.0).max(dim=1).values
+    hardest_negative = distance.masked_fill(~negative_mask, 1e5).min(dim=1).values
+    hardest_positive = hardest_positive[valid_anchor]
+    hardest_negative = hardest_negative[valid_anchor]
+    violations = hardest_positive - hardest_negative + float(margin) > 0
+
+    return {
+        "skipped": False,
+        "active_ratio": valid_anchor.float().mean().item(),
+        "hardest_positive": _diagnostic_stats(hardest_positive),
+        "hardest_negative": _diagnostic_stats(hardest_negative),
+        "margin_violation_ratio": violations.float().mean().item(),
+    }
+
+
+def _audit_scalar(audit, key):
+    value = audit.get(key)
+    if torch.is_tensor(value):
+        return value.detach().float().item()
+    return None
+
+
+@torch.no_grad()
+def print_identity_behavior_diagnostics(
+    args,
+    all_feats,
+    all_labels,
+    all_views,
+    identity_criterion,
+    triplet_criterion,
+    weak_criterion,
+    total_loss,
+):
+    """Print detached Identity behavior diagnostics without new collectives."""
+
+    feats = F.normalize(all_feats.detach().float(), p=2, dim=-1, eps=1e-6)
+    labels = all_labels.detach()
+    views = all_views.detach()
+    satellite_feats = feats[views == 0]
+    satellite_labels = labels[views == 0]
+    uav_feats = feats[views == 1]
+    uav_labels = labels[views == 1]
+
+    similarity = uav_feats @ satellite_feats.t()
+    positive_mask = uav_labels.unsqueeze(1).eq(satellite_labels.unsqueeze(0))
+    negative_mask = ~positive_mask
+    positive_similarities = similarity[positive_mask]
+
+    d2s_valid = negative_mask.any(dim=1)
+    s2d_valid = negative_mask.t().any(dim=1)
+    d2s_hardest_negative = similarity.masked_fill(~negative_mask, -float("inf")).max(dim=1).values
+    s2d_hardest_negative = similarity.t().masked_fill(
+        ~negative_mask.t(), -float("inf")
+    ).max(dim=1).values
+    d2s_hardest_negative = d2s_hardest_negative[d2s_valid]
+    s2d_hardest_negative = s2d_hardest_negative[s2d_valid]
+    combined_hardest_negative = torch.cat(
+        [d2s_hardest_negative, s2d_hardest_negative], dim=0
+    )
+
+    identity_audit = getattr(identity_criterion, "last_runtime_audit", None) or {}
+    triplet_audit = getattr(triplet_criterion, "last_runtime_audit", None) or {}
+    weak_audit = getattr(weak_criterion, "last_runtime_audit", None) or {}
+
+    identity_d2s = _audit_scalar(identity_audit, "d2s_loss_value")
+    identity_s2d = _audit_scalar(identity_audit, "s2d_loss_value")
+    identity_total = _audit_scalar(identity_audit, "total_loss_value")
+    uav_triplet = _audit_scalar(triplet_audit, "uav_loss_value")
+    satellite_triplet = _audit_scalar(triplet_audit, "satellite_loss_value")
+    same_triplet = _audit_scalar(triplet_audit, "total_loss_value")
+    weak_s4g = _audit_scalar(weak_audit, "loss_value")
+
+    identity_enabled = args.identity_loss_weight > 0
+    triplet_enabled = args.same_domain_triplet_weight > 0
+    weak_enabled = args.infonce_weight > 0 and args.weak_sample4geo_weight > 0
+
+    identity_contribution = (
+        args.identity_loss_weight * identity_total
+        if identity_enabled and identity_total is not None
+        else 0.0
+    )
+    triplet_contribution = (
+        args.same_domain_triplet_weight * same_triplet
+        if triplet_enabled and same_triplet is not None
+        else 0.0
+    )
+    weak_contribution = (
+        args.weak_sample4geo_weight * weak_s4g
+        if weak_enabled and weak_s4g is not None
+        else 0.0
+    )
+
+    print("=" * 80)
+    print("[Identity Loss and Behavior Diagnostics]")
+    print(f"L_identity_d2s={identity_d2s if identity_d2s is not None else 'disabled'}")
+    print(f"L_identity_s2d={identity_s2d if identity_s2d is not None else 'disabled'}")
+    print(f"L_identity={identity_total if identity_total is not None else 'disabled'}")
+    print(f"L_uav_triplet={uav_triplet if uav_triplet is not None else 'skipped'}")
+    print(
+        "L_sat_triplet="
+        f"{satellite_triplet if satellite_triplet is not None else 'skipped'}"
+    )
+    print(f"L_same_triplet={same_triplet if same_triplet is not None else 'disabled'}")
+    print(f"L_weak_s4g={weak_s4g if weak_enabled and weak_s4g is not None else 'disabled/0'}")
+    print(f"identity_weight={args.identity_loss_weight}")
+    print(f"triplet_weight={args.same_domain_triplet_weight}")
+    print(f"infonce_weight={args.infonce_weight}")
+    print(f"weak_sample4geo_weight={args.weak_sample4geo_weight}")
+    print(f"weighted_identity_contribution={identity_contribution}")
+    print(f"weighted_triplet_contribution={triplet_contribution}")
+    print(f"weighted_weak_s4g_contribution={weak_contribution}")
+    print(f"L_total={total_loss.detach().float().item()}")
+
+    positive_stats = _diagnostic_stats(positive_similarities)
+    hardest_negative_stats = _diagnostic_stats(combined_hardest_negative)
+    d2s_positive_stats = _diagnostic_stats(similarity[positive_mask])
+    s2d_positive_stats = _diagnostic_stats(similarity.t()[positive_mask.t()])
+    d2s_negative_stats = _diagnostic_stats(d2s_hardest_negative)
+    s2d_negative_stats = _diagnostic_stats(s2d_hardest_negative)
+    if positive_stats is not None:
+        print(f"cross_view_positive_similarity_mean={positive_stats['mean']}")
+        print(f"cross_view_positive_similarity_min={positive_stats['min']}")
+        print(f"cross_view_positive_similarity_max={positive_stats['max']}")
+    if hardest_negative_stats is not None:
+        print(
+            "cross_view_hardest_negative_similarity_mean="
+            f"{hardest_negative_stats['mean']}"
+        )
+    if d2s_positive_stats is not None:
+        print(f"d2s_positive_similarity_mean={d2s_positive_stats['mean']}")
+    if d2s_negative_stats is not None:
+        print(f"d2s_hardest_negative_similarity_mean={d2s_negative_stats['mean']}")
+    if s2d_positive_stats is not None:
+        print(f"s2d_positive_similarity_mean={s2d_positive_stats['mean']}")
+    if s2d_negative_stats is not None:
+        print(f"s2d_hardest_negative_similarity_mean={s2d_negative_stats['mean']}")
+    if positive_stats is not None and hardest_negative_stats is not None:
+        print(
+            "ranking_margin_mean="
+            f"{positive_stats['mean'] - hardest_negative_stats['mean']}"
+        )
+
+    for domain_name, domain_feats, domain_labels in (
+        ("uav", uav_feats, uav_labels),
+        ("sat", satellite_feats, satellite_labels),
+    ):
+        domain_display_name = "UAV" if domain_name == "uav" else "Satellite"
+        if not triplet_enabled:
+            print(f"triplet_domain_skipped={domain_display_name}")
+            print("reason=disabled")
+            continue
+        diagnostics = _triplet_domain_diagnostics(
+            domain_feats, domain_labels, args.triplet_margin
+        )
+        if diagnostics["skipped"]:
+            print(f"triplet_domain_skipped={domain_display_name}")
+            print(f"reason={diagnostics['reason']}")
+            continue
+        positive = diagnostics["hardest_positive"]
+        negative = diagnostics["hardest_negative"]
+        print(f"{domain_name}_triplet_active_ratio={diagnostics['active_ratio']}")
+        print(f"{domain_name}_hardest_positive_distance_mean={positive['mean']}")
+        print(f"{domain_name}_hardest_positive_distance_min={positive['min']}")
+        print(f"{domain_name}_hardest_positive_distance_max={positive['max']}")
+        print(f"{domain_name}_hardest_negative_distance_mean={negative['mean']}")
+        print(f"{domain_name}_hardest_negative_distance_min={negative['min']}")
+        print(f"{domain_name}_hardest_negative_distance_max={negative['max']}")
+        print(
+            f"{domain_name}_margin_violation_ratio="
+            f"{diagnostics['margin_violation_ratio']}"
+        )
+    print("=" * 80)
+
+
+def _compress_block_ranges(indices):
+    if not indices:
+        return []
+    ranges = []
+    start = previous = indices[0]
+    for index in indices[1:]:
+        if index != previous + 1:
+            ranges.append((start, previous + 1))
+            start = index
+        previous = index
+    ranges.append((start, previous + 1))
+    return ranges
+
+
+@torch.no_grad()
+def audit_identity_preflight_parameters(model_engine):
+    base_model = get_base_model(model_engine)
+    parameters = list(base_model.parameters())
+    total_parameter_count = sum(int(parameter.numel()) for parameter in parameters)
+    trainable_parameter_count = sum(
+        int(parameter.numel()) for parameter in parameters if parameter.requires_grad
+    )
+    frozen_parameter_count = total_parameter_count - trainable_parameter_count
+
+    blocks = base_model.backbone.model.blocks
+    lora_start, lora_end = base_model.lora_range
+    full_start, full_end = base_model.full_finetune_range
+    failures = []
+    frozen_block_indices = []
+    allowed_trainable_parameter_ids = {id(base_model.logit_scale)}
+
+    for block_index, block in enumerate(blocks):
+        named_parameters = list(block.named_parameters())
+        if full_start <= block_index < full_end:
+            allowed_trainable_parameter_ids.update(
+                id(parameter) for _, parameter in named_parameters
+            )
+            if not named_parameters or any(
+                not parameter.requires_grad for _, parameter in named_parameters
+            ):
+                failures.append(
+                    f"full_finetune block {block_index} is not fully trainable"
+                )
+            continue
+
+        if lora_start <= block_index < lora_end:
+            lora_parameters = [
+                parameter
+                for name, parameter in named_parameters
+                if "lora_A" in name or "lora_B" in name
+            ]
+            allowed_trainable_parameter_ids.update(
+                id(parameter) for parameter in lora_parameters
+            )
+            non_lora_parameters = [
+                parameter
+                for name, parameter in named_parameters
+                if "lora_A" not in name and "lora_B" not in name
+            ]
+            if not lora_parameters:
+                failures.append(f"LoRA block {block_index} has no LoRA parameters")
+            if any(not parameter.requires_grad for parameter in lora_parameters):
+                failures.append(f"LoRA block {block_index} has frozen LoRA parameters")
+            if any(parameter.requires_grad for parameter in non_lora_parameters):
+                failures.append(
+                    f"LoRA block {block_index} has unexpected trainable base parameters"
+                )
+            continue
+
+        frozen_block_indices.append(block_index)
+        if any(parameter.requires_grad for _, parameter in named_parameters):
+            failures.append(f"frozen block {block_index} has trainable parameters")
+
+    unexpected_trainable_parameters = [
+        name
+        for name, parameter in base_model.named_parameters()
+        if parameter.requires_grad
+        and id(parameter) not in allowed_trainable_parameter_ids
+    ]
+    if unexpected_trainable_parameters:
+        failures.append(
+            "unexpected trainable parameters outside LoRA/full-FT/logit_scale: "
+            + ", ".join(unexpected_trainable_parameters)
+        )
+
+    parameter_dtypes = get_runtime_parameter_dtypes(model_engine)
+    report = {
+        "total_parameter_count": total_parameter_count,
+        "trainable_parameter_count": trainable_parameter_count,
+        "frozen_parameter_count": frozen_parameter_count,
+        "frozen_block_ranges": _compress_block_ranges(frozen_block_indices),
+        "LoRA_block_ranges": [tuple(base_model.lora_range)],
+        "full_finetune_block_ranges": [tuple(base_model.full_finetune_range)],
+        "representative_LoRA_module": parameter_dtypes.get("lora_module_name"),
+        "representative_LoRA_A_dtype": parameter_dtypes.get("lora_A_dtype_value"),
+        "representative_LoRA_B_dtype": parameter_dtypes.get("lora_B_dtype_value"),
+        "frozen_requires_grad_check": not any(
+            "frozen block" in failure or "unexpected trainable" in failure
+            for failure in failures
+        ),
+        "lora_requires_grad_check": not any(
+            failure.startswith("LoRA block") for failure in failures
+        ),
+        "full_finetune_requires_grad_check": not any(
+            failure.startswith("full_finetune block") for failure in failures
+        ),
+    }
+    if failures:
+        raise RuntimeError(
+            "[IDENTITY PREFLIGHT PARAMETER CONTRACT VIOLATION]\n"
+            + "\n".join(failures)
+        )
+    return report
+
+
+@torch.no_grad()
+def run_teacher_identity_preflight(
+    model_engine,
+    train_loaders,
+    args,
+    identity_criterion,
+    triplet_criterion,
+    weak_criterion,
+    init_checkpoint_report,
+):
+    requested_batches = int(args.identity_preflight_batches)
+    identity_loader = train_loaders.get("identity") if isinstance(train_loaders, dict) else None
+    if identity_loader is None:
+        raise RuntimeError("Identity preflight requires an active identity dataloader")
+
+    checkpoint_report = init_checkpoint_report or {}
+    if not checkpoint_report.get("trainable_coverage_pass", False):
+        raise RuntimeError("init checkpoint did not pass trainable-parameter coverage")
+
+    parameter_report = audit_identity_preflight_parameters(model_engine)
+    rank, world_size = get_dist_rank_world()
+    starting_global_steps = int(getattr(model_engine, "global_steps", 0))
+    processed_batches = 0
+    first_contract = None
+    first_runtime = None
+    nan_count = 0
+    inf_count = 0
+    all_descriptors_finite = True
+    all_losses_finite = True
+    cross_gpu_gather_pass = True
+
+    model_engine.train()
+    for batch_index, batch in enumerate(identity_loader):
+        if processed_batches >= requested_batches:
+            break
+
+        imgs, labels, views, batch_meta = unpack_training_batch(
+            batch, "identity", args.device
+        )
+        final_feats = select_model_descriptor(model_engine(imgs))
+        all_feats, all_labels, all_views = gather_features_and_labels_and_views(
+            final_feats, labels, views
+        )
+        satellite_mask = all_views == 0
+        uav_mask = all_views == 1
+        satellite_feats = all_feats[satellite_mask]
+        uav_feats = all_feats[uav_mask]
+
+        contract = audit_identity_batch_contract_once(
+            args,
+            labels,
+            views,
+            all_labels,
+            all_views,
+            print_report=batch_index == 0,
+        )
+        if first_contract is None:
+            first_contract = contract
+
+        local_satellite_count = int((views == 0).sum().item())
+        local_uav_count = int((views == 1).sum().item())
+        gather_pass = (
+            contract["global_satellite_count"] == local_satellite_count * world_size
+            and contract["global_uav_count"] == local_uav_count * world_size
+        )
+        cross_gpu_gather_pass = cross_gpu_gather_pass and gather_pass
+        if not gather_pass:
+            raise RuntimeError(
+                "Identity preflight cross-GPU gather shape/count contract failed"
+            )
+
+        loss_terms = []
+        if args.identity_loss_weight > 0:
+            identity_loss = identity_criterion(all_feats, all_labels, all_views)
+            loss_terms.append(args.identity_loss_weight * identity_loss)
+        if args.same_domain_triplet_weight > 0:
+            same_triplet_loss = triplet_criterion(all_feats, all_labels, all_views)
+            loss_terms.append(args.same_domain_triplet_weight * same_triplet_loss)
+        weak_enabled = args.infonce_weight > 0 and args.weak_sample4geo_weight > 0
+        if weak_enabled:
+            weak_loss = weak_criterion(all_feats, all_labels, all_views)
+            loss_terms.append(args.weak_sample4geo_weight * weak_loss)
+
+        total_loss = sum(loss_terms) if loss_terms else None
+        if not torch.is_tensor(total_loss):
+            raise RuntimeError("Identity preflight produced no active loss tensor")
+
+        if batch_index == 0:
+            audit_identity_runtime_precision_once(
+                model_engine=model_engine,
+                batch_meta=batch_meta,
+                model_inputs=imgs,
+                local_views=views,
+                local_descriptors=final_feats,
+                gathered_satellite_descriptors=satellite_feats,
+                gathered_uav_descriptors=uav_feats,
+                identity_criterion=identity_criterion,
+                triplet_criterion=triplet_criterion,
+                weak_criterion=weak_criterion,
+                total_loss=total_loss,
+                identity_enabled=args.identity_loss_weight > 0,
+                triplet_enabled=args.same_domain_triplet_weight > 0,
+                weak_enabled=weak_enabled,
+            )
+
+        if is_main_process():
+            print_identity_behavior_diagnostics(
+                args=args,
+                all_feats=all_feats,
+                all_labels=all_labels,
+                all_views=all_views,
+                identity_criterion=identity_criterion,
+                triplet_criterion=triplet_criterion,
+                weak_criterion=weak_criterion,
+                total_loss=total_loss,
+            )
+
+        descriptor_tensors = (final_feats, all_feats, satellite_feats, uav_feats)
+        loss_tensors = tuple(loss_terms) + (total_loss,)
+        for tensor in descriptor_tensors:
+            current_nan = int(torch.isnan(tensor.detach()).sum().item())
+            current_inf = int(torch.isinf(tensor.detach()).sum().item())
+            nan_count += current_nan
+            inf_count += current_inf
+            all_descriptors_finite = all_descriptors_finite and not (
+                current_nan or current_inf
+            )
+        for tensor in loss_tensors:
+            current_nan = int(torch.isnan(tensor.detach()).sum().item())
+            current_inf = int(torch.isinf(tensor.detach()).sum().item())
+            nan_count += current_nan
+            inf_count += current_inf
+            all_losses_finite = all_losses_finite and not (current_nan or current_inf)
+
+        if first_runtime is None:
+            identity_audit = getattr(identity_criterion, "last_runtime_audit", None) or {}
+            triplet_audit = getattr(triplet_criterion, "last_runtime_audit", None) or {}
+            weak_audit = getattr(weak_criterion, "last_runtime_audit", None) or {}
+            first_runtime = {
+                "descriptor_dtype": final_feats.dtype,
+                "gathered_descriptor_dtype": all_feats.dtype,
+                "identity_logits_dtype": identity_audit.get("d2s_logits_dtype_value"),
+                "identity_loss_dtype": identity_audit.get("total_loss_dtype_value"),
+                "uav_triplet_dtype": triplet_audit.get("uav_loss_dtype_value"),
+                "sat_triplet_dtype": triplet_audit.get("satellite_loss_dtype_value"),
+                "weak_infonce_logits_dtype": weak_audit.get("logits_dtype_value"),
+                "weak_infonce_loss_dtype": weak_audit.get("loss_dtype_value"),
+                "total_loss_dtype": total_loss.dtype,
+            }
+        processed_batches += 1
+
+    if processed_batches != requested_batches:
+        raise RuntimeError(
+            f"Identity preflight requested {requested_batches} batches, "
+            f"but only processed {processed_batches}"
+        )
+    if not all_descriptors_finite or not all_losses_finite or nan_count or inf_count:
+        raise RuntimeError(
+            "Identity preflight finite-value contract failed: "
+            f"all_descriptors_finite={all_descriptors_finite}, "
+            f"all_losses_finite={all_losses_finite}, "
+            f"NaN_count={nan_count}, Inf_count={inf_count}"
+        )
+
+    ending_global_steps = int(getattr(model_engine, "global_steps", 0))
+    gradient_parameter_count = sum(
+        parameter.grad is not None for parameter in get_base_model(model_engine).parameters()
+    )
+    if ending_global_steps != starting_global_steps or gradient_parameter_count != 0:
+        raise RuntimeError(
+            "Identity preflight unexpectedly updated training state: "
+            f"global_steps={starting_global_steps}->{ending_global_steps}, "
+            f"gradient_parameter_count={gradient_parameter_count}"
+        )
+
+    if is_main_process():
+        positive_uav = first_contract["uav_positive_counts"]
+        positive_satellite = first_contract["satellite_positive_counts"]
+        negative_identity = first_contract["negative_identity_counts"]
+        print("=" * 80)
+        print("[Teacher Identity Preflight]")
+        print("model_initialized=True")
+        print(f"init_checkpoint_loaded={checkpoint_report.get('loaded', False)}")
+        print(f"checkpoint_path={checkpoint_report.get('checkpoint_path')}")
+        print("checkpoint_trainable_coverage=PASS")
+        print(f"training_stage={args.training_stage}")
+        print(f"world_size={world_size}")
+        print(f"identity_drone_per_id={args.identity_drone_per_id}")
+        print(f"identity_sat_per_id={args.identity_sat_per_id}")
+        print(f"identity_ids_per_batch={args.identity_ids_per_batch}")
+        print(f"local_unique_pid={first_contract['local_unique_pid_count']}")
+        print(f"global_unique_pid={first_contract['global_unique_pid_count']}")
+        print(f"local_uav={first_contract['local_uav_count']}")
+        print(f"local_satellite={first_contract['local_satellite_count']}")
+        print(f"global_uav={first_contract['global_uav_count']}")
+        print(f"global_satellite={first_contract['global_satellite_count']}")
+        print(f"positive_count_per_uav_anchor={positive_uav}")
+        print(f"positive_count_per_sat_anchor={positive_satellite}")
+        print(f"negative_identity_count={negative_identity}")
+        print(
+            "same_pid_as_negative_count="
+            f"{first_contract['same_pid_as_negative_count']}"
+        )
+        print(f"cross_gpu_gather={'PASS' if cross_gpu_gather_pass else 'FAIL'}")
+        for key, value in first_runtime.items():
+            print(f"{key}={_dtype_name(value)}")
+        print(f"all_losses_finite={all_losses_finite}")
+        print(f"all_descriptors_finite={all_descriptors_finite}")
+        print(f"NaN_count={nan_count}")
+        print(f"Inf_count={inf_count}")
+        for key, value in parameter_report.items():
+            if key.endswith("_dtype"):
+                value = _dtype_name(value)
+            print(f"{key}={value}")
+        print(f"processed_batches={processed_batches}")
+        print("optimizer_step_called=False")
+        print("scheduler_step_called=False")
+        print("checkpoint_written=False")
+        print("validation_run=False")
+        print("[Teacher Identity Preflight PASSED]")
+        print("=" * 80)
+
+
 def print_distributed_descriptor_audit_once(
     local_feats,
     local_views,
@@ -537,7 +1461,7 @@ def validate_loss_weights(args):
     identity_loss_enabled = (
         args.identity_loss_weight > 0
         or args.same_domain_triplet_weight > 0
-        or args.weak_sample4geo_weight > 0
+        or (args.infonce_weight > 0 and args.weak_sample4geo_weight > 0)
     )
 
     will_use_sample4geo = (not args.enable_identity_stage) or args.stage1_end_epoch >= 1
@@ -1204,7 +2128,16 @@ def unpack_training_batch(batch, training_mode, device):
     raise ValueError(f"unsupported training_mode: {training_mode}")
 
 
-def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=None, ds_config=None):
+def train(
+    model,
+    dataloader,
+    args,
+    optimizer=None,
+    scheduler=None,
+    val_loaders=None,
+    ds_config=None,
+    init_checkpoint_report=None,
+):
     local_rank = int(os.environ.get('LOCAL_RANK', 0)) if 'LOCAL_RANK' in os.environ else 0
     
     amp_device = args.device
@@ -1218,9 +2151,13 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
     same_domain_triplet_criterion = SameDomainBatchHardTripletLoss(
         margin=args.triplet_margin
     )
-    weak_sample4geo_criterion = WeakSample4GeoAnchorLoss(
-        temperature=args.identity_temperature,
-        repr_mode=args.s4g_anchor_repr,
+    weak_sample4geo_criterion = (
+        WeakSample4GeoAnchorLoss(
+            temperature=args.identity_temperature,
+            repr_mode=args.s4g_anchor_repr,
+        )
+        if args.infonce_weight > 0
+        else None
     )
     # Initialize DeepSpeed.
     import deepspeed
@@ -1232,6 +2169,8 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
         config=ds_config if ds_config is not None else args.deepspeed_config
     )
     runtime_dtype_audit_printed = False
+    identity_precision_audit_printed = False
+    identity_batch_contract_printed = False
     distributed_descriptor_audit_printed = False
     if is_main_process():
         print(
@@ -1239,6 +2178,17 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
             "without gathering ZeRO-2 partitioned gradients; fields will be reported as "
             "unavailable rather than fabricated."
         )
+    if getattr(args, "identity_preflight_batches", 0) > 0:
+        run_teacher_identity_preflight(
+            model_engine=model_engine,
+            train_loaders=dataloader,
+            args=args,
+            identity_criterion=identity_contrast_criterion,
+            triplet_criterion=same_domain_triplet_criterion,
+            weak_criterion=weak_sample4geo_criterion,
+            init_checkpoint_report=init_checkpoint_report,
+        )
+        return
     # Prepare the training run directory.
     save_dir = get_save_pth(args)
     if getattr(args, "save_hard_pool_path", None) is None:
@@ -1347,6 +2297,19 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
             sat_feats = all_feats[sat_mask]
             drone_feats = all_feats[drone_mask]
 
+            if (
+                effective_mode in {"identity", "identity_hard"}
+                and not identity_batch_contract_printed
+            ):
+                audit_identity_batch_contract_once(
+                    args,
+                    labels,
+                    views,
+                    all_labels,
+                    all_views,
+                )
+                identity_batch_contract_printed = True
+
             if is_main_process() and not distributed_descriptor_audit_printed:
                 print_distributed_descriptor_audit_once(
                     final_feats,
@@ -1403,7 +2366,7 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                     loss_terms.append(weighted_same_triplet)
                     loss_values["same_triplet"] = weighted_same_triplet.item()
 
-                if args.weak_sample4geo_weight > 0:
+                if args.infonce_weight > 0 and args.weak_sample4geo_weight > 0:
                     weak_s4g_loss = weak_sample4geo_criterion(all_feats, all_labels, all_views)
                     weighted_weak_s4g = args.weak_sample4geo_weight * weak_s4g_loss
                     loss_terms.append(weighted_weak_s4g)
@@ -1414,6 +2377,31 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
             # Backpropagation and optimizer step.
             loss = sum(loss_terms) if loss_terms else None
             if torch.is_tensor(loss):
+                if (
+                    getattr(args, "training_stage", None) == "identity"
+                    and effective_mode == "identity"
+                    and not identity_precision_audit_printed
+                ):
+                    audit_identity_runtime_precision_once(
+                        model_engine=model_engine,
+                        batch_meta=batch_meta,
+                        model_inputs=imgs,
+                        local_views=views,
+                        local_descriptors=final_feats,
+                        gathered_satellite_descriptors=sat_feats,
+                        gathered_uav_descriptors=drone_feats,
+                        identity_criterion=identity_contrast_criterion,
+                        triplet_criterion=same_domain_triplet_criterion,
+                        weak_criterion=weak_sample4geo_criterion,
+                        total_loss=loss,
+                        identity_enabled=args.identity_loss_weight > 0,
+                        triplet_enabled=args.same_domain_triplet_weight > 0,
+                        weak_enabled=(
+                            args.infonce_weight > 0
+                            and args.weak_sample4geo_weight > 0
+                        ),
+                    )
+                    identity_precision_audit_printed = True
                 if effective_mode == "sample4geo" and not runtime_dtype_audit_printed:
                     print_runtime_dtype_audit_once(
                         model_engine,
@@ -1460,6 +2448,17 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                 )
             )
             if should_log:
+                if effective_mode in {"identity", "identity_hard"}:
+                    print_identity_behavior_diagnostics(
+                        args=args,
+                        all_feats=all_feats,
+                        all_labels=all_labels,
+                        all_views=all_views,
+                        identity_criterion=identity_contrast_criterion,
+                        triplet_criterion=same_domain_triplet_criterion,
+                        weak_criterion=weak_sample4geo_criterion,
+                        total_loss=loss,
+                    )
                 last_grad_norm, last_grad_norm_source = read_deepspeed_grad_norm(model_engine)
                 avg_total = loss_sums["total"] / max(loss_counts["total"], 1)
                 progress = 100.0 * step / max(num_batches, 1)
@@ -1734,14 +2733,25 @@ def print_deepspeed_batch_config(ds_config, args, world_size):
     micro_pid_batch = ds_config["train_micro_batch_size_per_gpu"]
     grad_accum_steps = ds_config["gradient_accumulation_steps"]
     global_pid_batch = ds_config["train_batch_size"]
-    views_per_pid = 2
-    micro_image_batch = micro_pid_batch * views_per_pid
-    global_image_batch = global_pid_batch * views_per_pid
+    active_stage = get_training_mode(1, args)
+    if active_stage in {"identity", "identity_hard"}:
+        drone_views_per_pid = int(args.identity_drone_per_id)
+        satellite_views_per_pid = int(args.identity_sat_per_id)
+    else:
+        drone_views_per_pid = 1
+        satellite_views_per_pid = 1
+    total_views_per_pid = drone_views_per_pid + satellite_views_per_pid
+    micro_image_batch = micro_pid_batch * total_views_per_pid
+    global_image_batch = global_pid_batch * total_views_per_pid
 
     print(
         f"[DeepSpeedBatch] local_pid_batch={micro_pid_batch} | "
         f"world_size={world_size} | grad_accum_steps={grad_accum_steps} | "
-        f"global_pid_batch={global_pid_batch} | views_per_pid={views_per_pid} | "
+        f"global_pid_batch={global_pid_batch} | "
+        f"drone_views_per_pid={drone_views_per_pid} | "
+        f"satellite_views_per_pid={satellite_views_per_pid} | "
+        f"total_views_per_pid={total_views_per_pid} | "
+        f"views_per_pid={total_views_per_pid} | "
         f"local_image_batch={micro_image_batch} | global_image_batch={global_image_batch}"
     )
 
@@ -1751,6 +2761,13 @@ def main():
     args = parse_args()
     try:
         normalize_explicit_training_stage(args)
+        if args.identity_preflight_batches < 0:
+            raise ValueError("identity_preflight_batches must be greater than or equal to 0")
+        if args.identity_preflight_batches > 0 and args.training_stage != "identity":
+            raise ValueError(
+                "identity_preflight_batches can only be enabled when "
+                "training_stage=identity"
+            )
         normalize_hard_pool_args(args)
         validate_loss_weights(args)
         validate_scheduler_args(args)
@@ -1782,17 +2799,19 @@ def main():
 
         # Build training dataloaders.
         train_dataset, train_sampler, train_loader = create_1652_teacher_train_dataloaders(args)
-        # Build validation dataloaders.
-        val_loaders = build_1652_val_dataloaders(
-            data_dir=args.data_dir,
-            img_size=[args.img_size, args.img_size],
-            batch_size=getattr(args, "val_batch_size", 32),
-            num_workers=args.num_workers
-        )
+        # Preflight never constructs or runs validation; default training is unchanged.
+        val_loaders = None
+        if args.identity_preflight_batches == 0:
+            val_loaders = build_1652_val_dataloaders(
+                data_dir=args.data_dir,
+                img_size=[args.img_size, args.img_size],
+                batch_size=getattr(args, "val_batch_size", 32),
+                num_workers=args.num_workers
+            )
         # Build teacher model.
         model = TeacherModel(args)
         model = model.to(device)
-        load_teacher_init_checkpoint(
+        init_checkpoint_report = load_teacher_init_checkpoint(
             model,
             getattr(args, "init_checkpoint", None),
             device,
@@ -1826,8 +2845,12 @@ def main():
             scheduler=scheduler,
             val_loaders=val_loaders,
             ds_config=ds_config,
+            init_checkpoint_report=init_checkpoint_report,
         )
     except Exception as e:
+        if getattr(args, "identity_preflight_batches", 0) > 0:
+            print("\n[Teacher Identity Preflight FAILED]")
+            print(f"reason={e}")
         print("\n[Error] Exception occurred during training:")
         traceback.print_exc()
         import sys

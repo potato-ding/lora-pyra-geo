@@ -71,6 +71,7 @@ def build_arg_parser():
     parser.add_argument("--identity_ids_per_batch", type=int, default=8)
     parser.add_argument("--identity_drone_per_id", type=int, default=4)
     parser.add_argument("--identity_sat_per_id", type=int, default=1)
+    parser.add_argument("--identity_preflight_batches", type=int, default=0)
 
     parser.add_argument("--enable_hard_pool_stage", action="store_true")
     parser.add_argument("--build_hard_pool_before_train", action="store_true")

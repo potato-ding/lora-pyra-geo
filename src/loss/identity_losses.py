@@ -24,8 +24,16 @@ class CrossDomainIdentityContrastiveLoss(nn.Module):
         super().__init__()
         self.temperature = temperature
         self.eps = eps
+        self.last_runtime_audit = None
 
-    def _direction_loss(self, anchor_feats, anchor_labels, candidate_feats, candidate_labels):
+    def _direction_loss(
+        self,
+        anchor_feats,
+        anchor_labels,
+        candidate_feats,
+        candidate_labels,
+        direction,
+    ):
         if anchor_feats.numel() == 0 or candidate_feats.numel() == 0:
             return None
 
@@ -42,9 +50,18 @@ class CrossDomainIdentityContrastiveLoss(nn.Module):
         targets = positive_mask / positive_mask.sum(dim=1, keepdim=True).clamp_min(self.eps)
 
         log_probs = F.log_softmax(logits, dim=1)
-        return -(targets * log_probs).sum(dim=1).mean()
+        loss = -(targets * log_probs).sum(dim=1).mean()
+        self.last_runtime_audit.update({
+            f"{direction}_logits_dtype_value": logits.dtype,
+            f"{direction}_logits_shape": tuple(logits.shape),
+            f"{direction}_loss_dtype_value": loss.dtype,
+            f"{direction}_loss_shape": tuple(loss.shape),
+            f"{direction}_loss_value": loss.detach(),
+        })
+        return loss
 
     def forward(self, feats, labels, view_type):
+        self.last_runtime_audit = {}
         if feats.numel() == 0:
             return _zero_loss_like(feats)
 
@@ -61,16 +78,27 @@ class CrossDomainIdentityContrastiveLoss(nn.Module):
         drone_labels = labels[drone_mask]
 
         losses = []
-        d2s_loss = self._direction_loss(drone_feats, drone_labels, sat_feats, sat_labels)
+        d2s_loss = self._direction_loss(
+            drone_feats, drone_labels, sat_feats, sat_labels, "d2s"
+        )
         if d2s_loss is not None:
             losses.append(d2s_loss)
-        s2d_loss = self._direction_loss(sat_feats, sat_labels, drone_feats, drone_labels)
+        s2d_loss = self._direction_loss(
+            sat_feats, sat_labels, drone_feats, drone_labels, "s2d"
+        )
         if s2d_loss is not None:
             losses.append(s2d_loss)
 
         if not losses:
-            return _zero_loss_like(feats)
-        return torch.stack(losses).mean()
+            total_loss = _zero_loss_like(feats)
+        else:
+            total_loss = torch.stack(losses).mean()
+        self.last_runtime_audit.update({
+            "total_loss_dtype_value": total_loss.dtype,
+            "total_loss_shape": tuple(total_loss.shape),
+            "total_loss_value": total_loss.detach(),
+        })
+        return total_loss
 
 
 class SameDomainBatchHardTripletLoss(nn.Module):
@@ -84,6 +112,7 @@ class SameDomainBatchHardTripletLoss(nn.Module):
     def __init__(self, margin=0.3):
         super().__init__()
         self.margin = margin
+        self.last_runtime_audit = None
 
     def _domain_loss(self, feats, labels):
         if feats.size(0) < 2:
@@ -115,6 +144,7 @@ class SameDomainBatchHardTripletLoss(nn.Module):
         )
 
     def forward(self, feats, labels, view_type):
+        self.last_runtime_audit = {}
         if feats.numel() == 0:
             return _zero_loss_like(feats)
 
@@ -123,15 +153,31 @@ class SameDomainBatchHardTripletLoss(nn.Module):
         view_type = view_type.to(device=feats.device)
 
         losses = []
-        for domain in (VIEW_DRONE, VIEW_SATELLITE):
+        for domain, domain_name in (
+            (VIEW_DRONE, "uav"),
+            (VIEW_SATELLITE, "satellite"),
+        ):
             domain_mask = view_type == domain
-            domain_loss = self._domain_loss(feats[domain_mask], labels[domain_mask])
+            domain_feats = feats[domain_mask]
+            self.last_runtime_audit.update({
+                f"{domain_name}_input_dtype_value": domain_feats.dtype,
+                f"{domain_name}_input_shape": tuple(domain_feats.shape),
+            })
+            domain_loss = self._domain_loss(domain_feats, labels[domain_mask])
             if domain_loss is not None:
+                self.last_runtime_audit.update({
+                    f"{domain_name}_loss_dtype_value": domain_loss.dtype,
+                    f"{domain_name}_loss_shape": tuple(domain_loss.shape),
+                    f"{domain_name}_loss_value": domain_loss.detach(),
+                })
                 losses.append(domain_loss)
 
         if not losses:
-            return _zero_loss_like(feats)
-        return torch.stack(losses).mean()
+            total_loss = _zero_loss_like(feats)
+        else:
+            total_loss = torch.stack(losses).mean()
+        self.last_runtime_audit["total_loss_value"] = total_loss.detach()
+        return total_loss
 
 
 class WeakSample4GeoAnchorLoss(nn.Module):
@@ -145,6 +191,7 @@ class WeakSample4GeoAnchorLoss(nn.Module):
             raise ValueError(f"unsupported repr_mode: {repr_mode}")
         self.temperature = temperature
         self.repr_mode = repr_mode
+        self.last_runtime_audit = None
 
     def _select_anchor(self, feats):
         if self.repr_mode == "first":
@@ -152,6 +199,7 @@ class WeakSample4GeoAnchorLoss(nn.Module):
         return feats.mean(dim=0)
 
     def forward(self, feats, labels, view_type):
+        self.last_runtime_audit = {}
         if feats.numel() == 0:
             return _zero_loss_like(feats)
 
@@ -182,4 +230,12 @@ class WeakSample4GeoAnchorLoss(nn.Module):
 
         loss_d2s = F.cross_entropy(logits, targets)
         loss_s2d = F.cross_entropy(logits.t(), targets)
-        return (loss_d2s + loss_s2d) / 2.0
+        total_loss = (loss_d2s + loss_s2d) / 2.0
+        self.last_runtime_audit.update({
+            "logits_dtype_value": logits.dtype,
+            "logits_shape": tuple(logits.shape),
+            "loss_dtype_value": total_loss.dtype,
+            "loss_shape": tuple(total_loss.shape),
+            "loss_value": total_loss.detach(),
+        })
+        return total_loss
