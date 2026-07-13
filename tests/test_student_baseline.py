@@ -199,6 +199,91 @@ def test_negative_aware_kd_math_runs_in_fp32_for_bf16_descriptors():
     assert loss.dtype == torch.float32
 
 
+def test_margin_incidence_half_up_counts_and_deterministic_tie_break():
+    assert student_train.half_up_candidate_count(0.50, 31) == 16
+    assert student_train.half_up_candidate_count(0.75, 31) == 23
+    assert student_train.half_up_candidate_count(1.00, 31) == 31
+
+    teacher_neg = torch.tensor([[0.0, 0.0, 1.0, 1.0]])
+    selected, confidence, k = student_train._margin_incidence_selected_indices(
+        teacher_neg, 0.50
+    )
+    assert k == 2
+    # All four candidates have equal incident confidence; stable selection
+    # must retain ascending candidate indices.
+    assert selected.tolist() == [[0, 1]]
+    assert confidence.dtype == torch.float32
+
+
+def test_margin_incidence_mi50_mi75_select_exact_candidates_per_anchor():
+    torch.manual_seed(4)
+    student_sim = torch.randn(32, 32, dtype=torch.bfloat16)
+    teacher_sim = torch.randn(32, 32, dtype=torch.float32)
+    for ratio, expected_k in ((0.50, 16), (0.75, 23)):
+        loss, audit = student_train.neg_rank_kl(
+            student_sim,
+            teacher_sim,
+            temperature=0.2,
+            selection_mode="margin_incidence",
+            keep_ratio=ratio,
+            return_selection_audit=True,
+        )
+        assert loss.dtype == torch.float32
+        assert audit["negative_count_per_anchor"] == 31
+        assert audit["selected_count_per_anchor"] == expected_k
+        assert audit["actual_selected_ratio"] == expected_k / 31
+        assert audit["selected_indices_teacher_only"] is True
+        assert audit["teacher_student_share_selected_indices"] is True
+
+
+def test_margin_incidence_mi100_is_strictly_identical_to_original_d1a():
+    torch.manual_seed(5)
+    student_sim = torch.randn(8, 8, requires_grad=True)
+    teacher_sim = torch.randn(8, 8)
+    original = student_train.neg_rank_kl(student_sim, teacher_sim, 0.2)
+    mi100 = student_train.neg_rank_kl(
+        student_sim,
+        teacher_sim,
+        0.2,
+        selection_mode="margin_incidence",
+        keep_ratio=1.0,
+    )
+    assert torch.equal(original, mi100)
+    original_grad = torch.autograd.grad(original, student_sim, retain_graph=True)[0]
+    mi100_grad = torch.autograd.grad(mi100, student_sim)[0]
+    assert torch.equal(original_grad, mi100_grad)
+
+
+def test_margin_incidence_d2s_and_s2d_have_separate_selection_audits():
+    torch.manual_seed(6)
+    features = [torch.randn(8, 12, dtype=torch.bfloat16) for _ in range(4)]
+    loss, audit = student_train.negative_aware_cross_view_ranking_kd(
+        *features,
+        temperature=0.2,
+        return_audit=True,
+        selection_mode="margin_incidence",
+        keep_ratio=0.50,
+    )
+    assert loss.dtype == torch.float32
+    assert set(audit["selection"]) == {"D2S", "S2D"}
+    assert audit["selection"]["D2S"]["selected_count_per_anchor"] == 4
+    assert audit["selection"]["S2D"]["selected_count_per_anchor"] == 4
+
+
+def test_margin_incidence_cli_and_experiment_ids():
+    args = student_train.parse_args([
+        "--rank_kd_selection_mode",
+        "margin_incidence",
+        "--rank_kd_keep_ratio",
+        "0.5",
+        "--experiment_id",
+        "D1-B-MI50",
+    ])
+    assert args.rank_kd_selection_mode == "margin_incidence"
+    assert args.rank_kd_keep_ratio == 0.5
+    assert student_train.experiment_id(args) == "D1-B-MI50"
+
+
 def test_compute_student_batch_losses_adds_only_weighted_negrank_kd():
     class IdentityFeatureModel(nn.Module):
         def __init__(self):

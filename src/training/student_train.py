@@ -94,7 +94,16 @@ def _git_commit(project_root):
 
 
 def experiment_id(args):
-    return D1_A_EXPERIMENT_ID if args.use_negrank_kd else B0_EXPERIMENT_ID
+    explicit_id = getattr(args, "experiment_id", None)
+    if explicit_id:
+        return explicit_id
+    if args.use_negrank_kd:
+        mode = getattr(args, "rank_kd_selection_mode", "all")
+        ratio = float(getattr(args, "rank_kd_keep_ratio", 1.0))
+        if mode == "margin_incidence" and ratio < 1.0:
+            return f"D1-MI{int(ratio * 100):02d}-3090"
+        return D1_A_EXPERIMENT_ID
+    return B0_EXPERIMENT_ID
 
 
 def print_experiment_configuration(
@@ -610,7 +619,59 @@ def gather_paired_views(tensor, pair_batch_size, with_grad=True):
     )
 
 
-def neg_rank_kl(student_sim, teacher_sim, temperature):
+def half_up_candidate_count(keep_ratio, negative_count):
+    return int(math.floor(float(keep_ratio) * int(negative_count) + 0.5))
+
+
+def _margin_incidence_selected_indices(teacher_neg, keep_ratio):
+    """Teacher-only deterministic per-anchor candidate top-k in FP32."""
+    teacher_neg = teacher_neg.detach().float()
+    negative_count = teacher_neg.size(1)
+    k = half_up_candidate_count(keep_ratio, negative_count)
+    if k < 1 or k > negative_count:
+        raise RuntimeError(
+            f"invalid MI selected count k={k} for negatives={negative_count}"
+        )
+    margins = torch.abs(teacher_neg.unsqueeze(2) - teacher_neg.unsqueeze(1))
+    confidence = margins.sum(dim=2) / float(max(negative_count - 1, 1))
+    # Candidate indices start in ascending order, so stable sort supplies the
+    # required candidate-index-ascending tie break.
+    selected_indices = torch.argsort(
+        confidence, dim=1, descending=True, stable=True
+    )[:, :k]
+    return selected_indices.detach(), confidence.detach(), k
+
+
+def _selected_ranking_agreement(student_selected, teacher_selected):
+    selected_count = teacher_selected.size(1)
+    if selected_count <= 1:
+        return 0.0
+    pair_mask = torch.triu(
+        torch.ones(
+            selected_count,
+            selected_count,
+            dtype=torch.bool,
+            device=teacher_selected.device,
+        ),
+        diagonal=1,
+    ).unsqueeze(0)
+    teacher_delta = teacher_selected.unsqueeze(2) - teacher_selected.unsqueeze(1)
+    student_delta = student_selected.unsqueeze(2) - student_selected.unsqueeze(1)
+    valid = pair_mask & teacher_delta.ne(0)
+    if not valid.any():
+        return 0.0
+    agreement = valid & (torch.sign(teacher_delta) == torch.sign(student_delta))
+    return float(agreement.sum().item()) / float(valid.sum().item())
+
+
+def neg_rank_kl(
+    student_sim,
+    teacher_sim,
+    temperature,
+    selection_mode="all",
+    keep_ratio=1.0,
+    return_selection_audit=False,
+):
     student_sim = student_sim.float()
     teacher_sim = teacher_sim.detach().float()
     if student_sim.shape != teacher_sim.shape:
@@ -630,9 +691,71 @@ def neg_rank_kl(student_sim, teacher_sim, temperature):
     student_neg = student_sim[mask].view(batch_size, batch_size - 1)
     teacher_neg = teacher_sim[mask].view(batch_size, batch_size - 1)
 
-    teacher_prob = F.softmax(teacher_neg / temperature, dim=1).detach()
-    student_log_prob = F.log_softmax(student_neg / temperature, dim=1)
-    return F.kl_div(student_log_prob, teacher_prob, reduction="batchmean")
+    # This exact branch is the original D1-A implementation. MI100 is routed
+    # here too, guaranteeing identical operations rather than merely equivalent
+    # mathematics.
+    if selection_mode == "all" or float(keep_ratio) == 1.0:
+        teacher_prob = F.softmax(teacher_neg / temperature, dim=1).detach()
+        student_log_prob = F.log_softmax(student_neg / temperature, dim=1)
+        loss = F.kl_div(student_log_prob, teacher_prob, reduction="batchmean")
+        if not return_selection_audit:
+            return loss
+        negative_count = teacher_neg.size(1)
+        return loss, {
+            "negative_count_per_anchor": negative_count,
+            "selected_count_per_anchor": negative_count,
+            "actual_selected_ratio": 1.0,
+            "selected_teacher_similarity_mean": teacher_neg.mean().item(),
+            "selected_margin_incidence_mean": None,
+            "retained_teacher_probability_mass": 1.0,
+            "selected_ranking_agreement": _selected_ranking_agreement(
+                student_neg.detach(), teacher_neg.detach()
+            ),
+            "selected_indices_teacher_only": True,
+            "teacher_student_share_selected_indices": True,
+        }
+    if selection_mode != "margin_incidence":
+        raise ValueError(f"unsupported rank_kd_selection_mode: {selection_mode}")
+
+    selected_indices, confidence, k = _margin_incidence_selected_indices(
+        teacher_neg, keep_ratio
+    )
+    teacher_selected = torch.gather(teacher_neg, 1, selected_indices)
+    student_selected = torch.gather(student_neg, 1, selected_indices)
+    selected_confidence = torch.gather(confidence, 1, selected_indices)
+    teacher_prob_full = F.softmax(teacher_neg / temperature, dim=1).detach()
+    retained_mass = torch.gather(
+        teacher_prob_full, 1, selected_indices
+    ).sum(dim=1)
+    teacher_prob_selected = F.softmax(
+        teacher_selected / temperature, dim=1
+    ).detach()
+    student_log_prob_selected = F.log_softmax(
+        student_selected / temperature, dim=1
+    )
+    loss = F.kl_div(
+        student_log_prob_selected,
+        teacher_prob_selected,
+        reduction="batchmean",
+    )
+    if not return_selection_audit:
+        return loss
+    negative_count = teacher_neg.size(1)
+    if selected_indices.size(1) != k:
+        raise RuntimeError(f"MI selection expected k={k}, got {selected_indices.size(1)}")
+    return loss, {
+        "negative_count_per_anchor": negative_count,
+        "selected_count_per_anchor": k,
+        "actual_selected_ratio": float(k) / float(negative_count),
+        "selected_teacher_similarity_mean": teacher_selected.detach().mean().item(),
+        "selected_margin_incidence_mean": selected_confidence.mean().item(),
+        "retained_teacher_probability_mass": retained_mass.mean().item(),
+        "selected_ranking_agreement": _selected_ranking_agreement(
+            student_selected.detach(), teacher_selected.detach()
+        ),
+        "selected_indices_teacher_only": True,
+        "teacher_student_share_selected_indices": True,
+    }
 
 
 def negative_aware_cross_view_ranking_kd(
@@ -642,6 +765,8 @@ def negative_aware_cross_view_ranking_kd(
     teacher_sat_feat,
     temperature,
     return_audit=False,
+    selection_mode="all",
+    keep_ratio=1.0,
 ):
     student_drone_feat = F.normalize(student_drone_feat.float(), dim=1)
     student_sat_feat = F.normalize(student_sat_feat.float(), dim=1)
@@ -651,16 +776,36 @@ def negative_aware_cross_view_ranking_kd(
     sim_s_d2s = student_drone_feat @ student_sat_feat.t()
     sim_t_d2s = teacher_drone_feat @ teacher_sat_feat.t()
 
-    loss_d2s = neg_rank_kl(sim_s_d2s, sim_t_d2s, temperature)
-    loss_s2d = neg_rank_kl(sim_s_d2s.t(), sim_t_d2s.t(), temperature)
+    d2s_output = neg_rank_kl(
+        sim_s_d2s, sim_t_d2s, temperature,
+        selection_mode=selection_mode, keep_ratio=keep_ratio,
+        return_selection_audit=return_audit,
+    )
+    s2d_output = neg_rank_kl(
+        sim_s_d2s.t(), sim_t_d2s.t(), temperature,
+        selection_mode=selection_mode, keep_ratio=keep_ratio,
+        return_selection_audit=return_audit,
+    )
+    if return_audit:
+        loss_d2s, d2s_selection_audit = d2s_output
+        loss_s2d, s2d_selection_audit = s2d_output
+    else:
+        loss_d2s, loss_s2d = d2s_output, s2d_output
     loss = 0.5 * (loss_d2s + loss_s2d)
     if not return_audit:
         return loss
-    return loss, {
+    audit = {
         "student_ranking_tensor_dtype": sim_s_d2s.dtype,
         "teacher_ranking_tensor_dtype": sim_t_d2s.dtype,
+        "margin_incidence_confidence_dtype": torch.float32,
+        "selected_kl_input_dtype": torch.float32,
         "negative_rank_kd_loss_dtype": loss.dtype,
     }
+    audit["selection"] = {
+        "D2S": d2s_selection_audit,
+        "S2D": s2d_selection_audit,
+    }
+    return loss, audit
 
 
 @torch.no_grad()
@@ -758,6 +903,39 @@ def print_epoch_kd_configuration(args, epoch):
         f"target_kd_weight={float(args.rank_kd_weight):.6f} | "
         f"effective_kd_weight={current_rank_kd_weight(args, epoch):.6f}"
     )
+
+
+def print_margin_incidence_configuration(args):
+    if not (
+        is_main_process()
+        and args.use_negrank_kd
+        and args.rank_kd_selection_mode == "margin_incidence"
+    ):
+        return
+    negative_count = 31
+    selected_count = half_up_candidate_count(args.rank_kd_keep_ratio, negative_count)
+    print("=" * 80)
+    print("[MARGIN-INCIDENCE NEGRANK KD CONFIG]")
+    print(f"experiment_id={experiment_id(args)}")
+    print("KD_type=Margin-Incidence Selective Negative Distribution KL")
+    print("base_method=D1-A Negative Rank KD")
+    print(f"rank_kd_selection_mode={args.rank_kd_selection_mode}")
+    print(f"rank_kd_keep_ratio={args.rank_kd_keep_ratio}")
+    print(f"negative_count_per_anchor={negative_count}")
+    print(f"selected_count_per_anchor={selected_count}")
+    print(f"actual_selected_ratio={selected_count / negative_count}")
+    print("selection_per_anchor=True")
+    print("selection_per_direction=True")
+    print("pair_union_used=False")
+    print("deterministic_topk=True")
+    print("tie_break=candidate_index_ascending")
+    print("rounding_rule=floor(ratio*N+0.5)")
+    print("teacher_margin_dtype=float32")
+    print("teacher_student_share_selected_indices=True")
+    print("selected_subset_renormalized=True")
+    print("loss_type=listwise_negative_distribution_KL")
+    print("pairwise_ranking_loss_used=False")
+    print("=" * 80)
 
 
 def teacher_gradient_counts(teacher_model, aggregate=True):
@@ -875,6 +1053,8 @@ def compute_student_batch_losses(
     rank_kd_temperature=0.2,
     audit_runtime=False,
     collect_kd_stats=False,
+    rank_kd_selection_mode="all",
+    rank_kd_keep_ratio=1.0,
 ):
     local_features = model(images)
     features, global_pair_batch_size = gather_paired_views(
@@ -929,20 +1109,25 @@ def compute_student_batch_losses(
             teacher_drone_feat,
             teacher_sat_feat,
             rank_kd_temperature,
-            return_audit=audit_runtime,
+            return_audit=bool(audit_runtime or collect_kd_stats),
+            selection_mode=rank_kd_selection_mode,
+            keep_ratio=rank_kd_keep_ratio,
         )
-        if audit_runtime:
+        if audit_runtime or collect_kd_stats:
             loss_negrank, kd_runtime_audit = negrank_output
         else:
             loss_negrank = negrank_output
         loss = loss + float(rank_kd_weight_current) * loss_negrank
         if collect_kd_stats:
-            kd_behavior_stats = negative_rank_behavior_stats(
-                student_drone_feat,
-                student_sat_feat,
-                teacher_drone_feat,
-                teacher_sat_feat,
-            )
+            if rank_kd_selection_mode == "margin_incidence":
+                kd_behavior_stats = kd_runtime_audit["selection"]
+            else:
+                kd_behavior_stats = negative_rank_behavior_stats(
+                    student_drone_feat,
+                    student_sat_feat,
+                    teacher_drone_feat,
+                    teacher_sat_feat,
+                )
 
     result = {
         "loss": loss_infonce,
@@ -978,12 +1163,32 @@ def compute_student_batch_losses(
         )
         result["rank_kd_weight_current"] = float(rank_kd_weight_current)
         result["rank_kd_temperature"] = float(rank_kd_temperature)
+        result["rank_kd_selection_mode"] = rank_kd_selection_mode
+        result["rank_kd_keep_ratio"] = float(rank_kd_keep_ratio)
         if kd_behavior_stats is not None:
             result["kd_behavior_stats"] = kd_behavior_stats
     return result
 
 
-def print_first_runtime_audit(model, criterion, batch_meta, images, batch_losses):
+def print_first_runtime_audit(model, criterion, batch_meta, images, batch_losses, args):
+    local_gpu_model = (
+        torch.cuda.get_device_name(torch.cuda.current_device())
+        if torch.cuda.is_available()
+        else "CUDA unavailable"
+    )
+    gpu_models_by_rank = [local_gpu_model]
+    if is_distributed():
+        gpu_models_by_rank = [None for _ in range(get_world_size())]
+        dist.all_gather_object(gpu_models_by_rank, local_gpu_model)
+    if batch_losses.get("rank_kd_selection_mode") == "margin_incidence":
+        local_pairs = int(batch_meta["pair_batch_size"])
+        global_pairs = int(batch_losses["global_pair_batch_size"])
+        if get_world_size() != 2 or local_pairs != 16 or global_pairs != 32:
+            raise RuntimeError(
+                "formal MI-KD protocol requires world_size=2, local_pair_batch=16, "
+                f"global_pair_batch=32; got world_size={get_world_size()}, "
+                f"local={local_pairs}, global={global_pairs}"
+            )
     if not is_main_process():
         return
 
@@ -1078,6 +1283,46 @@ def print_first_runtime_audit(model, criterion, batch_meta, images, batch_losses
         print("online_teacher_forward=True")
         print("offline_teacher_cache=False")
         print("same_current_augmented_images=True")
+
+    if batch_losses.get("rank_kd_selection_mode") == "margin_incidence":
+        selection = kd_audit.get("selection") or {}
+        d2s_selection = selection.get("D2S") or {}
+        s2d_selection = selection.get("S2D") or {}
+        expected_k = half_up_candidate_count(
+            batch_losses["rank_kd_keep_ratio"], global_pair_count - 1
+        )
+        if d2s_selection.get("selected_count_per_anchor") != expected_k:
+            raise RuntimeError("D2S MI selected count did not match expected k")
+        if s2d_selection.get("selected_count_per_anchor") != expected_k:
+            raise RuntimeError("S2D MI selected count did not match expected k")
+        print("[FIRST REAL BATCH MI-KD AUDIT]")
+        print(f"world_size={world_size}")
+        print(f"GPU models by rank={gpu_models_by_rank}")
+        print(f"local pair batch={local_pair_count}")
+        print(f"global pair batch={global_pair_count}")
+        print(f"effective pair batch={global_pair_count}")
+        print(f"cross-GPU gather actually effective={cross_gpu_effective}")
+        print(f"D2S candidate pool size={global_pair_count}")
+        print(f"S2D candidate pool size={global_pair_count}")
+        print(f"negatives per anchor={global_pair_count - 1}")
+        print("student=clean RepViT-M1.5")
+        print("no extra student module=True")
+        print(f"teacher checkpoint path={args.teacher_checkpoint_path}")
+        print(f"teacher checkpoint selection={args.teacher_ckpt_type}")
+        print(f"teacher eval mode=True")
+        print(f"teacher trainable params=0")
+        print(f"teacher grad count=0")
+        print("selection mode=margin_incidence")
+        print(f"keep ratio={batch_losses['rank_kd_keep_ratio']}")
+        print(f"expected k={expected_k}")
+        print(f"actual k={d2s_selection['selected_count_per_anchor']}")
+        print(f"D2S selected count={d2s_selection['selected_count_per_anchor']}")
+        print(f"S2D selected count={s2d_selection['selected_count_per_anchor']}")
+        print("deterministic=True")
+        print("pair union=False")
+        print("teacher/student share selected indices=True")
+        print("margin-incidence confidence dtype=float32")
+        print("selected KL input dtype=float32")
 
     finite_reports = {
         "raw drone image": tensor_nonfinite_counts(raw_drone),
@@ -1357,6 +1602,8 @@ def train_one_epoch(
                 teacher_model=teacher_model,
                 rank_kd_weight_current=rank_kd_weight_current,
                 rank_kd_temperature=args.rank_kd_temperature,
+                rank_kd_selection_mode=args.rank_kd_selection_mode,
+                rank_kd_keep_ratio=args.rank_kd_keep_ratio,
             )
             loss = batch_losses["loss"]
 
@@ -1451,6 +1698,16 @@ def train_one_epoch_deepspeed(
     kd_coverage_meter = AverageMeter()
     ranking_agreement_meter = AverageMeter()
     violation_ratio_meter = AverageMeter()
+    mi_metric_names = (
+        "selected_teacher_similarity_mean",
+        "selected_margin_incidence_mean",
+        "retained_teacher_probability_mass",
+        "selected_ranking_agreement",
+    )
+    mi_meters = {
+        direction: {name: AverageMeter() for name in mi_metric_names}
+        for direction in ("D2S", "S2D")
+    }
     batch_time = AverageMeter()
     data_time = AverageMeter()
     end = time.time()
@@ -1482,8 +1739,16 @@ def train_one_epoch_deepspeed(
             teacher_model=teacher_model,
             rank_kd_weight_current=rank_kd_weight_current,
             rank_kd_temperature=args.rank_kd_temperature,
+            rank_kd_selection_mode=args.rank_kd_selection_mode,
+            rank_kd_keep_ratio=args.rank_kd_keep_ratio,
             audit_runtime=not runtime_audit_printed,
-            collect_kd_stats=bool(teacher_model is not None and should_print),
+            collect_kd_stats=bool(
+                teacher_model is not None
+                and (
+                    should_print
+                    or args.rank_kd_selection_mode == "margin_incidence"
+                )
+            ),
         )
         loss = batch_losses["loss"]
         if not runtime_audit_printed:
@@ -1493,6 +1758,7 @@ def train_one_epoch_deepspeed(
                 meta,
                 images,
                 batch_losses,
+                args,
             )
             get_raw_model(model_engine)._runtime_audit_printed = True
             runtime_audit_printed = True
@@ -1523,13 +1789,20 @@ def train_one_epoch_deepspeed(
             kd_weight_meter.update(rank_kd_weight_current, images.size(0))
         behavior = batch_losses.get("kd_behavior_stats")
         if behavior is not None:
-            valid_ranking_pair_meter.update(behavior["valid_ranking_pair_count"])
-            total_ranking_pair_meter.update(
-                behavior["total_possible_ranking_pair_count"]
-            )
-            kd_coverage_meter.update(behavior["kd_coverage_ratio"])
-            ranking_agreement_meter.update(behavior["ranking_agreement"])
-            violation_ratio_meter.update(behavior["violation_ratio"])
+            if args.rank_kd_selection_mode == "margin_incidence":
+                for direction in ("D2S", "S2D"):
+                    for metric_name in mi_metric_names:
+                        mi_meters[direction][metric_name].update(
+                            behavior[direction][metric_name]
+                        )
+            else:
+                valid_ranking_pair_meter.update(behavior["valid_ranking_pair_count"])
+                total_ranking_pair_meter.update(
+                    behavior["total_possible_ranking_pair_count"]
+                )
+                kd_coverage_meter.update(behavior["kd_coverage_ratio"])
+                ranking_agreement_meter.update(behavior["ranking_agreement"])
+                violation_ratio_meter.update(behavior["violation_ratio"])
         batch_time.update(time.time() - end)
         end = time.time()
 
@@ -1542,12 +1815,43 @@ def train_one_epoch_deepspeed(
                     f"rank_kd_weight_current {rank_kd_weight_current:.6f} | "
                     f"rank_kd_temperature {args.rank_kd_temperature:.4f} | "
                     f"weighted_loss_negrank {batch_losses['loss_negrank_weighted'].item():.4f} | "
-                    f"valid_ranking_pair_count {behavior['valid_ranking_pair_count']} | "
-                    f"total_possible_ranking_pair_count {behavior['total_possible_ranking_pair_count']} | "
-                    f"kd_coverage_ratio {behavior['kd_coverage_ratio']:.6f} | "
-                    f"ranking_agreement {behavior['ranking_agreement']:.6f} | "
-                    f"violation_ratio {behavior['violation_ratio']:.6f} | "
+                    f"rank_kd_selection_mode={args.rank_kd_selection_mode} | "
+                    f"rank_kd_keep_ratio={args.rank_kd_keep_ratio} | "
                 )
+                if args.rank_kd_selection_mode == "margin_incidence":
+                    d2s = behavior["D2S"]
+                    s2d = behavior["S2D"]
+                    combined_count = d2s["selected_count_per_anchor"] + s2d["selected_count_per_anchor"]
+                    negrank_text += (
+                        f"D2S_negative_count_per_anchor={d2s['negative_count_per_anchor']} | "
+                        f"D2S_selected_count_per_anchor={d2s['selected_count_per_anchor']} | "
+                        f"D2S_actual_selected_ratio={d2s['actual_selected_ratio']:.6f} | "
+                        f"D2S_selected_teacher_similarity_mean={d2s['selected_teacher_similarity_mean']:.6f} | "
+                        f"D2S_selected_margin_incidence_mean={d2s['selected_margin_incidence_mean']:.6f} | "
+                        f"D2S_retained_teacher_probability_mass={d2s['retained_teacher_probability_mass']:.6f} | "
+                        f"D2S_selected_ranking_agreement={d2s['selected_ranking_agreement']:.6f} | "
+                        f"S2D_negative_count_per_anchor={s2d['negative_count_per_anchor']} | "
+                        f"S2D_selected_count_per_anchor={s2d['selected_count_per_anchor']} | "
+                        f"S2D_actual_selected_ratio={s2d['actual_selected_ratio']:.6f} | "
+                        f"S2D_selected_teacher_similarity_mean={s2d['selected_teacher_similarity_mean']:.6f} | "
+                        f"S2D_selected_margin_incidence_mean={s2d['selected_margin_incidence_mean']:.6f} | "
+                        f"S2D_retained_teacher_probability_mass={s2d['retained_teacher_probability_mass']:.6f} | "
+                        f"S2D_selected_ranking_agreement={s2d['selected_ranking_agreement']:.6f} | "
+                        f"combined_selected_count={combined_count} | "
+                        f"combined_actual_selected_ratio={(d2s['actual_selected_ratio'] + s2d['actual_selected_ratio']) / 2:.6f} | "
+                        f"combined_selected_teacher_similarity_mean={(d2s['selected_teacher_similarity_mean'] + s2d['selected_teacher_similarity_mean']) / 2:.6f} | "
+                        f"combined_selected_margin_incidence_mean={(d2s['selected_margin_incidence_mean'] + s2d['selected_margin_incidence_mean']) / 2:.6f} | "
+                        f"combined_retained_teacher_probability_mass={(d2s['retained_teacher_probability_mass'] + s2d['retained_teacher_probability_mass']) / 2:.6f} | "
+                        f"combined_selected_ranking_agreement={(d2s['selected_ranking_agreement'] + s2d['selected_ranking_agreement']) / 2:.6f} | "
+                    )
+                else:
+                    negrank_text += (
+                        f"valid_ranking_pair_count {behavior['valid_ranking_pair_count']} | "
+                        f"total_possible_ranking_pair_count {behavior['total_possible_ranking_pair_count']} | "
+                        f"kd_coverage_ratio {behavior['kd_coverage_ratio']:.6f} | "
+                        f"ranking_agreement {behavior['ranking_agreement']:.6f} | "
+                        f"violation_ratio {behavior['violation_ratio']:.6f} | "
+                    )
             memory = gpu_memory_snapshot()
             grad_norm_text = (
                 f"{last_grad_norm:.6f}" if last_grad_norm is not None else "unavailable"
@@ -1596,11 +1900,30 @@ def train_one_epoch_deepspeed(
         stats["loss_negrank_weighted"] = loss_negrank_weighted_meter.avg
         stats["rank_kd_weight_current"] = kd_weight_meter.avg
         stats["rank_kd_temperature"] = float(args.rank_kd_temperature)
-        stats["valid_ranking_pair_count"] = valid_ranking_pair_meter.avg
-        stats["total_possible_ranking_pair_count"] = total_ranking_pair_meter.avg
-        stats["kd_coverage_ratio"] = kd_coverage_meter.avg
-        stats["ranking_agreement"] = ranking_agreement_meter.avg
-        stats["violation_ratio"] = violation_ratio_meter.avg
+        stats["rank_kd_selection_mode"] = args.rank_kd_selection_mode
+        stats["rank_kd_keep_ratio"] = float(args.rank_kd_keep_ratio)
+        if args.rank_kd_selection_mode == "margin_incidence":
+            selected_count = half_up_candidate_count(args.rank_kd_keep_ratio, 31)
+            stats["mi_selected_count_per_anchor"] = selected_count
+            stats["mi_actual_selected_ratio"] = selected_count / 31.0
+            for direction in ("D2S", "S2D"):
+                for metric_name in mi_metric_names:
+                    stats[f"mi_{direction}_{metric_name}"] = mi_meters[direction][metric_name].avg
+            stats["mi_combined_selected_ranking_agreement"] = 0.5 * (
+                stats["mi_D2S_selected_ranking_agreement"]
+                + stats["mi_S2D_selected_ranking_agreement"]
+            )
+            stats["mi_combined_retained_teacher_probability_mass"] = 0.5 * (
+                stats["mi_D2S_retained_teacher_probability_mass"]
+                + stats["mi_S2D_retained_teacher_probability_mass"]
+            )
+            stats["kd_coverage_ratio"] = selected_count / 31.0
+        else:
+            stats["valid_ranking_pair_count"] = valid_ranking_pair_meter.avg
+            stats["total_possible_ranking_pair_count"] = total_ranking_pair_meter.avg
+            stats["kd_coverage_ratio"] = kd_coverage_meter.avg
+            stats["ranking_agreement"] = ranking_agreement_meter.avg
+            stats["violation_ratio"] = violation_ratio_meter.avg
         teacher_grad_tensor_count, teacher_grad_nonzero_count = teacher_gradient_counts(
             teacher_model
         )
@@ -1879,16 +2202,34 @@ def train_deepspeed(
                     f"{train_stats['loss_negrank_weighted']:.6f}"
                 )
                 print(
-                    "average valid ranking pair count="
-                    f"{train_stats['valid_ranking_pair_count']:.2f}"
+                    "effective KD weight="
+                    f"{train_stats['rank_kd_weight_current']:.6f}"
                 )
-                print(
-                    "average total possible ranking pair count="
-                    f"{train_stats['total_possible_ranking_pair_count']:.2f}"
-                )
-                print(f"average KD coverage ratio={train_stats['kd_coverage_ratio']:.6f}")
-                print(f"average ranking agreement={train_stats['ranking_agreement']:.6f}")
-                print(f"average violation ratio={train_stats['violation_ratio']:.6f}")
+                print(f"experiment_id={experiment_id(args)}")
+                print(f"selection mode={train_stats['rank_kd_selection_mode']}")
+                print(f"keep ratio={train_stats['rank_kd_keep_ratio']}")
+                if train_stats["rank_kd_selection_mode"] == "margin_incidence":
+                    print(f"selected count per anchor={train_stats['mi_selected_count_per_anchor']}")
+                    print(f"actual selected ratio={train_stats['mi_actual_selected_ratio']:.15f}")
+                    print(f"D2S selected ranking agreement={train_stats['mi_D2S_selected_ranking_agreement']:.6f}")
+                    print(f"S2D selected ranking agreement={train_stats['mi_S2D_selected_ranking_agreement']:.6f}")
+                    print(f"combined selected ranking agreement={train_stats['mi_combined_selected_ranking_agreement']:.6f}")
+                    print(f"D2S retained teacher probability mass={train_stats['mi_D2S_retained_teacher_probability_mass']:.6f}")
+                    print(f"S2D retained teacher probability mass={train_stats['mi_S2D_retained_teacher_probability_mass']:.6f}")
+                    print(f"combined retained teacher probability mass={train_stats['mi_combined_retained_teacher_probability_mass']:.6f}")
+                    print(f"average KD coverage ratio={train_stats['kd_coverage_ratio']:.6f}")
+                else:
+                    print(
+                        "average valid ranking pair count="
+                        f"{train_stats['valid_ranking_pair_count']:.2f}"
+                    )
+                    print(
+                        "average total possible ranking pair count="
+                        f"{train_stats['total_possible_ranking_pair_count']:.2f}"
+                    )
+                    print(f"average KD coverage ratio={train_stats['kd_coverage_ratio']:.6f}")
+                    print(f"average ranking agreement={train_stats['ranking_agreement']:.6f}")
+                    print(f"average violation ratio={train_stats['violation_ratio']:.6f}")
                 print(
                     "teacher gradient count | "
                     f"teacher_grad_tensor_count={train_stats['teacher_grad_tensor_count']} | "
@@ -1991,6 +2332,7 @@ def parse_args(argv=None):
     parser.add_argument("--save_last", dest="save_last", action="store_true", default=True)
     parser.add_argument("--no_save_last", dest="save_last", action="store_false")
     parser.add_argument("--use_negrank_kd", action="store_true", default=False)
+    parser.add_argument("--experiment_id", type=str, default=None)
     parser.add_argument("--teacher_model_dir", type=str, default=None)
     parser.add_argument(
         "--teacher_ckpt_type",
@@ -2000,6 +2342,13 @@ def parse_args(argv=None):
     )
     parser.add_argument("--rank_kd_weight", type=float, default=0.01)
     parser.add_argument("--rank_kd_temperature", type=float, default=0.2)
+    parser.add_argument(
+        "--rank_kd_selection_mode",
+        type=str,
+        default="all",
+        choices=("all", "margin_incidence"),
+    )
+    parser.add_argument("--rank_kd_keep_ratio", type=float, default=1.0)
     parser.add_argument("--rank_kd_warmup_epochs", type=int, default=5)
     parser.add_argument(
         "--rank_kd_decay",
@@ -2027,6 +2376,16 @@ def parse_args(argv=None):
         parser.error("--rank_kd_temperature must be greater than 0")
     if args.rank_kd_warmup_epochs < 0:
         parser.error("--rank_kd_warmup_epochs must be non-negative")
+    if not (0.0 < args.rank_kd_keep_ratio <= 1.0):
+        parser.error("--rank_kd_keep_ratio must be in (0, 1]")
+    if args.rank_kd_selection_mode == "all" and args.rank_kd_keep_ratio != 1.0:
+        parser.error("selection_mode=all requires --rank_kd_keep_ratio 1.0")
+    if half_up_candidate_count(0.50, 31) != 16:
+        raise RuntimeError("MI rounding assertion failed for ratio=0.50")
+    if half_up_candidate_count(0.75, 31) != 23:
+        raise RuntimeError("MI rounding assertion failed for ratio=0.75")
+    if half_up_candidate_count(1.00, 31) != 31:
+        raise RuntimeError("MI rounding assertion failed for ratio=1.00")
     if args.best_metric_name != "R1_sum":
         print(
             f"[Best] overriding best_metric_name="
@@ -2069,6 +2428,7 @@ def main():
         world_size,
         run_started_at,
     )
+    print_margin_incidence_configuration(args)
 
     if is_main_process():
         print(f"[StudentTrain] device={device} | world_size={world_size}")
