@@ -298,7 +298,6 @@ def diagnose_student(name, model, images, pair_batch, teacher_features, criterio
     )
     with amp_context:
         local_features = model(images)
-    restore_bn(model, bn_before)
     global_features, global_pairs = gather_paired_views(local_features, pair_batch, with_grad=True)
     student_drone, student_satellite = split_paired_features(global_features, global_pairs)
     teacher_drone, teacher_satellite = split_paired_features(teacher_features, global_pairs)
@@ -311,10 +310,16 @@ def diagnose_student(name, model, images, pair_batch, teacher_features, criterio
     )
     weighted_kd = args.rank_kd_weight * raw_kd
     parameters = trainable_parameters(model)
-    retrieval_grads = torch.autograd.grad(
-        retrieval_loss, parameters, retain_graph=True, allow_unused=True
-    )
-    raw_kd_grads = torch.autograd.grad(raw_kd, parameters, allow_unused=True)
+    # BN buffers participate in autograd's saved-tensor version checks. Restore
+    # them only after both diagnostic gradient extractions have consumed the
+    # graph; restoring earlier is an in-place mutation of saved BF16 buffers.
+    try:
+        retrieval_grads = torch.autograd.grad(
+            retrieval_loss, parameters, retain_graph=True, allow_unused=True
+        )
+        raw_kd_grads = torch.autograd.grad(raw_kd, parameters, allow_unused=True)
+    finally:
+        restore_bn(model, bn_before)
     retrieval_grads = aggregate_gradients(retrieval_grads, parameters)
     raw_kd_grads = aggregate_gradients(raw_kd_grads, parameters)
     metrics = {
