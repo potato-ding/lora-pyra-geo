@@ -61,6 +61,38 @@ GRADIENT_FIELDS = (
 )
 
 
+def dtype_name(dtype):
+    return str(dtype).replace("torch.", "") if dtype is not None else "unavailable"
+
+
+STUDENT_PRECISION_EXPECTED = {
+    "student_forward_input_dtype": torch.bfloat16,
+    "backbone_parameter_dtype": torch.bfloat16,
+    "f4_dtype": torch.bfloat16,
+    "gap_output_dtype": torch.bfloat16,
+    "batchnorm_input_dtype": torch.bfloat16,
+    "batchnorm_output_dtype": torch.bfloat16,
+    "descriptor_dtype": torch.bfloat16,
+    "gathered_drone_descriptor_dtype": torch.bfloat16,
+    "gathered_satellite_descriptor_dtype": torch.bfloat16,
+    "similarity_logits_dtype": torch.float32,
+    "d2s_loss_dtype": torch.float32,
+    "s2d_loss_dtype": torch.float32,
+    "base_infonce_dtype": torch.float32,
+    "ranking_tensor_dtype": torch.float32,
+    "negative_rank_kd_loss_dtype": torch.float32,
+    "total_diagnostic_loss_dtype": torch.float32,
+}
+
+TEACHER_PRECISION_EXPECTED = {
+    "input_dtype": torch.bfloat16,
+    "backbone_parameter_dtype": torch.bfloat16,
+    "backbone_output_dtype": torch.bfloat16,
+    "descriptor_dtype": torch.float32,
+    "gathered_descriptor_dtype": torch.float32,
+}
+
+
 def distributed():
     return dist.is_available() and dist.is_initialized()
 
@@ -292,12 +324,13 @@ def build_student(path, device, temperature):
 def diagnose_student(name, model, images, pair_batch, teacher_features, criterion, args):
     bn_before = snapshot_bn(model)
     model._runtime_forward_audit = None
+    student_images = cast_images_to_model_dtype(model, images)
     amp_context = (
         torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-        if images.device.type == "cuda" else nullcontext()
+        if student_images.device.type == "cuda" else nullcontext()
     )
     with amp_context:
-        local_features = model(images)
+        local_features = model(student_images)
     global_features, global_pairs = gather_paired_views(local_features, pair_batch, with_grad=True)
     student_drone, student_satellite = split_paired_features(global_features, global_pairs)
     teacher_drone, teacher_satellite = split_paired_features(teacher_features, global_pairs)
@@ -309,6 +342,7 @@ def diagnose_student(name, model, images, pair_batch, teacher_features, criterio
         args.rank_kd_temperature,
     )
     weighted_kd = args.rank_kd_weight * raw_kd
+    total_diagnostic_loss = retrieval_loss + weighted_kd
     parameters = trainable_parameters(model)
     # BN buffers participate in autograd's saved-tensor version checks. Restore
     # them only after both diagnostic gradient extractions have consumed the
@@ -335,12 +369,34 @@ def diagnose_student(name, model, images, pair_batch, teacher_features, criterio
         "D2S": confidence_pairs(student_sim, teacher_sim, args.rank_kd_temperature, "D2S"),
         "S2D": confidence_pairs(student_sim.t(), teacher_sim.t(), args.rank_kd_temperature, "S2D"),
     }
+    forward_audit = model._runtime_forward_audit or {}
+    backbone_parameter = next(
+        (parameter for parameter in model.backbone.parameters() if parameter.is_floating_point()),
+        None,
+    )
     audit = {
-        "f4_shape": (model._runtime_forward_audit or {}).get("f4_shape"),
+        "student_forward_input_dtype": forward_audit.get(
+            "student_forward_input_dtype", student_images.dtype
+        ),
+        "backbone_parameter_dtype": (
+            backbone_parameter.dtype if backbone_parameter is not None else None
+        ),
+        "f4_shape": forward_audit.get("f4_shape"),
+        "f4_dtype": forward_audit.get("f4_dtype"),
+        "gap_output_dtype": forward_audit.get("gap_output_dtype"),
+        "batchnorm_input_dtype": forward_audit.get("batchnorm_input_dtype"),
+        "batchnorm_output_dtype": forward_audit.get("batchnorm_output_dtype"),
+        "descriptor_dtype": forward_audit.get("descriptor_dtype", local_features.dtype),
         "descriptor_shape": tuple(local_features.shape),
-        "student_dtype": local_features.dtype,
+        "gathered_drone_descriptor_dtype": student_drone.dtype,
+        "gathered_satellite_descriptor_dtype": student_satellite.dtype,
+        "similarity_logits_dtype": logits.dtype,
+        "d2s_loss_dtype": d2s.dtype,
+        "s2d_loss_dtype": s2d.dtype,
+        "base_infonce_dtype": retrieval_loss.dtype,
         "ranking_tensor_dtype": student_sim.dtype,
-        "logits_dtype": logits.dtype,
+        "negative_rank_kd_loss_dtype": raw_kd.dtype,
+        "total_diagnostic_loss_dtype": total_diagnostic_loss.dtype,
         "nan_count": sum(int(torch.isnan(t).sum()) for t in (local_features, logits, retrieval_loss, raw_kd)),
         "inf_count": sum(int(torch.isinf(t).sum()) for t in (local_features, logits, retrieval_loss, raw_kd)),
         "bn_restored_after_forward": bn_unchanged(model, bn_before),
@@ -370,6 +426,81 @@ def print_batch_confidence(name, batch_index, confidence_records):
             f"direction={direction} | pair_count={count} | "
             f"ranking_agreement={agreement} | violation_ratio={1.0 - agreement if count else 0.0}"
         )
+
+
+def evaluate_precision_contract(dtype_audit):
+    mismatches = []
+    for raw_name in ("raw_drone_image_dtype", "raw_satellite_image_dtype"):
+        actual = dtype_audit.get(raw_name)
+        if actual != torch.float32:
+            mismatches.append(
+                f"{raw_name}: expected=float32 actual={dtype_name(actual)}"
+            )
+    for checkpoint_name in ("B0", "D1-A"):
+        student_audit = dtype_audit.get(checkpoint_name, {})
+        for field, expected in STUDENT_PRECISION_EXPECTED.items():
+            actual = student_audit.get(field)
+            if actual != expected:
+                mismatches.append(
+                    f"{checkpoint_name}.{field}: expected={dtype_name(expected)} "
+                    f"actual={dtype_name(actual)}"
+                )
+    teacher_audit = dtype_audit.get("teacher", {})
+    for field, expected in TEACHER_PRECISION_EXPECTED.items():
+        actual = teacher_audit.get(field)
+        if actual != expected:
+            mismatches.append(
+                f"teacher.{field}: expected={dtype_name(expected)} "
+                f"actual={dtype_name(actual)}"
+            )
+    return not mismatches, mismatches
+
+
+def print_runtime_dtype_audit(dtype_audit):
+    rank0_print("[RUNTIME DTYPE AUDIT]")
+    rank0_print(
+        f"raw drone image dtype={dtype_name(dtype_audit['raw_drone_image_dtype'])}"
+    )
+    rank0_print(
+        "raw satellite image dtype="
+        f"{dtype_name(dtype_audit['raw_satellite_image_dtype'])}"
+    )
+    labels = (
+        ("student forward input dtype", "student_forward_input_dtype"),
+        ("representative backbone parameter dtype", "backbone_parameter_dtype"),
+        ("f4 output dtype", "f4_dtype"),
+        ("GAP output dtype", "gap_output_dtype"),
+        ("BatchNorm1d input dtype", "batchnorm_input_dtype"),
+        ("BatchNorm1d output dtype", "batchnorm_output_dtype"),
+        ("normalized descriptor dtype", "descriptor_dtype"),
+        ("gathered drone descriptor dtype", "gathered_drone_descriptor_dtype"),
+        ("gathered satellite descriptor dtype", "gathered_satellite_descriptor_dtype"),
+        ("similarity/logits dtype", "similarity_logits_dtype"),
+        ("D2S loss dtype", "d2s_loss_dtype"),
+        ("S2D loss dtype", "s2d_loss_dtype"),
+        ("base InfoNCE dtype", "base_infonce_dtype"),
+        ("ranking tensor dtype", "ranking_tensor_dtype"),
+        ("Negative Rank KD loss dtype", "negative_rank_kd_loss_dtype"),
+        ("total diagnostic loss dtype", "total_diagnostic_loss_dtype"),
+    )
+    for checkpoint_name in ("B0", "D1-A"):
+        audit = dtype_audit[checkpoint_name]
+        for label, field in labels:
+            rank0_print(
+                f"{checkpoint_name} {label}={dtype_name(audit.get(field))}"
+            )
+    teacher = dtype_audit["teacher"]
+    for label, field in (
+        ("teacher input dtype", "input_dtype"),
+        ("teacher representative backbone parameter dtype", "backbone_parameter_dtype"),
+        ("teacher backbone output dtype", "backbone_output_dtype"),
+        ("teacher descriptor dtype", "descriptor_dtype"),
+        ("teacher gathered descriptor dtype", "gathered_descriptor_dtype"),
+    ):
+        rank0_print(f"{label}={dtype_name(teacher.get(field))}")
+    rank0_print(f"precision_contract_match={dtype_audit['precision_contract_match']}")
+    for mismatch in dtype_audit["precision_contract_mismatches"]:
+        rank0_print(f"precision_contract_mismatch={mismatch}")
 
 
 def parse_args():
@@ -475,6 +606,42 @@ def main():
 
         if batch_index == 1:
             teacher_grad_count = sum(parameter.grad is not None for parameter in teacher.parameters())
+            teacher_forward_audit = getattr(teacher, "_runtime_forward_audit", None) or {}
+            teacher_backbone = getattr(teacher, "backbone", teacher)
+            teacher_backbone_parameter = next(
+                (
+                    parameter
+                    for parameter in teacher_backbone.parameters()
+                    if parameter.is_floating_point()
+                ),
+                None,
+            )
+            dtype_audit["raw_drone_image_dtype"] = meta[
+                "raw_drone_tensor"
+            ].dtype
+            dtype_audit["raw_satellite_image_dtype"] = meta[
+                "raw_satellite_tensor"
+            ].dtype
+            dtype_audit["teacher"] = {
+                "input_dtype": teacher_images.dtype,
+                "backbone_parameter_dtype": (
+                    teacher_backbone_parameter.dtype
+                    if teacher_backbone_parameter is not None
+                    else None
+                ),
+                "backbone_output_dtype": teacher_forward_audit.get(
+                    "backbone_output_dtype_value"
+                ),
+                "descriptor_dtype": teacher_local.dtype,
+                "gathered_descriptor_dtype": teacher_features.dtype,
+            }
+            precision_contract_match, precision_contract_mismatches = (
+                evaluate_precision_contract(dtype_audit)
+            )
+            dtype_audit["precision_contract_match"] = precision_contract_match
+            dtype_audit["precision_contract_mismatches"] = (
+                precision_contract_mismatches
+            )
             distributed_audit = {
                 "world_size": world_size(), "local_pair_count": pair_batch,
                 "global_pair_count": global_pairs,
@@ -493,6 +660,7 @@ def main():
                 "same_batch_for_B0_and_D1A": True,
                 "same_teacher_descriptors_for_B0_and_D1A": True,
             }
+            print_runtime_dtype_audit(dtype_audit)
             rank0_print("[FIRST REAL BATCH AUDIT]")
             rank0_print(json.dumps(json_safe({"dtype": dtype_audit, "distributed": distributed_audit}), indent=2))
             if not distributed_audit["cross_gpu_gather_actually_effective"]:
@@ -535,6 +703,12 @@ def main():
         "BN_unchanged_audit": bn_audit,
         "distributed_audit": distributed_audit,
         "dtype_audit": dtype_audit,
+        "precision_contract_match": dtype_audit.get(
+            "precision_contract_match", False
+        ),
+        "precision_contract_mismatches": dtype_audit.get(
+            "precision_contract_mismatches", []
+        ),
         "finite_audit": finite_audit,
         "teacher_grad_count": teacher_grad_count,
     }
