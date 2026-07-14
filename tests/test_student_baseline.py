@@ -3,6 +3,7 @@ import os
 import sys
 from types import SimpleNamespace
 
+import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -236,10 +237,15 @@ def test_margin_incidence_mi50_mi75_select_exact_candidates_per_anchor():
         assert audit["teacher_student_share_selected_indices"] is True
 
 
-def test_margin_incidence_mi100_is_strictly_identical_to_original_d1a():
+def test_margin_incidence_mi100_is_strictly_identical_to_original_d1a(monkeypatch):
+    monkeypatch.setattr(
+        student_train,
+        "_margin_incidence_selected_indices",
+        lambda *args, **kwargs: pytest.fail("MI100 must not execute filtering"),
+    )
     torch.manual_seed(5)
-    student_sim = torch.randn(8, 8, requires_grad=True)
-    teacher_sim = torch.randn(8, 8)
+    student_sim = torch.randn(32, 32, requires_grad=True)
+    teacher_sim = torch.randn(32, 32)
     original = student_train.neg_rank_kl(student_sim, teacher_sim, 0.2)
     mi100 = student_train.neg_rank_kl(
         student_sim,
@@ -252,6 +258,16 @@ def test_margin_incidence_mi100_is_strictly_identical_to_original_d1a():
     original_grad = torch.autograd.grad(original, student_sim, retain_graph=True)[0]
     mi100_grad = torch.autograd.grad(mi100, student_sim)[0]
     assert torch.equal(original_grad, mi100_grad)
+    _, audit = student_train.neg_rank_kl(
+        student_sim.detach(),
+        teacher_sim,
+        0.2,
+        selection_mode="margin_incidence",
+        keep_ratio=1.0,
+        return_selection_audit=True,
+    )
+    assert audit["negative_count_per_anchor"] == 31
+    assert audit["selected_count_per_anchor"] == 31
 
 
 def test_margin_incidence_d2s_and_s2d_have_separate_selection_audits():
@@ -262,12 +278,167 @@ def test_margin_incidence_d2s_and_s2d_have_separate_selection_audits():
         temperature=0.2,
         return_audit=True,
         selection_mode="margin_incidence",
-        keep_ratio=0.50,
+        d2s_keep_ratio=0.50,
+        s2d_keep_ratio=0.75,
     )
     assert loss.dtype == torch.float32
     assert set(audit["selection"]) == {"D2S", "S2D"}
     assert audit["selection"]["D2S"]["selected_count_per_anchor"] == 4
-    assert audit["selection"]["S2D"]["selected_count_per_anchor"] == 4
+    assert audit["selection"]["S2D"]["selected_count_per_anchor"] == 5
+    for direction in ("D2S", "S2D"):
+        assert audit["selection"][direction]["selected_indices_teacher_only"] is True
+        assert (
+            audit["selection"][direction]["teacher_student_share_selected_indices"]
+            is True
+        )
+    assert audit["d2s_s2d_independent_selection"] is True
+    assert audit["d2s_s2d_selected_indices_shared"] is False
+    assert audit["teacher_student_same_direction_selected_indices_shared"] is True
+    assert audit["pair_union_used"] is False
+
+
+@pytest.mark.parametrize("legacy_ratio", [1.0, 0.50, 0.75])
+def test_directional_keep_ratios_fall_back_to_legacy_ratio(legacy_ratio):
+    args = student_train.parse_args([
+        "--rank_kd_selection_mode",
+        "margin_incidence",
+        "--rank_kd_keep_ratio",
+        str(legacy_ratio),
+    ])
+
+    assert args.rank_kd_d2s_keep_ratio is None
+    assert args.rank_kd_s2d_keep_ratio is None
+    assert args.effective_rank_kd_d2s_keep_ratio == legacy_ratio
+    assert args.effective_rank_kd_s2d_keep_ratio == legacy_ratio
+
+
+@pytest.mark.parametrize(
+    "d2s_ratio,s2d_ratio,d2s_k,s2d_k",
+    [
+        (0.75, 1.00, 23, 31),
+        (1.00, 0.75, 31, 23),
+        (0.50, 1.00, 16, 31),
+        (1.00, 0.50, 31, 16),
+    ],
+)
+def test_direction_decoupled_d2_candidate_counts(
+    d2s_ratio,
+    s2d_ratio,
+    d2s_k,
+    s2d_k,
+):
+    args = student_train.parse_args([
+        "--rank_kd_selection_mode",
+        "margin_incidence",
+        "--rank_kd_d2s_keep_ratio",
+        str(d2s_ratio),
+        "--rank_kd_s2d_keep_ratio",
+        str(s2d_ratio),
+    ])
+    assert args.effective_rank_kd_d2s_keep_ratio == d2s_ratio
+    assert args.effective_rank_kd_s2d_keep_ratio == s2d_ratio
+
+    torch.manual_seed(9)
+    features = [torch.randn(32, 12, dtype=torch.bfloat16) for _ in range(4)]
+    _, audit = student_train.negative_aware_cross_view_ranking_kd(
+        *features,
+        temperature=0.2,
+        return_audit=True,
+        selection_mode="margin_incidence",
+        d2s_keep_ratio=d2s_ratio,
+        s2d_keep_ratio=s2d_ratio,
+    )
+    assert audit["selection"]["D2S"]["selected_count_per_anchor"] == d2s_k
+    assert audit["selection"]["S2D"]["selected_count_per_anchor"] == s2d_k
+
+
+@pytest.mark.parametrize(
+    "directional_argument",
+    ["--rank_kd_d2s_keep_ratio", "--rank_kd_s2d_keep_ratio"],
+)
+def test_directional_keep_ratio_overrides_must_be_provided_together(
+    directional_argument,
+):
+    with pytest.raises(SystemExit):
+        student_train.parse_args([
+            "--rank_kd_selection_mode",
+            "margin_incidence",
+            directional_argument,
+            "0.75",
+        ])
+
+    features = [torch.randn(4, 6) for _ in range(4)]
+    keyword = (
+        {"d2s_keep_ratio": 0.75}
+        if directional_argument == "--rank_kd_d2s_keep_ratio"
+        else {"s2d_keep_ratio": 0.75}
+    )
+    with pytest.raises(ValueError):
+        student_train.negative_aware_cross_view_ranking_kd(
+            *features,
+            temperature=0.2,
+            selection_mode="margin_incidence",
+            **keyword,
+        )
+
+
+@pytest.mark.parametrize("ratio", [0.50, 0.75])
+def test_legacy_mi50_mi75_match_equal_directional_overrides(ratio):
+    torch.manual_seed(10)
+    legacy_features = [torch.randn(8, 12, requires_grad=True) for _ in range(2)]
+    teacher_features = [torch.randn(8, 12) for _ in range(2)]
+    directional_features = [feature.detach().clone().requires_grad_(True) for feature in legacy_features]
+
+    legacy = student_train.negative_aware_cross_view_ranking_kd(
+        *legacy_features,
+        *teacher_features,
+        temperature=0.2,
+        selection_mode="margin_incidence",
+        keep_ratio=ratio,
+    )
+    directional = student_train.negative_aware_cross_view_ranking_kd(
+        *directional_features,
+        *teacher_features,
+        temperature=0.2,
+        selection_mode="margin_incidence",
+        d2s_keep_ratio=ratio,
+        s2d_keep_ratio=ratio,
+    )
+    assert torch.equal(legacy, directional)
+    legacy_grads = torch.autograd.grad(legacy, legacy_features)
+    directional_grads = torch.autograd.grad(directional, directional_features)
+    for legacy_grad, directional_grad in zip(legacy_grads, directional_grads):
+        assert torch.equal(legacy_grad, directional_grad)
+
+
+def test_ratio_one_direction_uses_exact_branch_without_mi_filtering(monkeypatch):
+    original_selector = student_train._margin_incidence_selected_indices
+    selector_calls = []
+
+    def tracked_selector(teacher_neg, keep_ratio):
+        selector_calls.append(float(keep_ratio))
+        return original_selector(teacher_neg, keep_ratio)
+
+    monkeypatch.setattr(
+        student_train,
+        "_margin_incidence_selected_indices",
+        tracked_selector,
+    )
+    torch.manual_seed(11)
+    features = [torch.randn(32, 12) for _ in range(4)]
+    _, audit = student_train.negative_aware_cross_view_ranking_kd(
+        *features,
+        temperature=0.2,
+        return_audit=True,
+        selection_mode="margin_incidence",
+        d2s_keep_ratio=0.75,
+        s2d_keep_ratio=1.0,
+    )
+
+    assert selector_calls == [0.75]
+    assert audit["selection"]["D2S"]["selected_count_per_anchor"] == 23
+    assert audit["selection"]["S2D"]["selected_count_per_anchor"] == 31
+    assert audit["selection"]["S2D"]["selected_margin_incidence_mean"] is None
 
 
 def test_margin_incidence_cli_and_experiment_ids():
@@ -281,7 +452,36 @@ def test_margin_incidence_cli_and_experiment_ids():
     ])
     assert args.rank_kd_selection_mode == "margin_incidence"
     assert args.rank_kd_keep_ratio == 0.5
+    assert args.rank_kd_d2s_keep_ratio is None
+    assert args.rank_kd_s2d_keep_ratio is None
+    assert args.effective_rank_kd_d2s_keep_ratio == 0.5
+    assert args.effective_rank_kd_s2d_keep_ratio == 0.5
     assert student_train.experiment_id(args) == "D1-B-MI50"
+
+
+def test_direction_decoupled_startup_configuration_log(monkeypatch, capsys):
+    args = SimpleNamespace(
+        use_negrank_kd=True,
+        experiment_id="D2-A",
+        rank_kd_selection_mode="margin_incidence",
+        rank_kd_keep_ratio=1.0,
+        rank_kd_d2s_keep_ratio=0.75,
+        rank_kd_s2d_keep_ratio=1.0,
+    )
+    monkeypatch.setattr(student_train, "is_main_process", lambda: True)
+
+    student_train.print_margin_incidence_configuration(args)
+    text = capsys.readouterr().out
+
+    assert "[DIRECTION-DECOUPLED MI-KD CONFIG]" in text
+    assert "experiment_id=D2-A" in text
+    assert "legacy_rank_kd_keep_ratio=1.0" in text
+    assert "effective_d2s_keep_ratio=0.75" in text
+    assert "effective_s2d_keep_ratio=1.0" in text
+    assert "D2S_selected_count_per_anchor=23" in text
+    assert "S2D_selected_count_per_anchor=31" in text
+    assert "D2S_S2D_share_selected_indices=False" in text
+    assert "pair_union_used=False" in text
 
 
 def test_mi_deepspeed_epoch_log_does_not_require_legacy_agreement_keys():
@@ -291,17 +491,29 @@ def test_mi_deepspeed_epoch_log_does_not_require_legacy_agreement_keys():
         "rank_kd_weight_current": 0.002,
         "rank_kd_temperature": 0.2,
         "rank_kd_selection_mode": "margin_incidence",
-        "rank_kd_keep_ratio": 0.5,
-        "mi_selected_count_per_anchor": 16,
-        "mi_actual_selected_ratio": 16 / 31,
+        "legacy_rank_kd_keep_ratio": 1.0,
+        "effective_d2s_keep_ratio": 0.75,
+        "effective_s2d_keep_ratio": 1.0,
+        "mi_D2S_selected_count_per_anchor": 23,
+        "mi_D2S_actual_selected_ratio": 23 / 31,
+        "mi_D2S_selected_teacher_similarity_mean": 0.31,
+        "mi_D2S_selected_margin_incidence_mean": 0.12,
+        "mi_D2S_retained_teacher_probability_mass": 0.61,
         "mi_D2S_selected_ranking_agreement": 0.71,
+        "mi_S2D_selected_count_per_anchor": 31,
+        "mi_S2D_actual_selected_ratio": 1.0,
+        "mi_S2D_selected_teacher_similarity_mean": 0.22,
+        "mi_S2D_selected_margin_incidence_mean": None,
+        "mi_S2D_retained_teacher_probability_mass": 1.0,
         "mi_S2D_selected_ranking_agreement": 0.69,
         "mi_combined_selected_ranking_agreement": 0.70,
-        "mi_combined_retained_teacher_probability_mass": 0.61,
+        "mi_combined_retained_teacher_probability_mass": 0.805,
     })
-    assert "selected_count_per_anchor=16" in text
+    assert "D2S_selected_count_per_anchor=23" in text
+    assert "S2D_selected_count_per_anchor=31" in text
+    assert "S2D_selected_margin_incidence_mean=N/A" in text
     assert "combined_selected_ranking_agreement=0.700000" in text
-    assert "ranking_agreement=" in text
+    assert "D2S_selected_ranking_agreement=" in text
 
 
 def test_compute_student_batch_losses_adds_only_weighted_negrank_kd():
@@ -511,6 +723,10 @@ def test_cli_defaults_to_clean_deepspeed_capable_baseline(monkeypatch):
     assert args.grad_accum_steps == 1
     assert args.temperature == 0.07
     assert args.label_smoothing == 0.1
+    assert args.rank_kd_d2s_keep_ratio is None
+    assert args.rank_kd_s2d_keep_ratio is None
+    assert args.effective_rank_kd_d2s_keep_ratio == 1.0
+    assert args.effective_rank_kd_s2d_keep_ratio == 1.0
 
     removed_attrs = [
         "enable_online_kd",
@@ -563,3 +779,36 @@ def test_deepspeed_runtime_config_preserves_multigpu_batch_math(tmp_path):
     assert config["gradient_accumulation_steps"] == 2
     assert config["train_batch_size"] == 64
     assert config["zero_optimization"]["stage"] == 1
+
+
+def test_stu_2g_b32_v1_batch_protocol_is_unchanged(tmp_path):
+    config_path = tmp_path / "ds.json"
+    config_path.write_text(
+        json.dumps({
+            "train_batch_size": 1,
+            "train_micro_batch_size_per_gpu": 1,
+            "gradient_accumulation_steps": 1,
+            "zero_optimization": {"stage": 1},
+            "bf16": {"enabled": True},
+            "fp16": {"enabled": False},
+        }),
+        encoding="utf-8",
+    )
+    args = student_train.parse_args([
+        "--batch_size",
+        "16",
+        "--grad_accum_steps",
+        "1",
+        "--deepspeed_config",
+        str(config_path),
+    ])
+
+    config = student_train.build_deepspeed_runtime_config(
+        str(config_path),
+        args,
+        world_size=2,
+    )
+
+    assert config["train_micro_batch_size_per_gpu"] == 16
+    assert config["gradient_accumulation_steps"] == 1
+    assert config["train_batch_size"] == 32
