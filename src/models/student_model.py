@@ -46,11 +46,12 @@ class StudentModel(nn.Module):
         rank0_print(f"StudentModel f4 feature shape: {tuple(f4.shape)}")
         self._f4_shape_logged = True
 
-    def forward(self, x):
+    def forward(self, x, return_audit_features=False):
         features = self.backbone(x)
         f4 = features[-1]
         self._log_f4_shape_once(f4)
-        gap_output = F.adaptive_avg_pool2d(f4, 1).flatten(1)
+        f4_gap = F.adaptive_avg_pool2d(f4, 1).flatten(1)
+        gap_output = f4_gap
         bn_output = self.neck(gap_output)
         descriptor = F.normalize(bn_output, dim=1)
 
@@ -91,4 +92,23 @@ class StudentModel(nn.Module):
                 "descriptor_finite": finite_counts(descriptor),
             }
 
+        if return_audit_features:
+            if len(features) != 4:
+                raise RuntimeError(
+                    f"RepViT-M1.5 must expose four stage outputs, got {len(features)}"
+                )
+            _, f2, f3, _ = features
+            f2_gap = F.adaptive_avg_pool2d(f2, 1).flatten(1)
+            f3_gap = F.adaptive_avg_pool2d(f3, 1).flatten(1)
+            return {
+                "f2": f2,
+                "f3": f3,
+                "f4": f4,
+                "f2_gap": f2_gap,
+                "f3_gap": f3_gap,
+                "f4_gap": f4_gap,
+                "bn_input": gap_output,
+                "bn_output": bn_output,
+                "final_descriptor": descriptor,
+            }
         return descriptor
