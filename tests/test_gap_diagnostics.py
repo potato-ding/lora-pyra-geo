@@ -1,6 +1,9 @@
 import os
 import sys
 import json
+import shutil
+import socket
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -203,6 +206,79 @@ def test_server_scripts_encode_requested_gpu_allocation_and_dry_run_guard():
     assert 'if [[ "$DRY_RUN" != "1" ]]' in common
     run_all = (root / "run_all_8gpu.sh").read_text(encoding="utf-8")
     assert "validation and SUCCESS creation skipped" in run_all
+
+
+def _bash_executable():
+    executable = shutil.which("bash")
+    if executable:
+        return executable
+    for candidate in (r"C:\Program Files\Git\bin\bash.exe", r"C:\Program Files\Git\usr\bin\bash.exe"):
+        if Path(candidate).is_file():
+            return candidate
+    pytest.skip("bash is unavailable")
+
+
+def test_probe_ports_are_distinct_and_launcher_receives_master_port():
+    root = Path(ROOT) / "scripts" / "bottleneck_audit"
+    common = (root / "_common.sh").read_text(encoding="utf-8")
+    assert 'MASTER_PORT_P1="${MASTER_PORT_P1:-29501}"' in common
+    assert 'MASTER_PORT_P2="${MASTER_PORT_P2:-29502}"' in common
+    assert 'MASTER_PORT_P3="${MASTER_PORT_P3:-29503}"' in common
+    assert len({29501, 29502, 29503}) == 3
+    for probe, port, script in (
+        ("P1", "29501", "run_probe_p1_gpu23.sh"),
+        ("P2", "29502", "run_probe_p2_gpu45.sh"),
+        ("P3", "29503", "run_probe_p3_gpu67.sh"),
+    ):
+        env = os.environ.copy()
+        env.update({"DRY_RUN": "1", "PYTHON_BIN": "python-must-not-execute"})
+        completed = subprocess.run(
+            [_bash_executable(), str(root / script)], cwd=ROOT, env=env,
+            text=True, encoding="utf-8", errors="replace",
+            capture_output=True, check=False,
+        )
+        output = completed.stdout + completed.stderr
+        assert completed.returncode == 0, output
+        assert f"probe={probe}" in output
+        assert f"master_port={port}" in output
+        assert f"--master_port {port}" in output
+        assert "python-must-not-execute: command not found" not in output
+
+
+def test_single_gpu_diagnostics_do_not_use_distributed_launcher():
+    root = Path(ROOT) / "scripts" / "bottleneck_audit"
+    for filename in (
+        "run_gap_u1652_sues_gpu0.sh",
+        "run_gap_gta_gpu1.sh",
+        "run_representation_gpu1.sh",
+    ):
+        text = (root / filename).read_text(encoding="utf-8")
+        assert "torch.distributed.run" not in text
+        assert "torchrun" not in text
+        assert "--master_port" not in text
+
+
+def test_occupied_probe_port_fails_with_explicit_status():
+    root = Path(ROOT) / "scripts" / "bottleneck_audit"
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        port = listener.getsockname()[1]
+        command = (
+            'source "scripts/bottleneck_audit/_common.sh"; '
+            f'check_master_port TEST 127.0.0.1 {port}'
+        )
+        env = os.environ.copy()
+        env.update({"DRY_RUN": "0", "PYTHON_BIN": "python"})
+        completed = subprocess.run(
+            [_bash_executable(), "-c", command], cwd=ROOT, env=env,
+            text=True, encoding="utf-8", errors="replace",
+            capture_output=True, check=False,
+        )
+    output = completed.stdout + completed.stderr
+    assert completed.returncode != 0
+    assert f"master_port={port}" in output
+    assert "status=occupied_or_unavailable" in output
 
 
 def test_missing_formal_results_cannot_build_report_or_success(tmp_path):

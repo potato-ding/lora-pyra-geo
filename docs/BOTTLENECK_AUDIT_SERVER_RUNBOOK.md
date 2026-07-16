@@ -45,6 +45,10 @@ export SUES_ROOT=data/SUES-200/SUES-200-512x512
 export GTA_ROOT=data/GTA-UAV-LR/GTA-UAV-LR-baidu
 export OUTPUT_ROOT=src/diagnostics/results/bottleneck_audit
 export PYTHON_BIN=python
+export MASTER_ADDR=127.0.0.1
+export MASTER_PORT_P1=29501
+export MASTER_PORT_P2=29502
+export MASTER_PORT_P3=29503
 
 test -s "$B0_CKPT" && test -s "$T0_CKPT"
 test -d "$U1652_ROOT" && test -d "$SUES_ROOT" && test -d "$GTA_ROOT"
@@ -76,7 +80,7 @@ conda activate pyra_geo
 bash scripts/bottleneck_audit/run_all_8gpu.sh
 ```
 
-GPU assignment is fixed by default: GPU 0 runs U1652+SUES G1; GPU 1 runs GTA G1 and then G2; GPU 2,3 run P1; GPU 4,5 run P2; GPU 6,7 run P3.
+GPU assignment is fixed by default: GPU 0 runs U1652+SUES G1; GPU 1 runs GTA G1 and then G2; GPU 2,3 run P1 on port 29501; GPU 4,5 run P2 on port 29502; GPU 6,7 run P3 on port 29503. Each probe checks its configured port before launching and fails explicitly if the port is occupied.
 
 Detach with `Ctrl-b`, then `d`. Reattach with:
 
