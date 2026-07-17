@@ -201,6 +201,19 @@ def test_student_batch_total_uses_only_configured_tagpm_terms():
     torch.testing.assert_close(losses["loss"], expected)
 
 
+def test_weighted_tagpm_logging_values_are_derived_from_raw_losses():
+    weighted_positive, weighted_margin = student_train.tagpm_weighted_loss_values({
+        "loss_tagpm_positive": torch.tensor(2.0, requires_grad=True),
+        "loss_tagpm_margin": torch.tensor(3.0, requires_grad=True),
+        "tagpm_positive_weight_current": 0.004,
+        "tagpm_margin_weight_current": 0.006,
+    })
+    assert weighted_positive.item() == pytest.approx(0.008)
+    assert weighted_margin.item() == pytest.approx(0.018)
+    assert not weighted_positive.requires_grad
+    assert not weighted_margin.requires_grad
+
+
 def _teacher_run(tmp_path):
     teacher_dir = tmp_path / "teacher"
     teacher_dir.mkdir()

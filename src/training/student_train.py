@@ -1377,6 +1377,19 @@ def compute_student_batch_losses(
     return result
 
 
+def tagpm_weighted_loss_values(batch_losses):
+    """Derive weighted TAG-PM values from the canonical raw losses and weights."""
+    positive = (
+        batch_losses["loss_tagpm_positive"].detach()
+        * float(batch_losses["tagpm_positive_weight_current"])
+    )
+    margin = (
+        batch_losses["loss_tagpm_margin"].detach()
+        * float(batch_losses["tagpm_margin_weight_current"])
+    )
+    return positive, margin
+
+
 def print_first_runtime_audit(model, criterion, batch_meta, images, batch_losses, args):
     local_gpu_model = (
         torch.cuda.get_device_name(torch.cuda.current_device())
@@ -1493,6 +1506,9 @@ def print_first_runtime_audit(model, criterion, batch_meta, images, batch_losses
 
     if batch_losses.get("tagpm_audit") is not None:
         tagpm_audit = batch_losses["tagpm_audit"]
+        weighted_positive, weighted_margin = tagpm_weighted_loss_values(
+            batch_losses
+        )
         print("[FIRST REAL BATCH TAG-PM AUDIT]")
         print(f"experiment_id={experiment_id(args)}")
         print(f"teacher checkpoint path={args.teacher_checkpoint_path}")
@@ -1526,11 +1542,11 @@ def print_first_runtime_audit(model, criterion, batch_meta, images, batch_losses
         )
         print(
             "weighted_positive_loss="
-            f"{batch_losses['loss_tagpm_positive_weighted'].item():.6f}"
+            f"{weighted_positive.item():.6f}"
         )
         print(
             "weighted_margin_loss="
-            f"{batch_losses['loss_tagpm_margin_weighted'].item():.6f}"
+            f"{weighted_margin.item():.6f}"
         )
 
     if batch_losses.get("rank_kd_selection_mode") == "margin_incidence":
@@ -1909,6 +1925,9 @@ def train_one_epoch(
             loss_negrank_meter.update(batch_losses["loss_negrank"].item(), images.size(0))
             kd_weight_meter.update(rank_kd_weight_current, images.size(0))
         if "loss_tagpm_positive" in batch_losses:
+            weighted_positive, weighted_margin = tagpm_weighted_loss_values(
+                batch_losses
+            )
             loss_tagpm_positive_meter.update(
                 batch_losses["loss_tagpm_positive"].item(), images.size(0)
             )
@@ -2123,11 +2142,11 @@ def train_one_epoch_deepspeed(
                 batch_losses["loss_tagpm_margin"].item(), images.size(0)
             )
             loss_tagpm_positive_weighted_meter.update(
-                batch_losses["loss_tagpm_positive_weighted"].item(),
+                weighted_positive.item(),
                 images.size(0),
             )
             loss_tagpm_margin_weighted_meter.update(
-                batch_losses["loss_tagpm_margin_weighted"].item(),
+                weighted_margin.item(),
                 images.size(0),
             )
         behavior = batch_losses.get("kd_behavior_stats")
@@ -2162,6 +2181,10 @@ def train_one_epoch_deepspeed(
         if is_main_process() and should_print:
             negrank_text = ""
             if teacher_model is not None:
+                if args.use_tagpm_kd:
+                    weighted_positive, weighted_margin = (
+                        tagpm_weighted_loss_values(batch_losses)
+                    )
                 negrank_text = (
                     f"loss_negrank {loss_negrank_meter.val:.4f} "
                     f"({loss_negrank_meter.avg:.4f}) | "
@@ -2176,9 +2199,9 @@ def train_one_epoch_deepspeed(
                     f"tagpm_positive_loss={loss_tagpm_positive_meter.val:.6f} | "
                     f"tagpm_margin_loss={loss_tagpm_margin_meter.val:.6f} | "
                     f"weighted_tagpm_positive="
-                    f"{batch_losses['loss_tagpm_positive_weighted'].item():.6f} | "
+                    f"{weighted_positive.item():.6f} | "
                     f"weighted_tagpm_margin="
-                    f"{batch_losses['loss_tagpm_margin_weighted'].item():.6f} | "
+                    f"{weighted_margin.item():.6f} | "
                     f"tagpm_warmup_factor={tagpm_factor:.6f} | "
                     f"tagpm_positive_weight_current="
                     f"{batch_losses['tagpm_positive_weight_current']:.6f} | "
