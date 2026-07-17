@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -268,6 +269,12 @@ def test_tagpm_configuration_forces_legacy_rank_kd_weight_inactive(tmp_path):
     assert student_train.current_rank_kd_weight(args, epoch=1) == 0.0
 
 
+def test_tagpm_batch_contract_fails_before_backward_when_fields_are_missing():
+    args = SimpleNamespace(use_tagpm_kd=True)
+    with pytest.raises(RuntimeError, match="incomplete before backward"):
+        student_train.validate_tagpm_batch_result(args, {"loss": torch.tensor(1.0)})
+
+
 def test_batch_loss_rejects_accidental_simultaneous_kd_activation():
     class FeatureModel(nn.Module):
         def __init__(self):
@@ -289,3 +296,211 @@ def test_batch_loss_rejects_accidental_simultaneous_kd_activation():
             drone_ids=torch.arange(3),
             satellite_ids=torch.arange(3),
         )
+
+
+def test_deepspeed_epoch_updates_weighted_tagpm_meters_before_logging(monkeypatch):
+    class TinyModule(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.logit_scale = nn.Parameter(torch.tensor(0.0))
+            self._runtime_audit_printed = True
+
+    class FakeEngine(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.module = TinyModule()
+            self.optimizer = SimpleNamespace(param_groups=[{"lr": 1e-4}])
+
+        def forward(self, value):
+            return value
+
+        def backward(self, loss):
+            loss.backward()
+
+        def step(self):
+            pass
+
+    class OneBatchLoader:
+        batch_sampler = object()
+
+        def __len__(self):
+            return 1
+
+        def __iter__(self):
+            yield (
+                torch.randn(3, 3, 2, 2),
+                torch.randn(3, 3, 2, 2),
+                torch.arange(3),
+                ("0", "1", "2"),
+            )
+
+    direction_audit = {
+        "teacher_correct_ratio": 1.0,
+        "positive_gate_ratio": 0.5,
+        "margin_gate_ratio": 0.5,
+        "student_z_positive_mean": 0.1,
+        "teacher_z_positive_mean": 0.2,
+        "student_z_margin_mean": 0.1,
+        "teacher_z_margin_mean": 0.2,
+        "positive_gap_mean": 0.1,
+        "margin_gap_mean": 0.1,
+    }
+
+    def fake_batch_losses(model, images, pair_batch_size, criterion, **kwargs):
+        loss = model.module.logit_scale * 0.0 + 1.0
+        criterion.last_loss_d2s = torch.tensor(0.4)
+        criterion.last_loss_s2d = torch.tensor(0.6)
+        return {
+            "loss": loss,
+            "main_loss": loss,
+            "global_pair_batch_size": pair_batch_size,
+            "loss_tagpm_positive": loss * 0.2,
+            "loss_tagpm_margin": loss * 0.3,
+            "tagpm_positive_weight_current": 0.002,
+            "tagpm_margin_weight_current": 0.003,
+            "tagpm_audit": {
+                "D2S": dict(direction_audit),
+                "S2D": dict(direction_audit),
+            },
+        }
+
+    teacher = nn.Linear(2, 2)
+    student_train.freeze_model(teacher)
+    teacher._d1_grad_audit_done = True
+    monkeypatch.setattr(
+        student_train, "compute_student_batch_losses", fake_batch_losses
+    )
+    monkeypatch.setattr(student_train, "is_main_process", lambda: False)
+    args = SimpleNamespace(
+        use_negrank_kd=False,
+        use_tagpm_kd=True,
+        rank_kd_weight=0.01,
+        rank_kd_warmup_epochs=5,
+        rank_kd_decay=False,
+        rank_kd_temperature=0.2,
+        rank_kd_selection_mode="all",
+        rank_kd_keep_ratio=1.0,
+        rank_kd_d2s_keep_ratio=None,
+        rank_kd_s2d_keep_ratio=None,
+        tagpm_positive_weight=0.01,
+        tagpm_margin_weight=0.0,
+        tagpm_warmup_epochs=5,
+        tagpm_d2s_enabled=True,
+        tagpm_s2d_enabled=True,
+        tagpm_std_epsilon=1e-12,
+        print_freq=200,
+        grad_clip=0.0,
+        epochs=30,
+    )
+    stats = student_train.train_one_epoch_deepspeed(
+        FakeEngine(),
+        OneBatchLoader(),
+        student_train.Sample4GeoLoss(label_smoothing=0.0),
+        torch.device("cpu"),
+        args,
+        epoch=1,
+        teacher_model=teacher,
+    )
+    assert stats["loss_tagpm_positive_weighted"] == pytest.approx(0.0004)
+    assert stats["loss_tagpm_margin_weighted"] == pytest.approx(0.0009)
+
+
+@pytest.mark.parametrize(
+    ("positive_weight", "margin_weight", "d2s_enabled", "s2d_enabled"),
+    [
+        (0.01, 0.0, True, True),
+        (0.0, 0.01, True, True),
+        (0.005, 0.005, True, True),
+        (0.005, 0.005, True, False),
+    ],
+)
+def test_all_four_g3_configs_execute_real_deepspeed_batch_and_step_log(
+    capsys, positive_weight, margin_weight, d2s_enabled, s2d_enabled
+):
+    class DescriptorModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.logit_scale = nn.Parameter(torch.tensor(0.0))
+            self._runtime_audit_printed = True
+
+        def forward(self, images):
+            return F.normalize(images.float().flatten(1), dim=1)
+
+    class FakeEngine(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.module = DescriptorModel()
+            self.optimizer = SimpleNamespace(param_groups=[{"lr": 1e-4}])
+
+        def forward(self, images):
+            return self.module(images)
+
+        def backward(self, loss):
+            loss.backward()
+
+        def step(self):
+            pass
+
+    class OneBatchLoader:
+        batch_sampler = object()
+
+        def __len__(self):
+            return 1
+
+        def __iter__(self):
+            generator = torch.Generator().manual_seed(17)
+            yield (
+                torch.randn(3, 3, 2, 2, generator=generator),
+                torch.randn(3, 3, 2, 2, generator=generator),
+                torch.arange(3),
+                ("0", "1", "2"),
+            )
+
+    teacher = DescriptorModel()
+    student_train.freeze_model(teacher)
+    teacher._d1_grad_audit_done = True
+    args = SimpleNamespace(
+        use_negrank_kd=False,
+        use_tagpm_kd=True,
+        experiment_id="G3-test",
+        rank_kd_weight=0.01,
+        rank_kd_warmup_epochs=5,
+        rank_kd_decay=False,
+        rank_kd_temperature=0.2,
+        rank_kd_selection_mode="all",
+        rank_kd_keep_ratio=1.0,
+        rank_kd_d2s_keep_ratio=None,
+        rank_kd_s2d_keep_ratio=None,
+        tagpm_positive_weight=positive_weight,
+        tagpm_margin_weight=margin_weight,
+        tagpm_warmup_epochs=5,
+        tagpm_d2s_enabled=d2s_enabled,
+        tagpm_s2d_enabled=s2d_enabled,
+        tagpm_std_epsilon=1e-12,
+        print_freq=200,
+        grad_clip=0.0,
+        epochs=30,
+    )
+    stats = student_train.train_one_epoch_deepspeed(
+        FakeEngine(),
+        OneBatchLoader(),
+        student_train.Sample4GeoLoss(label_smoothing=0.0),
+        torch.device("cpu"),
+        args,
+        epoch=1,
+        teacher_model=teacher,
+    )
+    log_text = capsys.readouterr().out
+    assert "weighted_tagpm_positive=" in log_text
+    assert "weighted_tagpm_margin=" in log_text
+    assert "loss_negrank" not in log_text
+    assert torch.isfinite(torch.tensor(stats["total_loss"]))
+    assert stats["loss_tagpm_positive_weighted"] == pytest.approx(
+        stats["loss_tagpm_positive"] * positive_weight * 0.2
+    )
+    assert stats["loss_tagpm_margin_weighted"] == pytest.approx(
+        stats["loss_tagpm_margin"] * margin_weight * 0.2
+    )
+    summary = student_train.format_deepspeed_epoch_tagpm_text(stats)
+    assert "D2S_enabled=True" in summary
+    assert f"S2D_enabled={s2d_enabled}" in summary

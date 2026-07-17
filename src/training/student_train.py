@@ -1396,6 +1396,24 @@ def tagpm_weighted_loss_values(batch_losses):
     return positive, margin
 
 
+def validate_tagpm_batch_result(args, batch_losses):
+    if not getattr(args, "use_tagpm_kd", False):
+        return
+    required = {
+        "loss_tagpm_positive",
+        "loss_tagpm_margin",
+        "tagpm_positive_weight_current",
+        "tagpm_margin_weight_current",
+        "tagpm_audit",
+    }
+    missing = sorted(required.difference(batch_losses))
+    if missing:
+        raise RuntimeError(
+            "TAG-PM batch result is incomplete before backward/logging: "
+            f"missing={missing}"
+        )
+
+
 def print_first_runtime_audit(model, criterion, batch_meta, images, batch_losses, args):
     local_gpu_model = (
         torch.cuda.get_device_name(torch.cuda.current_device())
@@ -1904,6 +1922,7 @@ def train_one_epoch(
                 satellite_ids=meta["satellite_ids"],
             )
             loss = batch_losses["loss"]
+            validate_tagpm_batch_result(args, batch_losses)
 
         if scaler.is_enabled():
             scaler.scale(loss).backward()
@@ -2104,6 +2123,7 @@ def train_one_epoch_deepspeed(
             ),
         )
         loss = batch_losses["loss"]
+        validate_tagpm_batch_result(args, batch_losses)
         if not runtime_audit_printed:
             print_first_runtime_audit(
                 model_engine,
@@ -2141,6 +2161,9 @@ def train_one_epoch_deepspeed(
             )
             kd_weight_meter.update(rank_kd_weight_current, images.size(0))
         if "loss_tagpm_positive" in batch_losses:
+            weighted_positive, weighted_margin = tagpm_weighted_loss_values(
+                batch_losses
+            )
             loss_tagpm_positive_meter.update(
                 batch_losses["loss_tagpm_positive"].item(), images.size(0)
             )
@@ -2979,6 +3002,10 @@ def parse_args(argv=None):
         args.tagpm_d2s_enabled or args.tagpm_s2d_enabled
     ):
         parser.error("TAG-PM requires D2S and/or S2D to be enabled")
+    if args.use_tagpm_kd and (
+        args.tagpm_positive_weight + args.tagpm_margin_weight <= 0.0
+    ):
+        parser.error("TAG-PM requires a positive total KD weight")
     if not (0.0 < args.rank_kd_keep_ratio <= 1.0):
         parser.error("--rank_kd_keep_ratio must be in (0, 1]")
     for name in ("rank_kd_d2s_keep_ratio", "rank_kd_s2d_keep_ratio"):
