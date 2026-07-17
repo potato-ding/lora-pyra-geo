@@ -19,6 +19,7 @@ import torch.nn.functional as F
 from torch.amp import GradScaler, autocast
 
 from src.loss.blocks_infoNCE import Sample4GeoLoss
+from src.loss.tagpm_kd import tagpm_kd_loss
 from src.models.student_model import StudentModel
 from src.utils.gather_features_and_labels_and_views import GatherLayer
 from src.utils.initdist import try_init_dist
@@ -136,6 +137,8 @@ def experiment_id(args):
         if mode == "margin_incidence" and d2s_ratio < 1.0:
             return f"D1-MI{int(d2s_ratio * 100):02d}-3090"
         return D1_A_EXPERIMENT_ID
+    if getattr(args, "use_tagpm_kd", False):
+        return "G3-TAGPM-2GPU-3090"
     return B0_EXPERIMENT_ID
 
 
@@ -168,12 +171,15 @@ def print_experiment_configuration(
     print("=" * 80)
     print("[EXPERIMENT CONFIGURATION]")
     print(f"Experiment ID={experiment_id(args)}")
-    print(
-        "KD type=Negative Rank KD"
+    kd_type = (
+        "Negative Rank KD"
         if args.use_negrank_kd
-        else "KD type=None"
+        else "TAG-PM KD"
+        if args.use_tagpm_kd
+        else "None"
     )
-    print(f"KD enabled={bool(args.use_negrank_kd)}")
+    print(f"KD type={kd_type}")
+    print(f"KD enabled={bool(args.use_negrank_kd or args.use_tagpm_kd)}")
     print(f"started_at={started_at}")
     print(f"command={shlex.join(str(part) for part in command_parts)}")
     print(f"git_commit={_git_commit(ROOT)}")
@@ -353,7 +359,7 @@ def load_model_checkpoint_compatible(
 def unpack_sample4geo_batch(batch, device):
     if len(batch) != 4:
         raise ValueError(f"Expected 4 fields from Sample4Geo batch, got {len(batch)}")
-    drone, satellite, _, _ = batch
+    drone, satellite, labels, pids = batch
 
     raw_drone = drone
     raw_satellite = satellite
@@ -377,6 +383,9 @@ def unpack_sample4geo_batch(batch, device):
         "effective_batch": images.size(0),
         "raw_drone_tensor": raw_drone,
         "raw_satellite_tensor": raw_satellite,
+        "drone_ids": labels.to(device, non_blocking=True).long(),
+        "satellite_ids": labels.to(device, non_blocking=True).long(),
+        "pids": tuple(str(pid) for pid in pids),
     }
 
 
@@ -390,12 +399,18 @@ def get_teacher_checkpoint_path(teacher_model_dir, teacher_ckpt_type):
 
 
 def validate_negrank_kd_files(args, parser=None):
-    if not getattr(args, "use_negrank_kd", False):
+    teacher_kd_enabled = bool(
+        getattr(args, "use_negrank_kd", False)
+        or getattr(args, "use_tagpm_kd", False)
+    )
+    if not teacher_kd_enabled:
         args.teacher_checkpoint_path = None
         return
 
     if not args.teacher_model_dir:
-        message = "--teacher_model_dir is required when --use_negrank_kd is enabled"
+        message = (
+            "--teacher_model_dir is required when teacher KD is enabled"
+        )
         if parser is not None:
             parser.error(message)
         raise ValueError(message)
@@ -483,14 +498,16 @@ def build_frozen_teacher_from_run(args, device):
     teacher_args = build_teacher_args_from_metrics(metrics_path, device)
     teacher = TeacherModel(teacher_args)
     teacher.to(device)
+    kd_prefix = "[NegRankKD]" if args.use_negrank_kd else "[TAGPM]"
     load_model_checkpoint_compatible(
         teacher,
         args.teacher_checkpoint_path,
         device,
         require_trainable=True,
-        log_prefix="[NegRankKD][Teacher]",
+        log_prefix=f"{kd_prefix}[Teacher]",
     )
     freeze_model(teacher)
+    teacher._student_kd_log_prefix = kd_prefix
 
     frozen = all(not param.requires_grad for param in teacher.parameters())
     teacher_total_params = sum(param.numel() for param in teacher.parameters())
@@ -498,19 +515,30 @@ def build_frozen_teacher_from_run(args, device):
         param.numel() for param in teacher.parameters() if param.requires_grad
     )
     if is_main_process():
-        print("[NegRankKD] KD type = Negative Rank KD")
-        print("[NegRankKD] KD enabled = True")
-        print(f"[NegRankKD] teacher_checkpoint_path = {args.teacher_checkpoint_path}")
-        print(f"[NegRankKD] teacher_checkpoint_selection = {args.teacher_ckpt_type}")
-        print(f"[NegRankKD] teacher_eval_mode = {not teacher.training}")
-        print(f"[NegRankKD] teacher_total_params = {teacher_total_params}")
-        print(f"[NegRankKD] teacher_trainable_params = {teacher_trainable_params}")
-        print(f"[NegRankKD] neg_rank_kd_weight_target = {args.rank_kd_weight}")
-        print(f"[NegRankKD] neg_rank_kd_temperature = {args.rank_kd_temperature}")
-        print(f"[NegRankKD] neg_rank_kd_warmup_epochs = {args.rank_kd_warmup_epochs}")
+        kd_type = "Negative Rank KD" if args.use_negrank_kd else "TAG-PM KD"
+        print(f"{kd_prefix} KD type = {kd_type}")
+        print(f"{kd_prefix} KD enabled = True")
+        print(f"{kd_prefix} teacher_checkpoint_path = {args.teacher_checkpoint_path}")
+        print(f"{kd_prefix} teacher_checkpoint_selection = {args.teacher_ckpt_type}")
+        print(f"{kd_prefix} teacher_eval_mode = {not teacher.training}")
+        print(f"{kd_prefix} teacher_total_params = {teacher_total_params}")
+        print(f"{kd_prefix} teacher_trainable_params = {teacher_trainable_params}")
+        if args.use_negrank_kd:
+            print(f"{kd_prefix} neg_rank_kd_weight_target = {args.rank_kd_weight}")
+            print(f"{kd_prefix} neg_rank_kd_temperature = {args.rank_kd_temperature}")
+            print(f"{kd_prefix} neg_rank_kd_warmup_epochs = {args.rank_kd_warmup_epochs}")
+        else:
+            print(f"{kd_prefix} tagpm_positive_weight = {args.tagpm_positive_weight}")
+            print(f"{kd_prefix} tagpm_margin_weight = {args.tagpm_margin_weight}")
+            print(f"{kd_prefix} tagpm_warmup_epochs = {args.tagpm_warmup_epochs}")
 
     if not frozen or teacher_trainable_params != 0:
-        raise RuntimeError("NegRankKD teacher must be fully frozen")
+        message = (
+            "NegRankKD teacher must be fully frozen"
+            if args.use_negrank_kd
+            else "TAG-PM teacher must be fully frozen"
+        )
+        raise RuntimeError(message)
     return teacher
 
 
@@ -551,6 +579,7 @@ def audit_clean_student_runtime(
     criterion,
     teacher_model,
     use_negrank_kd=False,
+    use_tagpm_kd=False,
 ):
     raw_model = get_raw_model(model)
     student_class = f"{raw_model.__class__.__module__}.{raw_model.__class__.__name__}"
@@ -583,10 +612,12 @@ def audit_clean_student_runtime(
         errors.append(f"embedding_dim={getattr(raw_model, 'embedding_dim', None)}, expected 512")
     if not isinstance(criterion, Sample4GeoLoss):
         errors.append(f"criterion is not Sample4GeoLoss: {type(criterion)}")
-    if teacher_present != bool(use_negrank_kd):
+    teacher_kd_enabled = bool(use_negrank_kd or use_tagpm_kd)
+    if teacher_present != teacher_kd_enabled:
         errors.append(
-            "teacher presence does not match Negative Rank KD configuration: "
-            f"teacher_present={teacher_present}, use_negrank_kd={use_negrank_kd}"
+            "teacher presence does not match teacher KD configuration: "
+            f"teacher_present={teacher_present}, "
+            f"use_negrank_kd={use_negrank_kd}, use_tagpm_kd={use_tagpm_kd}"
         )
     if extra_student_module_present:
         errors.append(f"unexpected top-level student modules: {extra_child_modules}")
@@ -638,6 +669,11 @@ def gather_tensor_no_grad(tensor):
     gathered = [torch.zeros_like(tensor) for _ in range(get_world_size())]
     dist.all_gather(gathered, tensor.contiguous())
     return torch.cat(gathered, dim=0)
+
+
+def gather_identity_ids(identity_ids):
+    identity_ids = identity_ids.detach().reshape(-1).long()
+    return gather_tensor_no_grad(identity_ids)
 
 
 def gather_paired_views(tensor, pair_batch_size, with_grad=True):
@@ -959,14 +995,31 @@ def current_rank_kd_weight(args, epoch):
     return base_weight
 
 
+def current_tagpm_warmup_factor(args, epoch):
+    warmup_epochs = int(getattr(args, "tagpm_warmup_epochs", 0))
+    if warmup_epochs > 0 and epoch <= warmup_epochs:
+        return float(epoch) / float(warmup_epochs)
+    return 1.0
+
+
 def print_epoch_kd_configuration(args, epoch):
-    if not (is_main_process() and args.use_negrank_kd):
+    if not is_main_process():
         return
-    print(
-        f"[NegRankKD][Epoch Start] epoch={epoch} | "
-        f"target_kd_weight={float(args.rank_kd_weight):.6f} | "
-        f"effective_kd_weight={current_rank_kd_weight(args, epoch):.6f}"
-    )
+    if args.use_negrank_kd:
+        print(
+            f"[NegRankKD][Epoch Start] epoch={epoch} | "
+            f"target_kd_weight={float(args.rank_kd_weight):.6f} | "
+            f"effective_kd_weight={current_rank_kd_weight(args, epoch):.6f}"
+        )
+    elif args.use_tagpm_kd:
+        factor = current_tagpm_warmup_factor(args, epoch)
+        print(
+            f"[TAGPM][Epoch Start] epoch={epoch} | warmup_factor={factor:.6f} | "
+            f"positive_weight={args.tagpm_positive_weight:.6f} | "
+            f"margin_weight={args.tagpm_margin_weight:.6f} | "
+            f"effective_positive_weight={args.tagpm_positive_weight * factor:.6f} | "
+            f"effective_margin_weight={args.tagpm_margin_weight * factor:.6f}"
+        )
 
 
 def print_margin_incidence_configuration(args):
@@ -1040,8 +1093,9 @@ def audit_teacher_gradients_after_backward(teacher_model):
         return
     grad_tensor_count, grad_nonzero_count = teacher_gradient_counts(teacher_model)
     if is_main_process():
+        prefix = getattr(teacher_model, "_student_kd_log_prefix", "[NegRankKD]")
         print(
-            "[NegRankKD][Teacher Gradient Audit] "
+            f"{prefix}[Teacher Gradient Audit] "
             f"teacher_grad_tensor_count={grad_tensor_count} | "
             f"teacher_grad_nonzero_count={grad_nonzero_count}"
         )
@@ -1132,6 +1186,13 @@ def compute_student_batch_losses(
     rank_kd_keep_ratio=1.0,
     rank_kd_d2s_keep_ratio=None,
     rank_kd_s2d_keep_ratio=None,
+    tagpm_positive_weight_current=0.0,
+    tagpm_margin_weight_current=0.0,
+    tagpm_d2s_enabled=True,
+    tagpm_s2d_enabled=True,
+    tagpm_std_epsilon=1e-12,
+    drone_ids=None,
+    satellite_ids=None,
 ):
     effective_d2s_ratio, effective_s2d_ratio = (
         resolve_rank_kd_directional_keep_ratios(
@@ -1154,13 +1215,20 @@ def compute_student_batch_losses(
     )
     loss = loss_infonce
     loss_negrank = None
+    loss_tagpm_positive = None
+    loss_tagpm_margin = None
     student_drone_feat = None
     student_sat_feat = None
     teacher_runtime_audit = None
     kd_runtime_audit = None
     kd_behavior_stats = None
 
-    if teacher_model is not None and rank_kd_weight_current > 0.0:
+    negrank_active = teacher_model is not None and rank_kd_weight_current > 0.0
+    tagpm_active = teacher_model is not None and (
+        tagpm_positive_weight_current > 0.0
+        or tagpm_margin_weight_current > 0.0
+    )
+    if negrank_active or tagpm_active:
         (
             teacher_features,
             teacher_global_pair_batch_size,
@@ -1187,33 +1255,64 @@ def compute_student_batch_losses(
             teacher_features,
             teacher_global_pair_batch_size,
         )
-        negrank_output = negative_aware_cross_view_ranking_kd(
-            student_drone_feat,
-            student_sat_feat,
-            teacher_drone_feat,
-            teacher_sat_feat,
-            rank_kd_temperature,
-            return_audit=bool(audit_runtime or collect_kd_stats),
-            selection_mode=rank_kd_selection_mode,
-            keep_ratio=rank_kd_keep_ratio,
-            d2s_keep_ratio=rank_kd_d2s_keep_ratio,
-            s2d_keep_ratio=rank_kd_s2d_keep_ratio,
-        )
-        if audit_runtime or collect_kd_stats:
-            loss_negrank, kd_runtime_audit = negrank_output
-        else:
-            loss_negrank = negrank_output
-        loss = loss + float(rank_kd_weight_current) * loss_negrank
-        if collect_kd_stats:
-            if rank_kd_selection_mode == "margin_incidence":
-                kd_behavior_stats = kd_runtime_audit["selection"]
+        if negrank_active:
+            negrank_output = negative_aware_cross_view_ranking_kd(
+                student_drone_feat,
+                student_sat_feat,
+                teacher_drone_feat,
+                teacher_sat_feat,
+                rank_kd_temperature,
+                return_audit=bool(audit_runtime or collect_kd_stats),
+                selection_mode=rank_kd_selection_mode,
+                keep_ratio=rank_kd_keep_ratio,
+                d2s_keep_ratio=rank_kd_d2s_keep_ratio,
+                s2d_keep_ratio=rank_kd_s2d_keep_ratio,
+            )
+            if audit_runtime or collect_kd_stats:
+                loss_negrank, kd_runtime_audit = negrank_output
             else:
-                kd_behavior_stats = negative_rank_behavior_stats(
-                    student_drone_feat,
-                    student_sat_feat,
-                    teacher_drone_feat,
-                    teacher_sat_feat,
-                )
+                loss_negrank = negrank_output
+            loss = loss + float(rank_kd_weight_current) * loss_negrank
+            if collect_kd_stats:
+                if rank_kd_selection_mode == "margin_incidence":
+                    kd_behavior_stats = kd_runtime_audit["selection"]
+                else:
+                    kd_behavior_stats = negative_rank_behavior_stats(
+                        student_drone_feat,
+                        student_sat_feat,
+                        teacher_drone_feat,
+                        teacher_sat_feat,
+                    )
+        else:
+            if drone_ids is None or satellite_ids is None:
+                raise ValueError("TAG-PM requires real drone and satellite identity labels")
+            global_drone_ids = gather_identity_ids(drone_ids)
+            global_satellite_ids = gather_identity_ids(satellite_ids)
+            if (
+                global_drone_ids.numel() != global_pair_batch_size
+                or global_satellite_ids.numel() != global_pair_batch_size
+            ):
+                raise RuntimeError("TAG-PM identity gather does not match descriptor gather")
+            (
+                loss_tagpm_positive,
+                loss_tagpm_margin,
+                kd_runtime_audit,
+            ) = tagpm_kd_loss(
+                student_drone_feat,
+                student_sat_feat,
+                teacher_drone_feat,
+                teacher_sat_feat,
+                global_drone_ids,
+                global_satellite_ids,
+                d2s_enabled=tagpm_d2s_enabled,
+                s2d_enabled=tagpm_s2d_enabled,
+                std_epsilon=tagpm_std_epsilon,
+            )
+            loss = (
+                loss
+                + float(tagpm_positive_weight_current) * loss_tagpm_positive
+                + float(tagpm_margin_weight_current) * loss_tagpm_margin
+            )
 
     result = {
         "loss": loss_infonce,
@@ -1258,6 +1357,23 @@ def compute_student_batch_losses(
         result["effective_s2d_keep_ratio"] = effective_s2d_ratio
         if kd_behavior_stats is not None:
             result["kd_behavior_stats"] = kd_behavior_stats
+    if loss_tagpm_positive is not None:
+        result["loss"] = loss
+        result["loss_tagpm_positive"] = loss_tagpm_positive
+        result["loss_tagpm_margin"] = loss_tagpm_margin
+        result["loss_tagpm_positive_weighted"] = (
+            loss_tagpm_positive.detach() * float(tagpm_positive_weight_current)
+        )
+        result["loss_tagpm_margin_weighted"] = (
+            loss_tagpm_margin.detach() * float(tagpm_margin_weight_current)
+        )
+        result["tagpm_positive_weight_current"] = float(
+            tagpm_positive_weight_current
+        )
+        result["tagpm_margin_weight_current"] = float(
+            tagpm_margin_weight_current
+        )
+        result["tagpm_audit"] = kd_runtime_audit
     return result
 
 
@@ -1374,6 +1490,48 @@ def print_first_runtime_audit(model, criterion, batch_meta, images, batch_losses
         print("online_teacher_forward=True")
         print("offline_teacher_cache=False")
         print("same_current_augmented_images=True")
+
+    if batch_losses.get("tagpm_audit") is not None:
+        tagpm_audit = batch_losses["tagpm_audit"]
+        print("[FIRST REAL BATCH TAG-PM AUDIT]")
+        print(f"experiment_id={experiment_id(args)}")
+        print(f"teacher checkpoint path={args.teacher_checkpoint_path}")
+        print("teacher eval mode=True")
+        print("teacher trainable params=0")
+        print("teacher detached=True")
+        print(f"local_pair_batch={local_pair_count}")
+        print(f"global_pair_batch={global_pair_count}")
+        print(f"world_size={world_size}")
+        print(f"cross_gpu_gather_actually_effective={cross_gpu_effective}")
+        print("identity_masked=True")
+        print("multi_positive_supported=True")
+        print(f"similarity_dtype={_dtype_name(tagpm_audit['similarity_dtype'])}")
+        print(f"statistics_dtype={_dtype_name(tagpm_audit['statistics_dtype'])}")
+        print(f"loss_dtype={_dtype_name(tagpm_audit['loss_dtype'])}")
+        print(f"std_epsilon={tagpm_audit['std_epsilon']}")
+        for direction in ("D2S", "S2D"):
+            direction_audit = tagpm_audit.get(direction)
+            print(f"{direction}_enabled={direction_audit is not None}")
+            if direction_audit is None:
+                continue
+            for name, value in direction_audit.items():
+                print(f"{direction}_{name}={value}")
+        print(
+            "raw_positive_loss="
+            f"{batch_losses['loss_tagpm_positive'].item():.6f}"
+        )
+        print(
+            "raw_margin_loss="
+            f"{batch_losses['loss_tagpm_margin'].item():.6f}"
+        )
+        print(
+            "weighted_positive_loss="
+            f"{batch_losses['loss_tagpm_positive_weighted'].item():.6f}"
+        )
+        print(
+            "weighted_margin_loss="
+            f"{batch_losses['loss_tagpm_margin_weighted'].item():.6f}"
+        )
 
     if batch_losses.get("rank_kd_selection_mode") == "margin_incidence":
         selection = kd_audit.get("selection") or {}
@@ -1677,6 +1835,8 @@ def train_one_epoch(
     loss_total_meter = AverageMeter()
     loss_retrieval_meter = AverageMeter()
     loss_negrank_meter = AverageMeter()
+    loss_tagpm_positive_meter = AverageMeter()
+    loss_tagpm_margin_meter = AverageMeter()
     kd_weight_meter = AverageMeter()
     end = time.time()
 
@@ -1693,6 +1853,7 @@ def train_one_epoch(
 
         optimizer.zero_grad(set_to_none=True)
         rank_kd_weight_current = current_rank_kd_weight(args, epoch)
+        tagpm_factor = current_tagpm_warmup_factor(args, epoch)
         with autocast(device_type="cuda", enabled=use_amp):
             batch_losses = compute_student_batch_losses(
                 model,
@@ -1706,6 +1867,19 @@ def train_one_epoch(
                 rank_kd_keep_ratio=args.rank_kd_keep_ratio,
                 rank_kd_d2s_keep_ratio=args.rank_kd_d2s_keep_ratio,
                 rank_kd_s2d_keep_ratio=args.rank_kd_s2d_keep_ratio,
+                tagpm_positive_weight_current=(
+                    args.tagpm_positive_weight * tagpm_factor
+                    if args.use_tagpm_kd else 0.0
+                ),
+                tagpm_margin_weight_current=(
+                    args.tagpm_margin_weight * tagpm_factor
+                    if args.use_tagpm_kd else 0.0
+                ),
+                tagpm_d2s_enabled=args.tagpm_d2s_enabled,
+                tagpm_s2d_enabled=args.tagpm_s2d_enabled,
+                tagpm_std_epsilon=args.tagpm_std_epsilon,
+                drone_ids=meta["drone_ids"],
+                satellite_ids=meta["satellite_ids"],
             )
             loss = batch_losses["loss"]
 
@@ -1734,6 +1908,13 @@ def train_one_epoch(
         if "loss_negrank" in batch_losses:
             loss_negrank_meter.update(batch_losses["loss_negrank"].item(), images.size(0))
             kd_weight_meter.update(rank_kd_weight_current, images.size(0))
+        if "loss_tagpm_positive" in batch_losses:
+            loss_tagpm_positive_meter.update(
+                batch_losses["loss_tagpm_positive"].item(), images.size(0)
+            )
+            loss_tagpm_margin_meter.update(
+                batch_losses["loss_tagpm_margin"].item(), images.size(0)
+            )
         batch_time.update(time.time() - end)
         end = time.time()
 
@@ -1745,6 +1926,11 @@ def train_one_epoch(
                     f"({loss_negrank_meter.avg:.4f}) | "
                     f"rank_kd_weight_current {rank_kd_weight_current:.6f} | "
                     f"rank_kd_temperature {args.rank_kd_temperature:.4f} | "
+                ) if args.use_negrank_kd else (
+                    f"tagpm_positive_loss {loss_tagpm_positive_meter.val:.4f} "
+                    f"({loss_tagpm_positive_meter.avg:.4f}) | "
+                    f"tagpm_margin_loss {loss_tagpm_margin_meter.val:.4f} "
+                    f"({loss_tagpm_margin_meter.avg:.4f}) | "
                 )
             print(
                 f"Epoch [{epoch}/{args.epochs}] "
@@ -1766,9 +1952,13 @@ def train_one_epoch(
         "loss_retrieval": loss_retrieval_meter.avg,
     }
     if teacher_model is not None:
-        stats["loss_negrank"] = loss_negrank_meter.avg
-        stats["rank_kd_weight_current"] = kd_weight_meter.avg
-        stats["rank_kd_temperature"] = float(args.rank_kd_temperature)
+        if args.use_negrank_kd:
+            stats["loss_negrank"] = loss_negrank_meter.avg
+            stats["rank_kd_weight_current"] = kd_weight_meter.avg
+            stats["rank_kd_temperature"] = float(args.rank_kd_temperature)
+        else:
+            stats["loss_tagpm_positive"] = loss_tagpm_positive_meter.avg
+            stats["loss_tagpm_margin"] = loss_tagpm_margin_meter.avg
     return stats
 
 
@@ -1795,6 +1985,10 @@ def train_one_epoch_deepspeed(
     loss_s2d_meter = AverageMeter()
     loss_negrank_meter = AverageMeter()
     loss_negrank_weighted_meter = AverageMeter()
+    loss_tagpm_positive_meter = AverageMeter()
+    loss_tagpm_margin_meter = AverageMeter()
+    loss_tagpm_positive_weighted_meter = AverageMeter()
+    loss_tagpm_margin_weighted_meter = AverageMeter()
     kd_weight_meter = AverageMeter()
     valid_ranking_pair_meter = AverageMeter()
     total_ranking_pair_meter = AverageMeter()
@@ -1809,6 +2003,21 @@ def train_one_epoch_deepspeed(
     )
     mi_meters = {
         direction: {name: AverageMeter() for name in mi_metric_names}
+        for direction in ("D2S", "S2D")
+    }
+    tagpm_metric_names = (
+        "teacher_correct_ratio",
+        "positive_gate_ratio",
+        "margin_gate_ratio",
+        "student_z_positive_mean",
+        "teacher_z_positive_mean",
+        "student_z_margin_mean",
+        "teacher_z_margin_mean",
+        "positive_gap_mean",
+        "margin_gap_mean",
+    )
+    tagpm_meters = {
+        direction: {name: AverageMeter() for name in tagpm_metric_names}
         for direction in ("D2S", "S2D")
     }
     batch_time = AverageMeter()
@@ -1834,6 +2043,7 @@ def train_one_epoch_deepspeed(
         )
 
         rank_kd_weight_current = current_rank_kd_weight(args, epoch)
+        tagpm_factor = current_tagpm_warmup_factor(args, epoch)
         batch_losses = compute_student_batch_losses(
             model_engine,
             images,
@@ -1846,6 +2056,19 @@ def train_one_epoch_deepspeed(
             rank_kd_keep_ratio=args.rank_kd_keep_ratio,
             rank_kd_d2s_keep_ratio=args.rank_kd_d2s_keep_ratio,
             rank_kd_s2d_keep_ratio=args.rank_kd_s2d_keep_ratio,
+            tagpm_positive_weight_current=(
+                args.tagpm_positive_weight * tagpm_factor
+                if args.use_tagpm_kd else 0.0
+            ),
+            tagpm_margin_weight_current=(
+                args.tagpm_margin_weight * tagpm_factor
+                if args.use_tagpm_kd else 0.0
+            ),
+            tagpm_d2s_enabled=args.tagpm_d2s_enabled,
+            tagpm_s2d_enabled=args.tagpm_s2d_enabled,
+            tagpm_std_epsilon=args.tagpm_std_epsilon,
+            drone_ids=meta["drone_ids"],
+            satellite_ids=meta["satellite_ids"],
             audit_runtime=not runtime_audit_printed,
             collect_kd_stats=bool(
                 teacher_model is not None
@@ -1892,6 +2115,21 @@ def train_one_epoch_deepspeed(
                 images.size(0),
             )
             kd_weight_meter.update(rank_kd_weight_current, images.size(0))
+        if "loss_tagpm_positive" in batch_losses:
+            loss_tagpm_positive_meter.update(
+                batch_losses["loss_tagpm_positive"].item(), images.size(0)
+            )
+            loss_tagpm_margin_meter.update(
+                batch_losses["loss_tagpm_margin"].item(), images.size(0)
+            )
+            loss_tagpm_positive_weighted_meter.update(
+                batch_losses["loss_tagpm_positive_weighted"].item(),
+                images.size(0),
+            )
+            loss_tagpm_margin_weighted_meter.update(
+                batch_losses["loss_tagpm_margin_weighted"].item(),
+                images.size(0),
+            )
         behavior = batch_losses.get("kd_behavior_stats")
         if behavior is not None:
             if args.rank_kd_selection_mode == "margin_incidence":
@@ -1908,6 +2146,16 @@ def train_one_epoch_deepspeed(
                 kd_coverage_meter.update(behavior["kd_coverage_ratio"])
                 ranking_agreement_meter.update(behavior["ranking_agreement"])
                 violation_ratio_meter.update(behavior["violation_ratio"])
+        tagpm_audit = batch_losses.get("tagpm_audit")
+        if tagpm_audit is not None:
+            for direction in ("D2S", "S2D"):
+                direction_audit = tagpm_audit.get(direction)
+                if direction_audit is None:
+                    continue
+                for metric_name in tagpm_metric_names:
+                    tagpm_meters[direction][metric_name].update(
+                        direction_audit[metric_name]
+                    )
         batch_time.update(time.time() - end)
         end = time.time()
 
@@ -1924,8 +2172,21 @@ def train_one_epoch_deepspeed(
                     f"legacy_rank_kd_keep_ratio={args.rank_kd_keep_ratio} | "
                     f"D2S_keep_ratio={effective_d2s_ratio} | "
                     f"S2D_keep_ratio={effective_s2d_ratio} | "
+                ) if args.use_negrank_kd else (
+                    f"tagpm_positive_loss={loss_tagpm_positive_meter.val:.6f} | "
+                    f"tagpm_margin_loss={loss_tagpm_margin_meter.val:.6f} | "
+                    f"weighted_tagpm_positive="
+                    f"{batch_losses['loss_tagpm_positive_weighted'].item():.6f} | "
+                    f"weighted_tagpm_margin="
+                    f"{batch_losses['loss_tagpm_margin_weighted'].item():.6f} | "
+                    f"tagpm_warmup_factor={tagpm_factor:.6f} | "
+                    f"tagpm_positive_weight_current="
+                    f"{batch_losses['tagpm_positive_weight_current']:.6f} | "
+                    f"tagpm_margin_weight_current="
+                    f"{batch_losses['tagpm_margin_weight_current']:.6f} | "
+                    f"tagpm_stats={batch_losses['tagpm_audit']} | "
                 )
-                if args.rank_kd_selection_mode == "margin_incidence":
+                if args.use_negrank_kd and args.rank_kd_selection_mode == "margin_incidence":
                     d2s = behavior["D2S"]
                     s2d = behavior["S2D"]
                     combined_count = d2s["selected_count_per_anchor"] + s2d["selected_count_per_anchor"]
@@ -1955,7 +2216,7 @@ def train_one_epoch_deepspeed(
                         f"combined_retained_teacher_probability_mass={(d2s['retained_teacher_probability_mass'] + s2d['retained_teacher_probability_mass']) / 2:.6f} | "
                         f"combined_selected_ranking_agreement={(d2s['selected_ranking_agreement'] + s2d['selected_ranking_agreement']) / 2:.6f} | "
                     )
-                else:
+                elif args.use_negrank_kd:
                     negrank_text += (
                         f"valid_ranking_pair_count {behavior['valid_ranking_pair_count']} | "
                         f"total_possible_ranking_pair_count {behavior['total_possible_ranking_pair_count']} | "
@@ -2007,18 +2268,36 @@ def train_one_epoch_deepspeed(
         "last_grad_norm_source": last_grad_norm_source,
     }
     if teacher_model is not None:
-        stats["loss_negrank"] = loss_negrank_meter.avg
-        stats["loss_negrank_weighted"] = loss_negrank_weighted_meter.avg
-        stats["rank_kd_weight_current"] = kd_weight_meter.avg
-        stats["rank_kd_temperature"] = float(args.rank_kd_temperature)
-        stats["rank_kd_selection_mode"] = args.rank_kd_selection_mode
-        stats["rank_kd_keep_ratio"] = float(args.rank_kd_keep_ratio)
-        stats["legacy_rank_kd_keep_ratio"] = float(args.rank_kd_keep_ratio)
-        stats["rank_kd_d2s_keep_ratio"] = args.rank_kd_d2s_keep_ratio
-        stats["rank_kd_s2d_keep_ratio"] = args.rank_kd_s2d_keep_ratio
-        stats["effective_d2s_keep_ratio"] = effective_d2s_ratio
-        stats["effective_s2d_keep_ratio"] = effective_s2d_ratio
-        if args.rank_kd_selection_mode == "margin_incidence":
+        if args.use_tagpm_kd:
+            stats["loss_tagpm_positive"] = loss_tagpm_positive_meter.avg
+            stats["loss_tagpm_margin"] = loss_tagpm_margin_meter.avg
+            stats["loss_tagpm_positive_weighted"] = (
+                loss_tagpm_positive_weighted_meter.avg
+            )
+            stats["loss_tagpm_margin_weighted"] = (
+                loss_tagpm_margin_weighted_meter.avg
+            )
+            stats["tagpm_warmup_factor"] = current_tagpm_warmup_factor(args, epoch)
+            for direction in ("D2S", "S2D"):
+                for metric_name in tagpm_metric_names:
+                    stats[f"tagpm_{direction}_{metric_name}"] = (
+                        average_meter_value_or_none(
+                            tagpm_meters[direction][metric_name]
+                        )
+                    )
+        else:
+            stats["loss_negrank"] = loss_negrank_meter.avg
+            stats["loss_negrank_weighted"] = loss_negrank_weighted_meter.avg
+            stats["rank_kd_weight_current"] = kd_weight_meter.avg
+            stats["rank_kd_temperature"] = float(args.rank_kd_temperature)
+            stats["rank_kd_selection_mode"] = args.rank_kd_selection_mode
+            stats["rank_kd_keep_ratio"] = float(args.rank_kd_keep_ratio)
+            stats["legacy_rank_kd_keep_ratio"] = float(args.rank_kd_keep_ratio)
+            stats["rank_kd_d2s_keep_ratio"] = args.rank_kd_d2s_keep_ratio
+            stats["rank_kd_s2d_keep_ratio"] = args.rank_kd_s2d_keep_ratio
+            stats["effective_d2s_keep_ratio"] = effective_d2s_ratio
+            stats["effective_s2d_keep_ratio"] = effective_s2d_ratio
+        if args.use_negrank_kd and args.rank_kd_selection_mode == "margin_incidence":
             d2s_selected_count = half_up_candidate_count(effective_d2s_ratio, 31)
             s2d_selected_count = half_up_candidate_count(effective_s2d_ratio, 31)
             stats["mi_D2S_selected_count_per_anchor"] = d2s_selected_count
@@ -2053,7 +2332,7 @@ def train_one_epoch_deepspeed(
             stats["kd_coverage_ratio"] = (
                 d2s_selected_count + s2d_selected_count
             ) / 62.0
-        else:
+        elif args.use_negrank_kd:
             stats["valid_ranking_pair_count"] = valid_ranking_pair_meter.avg
             stats["total_possible_ranking_pair_count"] = total_ranking_pair_meter.avg
             stats["kd_coverage_ratio"] = kd_coverage_meter.avg
@@ -2145,6 +2424,9 @@ def train(
                 f" | loss_negrank={train_stats['loss_negrank']:.4f}"
                 f" | rank_kd_weight_current={train_stats['rank_kd_weight_current']:.6f}"
                 f" | rank_kd_temperature={train_stats['rank_kd_temperature']:.4f}"
+            ) if args.use_negrank_kd else (
+                f" | tagpm_positive_loss={train_stats['loss_tagpm_positive']:.4f}"
+                f" | tagpm_margin_loss={train_stats['loss_tagpm_margin']:.4f}"
             )
         print(
             f"[Train] Epoch {epoch}/{args.epochs} | "
@@ -2255,6 +2537,46 @@ def format_deepspeed_epoch_negrank_text(train_stats):
     )
 
 
+def format_deepspeed_epoch_tagpm_text(train_stats):
+    text = (
+        f" | tagpm_positive_loss={train_stats['loss_tagpm_positive']:.6f}"
+        f" | tagpm_margin_loss={train_stats['loss_tagpm_margin']:.6f}"
+        f" | weighted_tagpm_positive="
+        f"{train_stats['loss_tagpm_positive_weighted']:.6f}"
+        f" | weighted_tagpm_margin="
+        f"{train_stats['loss_tagpm_margin_weighted']:.6f}"
+        f" | tagpm_warmup_factor={train_stats['tagpm_warmup_factor']:.6f}"
+    )
+    for direction in ("D2S", "S2D"):
+        teacher_correct = train_stats.get(
+            f"tagpm_{direction}_teacher_correct_ratio"
+        )
+        if teacher_correct is None:
+            text += f" | {direction}_enabled=False"
+            continue
+        text += (
+            f" | {direction}_enabled=True"
+            f" | {direction}_teacher_correct_coverage={teacher_correct:.6f}"
+            f" | {direction}_positive_gate_coverage="
+            f"{train_stats[f'tagpm_{direction}_positive_gate_ratio']:.6f}"
+            f" | {direction}_margin_gate_coverage="
+            f"{train_stats[f'tagpm_{direction}_margin_gate_ratio']:.6f}"
+            f" | {direction}_student_z_positive="
+            f"{train_stats[f'tagpm_{direction}_student_z_positive_mean']:.6f}"
+            f" | {direction}_teacher_z_positive="
+            f"{train_stats[f'tagpm_{direction}_teacher_z_positive_mean']:.6f}"
+            f" | {direction}_student_z_margin="
+            f"{train_stats[f'tagpm_{direction}_student_z_margin_mean']:.6f}"
+            f" | {direction}_teacher_z_margin="
+            f"{train_stats[f'tagpm_{direction}_teacher_z_margin_mean']:.6f}"
+            f" | {direction}_positive_gap="
+            f"{train_stats[f'tagpm_{direction}_positive_gap_mean']:.6f}"
+            f" | {direction}_margin_gap="
+            f"{train_stats[f'tagpm_{direction}_margin_gap_mean']:.6f}"
+        )
+    return text
+
+
 def train_deepspeed(
     model_engine,
     train_loader,
@@ -2293,7 +2615,11 @@ def train_deepspeed(
         if is_main_process():
             negrank_text = ""
             if teacher_model is not None:
-                negrank_text = format_deepspeed_epoch_negrank_text(train_stats)
+                negrank_text = (
+                    format_deepspeed_epoch_negrank_text(train_stats)
+                    if args.use_negrank_kd
+                    else format_deepspeed_epoch_tagpm_text(train_stats)
+                )
             print(
                 f"[Train] Epoch {epoch}/{args.epochs} | "
                 f"retrieval_loss={train_stats['loss_retrieval']:.4f} | "
@@ -2368,19 +2694,46 @@ def train_deepspeed(
             print(f"average D2S loss={train_stats['loss_d2s']:.6f}")
             print(f"average S2D loss={train_stats['loss_s2d']:.6f}")
             if teacher_model is not None:
-                print(f"average raw Negative Rank KD loss={train_stats['loss_negrank']:.6f}")
-                print(
-                    "average weighted Negative Rank KD loss="
-                    f"{train_stats['loss_negrank_weighted']:.6f}"
-                )
-                print(
-                    "effective KD weight="
-                    f"{train_stats['rank_kd_weight_current']:.6f}"
-                )
                 print(f"experiment_id={experiment_id(args)}")
-                print(f"selection mode={train_stats['rank_kd_selection_mode']}")
-                print(f"legacy_rank_kd_keep_ratio={train_stats['legacy_rank_kd_keep_ratio']}")
-                if train_stats["rank_kd_selection_mode"] == "margin_incidence":
+                if args.use_tagpm_kd:
+                    print(
+                        "average raw TAG-PM positive loss="
+                        f"{train_stats['loss_tagpm_positive']:.6f}"
+                    )
+                    print(
+                        "average raw TAG-PM margin loss="
+                        f"{train_stats['loss_tagpm_margin']:.6f}"
+                    )
+                    print(
+                        "average weighted TAG-PM positive loss="
+                        f"{train_stats['loss_tagpm_positive_weighted']:.6f}"
+                    )
+                    print(
+                        "average weighted TAG-PM margin loss="
+                        f"{train_stats['loss_tagpm_margin_weighted']:.6f}"
+                    )
+                    print(
+                        f"TAG-PM warmup factor={train_stats['tagpm_warmup_factor']:.6f}"
+                    )
+                    print(f"D2S enabled={args.tagpm_d2s_enabled}")
+                    print(f"S2D enabled={args.tagpm_s2d_enabled}")
+                    print(
+                        "TAG-PM direction statistics"
+                        f"{format_deepspeed_epoch_tagpm_text(train_stats)}"
+                    )
+                else:
+                    print(f"average raw Negative Rank KD loss={train_stats['loss_negrank']:.6f}")
+                    print(
+                        "average weighted Negative Rank KD loss="
+                        f"{train_stats['loss_negrank_weighted']:.6f}"
+                    )
+                    print(
+                        "effective KD weight="
+                        f"{train_stats['rank_kd_weight_current']:.6f}"
+                    )
+                    print(f"selection mode={train_stats['rank_kd_selection_mode']}")
+                    print(f"legacy_rank_kd_keep_ratio={train_stats['legacy_rank_kd_keep_ratio']}")
+                if args.use_negrank_kd and train_stats["rank_kd_selection_mode"] == "margin_incidence":
                     print(f"D2S_keep_ratio={train_stats['effective_d2s_keep_ratio']}")
                     print(f"D2S_selected_count_per_anchor={train_stats['mi_D2S_selected_count_per_anchor']}")
                     print(f"D2S_actual_selected_ratio={train_stats['mi_D2S_actual_selected_ratio']:.15f}")
@@ -2404,7 +2757,7 @@ def train_deepspeed(
                     print(f"combined selected ranking agreement={train_stats['mi_combined_selected_ranking_agreement']:.6f}")
                     print(f"combined retained teacher probability mass={train_stats['mi_combined_retained_teacher_probability_mass']:.6f}")
                     print(f"average KD coverage ratio={train_stats['kd_coverage_ratio']:.6f}")
-                else:
+                elif args.use_negrank_kd:
                     print(
                         "average valid ranking pair count="
                         f"{train_stats['valid_ranking_pair_count']:.2f}"
@@ -2518,6 +2871,7 @@ def parse_args(argv=None):
     parser.add_argument("--save_last", dest="save_last", action="store_true", default=True)
     parser.add_argument("--no_save_last", dest="save_last", action="store_false")
     parser.add_argument("--use_negrank_kd", action="store_true", default=False)
+    parser.add_argument("--use_tagpm_kd", action="store_true", default=False)
     parser.add_argument("--experiment_id", type=str, default=None)
     parser.add_argument("--teacher_model_dir", type=str, default=None)
     parser.add_argument(
@@ -2545,6 +2899,24 @@ def parse_args(argv=None):
         const=True,
         default=False,
     )
+    parser.add_argument("--tagpm_positive_weight", type=float, default=0.005)
+    parser.add_argument("--tagpm_margin_weight", type=float, default=0.005)
+    parser.add_argument("--tagpm_warmup_epochs", type=int, default=5)
+    parser.add_argument(
+        "--tagpm_d2s_enabled",
+        type=str2bool,
+        nargs="?",
+        const=True,
+        default=True,
+    )
+    parser.add_argument(
+        "--tagpm_s2d_enabled",
+        type=str2bool,
+        nargs="?",
+        const=True,
+        default=True,
+    )
+    parser.add_argument("--tagpm_std_epsilon", type=float, default=1e-12)
 
     args = parser.parse_args(argv)
     args.teacher_checkpoint_path = None
@@ -2564,6 +2936,20 @@ def parse_args(argv=None):
         parser.error("--rank_kd_temperature must be greater than 0")
     if args.rank_kd_warmup_epochs < 0:
         parser.error("--rank_kd_warmup_epochs must be non-negative")
+    if args.use_negrank_kd and args.use_tagpm_kd:
+        parser.error("--use_negrank_kd and --use_tagpm_kd are mutually exclusive")
+    if args.tagpm_positive_weight < 0.0:
+        parser.error("--tagpm_positive_weight must be non-negative")
+    if args.tagpm_margin_weight < 0.0:
+        parser.error("--tagpm_margin_weight must be non-negative")
+    if args.tagpm_warmup_epochs < 0:
+        parser.error("--tagpm_warmup_epochs must be non-negative")
+    if args.tagpm_std_epsilon <= 0.0:
+        parser.error("--tagpm_std_epsilon must be greater than 0")
+    if args.use_tagpm_kd and not (
+        args.tagpm_d2s_enabled or args.tagpm_s2d_enabled
+    ):
+        parser.error("TAG-PM requires D2S and/or S2D to be enabled")
     if not (0.0 < args.rank_kd_keep_ratio <= 1.0):
         parser.error("--rank_kd_keep_ratio must be in (0, 1]")
     for name in ("rank_kd_d2s_keep_ratio", "rank_kd_s2d_keep_ratio"):
@@ -2660,13 +3046,14 @@ def main():
 
     print_trainable_parameter_summary(model)
     teacher_model = None
-    if args.use_negrank_kd:
+    if args.use_negrank_kd or args.use_tagpm_kd:
         teacher_model = build_frozen_teacher_from_run(args, device)
     audit_clean_student_runtime(
         model,
         criterion,
         teacher_model,
         use_negrank_kd=args.use_negrank_kd,
+        use_tagpm_kd=args.use_tagpm_kd,
     )
 
     if args.deepspeed:
