@@ -977,6 +977,8 @@ def negative_rank_behavior_stats(
 
 
 def current_rank_kd_weight(args, epoch):
+    if hasattr(args, "use_negrank_kd") and not args.use_negrank_kd:
+        return 0.0
     base_weight = float(getattr(args, "rank_kd_weight", 0.0))
     if base_weight <= 0.0:
         return 0.0
@@ -1228,6 +1230,10 @@ def compute_student_batch_losses(
         tagpm_positive_weight_current > 0.0
         or tagpm_margin_weight_current > 0.0
     )
+    if negrank_active and tagpm_active:
+        raise RuntimeError(
+            "Negative Rank KD and TAG-PM KD cannot be active in the same batch"
+        )
     if negrank_active or tagpm_active:
         (
             teacher_features,

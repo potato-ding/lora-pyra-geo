@@ -255,3 +255,37 @@ def test_four_g3_experiment_weights_sum_to_point_zero_one(
 def test_tagpm_and_negrank_are_mutually_exclusive(tmp_path):
     with pytest.raises(SystemExit):
         student_train.parse_args(["--use_tagpm_kd", "--use_negrank_kd"])
+
+
+def test_tagpm_configuration_forces_legacy_rank_kd_weight_inactive(tmp_path):
+    teacher_dir = _teacher_run(tmp_path)
+    args = student_train.parse_args([
+        "--use_tagpm_kd",
+        "--teacher_model_dir", str(teacher_dir),
+        "--rank_kd_weight", "0.01",
+    ])
+    assert args.rank_kd_weight == 0.01
+    assert student_train.current_rank_kd_weight(args, epoch=1) == 0.0
+
+
+def test_batch_loss_rejects_accidental_simultaneous_kd_activation():
+    class FeatureModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.logit_scale = nn.Parameter(torch.tensor(0.0))
+
+        def forward(self, value):
+            return F.normalize(value.float(), dim=1)
+
+    with pytest.raises(RuntimeError, match="cannot be active"):
+        student_train.compute_student_batch_losses(
+            FeatureModel(),
+            torch.randn(6, 4),
+            3,
+            student_train.Sample4GeoLoss(label_smoothing=0.0),
+            teacher_model=FeatureModel().eval(),
+            rank_kd_weight_current=0.002,
+            tagpm_positive_weight_current=0.002,
+            drone_ids=torch.arange(3),
+            satellite_ids=torch.arange(3),
+        )
