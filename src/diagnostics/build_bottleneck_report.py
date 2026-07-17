@@ -52,6 +52,14 @@ def build_report(result_root, probe_root):
         payload = read_json(path)
         require_parity_passed(payload["parity_audit"]["student"], f"{path}:student")
         require_parity_passed(payload["parity_audit"]["teacher"], f"{path}:teacher")
+        require_parity_passed(
+            payload["parity_audit"]["student_query_level_top1"],
+            f"{path}:student_query_level_top1",
+        )
+        require_parity_passed(
+            payload["parity_audit"]["teacher_query_level_top1"],
+            f"{path}:teacher_query_level_top1",
+        )
         key = protocol_key(dataset, height, direction)
         report["protocols"][key] = {
             "B0": payload["student_metrics"],

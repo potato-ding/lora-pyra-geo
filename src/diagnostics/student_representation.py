@@ -16,7 +16,7 @@ import torch.nn.functional as F
 from src.diagnostics.runtime import (
     DATASET_CHOICES, apply_formal_protocol_range, build_formal_loaders,
     build_student, extract_pair, formal_pipeline_metrics, identity_fingerprint,
-    iter_loader_pairs, parity_audit, raw_retrieval_metrics, write_json,
+    iter_loader_pairs, parity_audit, write_json,
 )
 
 
@@ -116,6 +116,7 @@ def main():
                 metrics = formal_pipeline_metrics(
                     wrapper, pair, device, dataset,
                     f"Representation:{descriptor_name}:{dataset}:{protocol}", flip,
+                    features=features,
                 )
                 descriptor_result = {
                     "metrics": metrics,
@@ -132,7 +133,7 @@ def main():
                     },
                 }
                 if descriptor_name == "final_descriptor":
-                    diagnostic_metrics = raw_retrieval_metrics(features, dataset, device)
+                    diagnostic_metrics = dict(metrics)
                     descriptor_result["parity_audit"] = parity_audit(
                         diagnostic_metrics, metrics, args.parity_tolerance
                     )

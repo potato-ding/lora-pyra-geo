@@ -182,6 +182,38 @@ class ExtractFeaturesDistTest(unittest.TestCase):
         self.assertEqual(r10, 100.0)
         self.assertEqual(mean_ap, 100.0)
 
+    def test_formal_metrics_accept_precomputed_features_without_second_forward(self):
+        loader = DataLoader([0, 1], batch_size=2, shuffle=False)
+        query_features = torch.eye(2, dtype=torch.float32)
+        labels = torch.arange(2, dtype=torch.long)
+        coords = torch.tensor([[0.0, 0.0], [1.0, 0.0]], dtype=torch.float32)
+        precomputed = (
+            query_features, labels, coords,
+            query_features, labels, coords,
+        )
+
+        with unittest.mock.patch.object(
+            train_eval_utils,
+            "extract_features_dist",
+            side_effect=AssertionError("precomputed path must not extract again"),
+        ):
+            u1652 = train_eval_utils.getdist_1652_val_and_get_recall(
+                IdentityModel(), loader, loader, torch.device("cpu"),
+                precomputed_features=precomputed,
+            )
+            sues = train_eval_utils.run_sues_val_and_get_metrics(
+                IdentityModel(), loader, loader, torch.device("cpu"),
+                precomputed_features=precomputed,
+            )
+            gta = train_eval_utils.run_gta_val_and_get_metrics(
+                IdentityModel(), loader, loader, torch.device("cpu"),
+                precomputed_features=precomputed,
+            )
+
+        self.assertEqual(u1652, (100.0, 100.0, 100.0, 100.0))
+        self.assertEqual(sues["R@1"], 100.0)
+        self.assertEqual(gta["R@1"], 100.0)
+
     def test_stage_name_logging_is_quiet_by_default(self):
         loader = DataLoader(TinyIndexedDataset(), batch_size=2, shuffle=False)
         output = io.StringIO()

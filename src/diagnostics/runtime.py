@@ -156,21 +156,34 @@ def apply_formal_protocol_range(features, pair, dataset):
     return result
 
 
-def formal_pipeline_metrics(model, pair, device, dataset, task_name, horizontal_flip=False):
-    """Reuse the unchanged formal evaluation entry point for parity truth."""
+def formal_pipeline_metrics(
+    model, pair, device, dataset, task_name, horizontal_flip=False, features=None
+):
+    """Reuse formal metrics, optionally on the diagnosis' already-extracted descriptors."""
     query_loader, gallery_loader = pair
+    precomputed = None
+    if features is not None:
+        precomputed = (
+            features["query_features"], features["query_labels"], features["query_coords"],
+            features["gallery_features"], features["gallery_labels"], features["gallery_coords"],
+        )
     if dataset == "1652":
         r1, r5, r10, mean_ap = getdist_1652_val_and_get_recall(
-            model, query_loader, gallery_loader, device, task_name=task_name
+            model, query_loader, gallery_loader, device, task_name=task_name,
+            precomputed_features=precomputed,
         )
         return {"R@1": r1, "R@5": r5, "R@10": r10, "mAP": mean_ap}
     if dataset == "SUES-200":
         return run_sues_val_and_get_metrics(
             model, query_loader, gallery_loader, device,
             horizontal_flip=horizontal_flip,
+            precomputed_features=precomputed,
         )
     if dataset == "GTA-UAV":
-        return run_gta_val_and_get_metrics(model, query_loader, gallery_loader, device)
+        return run_gta_val_and_get_metrics(
+            model, query_loader, gallery_loader, device,
+            precomputed_features=precomputed,
+        )
     raise ValueError(dataset)
 
 

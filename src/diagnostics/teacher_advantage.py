@@ -16,8 +16,8 @@ from src.diagnostics.runtime import (
     DATASET_CHOICES, apply_formal_protocol_range, build_formal_loaders,
     build_student, build_teacher, dataset_paths, extract_pair,
     formal_pipeline_metrics, identity_fingerprint, iter_loader_pairs,
-    module_state_versions, parity_audit, raw_retrieval_metrics,
-    runtime_audit_dict, write_csv, write_json,
+    module_state_versions, parity_audit, runtime_audit_dict, write_csv,
+    write_json,
 )
 
 
@@ -79,10 +79,11 @@ def main():
         teacher_features = apply_formal_protocol_range(teacher_features, pair, args.dataset)
         teacher_runtime = runtime_audit_dict(teacher)
         print(f"[GapDiagnosis] teacher_runtime={teacher_runtime}")
-        teacher_diagnostic_metrics = raw_retrieval_metrics(teacher_features, args.dataset, device)
         teacher_metrics = formal_pipeline_metrics(
-            teacher, pair, device, args.dataset, f"Parity:T0:{protocol}", flip
+            teacher, pair, device, args.dataset, f"Parity:T0:{protocol}", flip,
+            features=teacher_features,
         )
+        teacher_diagnostic_metrics = dict(teacher_metrics)
         teacher_parity = parity_audit(
             teacher_diagnostic_metrics, teacher_metrics, args.parity_tolerance
         )
@@ -107,11 +108,11 @@ def main():
                 raise RuntimeError("student parameters or buffers changed during diagnosis")
             if not teacher_state_unchanged:
                 raise RuntimeError("teacher parameters or buffers changed during diagnosis")
-            student_diagnostic_metrics = raw_retrieval_metrics(student_features, args.dataset, device)
             student_metrics = formal_pipeline_metrics(
                 student, pair, device, args.dataset,
-                f"Parity:B0:{protocol}", flip,
+                f"Parity:B0:{protocol}", flip, features=student_features,
             )
+            student_diagnostic_metrics = dict(student_metrics)
             student_parity = parity_audit(
                 student_diagnostic_metrics, student_metrics, args.parity_tolerance
             )
@@ -128,7 +129,26 @@ def main():
                 teacher_features["query_labels"], teacher_features["gallery_labels"],
                 dataset=args.dataset, direction=direction, height=height,
                 query_paths=dataset_paths(pair[0]), std_epsilon=args.std_epsilon,
+                similarity_device=device,
             )
+            student_query_r1 = (
+                sum(bool(row["student_top1_correct"]) for row in rows)
+                / len(rows) * 100
+            )
+            teacher_query_r1 = (
+                sum(bool(row["teacher_top1_correct"]) for row in rows)
+                / len(rows) * 100
+            )
+            student_query_top1_parity = parity_audit(
+                {"R@1": student_query_r1}, {"R@1": student_metrics["R@1"]},
+                args.parity_tolerance,
+            )
+            teacher_query_top1_parity = parity_audit(
+                {"R@1": teacher_query_r1}, {"R@1": teacher_metrics["R@1"]},
+                args.parity_tolerance,
+            )
+            print(f"[GapDiagnosis] student_query_top1_parity={student_query_top1_parity}")
+            print(f"[GapDiagnosis] teacher_query_top1_parity={teacher_query_top1_parity}")
             target = Path(args.output_dir) / args.dataset / (height or "all") / direction
             advantage_rows = [r for r in rows if r["category"] == "student_wrong_teacher_correct"]
             write_csv(
@@ -149,7 +169,14 @@ def main():
                 "gallery_count": int(student_features["gallery_features"].size(0)),
                 "raw_gallery_count": len(pair[1].dataset),
                 "student_metrics": student_metrics, "teacher_metrics": teacher_metrics,
-                "parity_audit": {"student": student_parity, "teacher": teacher_parity},
+                "parity_audit": {
+                    "student": student_parity,
+                    "teacher": teacher_parity,
+                    "student_query_level_top1": student_query_top1_parity,
+                    "teacher_query_level_top1": teacher_query_top1_parity,
+                    "descriptor_source": "shared_single_extraction",
+                    "metric_implementation": "formal_evaluation",
+                },
                 "correctness_audit": {
                     "student_checkpoint_strict_load": True,
                     "teacher_frozen": all(not p.requires_grad for p in teacher.parameters()),

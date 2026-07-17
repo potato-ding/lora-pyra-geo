@@ -90,6 +90,21 @@ def _identity_overlap(order_a, order_b, labels, k):
     return len(a & b) / max(1, len(a | b))
 
 
+def _formal_similarity_matrix(query_features, gallery_features, device, chunk_size):
+    """Mirror formal evaluation's FP32, query-chunked similarity path."""
+    if device is None:
+        return query_features.float() @ gallery_features.float().t()
+    device = torch.device(device)
+    gallery = gallery_features.to(device=device, dtype=torch.float32)
+    chunks = []
+    for start in range(0, query_features.size(0), chunk_size):
+        query = query_features[start:start + chunk_size].to(
+            device=device, dtype=torch.float32
+        )
+        chunks.append((query @ gallery.t()).cpu())
+    return torch.cat(chunks, dim=0)
+
+
 def analyze_queries(
     student_query_features,
     student_gallery_features,
@@ -103,9 +118,13 @@ def analyze_queries(
     height=None,
     query_paths=None,
     std_epsilon=1e-12,
+    similarity_device=None,
+    similarity_chunk_size=1000,
 ):
     if std_epsilon <= 0.0:
         raise ValueError("std_epsilon must be greater than zero")
+    if similarity_chunk_size <= 0:
+        raise ValueError("similarity_chunk_size must be greater than zero")
     tensors = (
         student_query_features,
         student_gallery_features,
@@ -119,8 +138,14 @@ def analyze_queries(
     if student_gallery_features.size(0) != teacher_gallery_features.size(0):
         raise ValueError("student/teacher gallery identity order differs")
 
-    student_scores = student_query_features.float() @ student_gallery_features.float().t()
-    teacher_scores = teacher_query_features.float() @ teacher_gallery_features.float().t()
+    student_scores = _formal_similarity_matrix(
+        student_query_features, student_gallery_features,
+        similarity_device, similarity_chunk_size,
+    )
+    teacher_scores = _formal_similarity_matrix(
+        teacher_query_features, teacher_gallery_features,
+        similarity_device, similarity_chunk_size,
+    )
     rows = []
     for index in range(student_scores.size(0)):
         mask, positive_values = _positive_mask(query_labels[index], gallery_labels)

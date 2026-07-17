@@ -389,6 +389,7 @@ def getdist_1652_val_and_get_recall(
     device,
     task_name=None,
     feature_name=None,
+    precomputed_features=None,
 ):
     """
     University-1652 专用多卡验证函数。
@@ -409,19 +410,27 @@ def getdist_1652_val_and_get_recall(
     # 1. 提取并 all_gather query / gallery 特征
     query_stage = f"{task_name}:query" if task_name else None
     gallery_stage = f"{task_name}:gallery" if task_name else None
-    q_f, q_l, _ = extract_features_dist(
-        model,
-        val_query_loader,
-        device,
-        stage_name=query_stage,
-        feature_name=feature_name,
+    q_f, q_l, _ = (
+        precomputed_features[:3]
+        if precomputed_features is not None
+        else extract_features_dist(
+            model,
+            val_query_loader,
+            device,
+            stage_name=query_stage,
+            feature_name=feature_name,
+        )
     )
-    g_f, g_l, _ = extract_features_dist(
-        model,
-        val_gallery_loader,
-        device,
-        stage_name=gallery_stage,
-        feature_name=feature_name,
+    g_f, g_l, _ = (
+        precomputed_features[3:]
+        if precomputed_features is not None
+        else extract_features_dist(
+            model,
+            val_gallery_loader,
+            device,
+            stage_name=gallery_stage,
+            feature_name=feature_name,
+        )
     )
 
     # 2. 删除 DistributedSampler 为整除 world_size 补出来的重复样本
@@ -697,18 +706,27 @@ def run_gta_val_and_get_metrics(
     val_gallery_loader,
     device,
     feature_name=None,
+    precomputed_features=None,
 ):
-    q_f, q_l, q_c = extract_features_dist(
-        model,
-        val_query_loader,
-        device,
-        feature_name=feature_name,
+    q_f, q_l, q_c = (
+        precomputed_features[:3]
+        if precomputed_features is not None
+        else extract_features_dist(
+            model,
+            val_query_loader,
+            device,
+            feature_name=feature_name,
+        )
     )
-    g_f, g_l, g_c = extract_features_dist(
-        model,
-        val_gallery_loader,
-        device,
-        feature_name=feature_name,
+    g_f, g_l, g_c = (
+        precomputed_features[3:]
+        if precomputed_features is not None
+        else extract_features_dist(
+            model,
+            val_gallery_loader,
+            device,
+            feature_name=feature_name,
+        )
     )
 
     real_num_queries = len(val_query_loader.dataset)
@@ -813,20 +831,29 @@ def run_sues_val_and_get_metrics(
     device,
     horizontal_flip=False,
     feature_name=None,
+    precomputed_features=None,
 ):
-    q_f, q_l, _ = extract_features_dist(
-        model,
-        val_query_loader,
-        device,
-        horizontal_flip=horizontal_flip,
-        feature_name=feature_name,
+    q_f, q_l, _ = (
+        precomputed_features[:3]
+        if precomputed_features is not None
+        else extract_features_dist(
+            model,
+            val_query_loader,
+            device,
+            horizontal_flip=horizontal_flip,
+            feature_name=feature_name,
+        )
     )
-    g_f, g_l, _ = extract_features_dist(
-        model,
-        val_gallery_loader,
-        device,
-        horizontal_flip=horizontal_flip,
-        feature_name=feature_name,
+    g_f, g_l, _ = (
+        precomputed_features[3:]
+        if precomputed_features is not None
+        else extract_features_dist(
+            model,
+            val_gallery_loader,
+            device,
+            horizontal_flip=horizontal_flip,
+            feature_name=feature_name,
+        )
     )
 
     real_num_queries = len(val_query_loader.dataset)

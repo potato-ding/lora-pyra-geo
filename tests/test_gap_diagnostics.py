@@ -62,6 +62,7 @@ def test_query_gap_smoke_is_manually_verifiable():
     rows = analyze_queries(
         student_q, gallery, teacher_q, gallery, labels, labels,
         dataset="synthetic", direction="D2S", query_paths=["q0", "q1", "q2"],
+        similarity_device="cpu", similarity_chunk_size=2,
     )
     assert [row["category"] for row in rows] == [
         "both_correct", "student_wrong_teacher_correct", "student_correct_teacher_wrong"
@@ -297,6 +298,8 @@ def test_mock_report_keeps_sues_height_protocol_separate(tmp_path):
         "parity_audit": {
             "student": {"R@1": {"passed": True}},
             "teacher": {"R@1": {"passed": True}},
+            "student_query_level_top1": {"R@1": {"passed": True}},
+            "teacher_query_level_top1": {"R@1": {"passed": True}},
         },
         "categories": {}, "teacher_advantage_count": 0,
         "teacher_advantage_rank_buckets": {}, "teacher_advantage_rank_statistics": {},
