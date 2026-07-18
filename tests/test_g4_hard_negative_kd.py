@@ -22,7 +22,12 @@ if "albumentations" not in sys.modules:
     sys.modules["albumentations.pytorch"] = albumentations_pytorch
 
 from src.dataset.datasets import U1652PairDataset
-from src.diagnostics.mine_g4_hard_negatives import mine_direction
+from src.diagnostics.mine_g4_hard_negatives import (
+    mine_direction,
+    mine_query_level_direction,
+    official_identity_scores,
+    parse_args as parse_mining_args,
+)
 from src.loss.g4_hard_negative_kd import g4_direction_loss
 from src.training import student_train
 
@@ -57,6 +62,68 @@ def test_mining_excludes_identity_and_applies_teacher_advantage_filter():
     )
     assert audit["same_identity_negative_count"] == 0
     assert audit["duplicate_candidate_count"] == 0
+
+
+def test_v2_s2d_uses_best_gallery_image_per_identity_not_prototype_mean():
+    query = torch.tensor([[1.0, 0.0]])
+    gallery = torch.tensor([
+        [0.0, 1.0],
+        [1.0, 0.0],
+        [0.9, 0.4358899],
+    ])
+    gallery_labels = torch.tensor([0, 0, 1])
+    scores, parity = official_identity_scores(
+        query, gallery, gallery_labels, identity_count=2
+    )
+    assert scores[0, 0].item() == pytest.approx(1.0)
+    assert scores[0, 0] > scores[0, 1]
+    assert parity["passed"] is True
+    assert parity["matched_query_count"] == 1
+
+
+def test_v2_strict_advantage_and_rank_disagreement_come_from_queries():
+    identities = ["A", "B", "C", "D"]
+    query_labels = torch.tensor([0, 0, 1, 2, 3])
+    student_scores = torch.tensor([
+        [0.8, 0.9, 0.2, 0.1],
+        [0.95, 0.8, 0.2, 0.1],
+        [0.1, 0.9, 0.2, 0.0],
+        [0.1, 0.2, 0.9, 0.0],
+        [0.1, 0.2, 0.0, 0.9],
+    ])
+    teacher_scores = torch.tensor([
+        [0.95, 0.2, 0.8, 0.1],
+        [0.95, 0.2, 0.8, 0.1],
+        [0.1, 0.9, 0.2, 0.0],
+        [0.1, 0.2, 0.9, 0.0],
+        [0.1, 0.2, 0.0, 0.9],
+    ])
+    records, audit = mine_query_level_direction(
+        identities,
+        query_labels,
+        student_scores,
+        teacher_scores,
+        student_topk=3,
+        candidate_limit=4,
+    )
+    assert records["A"]["strict_teacher_advantage_ids"] == ["B"]
+    disagreement = records["A"]["teacher_rank_disagreement"][0]
+    assert disagreement["candidate_id"] == "B"
+    assert disagreement["query_frequency"] == 2
+    assert disagreement["student_negative_rank"]["min"] == 1
+    assert disagreement["teacher_negative_rank"]["min"] == 3
+    assert disagreement["rank_gap"]["mean"] > 0
+    assert records["B"]["strict_teacher_advantage_ids"] == []
+    assert audit["student_query_level_top1_error_count"] == 1
+    assert audit["strict_teacher_correct_student_wrong_query_count"] == 1
+    assert audit["student_top1_wrong_identity_retained_ratio"] == 1.0
+    assert audit["same_identity_negative_count"] == 0
+    assert audit["duplicate_count"] == 0
+
+
+def test_v1_remains_default_and_v2_is_explicit():
+    assert parse_mining_args([]).version == "v1"
+    assert parse_mining_args(["--version", "v2"]).version == "v2"
 
 
 def _direction_inputs(teacher_correct=True):

@@ -96,10 +96,349 @@ def extract_identity_prototypes(
     return F.normalize(sums / counts[:, None], dim=1).cpu()
 
 
+@torch.inference_mode()
+def extract_image_descriptors(
+    model, items, transform, batch_size, num_workers, device
+):
+    """Extract descriptors in deterministic dataset enumeration order."""
+    loader = DataLoader(
+        IdentityImageDataset(items, transform),
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+    )
+    features, labels = [], []
+    for images, batch_labels in loader:
+        images = cast_images_to_model_dtype(
+            model, images.to(device, non_blocking=True)
+        )
+        descriptors = select_model_descriptor(model(images))
+        features.append(F.normalize(descriptors.float(), dim=1).cpu())
+        labels.append(batch_labels.to(dtype=torch.long).cpu())
+    if not features:
+        raise RuntimeError("no images were enumerated for descriptor extraction")
+    return torch.cat(features), torch.cat(labels)
+
+
 def _positive_ranks(similarity):
     order = torch.argsort(similarity, dim=1, descending=True, stable=True)
     identity = torch.arange(similarity.size(0))[:, None]
     return order.eq(identity).to(torch.int64).argmax(dim=1) + 1, order
+
+
+def official_identity_scores(
+    query_features,
+    gallery_features,
+    gallery_labels,
+    identity_count,
+    query_labels=None,
+):
+    """Collapse the formal image ranking by each identity's first occurrence.
+
+    The formal evaluator ranks every gallery image. The first occurrence of an
+    identity in that ranking is exactly its maximum image-level similarity.
+    This preserves the official multi-positive S2D gallery semantics without
+    averaging gallery images into a prototype.
+    """
+    image_similarity = (
+        F.normalize(query_features.float(), dim=1)
+        @ F.normalize(gallery_features.float(), dim=1).t()
+    )
+    identity_scores = torch.full(
+        (query_features.size(0), identity_count),
+        -torch.inf,
+        dtype=image_similarity.dtype,
+    )
+    for identity_index in range(identity_count):
+        mask = gallery_labels.eq(identity_index)
+        if not bool(mask.any()):
+            raise RuntimeError(
+                f"gallery has no image for identity index {identity_index}"
+            )
+        identity_scores[:, identity_index] = image_similarity[:, mask].max(dim=1).values
+    formal_top1 = gallery_labels[image_similarity.argmax(dim=1)]
+    collapsed_top1 = identity_scores.argmax(dim=1)
+    matched = int(formal_top1.eq(collapsed_top1).sum().item())
+    total = int(query_features.size(0))
+    parity = {
+        "matched_query_count": matched,
+        "query_count": total,
+        "ratio": float(matched / max(total, 1)),
+        "passed": matched == total,
+        "definition": (
+            "formal image-level gallery rank versus first-occurrence "
+            "identity collapse"
+        ),
+    }
+    if query_labels is not None:
+        formal_correct = int(formal_top1.eq(query_labels).sum().item())
+        collapsed_correct = int(collapsed_top1.eq(query_labels).sum().item())
+        parity.update({
+            "formal_top1_correct_count": formal_correct,
+            "collapsed_top1_correct_count": collapsed_correct,
+            "formal_top1_correct_ratio": float(formal_correct / max(total, 1)),
+            "collapsed_top1_correct_ratio": float(
+                collapsed_correct / max(total, 1)
+            ),
+            "top1_correct_count_abs_diff": abs(
+                formal_correct - collapsed_correct
+            ),
+        })
+    if not parity["passed"]:
+        raise RuntimeError(f"official evaluator identity parity failed: {parity}")
+    return identity_scores, parity
+
+
+def _distribution(values):
+    if not values:
+        return {"mean": 0.0, "median": 0.0, "p75": 0.0, "p90": 0.0}
+    tensor = torch.tensor(values, dtype=torch.float64)
+    return {
+        "mean": float(tensor.mean().item()),
+        "median": float(torch.quantile(tensor, 0.5).item()),
+        "p75": float(torch.quantile(tensor, 0.75).item()),
+        "p90": float(torch.quantile(tensor, 0.9).item()),
+    }
+
+
+def mine_query_level_direction(
+    identities,
+    query_labels,
+    student_scores,
+    teacher_scores,
+    *,
+    student_topk=20,
+    candidate_limit=4,
+    official_parity=None,
+):
+    """Aggregate v2 candidates exclusively from real query-level rankings."""
+    identity_count = len(identities)
+    if student_scores.shape != teacher_scores.shape:
+        raise ValueError("student and teacher score matrices must have equal shape")
+    if student_scores.shape != (len(query_labels), identity_count):
+        raise ValueError("score matrix shape does not match queries/identities")
+
+    student_order = torch.argsort(
+        student_scores, dim=1, descending=True, stable=True
+    )
+    teacher_order = torch.argsort(
+        teacher_scores, dim=1, descending=True, stable=True
+    )
+    student_inverse = torch.empty_like(student_order)
+    teacher_inverse = torch.empty_like(teacher_order)
+    rank_values = torch.arange(identity_count)[None, :].expand_as(student_order)
+    student_inverse.scatter_(1, student_order, rank_values)
+    teacher_inverse.scatter_(1, teacher_order, rank_values)
+    query_rows = torch.arange(len(query_labels))
+    student_positive_rank = student_inverse[query_rows, query_labels] + 1
+    teacher_positive_rank = teacher_inverse[query_rows, query_labels] + 1
+
+    aggregates = {
+        index: {
+            "query_count": 0,
+            "student_positive_ranks": [],
+            "teacher_positive_ranks": [],
+            "strict": {},
+            "disagreement": {},
+        }
+        for index in range(identity_count)
+    }
+    student_error_count = 0
+    teacher_correct_count = 0
+    strict_query_count = 0
+    retained_wrong_top1_count = 0
+    same_identity_negative_count = 0
+    duplicate_count = 0
+    rank_gaps = []
+
+    for query_index, anchor_index_tensor in enumerate(query_labels):
+        anchor_index = int(anchor_index_tensor)
+        aggregate = aggregates[anchor_index]
+        student_rank = int(student_positive_rank[query_index])
+        teacher_rank = int(teacher_positive_rank[query_index])
+        aggregate["query_count"] += 1
+        aggregate["student_positive_ranks"].append(student_rank)
+        aggregate["teacher_positive_ranks"].append(teacher_rank)
+        student_wrong = student_rank > 1
+        teacher_correct = teacher_rank == 1
+        student_error_count += int(student_wrong)
+        teacher_correct_count += int(teacher_correct)
+
+        student_wrong_order = [
+            int(candidate)
+            for candidate in student_order[query_index].tolist()
+            if int(candidate) != anchor_index
+        ][:student_topk]
+        same_identity_negative_count += sum(
+            candidate == anchor_index for candidate in student_wrong_order
+        )
+        duplicate_count += len(student_wrong_order) - len(set(student_wrong_order))
+
+        if student_wrong and teacher_correct:
+            strict_query_count += 1
+            top1_wrong = int(student_order[query_index, 0])
+            strict = aggregate["strict"].setdefault(
+                top1_wrong,
+                {"query_frequency": 0, "worst_student_positive_rank": 0},
+            )
+            strict["query_frequency"] += 1
+            strict["worst_student_positive_rank"] = max(
+                strict["worst_student_positive_rank"], student_rank
+            )
+            retained_wrong_top1_count += 1
+
+        if teacher_correct:
+            for candidate in student_wrong_order:
+                student_negative_rank = int(
+                    student_inverse[query_index, candidate]
+                ) + 1
+                teacher_negative_rank = int(
+                    teacher_inverse[query_index, candidate]
+                ) + 1
+                rank_gap = teacher_negative_rank - student_negative_rank
+                if rank_gap <= 0:
+                    continue
+                rank_gaps.append(rank_gap)
+                disagreement = aggregate["disagreement"].setdefault(
+                    candidate,
+                    {
+                        "student_positive_ranks": [],
+                        "student_negative_ranks": [],
+                        "teacher_negative_ranks": [],
+                        "rank_gaps": [],
+                    },
+                )
+                disagreement["student_positive_ranks"].append(student_rank)
+                disagreement["student_negative_ranks"].append(student_negative_rank)
+                disagreement["teacher_negative_ranks"].append(teacher_negative_rank)
+                disagreement["rank_gaps"].append(rank_gap)
+
+    records = {}
+    strict_covered = 0
+    disagreement_covered = 0
+    candidate_counts = []
+    for anchor_index, anchor_pid in enumerate(identities):
+        aggregate = aggregates[anchor_index]
+        strict_items = [
+            {
+                "candidate_id": identities[candidate],
+                **summary,
+            }
+            for candidate, summary in aggregate["strict"].items()
+        ]
+        strict_items.sort(
+            key=lambda item: (
+                -item["query_frequency"],
+                -item["worst_student_positive_rank"],
+                item["candidate_id"],
+            )
+        )
+        strict_items = strict_items[:candidate_limit]
+
+        disagreement_items = []
+        for candidate, observations in aggregate["disagreement"].items():
+            gaps = observations["rank_gaps"]
+            student_negative = observations["student_negative_ranks"]
+            teacher_negative = observations["teacher_negative_ranks"]
+            disagreement_items.append(
+                {
+                    "candidate_id": identities[candidate],
+                    "query_frequency": len(gaps),
+                    "worst_student_positive_rank": max(
+                        observations["student_positive_ranks"]
+                    ),
+                    "student_negative_rank": {
+                        "min": min(student_negative),
+                        "mean": float(sum(student_negative) / len(student_negative)),
+                        "max": max(student_negative),
+                    },
+                    "teacher_negative_rank": {
+                        "min": min(teacher_negative),
+                        "mean": float(sum(teacher_negative) / len(teacher_negative)),
+                        "max": max(teacher_negative),
+                    },
+                    "rank_gap": {
+                        "mean": float(sum(gaps) / len(gaps)),
+                        "max": max(gaps),
+                    },
+                }
+            )
+        disagreement_items.sort(
+            key=lambda item: (
+                -item["query_frequency"],
+                -item["worst_student_positive_rank"],
+                -item["rank_gap"]["mean"],
+                item["candidate_id"],
+            )
+        )
+        disagreement_items = disagreement_items[:candidate_limit]
+        strict_covered += int(bool(strict_items))
+        disagreement_covered += int(bool(disagreement_items))
+        candidate_counts.append(len(disagreement_items))
+        query_count = aggregate["query_count"]
+        records[anchor_pid] = {
+            "query_count": query_count,
+            "student_positive_rank": {
+                "min": min(aggregate["student_positive_ranks"]),
+                "mean": float(
+                    sum(aggregate["student_positive_ranks"]) / query_count
+                ),
+                "max": max(aggregate["student_positive_ranks"]),
+            },
+            "teacher_positive_rank": {
+                "min": min(aggregate["teacher_positive_ranks"]),
+                "mean": float(
+                    sum(aggregate["teacher_positive_ranks"]) / query_count
+                ),
+                "max": max(aggregate["teacher_positive_ranks"]),
+            },
+            "strict_teacher_advantage_ids": [
+                item["candidate_id"] for item in strict_items
+            ],
+            "strict_teacher_advantage": strict_items,
+            "teacher_rank_disagreement": disagreement_items,
+        }
+
+    query_count = len(query_labels)
+    audit = {
+        "query_image_count": query_count,
+        "identity_count": identity_count,
+        "student_query_level_top1_error_count": student_error_count,
+        "student_query_level_top1_error_ratio": float(
+            student_error_count / max(query_count, 1)
+        ),
+        "teacher_query_level_top1_correct_count": teacher_correct_count,
+        "teacher_query_level_top1_correct_ratio": float(
+            teacher_correct_count / max(query_count, 1)
+        ),
+        "strict_teacher_correct_student_wrong_query_count": strict_query_count,
+        "strict_teacher_correct_student_wrong_query_ratio": float(
+            strict_query_count / max(query_count, 1)
+        ),
+        "strict_teacher_adv_identity_coverage_count": strict_covered,
+        "strict_teacher_adv_identity_coverage_ratio": float(
+            strict_covered / max(identity_count, 1)
+        ),
+        "rank_disagreement_identity_coverage_count": disagreement_covered,
+        "rank_disagreement_identity_coverage_ratio": float(
+            disagreement_covered / max(identity_count, 1)
+        ),
+        "student_top1_wrong_identity_retained_count": retained_wrong_top1_count,
+        "student_top1_wrong_identity_retained_ratio": float(
+            retained_wrong_top1_count / max(student_error_count, 1)
+        ),
+        "candidate_count": {
+            "min": min(candidate_counts) if candidate_counts else 0,
+            "mean": float(sum(candidate_counts) / max(len(candidate_counts), 1)),
+            "max": max(candidate_counts) if candidate_counts else 0,
+        },
+        "rank_gap": _distribution(rank_gaps),
+        "same_identity_negative_count": same_identity_negative_count,
+        "duplicate_count": duplicate_count,
+        "official_evaluator_parity": official_parity or {},
+    }
+    return records, audit
 
 
 def mine_direction(
@@ -187,6 +526,12 @@ def mine_direction(
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--version",
+        choices=("v1", "v2"),
+        default="v1",
+        help="v1 preserves prototype mining; v2 performs query-level mining",
+    )
     parser.add_argument("--data_dir", default="data/U1652/train")
     parser.add_argument(
         "--student_checkpoint",
@@ -213,11 +558,24 @@ def parse_args(argv=None):
     return args
 
 
-def main():
-    args = parse_args()
-    device = torch.device(args.device)
-    identities, domain_items = enumerate_train_domains(args.data_dir)
-    transform = get_test_transforms([args.img_size, args.img_size])
+def _metadata(args, identities):
+    identity_hash = hashlib.sha256(
+        "\n".join(identities).encode("utf-8")
+    ).hexdigest()
+    return {
+        "data_dir": args.data_dir,
+        "student_checkpoint": args.student_checkpoint,
+        "teacher_checkpoint": args.teacher_checkpoint,
+        "teacher_metrics": args.teacher_metrics,
+        "identity_count": len(identities),
+        "identity_hash": identity_hash,
+        "student_topk": args.student_topk,
+        "teacher_adv_pool_size": args.teacher_adv_pool_size,
+        "descriptor_tensors_saved": False,
+    }
+
+
+def run_v1(args, identities, domain_items, transform, device):
     student = build_student(args.student_checkpoint, device)
     teacher = build_teacher(
         args.teacher_checkpoint, args.teacher_metrics, device
@@ -246,24 +604,104 @@ def main():
             student_topk=args.student_topk,
             teacher_adv_pool_size=args.teacher_adv_pool_size,
         )
-    identity_hash = hashlib.sha256(
-        "\n".join(identities).encode("utf-8")
-    ).hexdigest()
     metadata = {
-        "data_dir": args.data_dir,
-        "student_checkpoint": args.student_checkpoint,
-        "teacher_checkpoint": args.teacher_checkpoint,
-        "teacher_metrics": args.teacher_metrics,
-        "identity_count": len(identities),
-        "identity_hash": identity_hash,
-        "student_topk": args.student_topk,
-        "teacher_adv_pool_size": args.teacher_adv_pool_size,
+        **_metadata(args, identities),
+        "version": "v1",
         "prototype_definition": "L2(image)->identity_domain_mean->L2",
-        "descriptor_tensors_saved": False,
     }
+    return metadata, directions, audits
+
+
+def run_v2(args, identities, domain_items, transform, device):
+    descriptors = {"student": {}, "teacher": {}}
+    labels = {}
+    student = build_student(args.student_checkpoint, device)
+    for domain in ("drone", "satellite"):
+        descriptors["student"][domain], labels[domain] = extract_image_descriptors(
+            student,
+            domain_items[domain],
+            transform,
+            args.batch_size,
+            args.num_workers,
+            device,
+        )
+    del student
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    teacher = build_teacher(args.teacher_checkpoint, args.teacher_metrics, device)
+    for domain in ("drone", "satellite"):
+        teacher_features, teacher_labels = extract_image_descriptors(
+            teacher,
+            domain_items[domain],
+            transform,
+            args.batch_size,
+            args.num_workers,
+            device,
+        )
+        if not torch.equal(teacher_labels, labels[domain]):
+            raise RuntimeError(
+                f"student/teacher {domain} image enumeration order differs"
+            )
+        descriptors["teacher"][domain] = teacher_features
+    del teacher
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    directions, audits = {}, {}
+    for name, query_domain, gallery_domain in (
+        ("D2S", "drone", "satellite"),
+        ("S2D", "satellite", "drone"),
+    ):
+        student_scores, student_parity = official_identity_scores(
+            descriptors["student"][query_domain],
+            descriptors["student"][gallery_domain],
+            labels[gallery_domain],
+            len(identities),
+            labels[query_domain],
+        )
+        teacher_scores, teacher_parity = official_identity_scores(
+            descriptors["teacher"][query_domain],
+            descriptors["teacher"][gallery_domain],
+            labels[gallery_domain],
+            len(identities),
+            labels[query_domain],
+        )
+        directions[name], audits[name] = mine_query_level_direction(
+            identities,
+            labels[query_domain],
+            student_scores,
+            teacher_scores,
+            student_topk=args.student_topk,
+            candidate_limit=args.teacher_adv_pool_size,
+            official_parity={
+                "student": student_parity,
+                "teacher": teacher_parity,
+            },
+        )
+    metadata = {
+        **_metadata(args, identities),
+        "version": "v2",
+        "query_definition": {
+            "D2S": "every drone image",
+            "S2D": "every satellite image",
+        },
+        "gallery_identity_ranking": (
+            "formal image-level similarity ranking collapsed at the first "
+            "occurrence of each identity (equivalent to per-identity max)"
+        ),
+        "transform": "deterministic get_test_transforms",
+        "cross_model_raw_score_comparison": False,
+        "candidate_aggregation_source": "query-level records only",
+    }
+    return metadata, directions, audits
+
+
+def _write_results(args, metadata, directions, audits):
+    suffix = "_v2" if args.version == "v2" else ""
     os.makedirs(args.output_dir, exist_ok=True)
     with open(
-        os.path.join(args.output_dir, "g4_hard_negatives.json"),
+        os.path.join(args.output_dir, f"g4_hard_negatives{suffix}.json"),
         "w", encoding="utf-8",
     ) as handle:
         json.dump(
@@ -271,7 +709,7 @@ def main():
             handle, indent=2, ensure_ascii=False,
         )
     with open(
-        os.path.join(args.output_dir, "g4_mining_audit.json"),
+        os.path.join(args.output_dir, f"g4_mining_audit{suffix}.json"),
         "w", encoding="utf-8",
     ) as handle:
         json.dump(
@@ -279,6 +717,18 @@ def main():
             handle, indent=2, ensure_ascii=False,
         )
     print(json.dumps(audits, indent=2, ensure_ascii=False))
+
+
+def main():
+    args = parse_args()
+    device = torch.device(args.device)
+    identities, domain_items = enumerate_train_domains(args.data_dir)
+    transform = get_test_transforms([args.img_size, args.img_size])
+    if args.version == "v2":
+        results = run_v2(args, identities, domain_items, transform, device)
+    else:
+        results = run_v1(args, identities, domain_items, transform, device)
+    _write_results(args, *results)
 
 
 if __name__ == "__main__":
