@@ -2,8 +2,11 @@
 
 import os
 import random
+import hashlib
+import json
 
 import numpy as np
+import torch
 import torch.distributed as dist
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
@@ -26,6 +29,11 @@ class U1652PairDataset(Dataset):
         drone_transforms=None,
         prob_flip=0.5,
         shuffle_batch_size=128,
+        g4_mining_file=None,
+        g4_mode=None,
+        g4_pool_size=4,
+        g4_d2s_enabled=True,
+        g4_s2d_enabled=True,
     ):
         self.data_dir = data_dir
         self.sat_transforms = sat_transforms
@@ -38,10 +46,20 @@ class U1652PairDataset(Dataset):
         self.pid_to_label = {}
         self.class_to_idx = self.pid_to_label
         self.samples = []
+        self.g4_mode = g4_mode
+        self.g4_pool_size = int(g4_pool_size)
+        self.g4_d2s_enabled = bool(g4_d2s_enabled)
+        self.g4_s2d_enabled = bool(g4_s2d_enabled)
+        self.g4_mining_file = g4_mining_file
+        self.g4_mining_hash = None
+        self.g4_records = None
+        self.domain_paths = {"drone": {}, "satellite": {}}
         self._parse_dataset()
         self.num_ids = len(self.pids)
         self.num_classes = self.num_ids
         self.samples = self.pairs[:]
+        if self.g4_mode is not None:
+            self._load_g4_mining()
 
     def _parse_dataset(self):
         sat_root = os.path.join(self.data_dir, "satellite")
@@ -69,6 +87,8 @@ class U1652PairDataset(Dataset):
             label = len(self.pids)
             self.pids.append(pid)
             self.pid_to_label[pid] = label
+            self.domain_paths["satellite"][pid] = sat_paths
+            self.domain_paths["drone"][pid] = drone_paths
             for drone_path in drone_paths:
                 self.pairs.append((pid, label, sat_paths[0], drone_path))
                 self.pair_pids.append(pid)
@@ -98,7 +118,107 @@ class U1652PairDataset(Dataset):
 
         drone_tensor = self.drone_transforms(image=drone_img)["image"]
         sat_tensor = self.sat_transforms(image=sat_img)["image"]
-        return drone_tensor, sat_tensor, label, pid
+        if self.g4_records is None:
+            return drone_tensor, sat_tensor, label, pid
+        extras = {
+            "anchor_id": torch.tensor(label, dtype=torch.long),
+        }
+        for direction, domain, reference in (
+            ("D2S", "satellite", sat_tensor),
+            ("S2D", "drone", drone_tensor),
+        ):
+            enabled = (
+                self.g4_d2s_enabled if direction == "D2S"
+                else self.g4_s2d_enabled
+            )
+            negative_pid = self._select_g4_negative(pid, direction) if enabled else None
+            valid = negative_pid is not None
+            if valid:
+                paths = self.domain_paths[domain].get(negative_pid, ())
+                if not paths:
+                    raise RuntimeError(
+                        f"G4 candidate identity {negative_pid!r} has no {domain} images"
+                    )
+                image = read_rgb_image(random.choice(paths))
+                transform = (
+                    self.sat_transforms if domain == "satellite"
+                    else self.drone_transforms
+                )
+                negative_tensor = transform(image=image)["image"]
+                negative_label = self.pid_to_label[negative_pid]
+            else:
+                # Invalid anchors remain masked and are never treated as negatives.
+                negative_tensor = torch.zeros_like(reference)
+                negative_label = -1
+            extras[f"{direction}_image"] = negative_tensor
+            extras[f"{direction}_negative_id"] = torch.tensor(
+                negative_label, dtype=torch.long
+            )
+            extras[f"{direction}_valid"] = torch.tensor(valid, dtype=torch.bool)
+        return drone_tensor, sat_tensor, label, pid, extras
+
+    def _load_g4_mining(self):
+        if not self.g4_mining_file:
+            raise ValueError("g4_mining_file is required when G4 is enabled")
+        with open(self.g4_mining_file, "rb") as handle:
+            raw = handle.read()
+        payload = json.loads(raw.decode("utf-8"))
+        expected_identity_hash = payload.get("metadata", {}).get("identity_hash")
+        current_identity_hash = hashlib.sha256(
+            "\n".join(self.pids).encode("utf-8")
+        ).hexdigest()
+        if (
+            expected_identity_hash is not None
+            and expected_identity_hash != current_identity_hash
+        ):
+            raise ValueError(
+                "G4 mining identity hash does not match the training dataset"
+            )
+        directions = payload.get("directions")
+        if not isinstance(directions, dict):
+            raise ValueError("G4 mining JSON must contain a directions object")
+        self.g4_records = directions
+        self.g4_mining_hash = hashlib.sha256(raw).hexdigest()
+        for direction in ("D2S", "S2D"):
+            records = directions.get(direction, {})
+            if not isinstance(records, dict):
+                raise ValueError(f"G4 mining direction {direction} must be an object")
+            for anchor_pid, record in records.items():
+                for field in (
+                    "student_topk_negative_ids",
+                    "teacher_advantage_negative_ids",
+                ):
+                    candidates = record.get(field, [])
+                    if len(candidates) != len(set(candidates)):
+                        raise ValueError(
+                            f"duplicate G4 candidates for {direction}/{anchor_pid}/{field}"
+                        )
+                    if anchor_pid in candidates:
+                        raise ValueError(
+                            f"same-identity G4 negative for {direction}/{anchor_pid}"
+                        )
+
+    def _select_g4_negative(self, anchor_pid, direction):
+        record = self.g4_records.get(direction, {}).get(anchor_pid)
+        if not record:
+            return None
+        if self.g4_mode == "student_hard_top1":
+            candidates = record.get("student_topk_negative_ids", [])[:1]
+        elif self.g4_mode == "teacher_adv_top1":
+            candidates = record.get("teacher_advantage_negative_ids", [])[:1]
+        elif self.g4_mode == "teacher_adv_pool":
+            candidates = record.get("teacher_advantage_negative_ids", [])[
+                :self.g4_pool_size
+            ]
+        else:
+            raise ValueError(f"unsupported g4_mode: {self.g4_mode}")
+        candidates = [
+            pid for pid in candidates
+            if pid != anchor_pid and pid in self.pid_to_label
+        ]
+        if not candidates:
+            return None
+        return random.choice(candidates)
 
     def shuffle(self):
         pair_pool = self.pairs[:]
@@ -156,6 +276,19 @@ def create_student_train_dataset_and_loader(args):
         drone_transforms=train_drone_tf,
         prob_flip=getattr(args, "prob_flip", 0.5),
         shuffle_batch_size=args.batch_size,
+        g4_mining_file=(
+            getattr(args, "g4_mining_file", None)
+            if getattr(args, "use_g4_hard_negative_kd", False)
+            else None
+        ),
+        g4_mode=(
+            getattr(args, "g4_mode", None)
+            if getattr(args, "use_g4_hard_negative_kd", False)
+            else None
+        ),
+        g4_pool_size=getattr(args, "g4_pool_size", 4),
+        g4_d2s_enabled=getattr(args, "g4_d2s_enabled", True),
+        g4_s2d_enabled=getattr(args, "g4_s2d_enabled", True),
     )
 
     if dist.is_available() and dist.is_initialized():

@@ -19,6 +19,7 @@ import torch.nn.functional as F
 from torch.amp import GradScaler, autocast
 
 from src.loss.blocks_infoNCE import Sample4GeoLoss
+from src.loss.g4_hard_negative_kd import g4_hard_negative_kd
 from src.loss.tagpm_kd import tagpm_kd_loss
 from src.models.student_model import StudentModel
 from src.utils.gather_features_and_labels_and_views import GatherLayer
@@ -139,6 +140,8 @@ def experiment_id(args):
         return D1_A_EXPERIMENT_ID
     if getattr(args, "use_tagpm_kd", False):
         return "G3-TAGPM-2GPU-3090"
+    if getattr(args, "use_g4_hard_negative_kd", False):
+        return "G4-HARD-NEGATIVE-2GPU-3090"
     return B0_EXPERIMENT_ID
 
 
@@ -176,10 +179,15 @@ def print_experiment_configuration(
         if args.use_negrank_kd
         else "TAG-PM KD"
         if args.use_tagpm_kd
+        else "G4 Full-Gallery Hard-Negative KD"
+        if args.use_g4_hard_negative_kd
         else "None"
     )
     print(f"KD type={kd_type}")
-    print(f"KD enabled={bool(args.use_negrank_kd or args.use_tagpm_kd)}")
+    print(
+        "KD enabled="
+        f"{bool(args.use_negrank_kd or args.use_tagpm_kd or args.use_g4_hard_negative_kd)}"
+    )
     print(f"started_at={started_at}")
     print(f"command={shlex.join(str(part) for part in command_parts)}")
     print(f"git_commit={_git_commit(ROOT)}")
@@ -357,9 +365,9 @@ def load_model_checkpoint_compatible(
 
 
 def unpack_sample4geo_batch(batch, device):
-    if len(batch) != 4:
-        raise ValueError(f"Expected 4 fields from Sample4Geo batch, got {len(batch)}")
-    drone, satellite, labels, pids = batch
+    if len(batch) not in (4, 5):
+        raise ValueError(f"Expected 4 or 5 fields from Sample4Geo batch, got {len(batch)}")
+    drone, satellite, labels, pids = batch[:4]
 
     raw_drone = drone
     raw_satellite = satellite
@@ -378,7 +386,7 @@ def unpack_sample4geo_batch(batch, device):
         )
 
     images = torch.cat([drone, satellite], dim=0)
-    return images, {
+    meta = {
         "pair_batch_size": drone.size(0),
         "effective_batch": images.size(0),
         "raw_drone_tensor": raw_drone,
@@ -387,6 +395,13 @@ def unpack_sample4geo_batch(batch, device):
         "satellite_ids": labels.to(device, non_blocking=True).long(),
         "pids": tuple(str(pid) for pid in pids),
     }
+    if len(batch) == 5:
+        meta["g4"] = {
+            key: value.to(device, non_blocking=True)
+            if torch.is_tensor(value) else value
+            for key, value in batch[4].items()
+        }
+    return images, meta
 
 
 def get_teacher_metrics_path(teacher_model_dir):
@@ -402,6 +417,7 @@ def validate_negrank_kd_files(args, parser=None):
     teacher_kd_enabled = bool(
         getattr(args, "use_negrank_kd", False)
         or getattr(args, "use_tagpm_kd", False)
+        or getattr(args, "use_g4_hard_negative_kd", False)
     )
     if not teacher_kd_enabled:
         args.teacher_checkpoint_path = None
@@ -498,7 +514,11 @@ def build_frozen_teacher_from_run(args, device):
     teacher_args = build_teacher_args_from_metrics(metrics_path, device)
     teacher = TeacherModel(teacher_args)
     teacher.to(device)
-    kd_prefix = "[NegRankKD]" if args.use_negrank_kd else "[TAGPM]"
+    kd_prefix = (
+        "[NegRankKD]" if args.use_negrank_kd
+        else "[TAGPM]" if args.use_tagpm_kd
+        else "[G4]"
+    )
     load_model_checkpoint_compatible(
         teacher,
         args.teacher_checkpoint_path,
@@ -515,7 +535,11 @@ def build_frozen_teacher_from_run(args, device):
         param.numel() for param in teacher.parameters() if param.requires_grad
     )
     if is_main_process():
-        kd_type = "Negative Rank KD" if args.use_negrank_kd else "TAG-PM KD"
+        kd_type = (
+            "Negative Rank KD" if args.use_negrank_kd
+            else "TAG-PM KD" if args.use_tagpm_kd
+            else "G4 Full-Gallery Hard-Negative KD"
+        )
         print(f"{kd_prefix} KD type = {kd_type}")
         print(f"{kd_prefix} KD enabled = True")
         print(f"{kd_prefix} teacher_checkpoint_path = {args.teacher_checkpoint_path}")
@@ -527,16 +551,22 @@ def build_frozen_teacher_from_run(args, device):
             print(f"{kd_prefix} neg_rank_kd_weight_target = {args.rank_kd_weight}")
             print(f"{kd_prefix} neg_rank_kd_temperature = {args.rank_kd_temperature}")
             print(f"{kd_prefix} neg_rank_kd_warmup_epochs = {args.rank_kd_warmup_epochs}")
-        else:
+        elif args.use_tagpm_kd:
             print(f"{kd_prefix} tagpm_positive_weight = {args.tagpm_positive_weight}")
             print(f"{kd_prefix} tagpm_margin_weight = {args.tagpm_margin_weight}")
             print(f"{kd_prefix} tagpm_warmup_epochs = {args.tagpm_warmup_epochs}")
+        else:
+            print(f"{kd_prefix} g4_weight = {args.g4_weight}")
+            print(f"{kd_prefix} g4_temperature = {args.g4_temperature}")
+            print(f"{kd_prefix} g4_warmup_epochs = {args.g4_warmup_epochs}")
 
     if not frozen or teacher_trainable_params != 0:
         message = (
             "NegRankKD teacher must be fully frozen"
             if args.use_negrank_kd
             else "TAG-PM teacher must be fully frozen"
+            if args.use_tagpm_kd
+            else "G4 teacher must be fully frozen"
         )
         raise RuntimeError(message)
     return teacher
@@ -580,6 +610,7 @@ def audit_clean_student_runtime(
     teacher_model,
     use_negrank_kd=False,
     use_tagpm_kd=False,
+    use_g4_hard_negative_kd=False,
 ):
     raw_model = get_raw_model(model)
     student_class = f"{raw_model.__class__.__module__}.{raw_model.__class__.__name__}"
@@ -612,12 +643,15 @@ def audit_clean_student_runtime(
         errors.append(f"embedding_dim={getattr(raw_model, 'embedding_dim', None)}, expected 512")
     if not isinstance(criterion, Sample4GeoLoss):
         errors.append(f"criterion is not Sample4GeoLoss: {type(criterion)}")
-    teacher_kd_enabled = bool(use_negrank_kd or use_tagpm_kd)
+    teacher_kd_enabled = bool(
+        use_negrank_kd or use_tagpm_kd or use_g4_hard_negative_kd
+    )
     if teacher_present != teacher_kd_enabled:
         errors.append(
             "teacher presence does not match teacher KD configuration: "
             f"teacher_present={teacher_present}, "
             f"use_negrank_kd={use_negrank_kd}, use_tagpm_kd={use_tagpm_kd}"
+            f", use_g4_hard_negative_kd={use_g4_hard_negative_kd}"
         )
     if extra_student_module_present:
         errors.append(f"unexpected top-level student modules: {extra_child_modules}")
@@ -1004,6 +1038,16 @@ def current_tagpm_warmup_factor(args, epoch):
     return 1.0
 
 
+def current_g4_weight(args, epoch):
+    if not getattr(args, "use_g4_hard_negative_kd", False):
+        return 0.0
+    weight = float(args.g4_weight)
+    warmup = int(args.g4_warmup_epochs)
+    if warmup > 0 and epoch <= warmup:
+        return weight * float(epoch) / float(warmup)
+    return weight
+
+
 def print_epoch_kd_configuration(args, epoch):
     if not is_main_process():
         return
@@ -1021,6 +1065,12 @@ def print_epoch_kd_configuration(args, epoch):
             f"margin_weight={args.tagpm_margin_weight:.6f} | "
             f"effective_positive_weight={args.tagpm_positive_weight * factor:.6f} | "
             f"effective_margin_weight={args.tagpm_margin_weight * factor:.6f}"
+        )
+    elif args.use_g4_hard_negative_kd:
+        print(
+            f"[G4][Epoch Start] epoch={epoch} | "
+            f"target_weight={args.g4_weight:.6f} | "
+            f"effective_weight={current_g4_weight(args, epoch):.6f}"
         )
 
 
@@ -1174,6 +1224,136 @@ def compute_teacher_paired_features(
     return teacher_features.detach(), global_pair_batch_size, runtime_audit
 
 
+def forward_descriptor_chunks(model, images, chunk_size, *, teacher=False):
+    if chunk_size <= 0:
+        raise ValueError("extra forward chunk size must be positive")
+    outputs = []
+    batch_norm_states = []
+    if not teacher:
+        for module in get_raw_model(model).modules():
+            if isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
+                batch_norm_states.append((module, module.training))
+                module.eval()
+    context = torch.inference_mode if teacher else torch.enable_grad
+    try:
+        with context():
+            for start in range(0, images.size(0), chunk_size):
+                chunk = cast_images_to_model_dtype(
+                    model, images[start:start + chunk_size]
+                )
+                output = select_model_descriptor(model(chunk))
+                outputs.append(output.detach() if teacher else output)
+    finally:
+        for module, was_training in batch_norm_states:
+            module.train(was_training)
+    if not outputs:
+        raise ValueError("cannot forward an empty G4 image tensor")
+    return torch.cat(outputs, dim=0)
+
+
+def forward_valid_extra_descriptors(
+    model, images, valid_mask, template, chunk_size, *, teacher=False
+):
+    valid_mask = valid_mask.reshape(-1).bool().to(images.device)
+    indices = torch.nonzero(valid_mask, as_tuple=False).reshape(-1)
+    base = template.detach() * 0.0 if teacher else template * 0.0
+    if indices.numel() == 0:
+        return base, 0
+    selected = images.index_select(0, indices)
+    descriptors = forward_descriptor_chunks(
+        model, selected, chunk_size, teacher=teacher
+    )
+    return base.index_copy(0, indices, descriptors), int(indices.numel())
+
+
+def compute_g4_batch_loss(
+    model,
+    teacher_model,
+    local_features,
+    teacher_features,
+    pair_batch_size,
+    g4_batch,
+    *,
+    temperature,
+    teacher_online_gate,
+    d2s_enabled,
+    s2d_enabled,
+    chunk_size,
+):
+    student_drone, student_satellite = split_paired_features(
+        local_features, pair_batch_size
+    )
+    global_pair_batch = teacher_features.size(0) // 2
+    teacher_drone_global, teacher_satellite_global = split_paired_features(
+        teacher_features, global_pair_batch
+    )
+    rank_start = get_rank() * pair_batch_size
+    rank_end = rank_start + pair_batch_size
+    teacher_drone = teacher_drone_global[rank_start:rank_end]
+    teacher_satellite = teacher_satellite_global[rank_start:rank_end]
+    if teacher_drone.size(0) != pair_batch_size:
+        raise RuntimeError("unable to recover local teacher descriptors for G4")
+
+    directions = {}
+    extra_forward_count = 0
+    for direction, enabled in (
+        ("D2S", d2s_enabled),
+        ("S2D", s2d_enabled),
+    ):
+        if not enabled:
+            continue
+        extra_images = g4_batch[f"{direction}_image"]
+        if direction == "D2S":
+            student_anchor, student_positive = student_drone, student_satellite
+            teacher_anchor, teacher_positive = teacher_drone, teacher_satellite
+        else:
+            student_anchor, student_positive = student_satellite, student_drone
+            teacher_anchor, teacher_positive = teacher_satellite, teacher_drone
+        valid_mask = g4_batch[f"{direction}_valid"]
+        student_negative, student_forward_count = (
+            forward_valid_extra_descriptors(
+                model,
+                extra_images,
+                valid_mask,
+                student_positive,
+                chunk_size,
+                teacher=False,
+            )
+        )
+        teacher_negative, teacher_forward_count = (
+            forward_valid_extra_descriptors(
+                teacher_model,
+                extra_images,
+                valid_mask,
+                teacher_positive,
+                chunk_size,
+                teacher=True,
+            )
+        )
+        if student_forward_count != teacher_forward_count:
+            raise RuntimeError("student/teacher G4 extra forward count mismatch")
+        extra_forward_count += student_forward_count
+        directions[direction] = {
+            "student_anchor": student_anchor,
+            "student_positive": student_positive,
+            "student_negative": student_negative,
+            "teacher_anchor": teacher_anchor,
+            "teacher_positive": teacher_positive,
+            "teacher_negative": teacher_negative,
+            "valid_mask": valid_mask,
+            "anchor_ids": g4_batch["anchor_id"],
+            "negative_ids": g4_batch[f"{direction}_negative_id"],
+        }
+    loss, audit = g4_hard_negative_kd(
+        directions,
+        temperature=temperature,
+        teacher_online_gate=teacher_online_gate,
+    )
+    audit["extra_forward_image_count"] = extra_forward_count
+    audit["extra_forward_chunk_size"] = int(chunk_size)
+    return loss, audit
+
+
 def compute_student_batch_losses(
     model,
     images,
@@ -1195,6 +1375,13 @@ def compute_student_batch_losses(
     tagpm_std_epsilon=1e-12,
     drone_ids=None,
     satellite_ids=None,
+    g4_weight_current=0.0,
+    g4_temperature=0.07,
+    g4_teacher_online_gate=True,
+    g4_d2s_enabled=True,
+    g4_s2d_enabled=True,
+    g4_extra_forward_chunk_size=4,
+    g4_batch=None,
 ):
     effective_d2s_ratio, effective_s2d_ratio = (
         resolve_rank_kd_directional_keep_ratios(
@@ -1219,6 +1406,7 @@ def compute_student_batch_losses(
     loss_negrank = None
     loss_tagpm_positive = None
     loss_tagpm_margin = None
+    loss_g4 = None
     student_drone_feat = None
     student_sat_feat = None
     teacher_runtime_audit = None
@@ -1230,11 +1418,12 @@ def compute_student_batch_losses(
         tagpm_positive_weight_current > 0.0
         or tagpm_margin_weight_current > 0.0
     )
-    if negrank_active and tagpm_active:
+    g4_active = teacher_model is not None and g4_weight_current > 0.0
+    if sum((negrank_active, tagpm_active, g4_active)) > 1:
         raise RuntimeError(
-            "Negative Rank KD and TAG-PM KD cannot be active in the same batch"
+            "Negative Rank KD, TAG-PM KD, and G4 cannot be active together"
         )
-    if negrank_active or tagpm_active:
+    if negrank_active or tagpm_active or g4_active:
         (
             teacher_features,
             teacher_global_pair_batch_size,
@@ -1289,7 +1478,7 @@ def compute_student_batch_losses(
                         teacher_drone_feat,
                         teacher_sat_feat,
                     )
-        else:
+        elif tagpm_active:
             if drone_ids is None or satellite_ids is None:
                 raise ValueError("TAG-PM requires real drone and satellite identity labels")
             global_drone_ids = gather_identity_ids(drone_ids)
@@ -1319,6 +1508,23 @@ def compute_student_batch_losses(
                 + float(tagpm_positive_weight_current) * loss_tagpm_positive
                 + float(tagpm_margin_weight_current) * loss_tagpm_margin
             )
+        else:
+            if g4_batch is None:
+                raise ValueError("G4 requires mined extra-image batch data")
+            loss_g4, kd_runtime_audit = compute_g4_batch_loss(
+                model,
+                teacher_model,
+                local_features,
+                teacher_features,
+                pair_batch_size,
+                g4_batch,
+                temperature=g4_temperature,
+                teacher_online_gate=g4_teacher_online_gate,
+                d2s_enabled=g4_d2s_enabled,
+                s2d_enabled=g4_s2d_enabled,
+                chunk_size=g4_extra_forward_chunk_size,
+            )
+            loss = loss + float(g4_weight_current) * loss_g4
 
     result = {
         "loss": loss_infonce,
@@ -1380,6 +1586,14 @@ def compute_student_batch_losses(
             tagpm_margin_weight_current
         )
         result["tagpm_audit"] = kd_runtime_audit
+    if loss_g4 is not None:
+        result["loss"] = loss
+        result["loss_g4"] = loss_g4
+        result["loss_g4_weighted"] = (
+            loss_g4.detach() * float(g4_weight_current)
+        )
+        result["g4_weight_current"] = float(g4_weight_current)
+        result["g4_audit"] = kd_runtime_audit
     return result
 
 
@@ -1527,6 +1741,37 @@ def print_first_runtime_audit(model, criterion, batch_meta, images, batch_losses
         print("online_teacher_forward=True")
         print("offline_teacher_cache=False")
         print("same_current_augmented_images=True")
+
+    if batch_losses.get("g4_audit") is not None:
+        g4_audit = batch_losses["g4_audit"]
+        print("[FIRST REAL BATCH G4 AUDIT]")
+        print(f"mining_file={args.g4_mining_file}")
+        print(f"mining_hash={getattr(args, 'g4_mining_hash', 'unavailable')}")
+        print(f"mining_checkpoint={getattr(args, 'g4_mining_checkpoint', {})}")
+        print(f"local_pair_batch={local_pair_count}")
+        print(f"global_pair_batch={global_pair_count}")
+        print(f"cross_gpu_gather={cross_gpu_effective}")
+        print(f"extra_forward_image_count={g4_audit['extra_forward_image_count']}")
+        print(f"extra_forward_chunk_size={g4_audit['extra_forward_chunk_size']}")
+        g4_batch = batch_meta.get("g4") or {}
+        print(f"anchor_identity={g4_batch.get('anchor_id', []).tolist() if torch.is_tensor(g4_batch.get('anchor_id')) else g4_batch.get('anchor_id')}")
+        print(f"positive_identity={g4_batch.get('anchor_id', []).tolist() if torch.is_tensor(g4_batch.get('anchor_id')) else g4_batch.get('anchor_id')}")
+        for direction in ("D2S", "S2D"):
+            negative_ids = g4_batch.get(f"{direction}_negative_id")
+            print(
+                f"{direction}_mined_negative_identity="
+                f"{negative_ids.tolist() if torch.is_tensor(negative_ids) else negative_ids}"
+            )
+        print("teacher_trainable_params=0")
+        print("teacher_grad_count=0")
+        for direction in ("D2S", "S2D"):
+            audit = g4_audit.get(direction)
+            print(f"{direction}_enabled={audit is not None}")
+            if audit is not None:
+                for key, value in audit.items():
+                    print(f"{direction}_{key}={value}")
+        print(f"raw_g4_loss={batch_losses['loss_g4'].item():.6f}")
+        print(f"weighted_g4_loss={batch_losses['loss_g4_weighted'].item():.6f}")
 
     if batch_losses.get("tagpm_audit") is not None:
         tagpm_audit = batch_losses["tagpm_audit"]
@@ -1723,6 +1968,18 @@ def save_metrics_json(save_dir, filename, payload):
         json.dump(payload, f, indent=2, ensure_ascii=False, sort_keys=False)
 
 
+def append_g4_diagnostics(output_dir, payload):
+    if not is_main_process():
+        return
+    os.makedirs(output_dir, exist_ok=True)
+    with open(
+        os.path.join(output_dir, "training_g4_diagnostics.jsonl"),
+        "a", encoding="utf-8",
+    ) as handle:
+        handle.write(json.dumps(_json_safe_value(payload), ensure_ascii=False))
+        handle.write("\n")
+
+
 def build_student_validation_metrics(epoch, result):
     return {
         "epoch": epoch,
@@ -1877,6 +2134,7 @@ def train_one_epoch(
     loss_negrank_meter = AverageMeter()
     loss_tagpm_positive_meter = AverageMeter()
     loss_tagpm_margin_meter = AverageMeter()
+    loss_g4_meter = AverageMeter()
     kd_weight_meter = AverageMeter()
     end = time.time()
 
@@ -1920,6 +2178,17 @@ def train_one_epoch(
                 tagpm_std_epsilon=args.tagpm_std_epsilon,
                 drone_ids=meta["drone_ids"],
                 satellite_ids=meta["satellite_ids"],
+                g4_weight_current=current_g4_weight(args, epoch),
+                g4_temperature=getattr(args, "g4_temperature", 0.07),
+                g4_teacher_online_gate=getattr(
+                    args, "g4_teacher_online_gate", True
+                ),
+                g4_d2s_enabled=getattr(args, "g4_d2s_enabled", True),
+                g4_s2d_enabled=getattr(args, "g4_s2d_enabled", True),
+                g4_extra_forward_chunk_size=getattr(
+                    args, "g4_extra_forward_chunk_size", 4
+                ),
+                g4_batch=meta.get("g4"),
             )
             loss = batch_losses["loss"]
             validate_tagpm_batch_result(args, batch_losses)
@@ -1959,6 +2228,8 @@ def train_one_epoch(
             loss_tagpm_margin_meter.update(
                 batch_losses["loss_tagpm_margin"].item(), images.size(0)
             )
+        if "loss_g4" in batch_losses:
+            loss_g4_meter.update(batch_losses["loss_g4"].item(), images.size(0))
         batch_time.update(time.time() - end)
         end = time.time()
 
@@ -2001,8 +2272,12 @@ def train_one_epoch(
             stats["rank_kd_weight_current"] = kd_weight_meter.avg
             stats["rank_kd_temperature"] = float(args.rank_kd_temperature)
         else:
-            stats["loss_tagpm_positive"] = loss_tagpm_positive_meter.avg
-            stats["loss_tagpm_margin"] = loss_tagpm_margin_meter.avg
+            if getattr(args, "use_g4_hard_negative_kd", False):
+                stats["loss_g4"] = loss_g4_meter.avg
+                stats["g4_weight_current"] = current_g4_weight(args, epoch)
+            else:
+                stats["loss_tagpm_positive"] = loss_tagpm_positive_meter.avg
+                stats["loss_tagpm_margin"] = loss_tagpm_margin_meter.avg
     return stats
 
 
@@ -2033,6 +2308,8 @@ def train_one_epoch_deepspeed(
     loss_tagpm_margin_meter = AverageMeter()
     loss_tagpm_positive_weighted_meter = AverageMeter()
     loss_tagpm_margin_weighted_meter = AverageMeter()
+    loss_g4_meter = AverageMeter()
+    loss_g4_weighted_meter = AverageMeter()
     kd_weight_meter = AverageMeter()
     valid_ranking_pair_meter = AverageMeter()
     total_ranking_pair_meter = AverageMeter()
@@ -2062,6 +2339,22 @@ def train_one_epoch_deepspeed(
     )
     tagpm_meters = {
         direction: {name: AverageMeter() for name in tagpm_metric_names}
+        for direction in ("D2S", "S2D")
+    }
+    g4_metric_names = (
+        "candidate_coverage",
+        "active_coverage",
+        "teacher_gate_coverage",
+        "student_violation_coverage",
+        "student_positive_mean",
+        "student_negative_mean",
+        "student_margin_mean",
+        "teacher_positive_mean",
+        "teacher_negative_mean",
+        "teacher_margin_mean",
+    )
+    g4_meters = {
+        direction: {name: AverageMeter() for name in g4_metric_names}
         for direction in ("D2S", "S2D")
     }
     batch_time = AverageMeter()
@@ -2113,6 +2406,17 @@ def train_one_epoch_deepspeed(
             tagpm_std_epsilon=args.tagpm_std_epsilon,
             drone_ids=meta["drone_ids"],
             satellite_ids=meta["satellite_ids"],
+            g4_weight_current=current_g4_weight(args, epoch),
+            g4_temperature=getattr(args, "g4_temperature", 0.07),
+            g4_teacher_online_gate=getattr(
+                args, "g4_teacher_online_gate", True
+            ),
+            g4_d2s_enabled=getattr(args, "g4_d2s_enabled", True),
+            g4_s2d_enabled=getattr(args, "g4_s2d_enabled", True),
+            g4_extra_forward_chunk_size=getattr(
+                args, "g4_extra_forward_chunk_size", 4
+            ),
+            g4_batch=meta.get("g4"),
             audit_runtime=not runtime_audit_printed,
             collect_kd_stats=bool(
                 teacher_model is not None
@@ -2178,6 +2482,11 @@ def train_one_epoch_deepspeed(
                 weighted_margin.item(),
                 images.size(0),
             )
+        if "loss_g4" in batch_losses:
+            loss_g4_meter.update(batch_losses["loss_g4"].item(), images.size(0))
+            loss_g4_weighted_meter.update(
+                batch_losses["loss_g4_weighted"].item(), images.size(0)
+            )
         behavior = batch_losses.get("kd_behavior_stats")
         if behavior is not None:
             if args.rank_kd_selection_mode == "margin_incidence":
@@ -2204,6 +2513,16 @@ def train_one_epoch_deepspeed(
                     tagpm_meters[direction][metric_name].update(
                         direction_audit[metric_name]
                     )
+        g4_audit = batch_losses.get("g4_audit")
+        if g4_audit is not None:
+            for direction in ("D2S", "S2D"):
+                direction_audit = g4_audit.get(direction)
+                if direction_audit is None:
+                    continue
+                for metric_name in g4_metric_names:
+                    value = direction_audit[metric_name]
+                    if value is not None:
+                        g4_meters[direction][metric_name].update(value)
         batch_time.update(time.time() - end)
         end = time.time()
 
@@ -2237,6 +2556,12 @@ def train_one_epoch_deepspeed(
                     f"tagpm_margin_weight_current="
                     f"{batch_losses['tagpm_margin_weight_current']:.6f} | "
                     f"tagpm_stats={batch_losses['tagpm_audit']} | "
+                ) if args.use_tagpm_kd else (
+                    f"loss_g4={loss_g4_meter.val:.6f} "
+                    f"({loss_g4_meter.avg:.6f}) | "
+                    f"weighted_loss_g4={batch_losses['loss_g4_weighted'].item():.6f} | "
+                    f"g4_weight_current={batch_losses['g4_weight_current']:.6f} | "
+                    f"g4_stats={batch_losses['g4_audit']} | "
                 )
                 if args.use_negrank_kd and args.rank_kd_selection_mode == "margin_incidence":
                     d2s = behavior["D2S"]
@@ -2306,6 +2631,22 @@ def train_one_epoch_deepspeed(
                 f"inf_loss_count {inf_loss_count} | "
                 "nan_gradient_count unavailable | inf_gradient_count unavailable"
             )
+            if getattr(args, "use_g4_hard_negative_kd", False):
+                append_g4_diagnostics(args.output_dir, {
+                    "event": "step",
+                    "epoch": epoch,
+                    "step": step + 1,
+                    "info_nce": loss_retrieval_meter.val,
+                    "raw_g4_loss": loss_g4_meter.val,
+                    "weighted_g4_loss": batch_losses["loss_g4_weighted"].item(),
+                    "effective_g4_weight": batch_losses["g4_weight_current"],
+                    "directions": batch_losses["g4_audit"],
+                    "lr": get_deepspeed_lr(model_engine),
+                    "grad_norm": last_grad_norm,
+                    "gpu_memory": memory,
+                    "nan_loss_count": nan_loss_count,
+                    "inf_loss_count": inf_loss_count,
+                })
 
     memory = gpu_memory_snapshot()
     stats = {
@@ -2320,7 +2661,18 @@ def train_one_epoch_deepspeed(
         "last_grad_norm_source": last_grad_norm_source,
     }
     if teacher_model is not None:
-        if args.use_tagpm_kd:
+        if getattr(args, "use_g4_hard_negative_kd", False):
+            stats["loss_g4"] = loss_g4_meter.avg
+            stats["loss_g4_weighted"] = loss_g4_weighted_meter.avg
+            stats["g4_weight_current"] = current_g4_weight(args, epoch)
+            for direction in ("D2S", "S2D"):
+                for metric_name in g4_metric_names:
+                    stats[f"g4_{direction}_{metric_name}"] = (
+                        average_meter_value_or_none(
+                            g4_meters[direction][metric_name]
+                        )
+                    )
+        elif args.use_tagpm_kd:
             stats["loss_tagpm_positive"] = loss_tagpm_positive_meter.avg
             stats["loss_tagpm_margin"] = loss_tagpm_margin_meter.avg
             stats["loss_tagpm_positive_weighted"] = (
@@ -2479,6 +2831,9 @@ def train(
             ) if args.use_negrank_kd else (
                 f" | tagpm_positive_loss={train_stats['loss_tagpm_positive']:.4f}"
                 f" | tagpm_margin_loss={train_stats['loss_tagpm_margin']:.4f}"
+            ) if args.use_tagpm_kd else (
+                f" | loss_g4={train_stats['loss_g4']:.4f}"
+                f" | g4_weight_current={train_stats['g4_weight_current']:.6f}"
             )
         print(
             f"[Train] Epoch {epoch}/{args.epochs} | "
@@ -2629,6 +2984,31 @@ def format_deepspeed_epoch_tagpm_text(train_stats):
     return text
 
 
+def format_deepspeed_epoch_g4_text(train_stats):
+    text = (
+        f" | loss_g4={train_stats['loss_g4']:.6f}"
+        f" | weighted_loss_g4={train_stats['loss_g4_weighted']:.6f}"
+        f" | g4_weight_current={train_stats['g4_weight_current']:.6f}"
+    )
+    for direction in ("D2S", "S2D"):
+        active = train_stats.get(f"g4_{direction}_active_coverage")
+        if active is None:
+            text += f" | {direction}_enabled=False"
+            continue
+        for name in (
+            "candidate_coverage", "active_coverage", "teacher_gate_coverage",
+            "student_violation_coverage", "student_positive_mean",
+            "student_negative_mean", "student_margin_mean",
+            "teacher_positive_mean", "teacher_negative_mean",
+            "teacher_margin_mean",
+        ):
+            text += (
+                f" | {direction}_{name}="
+                f"{train_stats[f'g4_{direction}_{name}']:.6f}"
+            )
+    return text
+
+
 def train_deepspeed(
     model_engine,
     train_loader,
@@ -2671,6 +3051,8 @@ def train_deepspeed(
                     format_deepspeed_epoch_negrank_text(train_stats)
                     if args.use_negrank_kd
                     else format_deepspeed_epoch_tagpm_text(train_stats)
+                    if args.use_tagpm_kd
+                    else format_deepspeed_epoch_g4_text(train_stats)
                 )
             print(
                 f"[Train] Epoch {epoch}/{args.epochs} | "
@@ -2747,7 +3129,18 @@ def train_deepspeed(
             print(f"average S2D loss={train_stats['loss_s2d']:.6f}")
             if teacher_model is not None:
                 print(f"experiment_id={experiment_id(args)}")
-                if args.use_tagpm_kd:
+                if getattr(args, "use_g4_hard_negative_kd", False):
+                    print(
+                        "G4 epoch statistics"
+                        f"{format_deepspeed_epoch_g4_text(train_stats)}"
+                    )
+                    append_g4_diagnostics(args.output_dir, {
+                        "event": "epoch",
+                        "epoch": epoch,
+                        "statistics": train_stats,
+                        "validation": epoch_validation_result,
+                    })
+                elif args.use_tagpm_kd:
                     print(
                         "average raw TAG-PM positive loss="
                         f"{train_stats['loss_tagpm_positive']:.6f}"
@@ -2924,6 +3317,9 @@ def parse_args(argv=None):
     parser.add_argument("--no_save_last", dest="save_last", action="store_false")
     parser.add_argument("--use_negrank_kd", action="store_true", default=False)
     parser.add_argument("--use_tagpm_kd", action="store_true", default=False)
+    parser.add_argument(
+        "--use_g4_hard_negative_kd", action="store_true", default=False
+    )
     parser.add_argument("--experiment_id", type=str, default=None)
     parser.add_argument("--teacher_model_dir", type=str, default=None)
     parser.add_argument(
@@ -2969,6 +3365,29 @@ def parse_args(argv=None):
         default=True,
     )
     parser.add_argument("--tagpm_std_epsilon", type=float, default=1e-12)
+    parser.add_argument("--g4_mining_file", type=str, default=None)
+    parser.add_argument(
+        "--g4_mode",
+        choices=("student_hard_top1", "teacher_adv_top1", "teacher_adv_pool"),
+        default="teacher_adv_pool",
+    )
+    parser.add_argument("--g4_pool_size", type=int, default=4)
+    parser.add_argument("--g4_weight", type=float, default=0.01)
+    parser.add_argument("--g4_temperature", type=float, default=0.07)
+    parser.add_argument("--g4_warmup_epochs", type=int, default=5)
+    parser.add_argument(
+        "--g4_teacher_online_gate",
+        type=str2bool, nargs="?", const=True, default=True,
+    )
+    parser.add_argument(
+        "--g4_d2s_enabled",
+        type=str2bool, nargs="?", const=True, default=True,
+    )
+    parser.add_argument(
+        "--g4_s2d_enabled",
+        type=str2bool, nargs="?", const=True, default=True,
+    )
+    parser.add_argument("--g4_extra_forward_chunk_size", type=int, default=4)
 
     args = parser.parse_args(argv)
     args.teacher_checkpoint_path = None
@@ -2988,8 +3407,12 @@ def parse_args(argv=None):
         parser.error("--rank_kd_temperature must be greater than 0")
     if args.rank_kd_warmup_epochs < 0:
         parser.error("--rank_kd_warmup_epochs must be non-negative")
-    if args.use_negrank_kd and args.use_tagpm_kd:
-        parser.error("--use_negrank_kd and --use_tagpm_kd are mutually exclusive")
+    if sum((
+        bool(args.use_negrank_kd),
+        bool(args.use_tagpm_kd),
+        bool(args.use_g4_hard_negative_kd),
+    )) > 1:
+        parser.error("NegRank KD, TAG-PM KD, and G4 are mutually exclusive")
     if args.tagpm_positive_weight < 0.0:
         parser.error("--tagpm_positive_weight must be non-negative")
     if args.tagpm_margin_weight < 0.0:
@@ -3006,6 +3429,23 @@ def parse_args(argv=None):
         args.tagpm_positive_weight + args.tagpm_margin_weight <= 0.0
     ):
         parser.error("TAG-PM requires a positive total KD weight")
+    if args.g4_weight < 0 or args.g4_temperature <= 0:
+        parser.error("G4 weight must be non-negative and temperature positive")
+    if args.g4_warmup_epochs < 0 or args.g4_pool_size <= 0:
+        parser.error("G4 warmup must be non-negative and pool size positive")
+    if args.g4_extra_forward_chunk_size <= 0:
+        parser.error("--g4_extra_forward_chunk_size must be positive")
+    if args.use_g4_hard_negative_kd:
+        if not args.g4_mining_file or not os.path.isfile(args.g4_mining_file):
+            parser.error("--g4_mining_file must exist when G4 is enabled")
+        if not (args.g4_d2s_enabled or args.g4_s2d_enabled):
+            parser.error("G4 requires D2S and/or S2D")
+        if args.g4_weight <= 0:
+            parser.error("G4 requires a positive weight")
+        if args.g4_mode == "student_hard_top1" and args.g4_teacher_online_gate:
+            parser.error("student_hard_top1 requires --g4_teacher_online_gate false")
+        if args.g4_mode != "student_hard_top1" and not args.g4_teacher_online_gate:
+            parser.error("teacher-advantage G4 modes require teacher online gate")
     if not (0.0 < args.rank_kd_keep_ratio <= 1.0):
         parser.error("--rank_kd_keep_ratio must be in (0, 1]")
     for name in ("rank_kd_d2s_keep_ratio", "rank_kd_s2d_keep_ratio"):
@@ -3079,6 +3519,15 @@ def main():
         print(f"[StudentTrain] output_dir={args.output_dir}")
 
     train_loader = create_student_train_dataset_and_loader(args)
+    if args.use_g4_hard_negative_kd:
+        args.g4_mining_hash = train_loader.dataset.g4_mining_hash
+        with open(args.g4_mining_file, "r", encoding="utf-8") as handle:
+            g4_payload = json.load(handle)
+        metadata = g4_payload.get("metadata", {})
+        args.g4_mining_checkpoint = {
+            "student": metadata.get("student_checkpoint"),
+            "teacher": metadata.get("teacher_checkpoint"),
+        }
     val_loaders = build_1652_val_dataloaders(
         data_dir=args.val_data_dir,
         img_size=[args.img_size, args.img_size],
@@ -3102,7 +3551,11 @@ def main():
 
     print_trainable_parameter_summary(model)
     teacher_model = None
-    if args.use_negrank_kd or args.use_tagpm_kd:
+    if (
+        args.use_negrank_kd
+        or args.use_tagpm_kd
+        or args.use_g4_hard_negative_kd
+    ):
         teacher_model = build_frozen_teacher_from_run(args, device)
     audit_clean_student_runtime(
         model,
@@ -3110,6 +3563,7 @@ def main():
         teacher_model,
         use_negrank_kd=args.use_negrank_kd,
         use_tagpm_kd=args.use_tagpm_kd,
+        use_g4_hard_negative_kd=args.use_g4_hard_negative_kd,
     )
 
     if args.deepspeed:
