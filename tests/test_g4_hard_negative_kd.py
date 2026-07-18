@@ -728,5 +728,7 @@ def test_four_g4_configs_complete_real_deepspeed_epoch_path(
     )
     assert torch.isfinite(torch.tensor(stats["total_loss"]))
     assert stats["g4_weight_current"] == pytest.approx(0.002)
+    assert stats["teacher_grad_tensor_count"] == 0
+    assert stats["teacher_grad_nonzero_count"] == 0
     assert stats["g4_D2S_active_coverage"] is not None
     assert (stats["g4_S2D_active_coverage"] is not None) is s2d

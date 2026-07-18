@@ -1130,6 +1130,8 @@ def print_margin_incidence_configuration(args):
 
 
 def teacher_gradient_counts(teacher_model, aggregate=True):
+    if teacher_model is None:
+        return 0, 0
     grad_tensor_count = 0
     grad_nonzero_count = 0
     for param in teacher_model.parameters():
@@ -2984,11 +2986,11 @@ def train_one_epoch_deepspeed(
             stats["kd_coverage_ratio"] = kd_coverage_meter.avg
             stats["ranking_agreement"] = ranking_agreement_meter.avg
             stats["violation_ratio"] = violation_ratio_meter.avg
-        teacher_grad_tensor_count, teacher_grad_nonzero_count = teacher_gradient_counts(
-            teacher_model
-        )
-        stats["teacher_grad_tensor_count"] = teacher_grad_tensor_count
-        stats["teacher_grad_nonzero_count"] = teacher_grad_nonzero_count
+    teacher_grad_tensor_count, teacher_grad_nonzero_count = (
+        teacher_gradient_counts(teacher_model)
+    )
+    stats["teacher_grad_tensor_count"] = teacher_grad_tensor_count
+    stats["teacher_grad_nonzero_count"] = teacher_grad_nonzero_count
     return stats
 
 
