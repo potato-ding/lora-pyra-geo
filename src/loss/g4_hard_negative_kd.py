@@ -27,9 +27,6 @@ def g4_direction_loss(
     student_anchor = F.normalize(student_anchor.float(), dim=1)
     student_positive = F.normalize(student_positive.float(), dim=1)
     student_negative = F.normalize(student_negative.float(), dim=1)
-    teacher_anchor = F.normalize(teacher_anchor.detach().float(), dim=1)
-    teacher_positive = F.normalize(teacher_positive.detach().float(), dim=1)
-    teacher_negative = F.normalize(teacher_negative.detach().float(), dim=1)
     valid_mask = valid_mask.reshape(-1).bool().to(student_anchor.device)
     anchor_ids = anchor_ids.reshape(-1).to(student_anchor.device)
     negative_ids = negative_ids.reshape(-1).to(student_anchor.device)
@@ -40,9 +37,23 @@ def g4_direction_loss(
 
     student_pos = (student_anchor * student_positive).sum(dim=1)
     student_neg = (student_anchor * student_negative).sum(dim=1)
-    teacher_pos = (teacher_anchor * teacher_positive).sum(dim=1)
-    teacher_neg = (teacher_anchor * teacher_negative).sum(dim=1)
-    teacher_valid = teacher_pos > teacher_neg
+    if teacher_online_gate:
+        if any(
+            tensor is None
+            for tensor in (teacher_anchor, teacher_positive, teacher_negative)
+        ):
+            raise ValueError("teacher online gate requires teacher descriptors")
+        teacher_anchor = F.normalize(teacher_anchor.detach().float(), dim=1)
+        teacher_positive = F.normalize(teacher_positive.detach().float(), dim=1)
+        teacher_negative = F.normalize(teacher_negative.detach().float(), dim=1)
+        teacher_pos = (teacher_anchor * teacher_positive).sum(dim=1)
+        teacher_neg = (teacher_anchor * teacher_negative).sum(dim=1)
+        teacher_valid = teacher_pos > teacher_neg
+    else:
+        teacher_anchor = teacher_positive = teacher_negative = None
+        teacher_pos = None
+        teacher_neg = None
+        teacher_valid = torch.ones_like(valid_mask)
     active = valid_mask & (teacher_valid if teacher_online_gate else True)
 
     per_anchor = F.softplus(
@@ -79,22 +90,30 @@ def g4_direction_loss(
             (student_pos - student_neg)[valid_mask].mean().item()
         ) if valid_count else None,
         "teacher_positive_mean": float(teacher_pos[valid_mask].mean().item())
-        if valid_count else None,
+        if valid_count and teacher_pos is not None else None,
         "teacher_negative_mean": float(teacher_neg[valid_mask].mean().item())
-        if valid_count else None,
+        if valid_count and teacher_neg is not None else None,
         "teacher_margin_mean": float(
             (teacher_pos - teacher_neg)[valid_mask].mean().item()
-        ) if valid_count else None,
+        ) if valid_count and teacher_pos is not None else None,
         "student_descriptor_dtype": str(student_anchor.dtype).replace("torch.", ""),
-        "teacher_descriptor_dtype": str(teacher_anchor.dtype).replace("torch.", ""),
+        "teacher_descriptor_dtype": (
+            str(teacher_anchor.dtype).replace("torch.", "")
+            if teacher_anchor is not None else None
+        ),
         "similarity_dtype": str(student_pos.dtype).replace("torch.", ""),
         "loss_dtype": str(loss.dtype).replace("torch.", ""),
         "teacher_online_gate": bool(teacher_online_gate),
         "finite": bool(
             torch.isfinite(student_pos).all()
             and torch.isfinite(student_neg).all()
-            and torch.isfinite(teacher_pos).all()
-            and torch.isfinite(teacher_neg).all()
+            and (
+                teacher_pos is None
+                or (
+                    torch.isfinite(teacher_pos).all()
+                    and torch.isfinite(teacher_neg).all()
+                )
+            )
             and torch.isfinite(loss)
         ),
     }

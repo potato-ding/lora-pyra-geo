@@ -52,6 +52,9 @@ class U1652PairDataset(Dataset):
         self.g4_s2d_enabled = bool(g4_s2d_enabled)
         self.g4_mining_file = g4_mining_file
         self.g4_mining_hash = None
+        self.g4_mining_version = None
+        self.g4_identity_hash = None
+        self.g4_direction_audit = {}
         self.g4_records = None
         self.domain_paths = {"drone": {}, "satellite": {}}
         self._parse_dataset()
@@ -131,7 +134,12 @@ class U1652PairDataset(Dataset):
                 self.g4_d2s_enabled if direction == "D2S"
                 else self.g4_s2d_enabled
             )
-            negative_pid = self._select_g4_negative(pid, direction) if enabled else None
+            candidate = (
+                self._select_g4_candidate(pid, direction) if enabled else None
+            )
+            negative_pid = (
+                candidate.get("candidate_id") if candidate is not None else None
+            )
             valid = negative_pid is not None
             if valid:
                 paths = self.domain_paths[domain].get(negative_pid, ())
@@ -155,6 +163,10 @@ class U1652PairDataset(Dataset):
                 negative_label, dtype=torch.long
             )
             extras[f"{direction}_valid"] = torch.tensor(valid, dtype=torch.bool)
+            extras[f"{direction}_rank_gap"] = torch.tensor(
+                float(candidate.get("rank_gap", 0.0)) if candidate else 0.0,
+                dtype=torch.float32,
+            )
         return drone_tensor, sat_tensor, label, pid, extras
 
     def _load_g4_mining(self):
@@ -163,14 +175,23 @@ class U1652PairDataset(Dataset):
         with open(self.g4_mining_file, "rb") as handle:
             raw = handle.read()
         payload = json.loads(raw.decode("utf-8"))
-        expected_identity_hash = payload.get("metadata", {}).get("identity_hash")
+        metadata = payload.get("metadata", {})
+        version = metadata.get("version")
+        expected_identity_hash = metadata.get("identity_hash")
         current_identity_hash = hashlib.sha256(
             "\n".join(self.pids).encode("utf-8")
         ).hexdigest()
-        if (
-            expected_identity_hash is not None
-            and expected_identity_hash != current_identity_hash
-        ):
+        rank_disagreement_mode = self.g4_mode in {
+            "rank_disagreement_top1",
+            "rank_disagreement_pool",
+        }
+        if rank_disagreement_mode and version != "v2":
+            raise ValueError(
+                "rank-disagreement G4 modes require metadata.version == 'v2'"
+            )
+        if version == "v2" and not expected_identity_hash:
+            raise ValueError("G4 v2 metadata.identity_hash is required")
+        if expected_identity_hash and expected_identity_hash != current_identity_hash:
             raise ValueError(
                 "G4 mining identity hash does not match the training dataset"
             )
@@ -179,15 +200,21 @@ class U1652PairDataset(Dataset):
             raise ValueError("G4 mining JSON must contain a directions object")
         self.g4_records = directions
         self.g4_mining_hash = hashlib.sha256(raw).hexdigest()
+        self.g4_mining_version = version or "v1"
+        self.g4_identity_hash = expected_identity_hash
         for direction in ("D2S", "S2D"):
             records = directions.get(direction, {})
             if not isinstance(records, dict):
                 raise ValueError(f"G4 mining direction {direction} must be an object")
+            covered = 0
+            strict_covered = 0
+            rank_gaps = []
             for anchor_pid, record in records.items():
-                for field in (
+                legacy_fields = (
                     "student_topk_negative_ids",
                     "teacher_advantage_negative_ids",
-                ):
+                )
+                for field in legacy_fields:
                     candidates = record.get(field, [])
                     if len(candidates) != len(set(candidates)):
                         raise ValueError(
@@ -197,28 +224,140 @@ class U1652PairDataset(Dataset):
                         raise ValueError(
                             f"same-identity G4 negative for {direction}/{anchor_pid}"
                         )
+                strict_candidates = record.get(
+                    "strict_teacher_advantage_ids", []
+                )
+                if len(strict_candidates) != len(set(strict_candidates)):
+                    raise ValueError(
+                        f"duplicate strict teacher-advantage candidates for "
+                        f"{direction}/{anchor_pid}"
+                    )
+                if anchor_pid in strict_candidates:
+                    raise ValueError(
+                        f"same-identity strict teacher-advantage candidate for "
+                        f"{direction}/{anchor_pid}"
+                    )
+                strict_covered += int(bool(strict_candidates))
+                disagreements = record.get("teacher_rank_disagreement", [])
+                if version == "v2" and not isinstance(disagreements, list):
+                    raise ValueError(
+                        f"teacher_rank_disagreement must be a list for "
+                        f"{direction}/{anchor_pid}"
+                    )
+                candidate_ids = []
+                for candidate in disagreements:
+                    if not isinstance(candidate, dict):
+                        raise ValueError(
+                            f"invalid rank-disagreement candidate for "
+                            f"{direction}/{anchor_pid}"
+                        )
+                    candidate_pid = candidate.get("candidate_id")
+                    rank_gap = candidate.get("rank_gap", {})
+                    rank_gap_mean = (
+                        rank_gap.get("mean")
+                        if isinstance(rank_gap, dict)
+                        else rank_gap
+                    )
+                    if (
+                        not isinstance(candidate_pid, str)
+                        or candidate_pid not in self.pid_to_label
+                    ):
+                        raise ValueError(
+                            f"unknown rank-disagreement candidate for "
+                            f"{direction}/{anchor_pid}"
+                        )
+                    if candidate_pid == anchor_pid:
+                        raise ValueError(
+                            f"same-identity G4 negative for {direction}/{anchor_pid}"
+                        )
+                    if (
+                        not isinstance(rank_gap_mean, (int, float))
+                        or rank_gap_mean <= 0
+                    ):
+                        raise ValueError(
+                            f"rank_gap must be positive for "
+                            f"{direction}/{anchor_pid}/{candidate_pid}"
+                        )
+                    candidate_ids.append(candidate_pid)
+                    rank_gaps.append(float(rank_gap_mean))
+                if len(candidate_ids) != len(set(candidate_ids)):
+                    raise ValueError(
+                        f"duplicate rank-disagreement candidates for "
+                        f"{direction}/{anchor_pid}"
+                    )
+                covered += int(bool(candidate_ids))
+            self.g4_direction_audit[direction] = {
+                "strict_teacher_advantage_coverage_count": strict_covered,
+                "strict_teacher_advantage_coverage_ratio": (
+                    strict_covered / max(len(self.pids), 1)
+                ),
+                "rank_disagreement_coverage_count": covered,
+                "rank_disagreement_coverage_ratio": (
+                    covered / max(len(self.pids), 1)
+                ),
+                "candidate_rank_gap_mean": (
+                    float(sum(rank_gaps) / len(rank_gaps))
+                    if rank_gaps else None
+                ),
+                "candidate_rank_gap_min": min(rank_gaps) if rank_gaps else None,
+                "candidate_rank_gap_max": max(rank_gaps) if rank_gaps else None,
+            }
 
-    def _select_g4_negative(self, anchor_pid, direction):
+    def _select_g4_candidate(self, anchor_pid, direction):
         record = self.g4_records.get(direction, {}).get(anchor_pid)
         if not record:
             return None
         if self.g4_mode == "student_hard_top1":
-            candidates = record.get("student_topk_negative_ids", [])[:1]
-        elif self.g4_mode == "teacher_adv_top1":
-            candidates = record.get("teacher_advantage_negative_ids", [])[:1]
-        elif self.g4_mode == "teacher_adv_pool":
-            candidates = record.get("teacher_advantage_negative_ids", [])[
-                :self.g4_pool_size
+            candidates = [
+                {"candidate_id": pid, "rank_gap": 0.0}
+                for pid in record.get("student_topk_negative_ids", [])[:1]
             ]
+        elif self.g4_mode == "teacher_adv_top1":
+            candidates = [
+                {"candidate_id": pid, "rank_gap": 0.0}
+                for pid in record.get("teacher_advantage_negative_ids", [])[:1]
+            ]
+        elif self.g4_mode == "teacher_adv_pool":
+            candidates = [
+                {"candidate_id": pid, "rank_gap": 0.0}
+                for pid in record.get("teacher_advantage_negative_ids", [])[
+                    :self.g4_pool_size
+                ]
+            ]
+        elif self.g4_mode in {
+            "rank_disagreement_top1",
+            "rank_disagreement_pool",
+        }:
+            limit = (
+                1 if self.g4_mode == "rank_disagreement_top1"
+                else self.g4_pool_size
+            )
+            candidates = []
+            for item in record.get("teacher_rank_disagreement", [])[:limit]:
+                rank_gap = item.get("rank_gap", {})
+                candidates.append({
+                    "candidate_id": item["candidate_id"],
+                    "rank_gap": float(
+                        rank_gap.get("mean")
+                        if isinstance(rank_gap, dict)
+                        else rank_gap
+                    ),
+                })
         else:
             raise ValueError(f"unsupported g4_mode: {self.g4_mode}")
         candidates = [
-            pid for pid in candidates
-            if pid != anchor_pid and pid in self.pid_to_label
+            candidate for candidate in candidates
+            if candidate["candidate_id"] != anchor_pid
+            and candidate["candidate_id"] in self.pid_to_label
         ]
         if not candidates:
             return None
         return random.choice(candidates)
+
+    def _select_g4_negative(self, anchor_pid, direction):
+        """Legacy helper retained for callers that only need the identity."""
+        candidate = self._select_g4_candidate(anchor_pid, direction)
+        return candidate["candidate_id"] if candidate is not None else None
 
     def shuffle(self):
         pair_pool = self.pairs[:]

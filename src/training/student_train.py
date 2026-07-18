@@ -1283,16 +1283,20 @@ def compute_g4_batch_loss(
     student_drone, student_satellite = split_paired_features(
         local_features, pair_batch_size
     )
-    global_pair_batch = teacher_features.size(0) // 2
-    teacher_drone_global, teacher_satellite_global = split_paired_features(
-        teacher_features, global_pair_batch
-    )
-    rank_start = get_rank() * pair_batch_size
-    rank_end = rank_start + pair_batch_size
-    teacher_drone = teacher_drone_global[rank_start:rank_end]
-    teacher_satellite = teacher_satellite_global[rank_start:rank_end]
-    if teacher_drone.size(0) != pair_batch_size:
-        raise RuntimeError("unable to recover local teacher descriptors for G4")
+    teacher_drone = teacher_satellite = None
+    if teacher_online_gate:
+        if teacher_model is None or teacher_features is None:
+            raise ValueError("G4 teacher gate requires online teacher features")
+        global_pair_batch = teacher_features.size(0) // 2
+        teacher_drone_global, teacher_satellite_global = split_paired_features(
+            teacher_features, global_pair_batch
+        )
+        rank_start = get_rank() * pair_batch_size
+        rank_end = rank_start + pair_batch_size
+        teacher_drone = teacher_drone_global[rank_start:rank_end]
+        teacher_satellite = teacher_satellite_global[rank_start:rank_end]
+        if teacher_drone.size(0) != pair_batch_size:
+            raise RuntimeError("unable to recover local teacher descriptors for G4")
 
     directions = {}
     extra_forward_count = 0
@@ -1320,17 +1324,20 @@ def compute_g4_batch_loss(
                 teacher=False,
             )
         )
-        teacher_negative, teacher_forward_count = (
-            forward_valid_extra_descriptors(
-                teacher_model,
-                extra_images,
-                valid_mask,
-                teacher_positive,
-                chunk_size,
-                teacher=True,
+        teacher_negative = None
+        teacher_forward_count = 0
+        if teacher_online_gate:
+            teacher_negative, teacher_forward_count = (
+                forward_valid_extra_descriptors(
+                    teacher_model,
+                    extra_images,
+                    valid_mask,
+                    teacher_positive,
+                    chunk_size,
+                    teacher=True,
+                )
             )
-        )
-        if student_forward_count != teacher_forward_count:
+        if teacher_online_gate and student_forward_count != teacher_forward_count:
             raise RuntimeError("student/teacher G4 extra forward count mismatch")
         extra_forward_count += student_forward_count
         directions[direction] = {
@@ -1349,8 +1356,19 @@ def compute_g4_batch_loss(
         temperature=temperature,
         teacher_online_gate=teacher_online_gate,
     )
+    for direction in directions:
+        valid_mask = g4_batch[f"{direction}_valid"].reshape(-1).bool()
+        rank_gap = g4_batch.get(f"{direction}_rank_gap")
+        if rank_gap is None or not torch.any(valid_mask):
+            audit[direction]["mined_rank_gap_mean"] = None
+        else:
+            rank_gap = rank_gap.reshape(-1).float().to(valid_mask.device)
+            audit[direction]["mined_rank_gap_mean"] = float(
+                rank_gap[valid_mask].mean().item()
+            )
     audit["extra_forward_image_count"] = extra_forward_count
     audit["extra_forward_chunk_size"] = int(chunk_size)
+    audit["teacher_online_forward"] = bool(teacher_online_gate)
     return loss, audit
 
 
@@ -1424,32 +1442,40 @@ def compute_student_batch_losses(
             "Negative Rank KD, TAG-PM KD, and G4 cannot be active together"
         )
     if negrank_active or tagpm_active or g4_active:
-        (
-            teacher_features,
-            teacher_global_pair_batch_size,
-            teacher_runtime_audit,
-        ) = compute_teacher_paired_features(
-            teacher_model,
-            images,
-            pair_batch_size,
-            audit_runtime=audit_runtime,
+        teacher_features = None
+        teacher_drone_feat = teacher_sat_feat = None
+        teacher_forward_required = (
+            negrank_active
+            or tagpm_active
+            or (g4_active and g4_teacher_online_gate)
         )
+        if teacher_forward_required:
+            (
+                teacher_features,
+                teacher_global_pair_batch_size,
+                teacher_runtime_audit,
+            ) = compute_teacher_paired_features(
+                teacher_model,
+                images,
+                pair_batch_size,
+                audit_runtime=audit_runtime,
+            )
 
-        if teacher_global_pair_batch_size != global_pair_batch_size:
-            raise RuntimeError(
-                "Teacher/student global pair batch mismatch: "
-                f"teacher={teacher_global_pair_batch_size} "
-                f"student={global_pair_batch_size}"
+            if teacher_global_pair_batch_size != global_pair_batch_size:
+                raise RuntimeError(
+                    "Teacher/student global pair batch mismatch: "
+                    f"teacher={teacher_global_pair_batch_size} "
+                    f"student={global_pair_batch_size}"
+                )
+            teacher_drone_feat, teacher_sat_feat = split_paired_features(
+                teacher_features,
+                teacher_global_pair_batch_size,
             )
         if student_drone_feat is None or student_sat_feat is None:
             student_drone_feat, student_sat_feat = split_paired_features(
                 features,
                 global_pair_batch_size,
             )
-        teacher_drone_feat, teacher_sat_feat = split_paired_features(
-            teacher_features,
-            teacher_global_pair_batch_size,
-        )
         if negrank_active:
             negrank_output = negative_aware_cross_view_ranking_kd(
                 student_drone_feat,
@@ -1746,10 +1772,23 @@ def print_first_runtime_audit(model, criterion, batch_meta, images, batch_losses
         g4_audit = batch_losses["g4_audit"]
         print("[FIRST REAL BATCH G4 AUDIT]")
         print(f"mining_file={args.g4_mining_file}")
+        print(
+            f"mining_version="
+            f"{getattr(args, 'g4_mining_version', 'unavailable')}"
+        )
         print(f"mining_hash={getattr(args, 'g4_mining_hash', 'unavailable')}")
+        print(
+            f"mining_identity_hash="
+            f"{getattr(args, 'g4_identity_hash', 'unavailable')}"
+        )
         print(f"mining_checkpoint={getattr(args, 'g4_mining_checkpoint', {})}")
+        print(
+            f"rank_disagreement_mining_audit="
+            f"{getattr(args, 'g4_direction_audit', {})}"
+        )
         print(f"local_pair_batch={local_pair_count}")
         print(f"global_pair_batch={global_pair_count}")
+        print(f"InfoNCE_global_candidate_count={global_pair_count}")
         print(f"cross_gpu_gather={cross_gpu_effective}")
         print(f"extra_forward_image_count={g4_audit['extra_forward_image_count']}")
         print(f"extra_forward_chunk_size={g4_audit['extra_forward_chunk_size']}")
@@ -1758,10 +1797,17 @@ def print_first_runtime_audit(model, criterion, batch_meta, images, batch_losses
         print(f"positive_identity={g4_batch.get('anchor_id', []).tolist() if torch.is_tensor(g4_batch.get('anchor_id')) else g4_batch.get('anchor_id')}")
         for direction in ("D2S", "S2D"):
             negative_ids = g4_batch.get(f"{direction}_negative_id")
+            rank_gaps = g4_batch.get(f"{direction}_rank_gap")
             print(
                 f"{direction}_mined_negative_identity="
                 f"{negative_ids.tolist() if torch.is_tensor(negative_ids) else negative_ids}"
             )
+            print(
+                f"{direction}_selected_candidate_rank_gap="
+                f"{rank_gaps.tolist() if torch.is_tensor(rank_gaps) else rank_gaps}"
+            )
+        memory = gpu_memory_snapshot()
+        print(f"gpu_memory={memory}")
         print("teacher_trainable_params=0")
         print("teacher_grad_count=0")
         for direction in ("D2S", "S2D"):
@@ -2352,6 +2398,7 @@ def train_one_epoch_deepspeed(
         "teacher_positive_mean",
         "teacher_negative_mean",
         "teacher_margin_mean",
+        "mined_rank_gap_mean",
     )
     g4_meters = {
         direction: {name: AverageMeter() for name in g4_metric_names}
@@ -2665,6 +2712,18 @@ def train_one_epoch_deepspeed(
             stats["loss_g4"] = loss_g4_meter.avg
             stats["loss_g4_weighted"] = loss_g4_weighted_meter.avg
             stats["g4_weight_current"] = current_g4_weight(args, epoch)
+            stats["g4_mining_version"] = getattr(
+                args, "g4_mining_version", "unavailable"
+            )
+            stats["g4_mining_hash"] = getattr(
+                args, "g4_mining_hash", "unavailable"
+            )
+            stats["g4_identity_hash"] = getattr(
+                args, "g4_identity_hash", "unavailable"
+            )
+            stats["g4_direction_audit"] = getattr(
+                args, "g4_direction_audit", {}
+            )
             for direction in ("D2S", "S2D"):
                 for metric_name in g4_metric_names:
                     stats[f"g4_{direction}_{metric_name}"] = (
@@ -2989,6 +3048,12 @@ def format_deepspeed_epoch_g4_text(train_stats):
         f" | loss_g4={train_stats['loss_g4']:.6f}"
         f" | weighted_loss_g4={train_stats['loss_g4_weighted']:.6f}"
         f" | g4_weight_current={train_stats['g4_weight_current']:.6f}"
+        f" | mining_version={train_stats.get('g4_mining_version', 'unavailable')}"
+        f" | mining_hash={train_stats.get('g4_mining_hash', 'unavailable')}"
+        f" | mining_identity_hash="
+        f"{train_stats.get('g4_identity_hash', 'unavailable')}"
+        f" | rank_disagreement_mining_audit="
+        f"{train_stats.get('g4_direction_audit', {})}"
     )
     for direction in ("D2S", "S2D"):
         active = train_stats.get(f"g4_{direction}_active_coverage")
@@ -3000,12 +3065,11 @@ def format_deepspeed_epoch_g4_text(train_stats):
             "student_violation_coverage", "student_positive_mean",
             "student_negative_mean", "student_margin_mean",
             "teacher_positive_mean", "teacher_negative_mean",
-            "teacher_margin_mean",
+            "teacher_margin_mean", "mined_rank_gap_mean",
         ):
-            text += (
-                f" | {direction}_{name}="
-                f"{train_stats[f'g4_{direction}_{name}']:.6f}"
-            )
+            value = train_stats.get(f"g4_{direction}_{name}")
+            text += f" | {direction}_{name}="
+            text += f"{value:.6f}" if value is not None else "unavailable"
     return text
 
 
@@ -3368,7 +3432,13 @@ def parse_args(argv=None):
     parser.add_argument("--g4_mining_file", type=str, default=None)
     parser.add_argument(
         "--g4_mode",
-        choices=("student_hard_top1", "teacher_adv_top1", "teacher_adv_pool"),
+        choices=(
+            "student_hard_top1",
+            "teacher_adv_top1",
+            "teacher_adv_pool",
+            "rank_disagreement_top1",
+            "rank_disagreement_pool",
+        ),
         default="teacher_adv_pool",
     )
     parser.add_argument("--g4_pool_size", type=int, default=4)
@@ -3442,9 +3512,17 @@ def parse_args(argv=None):
             parser.error("G4 requires D2S and/or S2D")
         if args.g4_weight <= 0:
             parser.error("G4 requires a positive weight")
+        gate_optional_modes = {
+            "student_hard_top1",
+            "rank_disagreement_top1",
+            "rank_disagreement_pool",
+        }
         if args.g4_mode == "student_hard_top1" and args.g4_teacher_online_gate:
             parser.error("student_hard_top1 requires --g4_teacher_online_gate false")
-        if args.g4_mode != "student_hard_top1" and not args.g4_teacher_online_gate:
+        if (
+            args.g4_mode not in gate_optional_modes
+            and not args.g4_teacher_online_gate
+        ):
             parser.error("teacher-advantage G4 modes require teacher online gate")
     if not (0.0 < args.rank_kd_keep_ratio <= 1.0):
         parser.error("--rank_kd_keep_ratio must be in (0, 1]")
@@ -3520,7 +3598,11 @@ def main():
 
     train_loader = create_student_train_dataset_and_loader(args)
     if args.use_g4_hard_negative_kd:
-        args.g4_mining_hash = train_loader.dataset.g4_mining_hash
+        g4_dataset = train_loader.dataset
+        args.g4_mining_hash = g4_dataset.g4_mining_hash
+        args.g4_mining_version = g4_dataset.g4_mining_version
+        args.g4_identity_hash = g4_dataset.g4_identity_hash
+        args.g4_direction_audit = g4_dataset.g4_direction_audit
         with open(args.g4_mining_file, "r", encoding="utf-8") as handle:
             g4_payload = json.load(handle)
         metadata = g4_payload.get("metadata", {})

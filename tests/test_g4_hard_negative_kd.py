@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+import hashlib
 from types import SimpleNamespace
 from types import ModuleType
 
@@ -229,6 +230,115 @@ def _mining_file(tmp_path, advantage):
     return path
 
 
+def _v2_mining_file(tmp_path, *, identity_hash=None, empty=False):
+    identities = ["1", "2", "3"]
+    if identity_hash is None:
+        identity_hash = hashlib.sha256(
+            "\n".join(identities).encode("utf-8")
+        ).hexdigest()
+    records = {}
+    for anchor in identities:
+        candidates = [pid for pid in identities if pid != anchor]
+        records[anchor] = {
+            "strict_teacher_advantage_ids": [],
+            "teacher_rank_disagreement": [] if empty else [
+                {
+                    "candidate_id": candidate,
+                    "query_frequency": 2 - index,
+                    "student_negative_rank": {"min": index + 1},
+                    "teacher_negative_rank": {"min": index + 3},
+                    "rank_gap": {"mean": float(index + 2), "max": index + 3},
+                }
+                for index, candidate in enumerate(candidates)
+            ],
+        }
+    path = tmp_path / ("mining_v2_empty.json" if empty else "mining_v2.json")
+    path.write_text(
+        json.dumps({
+            "metadata": {
+                "version": "v2",
+                "identity_hash": identity_hash,
+            },
+            "directions": {"D2S": records, "S2D": records},
+        }),
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_v2_loader_validates_schema_hash_and_extracts_candidate_ids(tmp_path):
+    for pid in ("1", "2", "3"):
+        _write_identity(tmp_path, pid)
+    mining = _v2_mining_file(tmp_path)
+    dataset = U1652PairDataset(
+        str(tmp_path),
+        sat_transforms=_TensorTransform(),
+        drone_transforms=_TensorTransform(),
+        prob_flip=0,
+        g4_mining_file=str(mining),
+        g4_mode="rank_disagreement_top1",
+    )
+    assert dataset.g4_mining_version == "v2"
+    assert dataset._select_g4_negative("1", "D2S") == "2"
+    candidate = dataset._select_g4_candidate("1", "D2S")
+    assert candidate == {"candidate_id": "2", "rank_gap": 2.0}
+    assert (
+        dataset.g4_direction_audit["D2S"][
+            "rank_disagreement_coverage_count"
+        ] == 3
+    )
+
+    bad_hash = _v2_mining_file(tmp_path, identity_hash="wrong")
+    with pytest.raises(ValueError, match="identity hash"):
+        U1652PairDataset(
+            str(tmp_path),
+            sat_transforms=_TensorTransform(),
+            drone_transforms=_TensorTransform(),
+            prob_flip=0,
+            g4_mining_file=str(bad_hash),
+            g4_mode="rank_disagreement_top1",
+        )
+
+
+def test_v2_pool4_samples_only_rank_disagreement_candidates(tmp_path):
+    for pid in ("1", "2", "3"):
+        _write_identity(tmp_path, pid)
+    dataset = U1652PairDataset(
+        str(tmp_path),
+        sat_transforms=_TensorTransform(),
+        drone_transforms=_TensorTransform(),
+        prob_flip=0,
+        g4_mining_file=str(_v2_mining_file(tmp_path)),
+        g4_mode="rank_disagreement_pool",
+        g4_pool_size=4,
+    )
+    selected = {dataset._select_g4_negative("1", "D2S") for _ in range(30)}
+    assert selected == {"2", "3"}
+    assert "1" not in selected
+
+
+def test_v2_no_candidate_produces_finite_zero_loss(tmp_path):
+    for pid in ("1", "2", "3"):
+        _write_identity(tmp_path, pid)
+    dataset = U1652PairDataset(
+        str(tmp_path),
+        sat_transforms=_TensorTransform(),
+        drone_transforms=_TensorTransform(),
+        prob_flip=0,
+        g4_mining_file=str(_v2_mining_file(tmp_path, empty=True)),
+        g4_mode="rank_disagreement_pool",
+    )
+    item = dataset[0]
+    inputs = _direction_inputs(teacher_correct=True)
+    inputs["valid_mask"] = item[4]["D2S_valid"].reshape(1)
+    inputs["negative_ids"] = torch.tensor([-1])
+    loss, audit = g4_direction_loss(**inputs)
+    assert loss.item() == 0.0
+    assert loss.requires_grad
+    assert torch.isfinite(loss)
+    assert audit["active_count"] == 0
+
+
 def test_pool4_samples_only_legal_candidates_and_no_candidate_has_no_fallback(tmp_path):
     for pid in ("1", "2", "3"):
         _write_identity(tmp_path, pid)
@@ -309,8 +419,10 @@ def test_g4_extra_descriptors_do_not_change_infonce_candidate_count():
         def __init__(self):
             super().__init__()
             self.logit_scale = nn.Parameter(torch.tensor(0.0))
+            self.forward_calls = 0
 
         def forward(self, images):
+            self.forward_calls += 1
             return F.normalize(images.float().flatten(1), dim=1)
 
     model = DescriptorModel()
@@ -344,8 +456,26 @@ def test_g4_extra_descriptors_do_not_change_infonce_candidate_count():
         pair_batch, pair_batch
     )
     assert "loss_g4" in losses
+    assert teacher.forward_calls == 0
+    assert losses["g4_audit"]["teacher_online_forward"] is False
     losses["loss"].backward()
     assert all(parameter.grad is None for parameter in teacher.parameters())
+
+    gated_teacher = DescriptorModel().eval()
+    student_train.freeze_model(gated_teacher)
+    gated_losses = student_train.compute_student_batch_losses(
+        model,
+        images,
+        pair_batch,
+        criterion,
+        teacher_model=gated_teacher,
+        g4_weight_current=0.01,
+        g4_teacher_online_gate=True,
+        g4_extra_forward_chunk_size=2,
+        g4_batch=g4_batch,
+    )
+    assert gated_teacher.forward_calls > 0
+    assert gated_losses["g4_audit"]["teacher_online_forward"] is True
 
 
 def test_use_g4_false_keeps_cli_and_old_batch_path_unchanged():
@@ -354,13 +484,24 @@ def test_use_g4_false_keeps_cli_and_old_batch_path_unchanged():
     assert student_train.current_g4_weight(args, 1) == 0.0
 
 
+def test_g4_boolean_cli_accepts_explicit_true_and_false():
+    args = student_train.parse_args([
+        "--g4_teacher_online_gate", "false",
+        "--g4_d2s_enabled", "true",
+        "--g4_s2d_enabled", "false",
+    ])
+    assert args.g4_teacher_online_gate is False
+    assert args.g4_d2s_enabled is True
+    assert args.g4_s2d_enabled is False
+
+
 @pytest.mark.parametrize(
     ("mode", "gate", "d2s", "s2d"),
     [
-        ("student_hard_top1", False, True, True),
-        ("teacher_adv_top1", True, True, True),
-        ("teacher_adv_pool", True, True, True),
-        ("teacher_adv_pool", True, True, False),
+        ("rank_disagreement_top1", False, True, True),
+        ("rank_disagreement_top1", True, True, True),
+        ("rank_disagreement_pool", True, True, True),
+        ("rank_disagreement_pool", True, True, False),
     ],
 )
 def test_four_g4_configs_complete_real_deepspeed_epoch_path(
