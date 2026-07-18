@@ -414,20 +414,144 @@ def test_invalid_candidates_are_not_forwarded():
     assert torch.count_nonzero(descriptors[[0, 2]]).item() == 0
 
 
+class _BNDescriptorModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.projection = nn.Linear(12, 12, bias=False)
+        self.neck = nn.BatchNorm1d(12)
+        self.logit_scale = nn.Parameter(torch.tensor(0.0))
+
+    def forward(self, images):
+        flattened = images.float().flatten(1)
+        return F.normalize(self.neck(self.projection(flattened)), dim=1)
+
+
+def _g4_tensor_batch(pair_batch):
+    return {
+        "anchor_id": torch.arange(pair_batch),
+        "D2S_image": torch.randn(pair_batch, 3, 2, 2),
+        "D2S_negative_id": torch.roll(torch.arange(pair_batch), 1),
+        "D2S_valid": torch.ones(pair_batch, dtype=torch.bool),
+        "S2D_image": torch.randn(pair_batch, 3, 2, 2),
+        "S2D_negative_id": torch.roll(torch.arange(pair_batch), 1),
+        "S2D_valid": torch.ones(pair_batch, dtype=torch.bool),
+    }
+
+
+def test_train_mode_extra_forward_changes_bn_without_restore():
+    model = _BNDescriptorModel().train()
+    before = student_train._snapshot_batch_norm_running_state(model)
+    student_train.forward_descriptor_chunks(
+        model, torch.randn(8, 3, 2, 2), 2, teacher=False
+    )
+    after = student_train._snapshot_batch_norm_running_state(model)
+    delta = student_train._batch_norm_buffer_delta(before, after)
+    assert delta["changed_count"] == 1
+    assert delta["max_delta"] > 0
+    assert delta["num_batches_tracked_delta"] == 4
+
+
+def test_g4_restores_bn_bitwise_keeps_main_update_and_student_gradient():
+    torch.manual_seed(7)
+    model = _BNDescriptorModel().train()
+    control = _BNDescriptorModel().train()
+    control.load_state_dict(model.state_dict())
+    pair_batch = 4
+    images = torch.randn(pair_batch * 2, 3, 2, 2)
+    g4_batch = _g4_tensor_batch(pair_batch)
+
+    with torch.no_grad():
+        control(images)
+    expected_after_main = student_train._snapshot_batch_norm_running_state(
+        control
+    )
+    before_main = student_train._snapshot_batch_norm_running_state(model)
+    losses = student_train.compute_student_batch_losses(
+        model,
+        images,
+        pair_batch,
+        student_train.Sample4GeoLoss(label_smoothing=0.0),
+        teacher_model=None,
+        g4_weight_current=0.01,
+        g4_teacher_online_gate=False,
+        g4_extra_forward_chunk_size=2,
+        g4_batch=g4_batch,
+    )
+    actual_after_g4 = student_train._snapshot_batch_norm_running_state(model)
+    assert student_train._batch_norm_buffer_delta(
+        before_main, actual_after_g4
+    )["changed_count"] == 1
+    for expected, actual in zip(expected_after_main, actual_after_g4):
+        assert torch.equal(
+            expected["running_mean"], actual["running_mean"]
+        )
+        assert torch.equal(
+            expected["running_var"], actual["running_var"]
+        )
+        assert torch.equal(
+            expected["num_batches_tracked"],
+            actual["num_batches_tracked"],
+        )
+
+    audit = losses["g4_audit"]
+    assert audit["main_forward_bn_changed_count"] == 1
+    assert audit["main_forward_num_batches_tracked_delta"] == 1
+    assert audit["extra_forward_bn_changed_before_restore"] == 1
+    assert audit["extra_forward_bn_max_delta_before_restore"] > 0
+    assert audit["extra_forward_num_batches_tracked_delta_before_restore"] == 4
+    assert audit["extra_forward_bn_changed_after_restore"] == 0
+    assert audit["extra_forward_bn_max_delta_after_restore"] == 0.0
+    assert audit["extra_forward_num_batches_tracked_delta_after_restore"] == 0
+
+    model.zero_grad(set_to_none=True)
+    losses["loss_g4"].backward()
+    assert model.projection.weight.grad is not None
+    assert torch.count_nonzero(model.projection.weight.grad).item() > 0
+
+
+def test_g4_gate_false_requires_no_teacher_files_or_object():
+    args = SimpleNamespace(
+        use_negrank_kd=False,
+        use_tagpm_kd=False,
+        use_g4_hard_negative_kd=True,
+        g4_teacher_online_gate=False,
+        teacher_model_dir="does/not/exist",
+        teacher_checkpoint_path="must-be-cleared",
+    )
+    assert student_train.teacher_required_for_training(args) is False
+    student_train.validate_negrank_kd_files(args)
+    assert args.teacher_checkpoint_path is None
+
+    model = _BNDescriptorModel().train()
+    pair_batch = 4
+    losses = student_train.compute_student_batch_losses(
+        model,
+        torch.randn(pair_batch * 2, 3, 2, 2),
+        pair_batch,
+        student_train.Sample4GeoLoss(label_smoothing=0.0),
+        teacher_model=None,
+        g4_weight_current=0.01,
+        g4_teacher_online_gate=False,
+        g4_batch=_g4_tensor_batch(pair_batch),
+    )
+    assert losses["g4_audit"]["teacher_online_forward"] is False
+
+
 def test_g4_extra_descriptors_do_not_change_infonce_candidate_count():
     class DescriptorModel(nn.Module):
         def __init__(self):
             super().__init__()
             self.logit_scale = nn.Parameter(torch.tensor(0.0))
+            self.neck = nn.BatchNorm1d(12)
             self.forward_calls = 0
 
         def forward(self, images):
             self.forward_calls += 1
-            return F.normalize(images.float().flatten(1), dim=1)
+            return F.normalize(
+                self.neck(images.float().flatten(1)), dim=1
+            )
 
     model = DescriptorModel()
-    teacher = DescriptorModel().eval()
-    student_train.freeze_model(teacher)
     criterion = student_train.Sample4GeoLoss(label_smoothing=0.0)
     pair_batch = 4
     images = torch.randn(pair_batch * 2, 3, 2, 2)
@@ -445,7 +569,7 @@ def test_g4_extra_descriptors_do_not_change_infonce_candidate_count():
         images,
         pair_batch,
         criterion,
-        teacher_model=teacher,
+        teacher_model=None,
         g4_weight_current=0.01,
         g4_teacher_online_gate=False,
         g4_extra_forward_chunk_size=2,
@@ -456,10 +580,8 @@ def test_g4_extra_descriptors_do_not_change_infonce_candidate_count():
         pair_batch, pair_batch
     )
     assert "loss_g4" in losses
-    assert teacher.forward_calls == 0
     assert losses["g4_audit"]["teacher_online_forward"] is False
     losses["loss"].backward()
-    assert all(parameter.grad is None for parameter in teacher.parameters())
 
     gated_teacher = DescriptorModel().eval()
     student_train.freeze_model(gated_teacher)
@@ -511,10 +633,13 @@ def test_four_g4_configs_complete_real_deepspeed_epoch_path(
         def __init__(self):
             super().__init__()
             self.logit_scale = nn.Parameter(torch.tensor(0.0))
+            self.neck = nn.BatchNorm1d(12)
             self._runtime_audit_printed = True
 
         def forward(self, images):
-            return F.normalize(images.float().flatten(1), dim=1)
+            return F.normalize(
+                self.neck(images.float().flatten(1)), dim=1
+            )
 
     class FakeEngine(nn.Module):
         def __init__(self):
@@ -599,7 +724,7 @@ def test_four_g4_configs_complete_real_deepspeed_epoch_path(
         torch.device("cpu"),
         args,
         epoch=1,
-        teacher_model=teacher,
+        teacher_model=teacher if gate else None,
     )
     assert torch.isfinite(torch.tensor(stats["total_loss"]))
     assert stats["g4_weight_current"] == pytest.approx(0.002)

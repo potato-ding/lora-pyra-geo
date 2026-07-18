@@ -413,12 +413,19 @@ def get_teacher_checkpoint_path(teacher_model_dir, teacher_ckpt_type):
     return os.path.join(teacher_model_dir, filename)
 
 
-def validate_negrank_kd_files(args, parser=None):
-    teacher_kd_enabled = bool(
+def teacher_required_for_training(args):
+    return bool(
         getattr(args, "use_negrank_kd", False)
         or getattr(args, "use_tagpm_kd", False)
-        or getattr(args, "use_g4_hard_negative_kd", False)
+        or (
+            getattr(args, "use_g4_hard_negative_kd", False)
+            and getattr(args, "g4_teacher_online_gate", True)
+        )
     )
+
+
+def validate_negrank_kd_files(args, parser=None):
+    teacher_kd_enabled = teacher_required_for_training(args)
     if not teacher_kd_enabled:
         args.teacher_checkpoint_path = None
         return
@@ -611,6 +618,7 @@ def audit_clean_student_runtime(
     use_negrank_kd=False,
     use_tagpm_kd=False,
     use_g4_hard_negative_kd=False,
+    g4_teacher_online_gate=True,
 ):
     raw_model = get_raw_model(model)
     student_class = f"{raw_model.__class__.__module__}.{raw_model.__class__.__name__}"
@@ -644,7 +652,9 @@ def audit_clean_student_runtime(
     if not isinstance(criterion, Sample4GeoLoss):
         errors.append(f"criterion is not Sample4GeoLoss: {type(criterion)}")
     teacher_kd_enabled = bool(
-        use_negrank_kd or use_tagpm_kd or use_g4_hard_negative_kd
+        use_negrank_kd
+        or use_tagpm_kd
+        or (use_g4_hard_negative_kd and g4_teacher_online_gate)
     )
     if teacher_present != teacher_kd_enabled:
         errors.append(
@@ -652,6 +662,7 @@ def audit_clean_student_runtime(
             f"teacher_present={teacher_present}, "
             f"use_negrank_kd={use_negrank_kd}, use_tagpm_kd={use_tagpm_kd}"
             f", use_g4_hard_negative_kd={use_g4_hard_negative_kd}"
+            f", g4_teacher_online_gate={g4_teacher_online_gate}"
         )
     if extra_student_module_present:
         errors.append(f"unexpected top-level student modules: {extra_child_modules}")
@@ -1228,24 +1239,14 @@ def forward_descriptor_chunks(model, images, chunk_size, *, teacher=False):
     if chunk_size <= 0:
         raise ValueError("extra forward chunk size must be positive")
     outputs = []
-    batch_norm_states = []
-    if not teacher:
-        for module in get_raw_model(model).modules():
-            if isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
-                batch_norm_states.append((module, module.training))
-                module.eval()
     context = torch.inference_mode if teacher else torch.enable_grad
-    try:
-        with context():
-            for start in range(0, images.size(0), chunk_size):
-                chunk = cast_images_to_model_dtype(
-                    model, images[start:start + chunk_size]
-                )
-                output = select_model_descriptor(model(chunk))
-                outputs.append(output.detach() if teacher else output)
-    finally:
-        for module, was_training in batch_norm_states:
-            module.train(was_training)
+    with context():
+        for start in range(0, images.size(0), chunk_size):
+            chunk = cast_images_to_model_dtype(
+                model, images[start:start + chunk_size]
+            )
+            output = select_model_descriptor(model(chunk))
+            outputs.append(output.detach() if teacher else output)
     if not outputs:
         raise ValueError("cannot forward an empty G4 image tensor")
     return torch.cat(outputs, dim=0)
@@ -1264,6 +1265,94 @@ def forward_valid_extra_descriptors(
         model, selected, chunk_size, teacher=teacher
     )
     return base.index_copy(0, indices, descriptors), int(indices.numel())
+
+
+def _snapshot_batch_norm_running_state(model):
+    states = []
+    for module in get_raw_model(model).modules():
+        if not isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
+            continue
+        states.append({
+            "module": module,
+            "training": bool(module.training),
+            "running_mean": (
+                module.running_mean.detach().clone()
+                if module.running_mean is not None else None
+            ),
+            "running_var": (
+                module.running_var.detach().clone()
+                if module.running_var is not None else None
+            ),
+            "num_batches_tracked": (
+                module.num_batches_tracked.detach().clone()
+                if module.num_batches_tracked is not None else None
+            ),
+        })
+    return states
+
+
+def _restore_batch_norm_running_state(states):
+    for state in states:
+        module = state["module"]
+        module.train(state["training"])
+        # These are non-parameter buffers. A regular copy_ increments their
+        # version counter and invalidates BatchNorm's saved backward tensors.
+        # Updating through .data restores persistent state without changing
+        # the autograd version observed by the already-built G4 graph.
+        if state["running_mean"] is not None:
+            module.running_mean.data.copy_(state["running_mean"])
+        if state["running_var"] is not None:
+            module.running_var.data.copy_(state["running_var"])
+        if state["num_batches_tracked"] is not None:
+            module.num_batches_tracked.data.copy_(
+                state["num_batches_tracked"]
+            )
+
+
+def _batch_norm_buffer_delta(before, after):
+    if len(before) != len(after):
+        raise RuntimeError("BatchNorm module count changed during G4 forward")
+    changed_count = 0
+    deltas = []
+    tracked_delta = 0
+    for old, new in zip(before, after):
+        if old["module"] is not new["module"]:
+            raise RuntimeError("BatchNorm module order changed during G4 forward")
+        module_changed = False
+        for name in ("running_mean", "running_var"):
+            old_value, new_value = old[name], new[name]
+            if old_value is None and new_value is None:
+                continue
+            if old_value is None or new_value is None:
+                module_changed = True
+                continue
+            difference = (new_value.float() - old_value.float()).abs()
+            deltas.append(difference.reshape(-1))
+            module_changed = module_changed or not torch.equal(
+                old_value, new_value
+            )
+        old_tracked = old["num_batches_tracked"]
+        new_tracked = new["num_batches_tracked"]
+        if old_tracked is not None and new_tracked is not None:
+            increment = int((new_tracked - old_tracked).item())
+            tracked_delta += increment
+            module_changed = module_changed or increment != 0
+        elif old_tracked is not new_tracked:
+            module_changed = True
+        changed_count += int(module_changed)
+    if deltas:
+        all_deltas = torch.cat(deltas)
+        max_delta = float(all_deltas.max().item())
+        mean_delta = float(all_deltas.mean().item())
+    else:
+        max_delta = 0.0
+        mean_delta = 0.0
+    return {
+        "changed_count": changed_count,
+        "max_delta": max_delta,
+        "mean_delta": mean_delta,
+        "num_batches_tracked_delta": tracked_delta,
+    }
 
 
 def compute_g4_batch_loss(
@@ -1300,57 +1389,77 @@ def compute_g4_batch_loss(
 
     directions = {}
     extra_forward_count = 0
-    for direction, enabled in (
-        ("D2S", d2s_enabled),
-        ("S2D", s2d_enabled),
-    ):
-        if not enabled:
-            continue
-        extra_images = g4_batch[f"{direction}_image"]
-        if direction == "D2S":
-            student_anchor, student_positive = student_drone, student_satellite
-            teacher_anchor, teacher_positive = teacher_drone, teacher_satellite
-        else:
-            student_anchor, student_positive = student_satellite, student_drone
-            teacher_anchor, teacher_positive = teacher_satellite, teacher_drone
-        valid_mask = g4_batch[f"{direction}_valid"]
-        student_negative, student_forward_count = (
-            forward_valid_extra_descriptors(
-                model,
-                extra_images,
-                valid_mask,
-                student_positive,
-                chunk_size,
-                teacher=False,
-            )
-        )
-        teacher_negative = None
-        teacher_forward_count = 0
-        if teacher_online_gate:
-            teacher_negative, teacher_forward_count = (
+    bn_before_extra = _snapshot_batch_norm_running_state(model)
+    if not bn_before_extra:
+        raise RuntimeError("G4 student model must contain BatchNorm modules")
+    bn_before_restore = None
+    try:
+        for direction, enabled in (
+            ("D2S", d2s_enabled),
+            ("S2D", s2d_enabled),
+        ):
+            if not enabled:
+                continue
+            extra_images = g4_batch[f"{direction}_image"]
+            if direction == "D2S":
+                student_anchor, student_positive = student_drone, student_satellite
+                teacher_anchor, teacher_positive = teacher_drone, teacher_satellite
+            else:
+                student_anchor, student_positive = student_satellite, student_drone
+                teacher_anchor, teacher_positive = teacher_satellite, teacher_drone
+            valid_mask = g4_batch[f"{direction}_valid"]
+            student_negative, student_forward_count = (
                 forward_valid_extra_descriptors(
-                    teacher_model,
+                    model,
                     extra_images,
                     valid_mask,
-                    teacher_positive,
+                    student_positive,
                     chunk_size,
-                    teacher=True,
+                    teacher=False,
                 )
             )
-        if teacher_online_gate and student_forward_count != teacher_forward_count:
-            raise RuntimeError("student/teacher G4 extra forward count mismatch")
-        extra_forward_count += student_forward_count
-        directions[direction] = {
-            "student_anchor": student_anchor,
-            "student_positive": student_positive,
-            "student_negative": student_negative,
-            "teacher_anchor": teacher_anchor,
-            "teacher_positive": teacher_positive,
-            "teacher_negative": teacher_negative,
-            "valid_mask": valid_mask,
-            "anchor_ids": g4_batch["anchor_id"],
-            "negative_ids": g4_batch[f"{direction}_negative_id"],
-        }
+            teacher_negative = None
+            teacher_forward_count = 0
+            if teacher_online_gate:
+                teacher_negative, teacher_forward_count = (
+                    forward_valid_extra_descriptors(
+                        teacher_model,
+                        extra_images,
+                        valid_mask,
+                        teacher_positive,
+                        chunk_size,
+                        teacher=True,
+                    )
+                )
+            if (
+                teacher_online_gate
+                and student_forward_count != teacher_forward_count
+            ):
+                raise RuntimeError("student/teacher G4 extra forward count mismatch")
+            extra_forward_count += student_forward_count
+            directions[direction] = {
+                "student_anchor": student_anchor,
+                "student_positive": student_positive,
+                "student_negative": student_negative,
+                "teacher_anchor": teacher_anchor,
+                "teacher_positive": teacher_positive,
+                "teacher_negative": teacher_negative,
+                "valid_mask": valid_mask,
+                "anchor_ids": g4_batch["anchor_id"],
+                "negative_ids": g4_batch[f"{direction}_negative_id"],
+            }
+        bn_before_restore = _snapshot_batch_norm_running_state(model)
+    finally:
+        if bn_before_restore is None:
+            bn_before_restore = _snapshot_batch_norm_running_state(model)
+        _restore_batch_norm_running_state(bn_before_extra)
+    bn_after_restore = _snapshot_batch_norm_running_state(model)
+    before_restore_delta = _batch_norm_buffer_delta(
+        bn_before_extra, bn_before_restore
+    )
+    after_restore_delta = _batch_norm_buffer_delta(
+        bn_before_extra, bn_after_restore
+    )
     loss, audit = g4_hard_negative_kd(
         directions,
         temperature=temperature,
@@ -1369,6 +1478,36 @@ def compute_g4_batch_loss(
     audit["extra_forward_image_count"] = extra_forward_count
     audit["extra_forward_chunk_size"] = int(chunk_size)
     audit["teacher_online_forward"] = bool(teacher_online_gate)
+    audit["extra_forward_bn_changed_before_restore"] = (
+        before_restore_delta["changed_count"]
+    )
+    audit["extra_forward_bn_changed_after_restore"] = (
+        after_restore_delta["changed_count"]
+    )
+    audit["extra_forward_bn_max_delta_before_restore"] = (
+        before_restore_delta["max_delta"]
+    )
+    audit["extra_forward_bn_mean_delta_before_restore"] = (
+        before_restore_delta["mean_delta"]
+    )
+    audit["extra_forward_bn_max_delta_after_restore"] = (
+        after_restore_delta["max_delta"]
+    )
+    audit["extra_forward_bn_mean_delta_after_restore"] = (
+        after_restore_delta["mean_delta"]
+    )
+    audit["extra_forward_num_batches_tracked_delta_before_restore"] = (
+        before_restore_delta["num_batches_tracked_delta"]
+    )
+    audit["extra_forward_num_batches_tracked_delta_after_restore"] = (
+        after_restore_delta["num_batches_tracked_delta"]
+    )
+    if (
+        after_restore_delta["changed_count"] != 0
+        or after_restore_delta["max_delta"] != 0.0
+        or after_restore_delta["num_batches_tracked_delta"] != 0
+    ):
+        raise RuntimeError("G4 extra forward failed to restore BatchNorm buffers")
     return loss, audit
 
 
@@ -1408,7 +1547,18 @@ def compute_student_batch_losses(
             rank_kd_s2d_keep_ratio,
         )
     )
+    g4_requested = g4_weight_current > 0.0
+    bn_before_main = (
+        _snapshot_batch_norm_running_state(model) if g4_requested else None
+    )
     local_features = model(images)
+    bn_after_main = (
+        _snapshot_batch_norm_running_state(model) if g4_requested else None
+    )
+    main_forward_bn_delta = (
+        _batch_norm_buffer_delta(bn_before_main, bn_after_main)
+        if g4_requested else None
+    )
     features, global_pair_batch_size = gather_paired_views(
         local_features,
         pair_batch_size,
@@ -1436,7 +1586,7 @@ def compute_student_batch_losses(
         tagpm_positive_weight_current > 0.0
         or tagpm_margin_weight_current > 0.0
     )
-    g4_active = teacher_model is not None and g4_weight_current > 0.0
+    g4_active = g4_requested
     if sum((negrank_active, tagpm_active, g4_active)) > 1:
         raise RuntimeError(
             "Negative Rank KD, TAG-PM KD, and G4 cannot be active together"
@@ -1551,6 +1701,18 @@ def compute_student_batch_losses(
                 chunk_size=g4_extra_forward_chunk_size,
             )
             loss = loss + float(g4_weight_current) * loss_g4
+            kd_runtime_audit["main_forward_bn_changed_count"] = (
+                main_forward_bn_delta["changed_count"]
+            )
+            kd_runtime_audit["main_forward_bn_max_delta"] = (
+                main_forward_bn_delta["max_delta"]
+            )
+            kd_runtime_audit["main_forward_bn_mean_delta"] = (
+                main_forward_bn_delta["mean_delta"]
+            )
+            kd_runtime_audit["main_forward_num_batches_tracked_delta"] = (
+                main_forward_bn_delta["num_batches_tracked_delta"]
+            )
 
     result = {
         "loss": loss_infonce,
@@ -1818,6 +1980,21 @@ def print_first_runtime_audit(model, criterion, batch_meta, images, batch_losses
                     print(f"{direction}_{key}={value}")
         print(f"raw_g4_loss={batch_losses['loss_g4'].item():.6f}")
         print(f"weighted_g4_loss={batch_losses['loss_g4_weighted'].item():.6f}")
+        for name in (
+            "main_forward_bn_changed_count",
+            "main_forward_bn_max_delta",
+            "main_forward_bn_mean_delta",
+            "main_forward_num_batches_tracked_delta",
+            "extra_forward_bn_changed_before_restore",
+            "extra_forward_bn_changed_after_restore",
+            "extra_forward_bn_max_delta_before_restore",
+            "extra_forward_bn_mean_delta_before_restore",
+            "extra_forward_bn_max_delta_after_restore",
+            "extra_forward_bn_mean_delta_after_restore",
+            "extra_forward_num_batches_tracked_delta_before_restore",
+            "extra_forward_num_batches_tracked_delta_after_restore",
+        ):
+            print(f"{name}={g4_audit[name]}")
 
     if batch_losses.get("tagpm_audit") is not None:
         tagpm_audit = batch_losses["tagpm_audit"]
@@ -2281,7 +2458,14 @@ def train_one_epoch(
 
         if (step + 1) % args.print_freq == 0 or step == len(train_loader) - 1:
             negrank_text = ""
-            if teacher_model is not None:
+            if getattr(args, "use_g4_hard_negative_kd", False):
+                negrank_text = (
+                    f"loss_g4 {loss_g4_meter.val:.4f} "
+                    f"({loss_g4_meter.avg:.4f}) | "
+                    f"g4_weight_current "
+                    f"{current_g4_weight(args, epoch):.6f} | "
+                )
+            elif teacher_model is not None:
                 negrank_text = (
                     f"loss_negrank {loss_negrank_meter.val:.4f} "
                     f"({loss_negrank_meter.avg:.4f}) | "
@@ -2312,18 +2496,17 @@ def train_one_epoch(
         "total_loss": loss_total_meter.avg,
         "loss_retrieval": loss_retrieval_meter.avg,
     }
-    if teacher_model is not None:
+    if getattr(args, "use_g4_hard_negative_kd", False):
+        stats["loss_g4"] = loss_g4_meter.avg
+        stats["g4_weight_current"] = current_g4_weight(args, epoch)
+    elif teacher_model is not None:
         if args.use_negrank_kd:
             stats["loss_negrank"] = loss_negrank_meter.avg
             stats["rank_kd_weight_current"] = kd_weight_meter.avg
             stats["rank_kd_temperature"] = float(args.rank_kd_temperature)
         else:
-            if getattr(args, "use_g4_hard_negative_kd", False):
-                stats["loss_g4"] = loss_g4_meter.avg
-                stats["g4_weight_current"] = current_g4_weight(args, epoch)
-            else:
-                stats["loss_tagpm_positive"] = loss_tagpm_positive_meter.avg
-                stats["loss_tagpm_margin"] = loss_tagpm_margin_meter.avg
+            stats["loss_tagpm_positive"] = loss_tagpm_positive_meter.avg
+            stats["loss_tagpm_margin"] = loss_tagpm_margin_meter.avg
     return stats
 
 
@@ -2707,31 +2890,31 @@ def train_one_epoch_deepspeed(
         "last_grad_norm": last_grad_norm,
         "last_grad_norm_source": last_grad_norm_source,
     }
-    if teacher_model is not None:
-        if getattr(args, "use_g4_hard_negative_kd", False):
-            stats["loss_g4"] = loss_g4_meter.avg
-            stats["loss_g4_weighted"] = loss_g4_weighted_meter.avg
-            stats["g4_weight_current"] = current_g4_weight(args, epoch)
-            stats["g4_mining_version"] = getattr(
-                args, "g4_mining_version", "unavailable"
-            )
-            stats["g4_mining_hash"] = getattr(
-                args, "g4_mining_hash", "unavailable"
-            )
-            stats["g4_identity_hash"] = getattr(
-                args, "g4_identity_hash", "unavailable"
-            )
-            stats["g4_direction_audit"] = getattr(
-                args, "g4_direction_audit", {}
-            )
-            for direction in ("D2S", "S2D"):
-                for metric_name in g4_metric_names:
-                    stats[f"g4_{direction}_{metric_name}"] = (
-                        average_meter_value_or_none(
-                            g4_meters[direction][metric_name]
-                        )
+    if getattr(args, "use_g4_hard_negative_kd", False):
+        stats["loss_g4"] = loss_g4_meter.avg
+        stats["loss_g4_weighted"] = loss_g4_weighted_meter.avg
+        stats["g4_weight_current"] = current_g4_weight(args, epoch)
+        stats["g4_mining_version"] = getattr(
+            args, "g4_mining_version", "unavailable"
+        )
+        stats["g4_mining_hash"] = getattr(
+            args, "g4_mining_hash", "unavailable"
+        )
+        stats["g4_identity_hash"] = getattr(
+            args, "g4_identity_hash", "unavailable"
+        )
+        stats["g4_direction_audit"] = getattr(
+            args, "g4_direction_audit", {}
+        )
+        for direction in ("D2S", "S2D"):
+            for metric_name in g4_metric_names:
+                stats[f"g4_{direction}_{metric_name}"] = (
+                    average_meter_value_or_none(
+                        g4_meters[direction][metric_name]
                     )
-        elif args.use_tagpm_kd:
+                )
+    elif teacher_model is not None:
+        if args.use_tagpm_kd:
             stats["loss_tagpm_positive"] = loss_tagpm_positive_meter.avg
             stats["loss_tagpm_margin"] = loss_tagpm_margin_meter.avg
             stats["loss_tagpm_positive_weighted"] = (
@@ -2882,7 +3065,12 @@ def train(
             teacher_model=teacher_model,
         )
         negrank_text = ""
-        if teacher_model is not None:
+        if getattr(args, "use_g4_hard_negative_kd", False):
+            negrank_text = (
+                f" | loss_g4={train_stats['loss_g4']:.4f}"
+                f" | g4_weight_current={train_stats['g4_weight_current']:.6f}"
+            )
+        elif teacher_model is not None:
             negrank_text = (
                 f" | loss_negrank={train_stats['loss_negrank']:.4f}"
                 f" | rank_kd_weight_current={train_stats['rank_kd_weight_current']:.6f}"
@@ -2890,9 +3078,6 @@ def train(
             ) if args.use_negrank_kd else (
                 f" | tagpm_positive_loss={train_stats['loss_tagpm_positive']:.4f}"
                 f" | tagpm_margin_loss={train_stats['loss_tagpm_margin']:.4f}"
-            ) if args.use_tagpm_kd else (
-                f" | loss_g4={train_stats['loss_g4']:.4f}"
-                f" | g4_weight_current={train_stats['g4_weight_current']:.6f}"
             )
         print(
             f"[Train] Epoch {epoch}/{args.epochs} | "
@@ -3110,13 +3295,13 @@ def train_deepspeed(
         epoch_validation_result = None
         if is_main_process():
             negrank_text = ""
-            if teacher_model is not None:
+            if getattr(args, "use_g4_hard_negative_kd", False):
+                negrank_text = format_deepspeed_epoch_g4_text(train_stats)
+            elif teacher_model is not None:
                 negrank_text = (
                     format_deepspeed_epoch_negrank_text(train_stats)
                     if args.use_negrank_kd
                     else format_deepspeed_epoch_tagpm_text(train_stats)
-                    if args.use_tagpm_kd
-                    else format_deepspeed_epoch_g4_text(train_stats)
                 )
             print(
                 f"[Train] Epoch {epoch}/{args.epochs} | "
@@ -3191,7 +3376,10 @@ def train_deepspeed(
             print(f"average InfoNCE loss={train_stats['loss_retrieval']:.6f}")
             print(f"average D2S loss={train_stats['loss_d2s']:.6f}")
             print(f"average S2D loss={train_stats['loss_s2d']:.6f}")
-            if teacher_model is not None:
+            if (
+                teacher_model is not None
+                or getattr(args, "use_g4_hard_negative_kd", False)
+            ):
                 print(f"experiment_id={experiment_id(args)}")
                 if getattr(args, "use_g4_hard_negative_kd", False):
                     print(
@@ -3633,11 +3821,7 @@ def main():
 
     print_trainable_parameter_summary(model)
     teacher_model = None
-    if (
-        args.use_negrank_kd
-        or args.use_tagpm_kd
-        or args.use_g4_hard_negative_kd
-    ):
+    if teacher_required_for_training(args):
         teacher_model = build_frozen_teacher_from_run(args, device)
     audit_clean_student_runtime(
         model,
@@ -3646,6 +3830,7 @@ def main():
         use_negrank_kd=args.use_negrank_kd,
         use_tagpm_kd=args.use_tagpm_kd,
         use_g4_hard_negative_kd=args.use_g4_hard_negative_kd,
+        g4_teacher_online_gate=args.g4_teacher_online_gate,
     )
 
     if args.deepspeed:
