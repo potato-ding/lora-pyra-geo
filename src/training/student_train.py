@@ -1237,36 +1237,150 @@ def compute_teacher_paired_features(
     return teacher_features.detach(), global_pair_batch_size, runtime_audit
 
 
-def forward_descriptor_chunks(model, images, chunk_size, *, teacher=False):
-    if chunk_size <= 0:
+def partition_extra_forward_chunk_sizes(candidate_count, max_chunk_size):
+    """Partition candidates in order without a singleton tail when possible."""
+    candidate_count = int(candidate_count)
+    max_chunk_size = int(max_chunk_size)
+    if candidate_count < 0:
+        raise ValueError("extra forward candidate count cannot be negative")
+    if max_chunk_size <= 0:
         raise ValueError("extra forward chunk size must be positive")
+    if candidate_count == 0:
+        return []
+    if candidate_count == 1:
+        return [1]
+    if max_chunk_size < 2:
+        raise ValueError(
+            "extra forward chunk size must be at least 2 for multiple candidates"
+        )
+    full_chunks, remainder = divmod(candidate_count, max_chunk_size)
+    if remainder != 1:
+        return [max_chunk_size] * full_chunks + (
+            [remainder] if remainder else []
+        )
+    if max_chunk_size < 3:
+        raise ValueError(
+            "cannot avoid a singleton chunk with max chunk size below 3"
+        )
+    # Replace the final max_chunk_size + 1 candidates with two ordered
+    # chunks. For the formal max size of four this is exactly 3 + 2.
+    return (
+        [max_chunk_size] * (full_chunks - 1)
+        + [max_chunk_size - 1, 2]
+    )
+
+
+def _set_batch_norm_eval_temporarily(model):
+    states = []
+    for module in get_raw_model(model).modules():
+        if isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
+            states.append((module, bool(module.training)))
+            module.train(False)
+    return states
+
+
+def _restore_batch_norm_training_modes(states):
+    for module, training in states:
+        module.train(training)
+
+
+def forward_descriptor_chunks(
+    model,
+    images,
+    chunk_size,
+    *,
+    teacher=False,
+    return_audit=False,
+):
+    chunk_sizes = partition_extra_forward_chunk_sizes(
+        images.size(0), chunk_size
+    )
     outputs = []
     context = torch.inference_mode if teacher else torch.enable_grad
+    start = 0
+    singleton_bn_eval_fallback_count = 0
     with context():
-        for start in range(0, images.size(0), chunk_size):
+        for current_chunk_size in chunk_sizes:
+            end = start + current_chunk_size
             chunk = cast_images_to_model_dtype(
-                model, images[start:start + chunk_size]
+                model, images[start:end]
             )
-            output = select_model_descriptor(model(chunk))
+            bn_training_states = []
+            if not teacher and current_chunk_size == 1:
+                bn_training_states = _set_batch_norm_eval_temporarily(model)
+                singleton_bn_eval_fallback_count += 1
+            try:
+                output = select_model_descriptor(model(chunk))
+            finally:
+                _restore_batch_norm_training_modes(bn_training_states)
+            if output.size(0) != current_chunk_size:
+                raise RuntimeError(
+                    "G4 descriptor batch dimension changed during extra forward"
+                )
             outputs.append(output.detach() if teacher else output)
+            start = end
     if not outputs:
         raise ValueError("cannot forward an empty G4 image tensor")
-    return torch.cat(outputs, dim=0)
+    descriptors = torch.cat(outputs, dim=0)
+    all_candidates_forwarded_once = (
+        start == images.size(0)
+        and sum(chunk_sizes) == images.size(0)
+        and descriptors.size(0) == images.size(0)
+    )
+    audit = {
+        "valid_extra_candidate_count": int(images.size(0)),
+        "extra_forward_chunk_sizes": chunk_sizes,
+        # A singleton handled with the explicit BN-eval fallback is safe and
+        # is not counted as an unsafe singleton chunk.
+        "singleton_chunk_count": (
+            sum(size == 1 for size in chunk_sizes)
+            - singleton_bn_eval_fallback_count
+        ),
+        "singleton_bn_eval_fallback_count": (
+            singleton_bn_eval_fallback_count
+        ),
+        "all_candidates_forwarded_once": all_candidates_forwarded_once,
+        "descriptor_order_preserved": all_candidates_forwarded_once,
+    }
+    if not all_candidates_forwarded_once:
+        raise RuntimeError("G4 extra forward did not preserve candidate order")
+    return (descriptors, audit) if return_audit else descriptors
 
 
 def forward_valid_extra_descriptors(
-    model, images, valid_mask, template, chunk_size, *, teacher=False
+    model,
+    images,
+    valid_mask,
+    template,
+    chunk_size,
+    *,
+    teacher=False,
+    return_audit=False,
 ):
     valid_mask = valid_mask.reshape(-1).bool().to(images.device)
     indices = torch.nonzero(valid_mask, as_tuple=False).reshape(-1)
     base = template.detach() * 0.0 if teacher else template * 0.0
     if indices.numel() == 0:
-        return base, 0
+        empty_audit = {
+            "valid_extra_candidate_count": 0,
+            "extra_forward_chunk_sizes": [],
+            "singleton_chunk_count": 0,
+            "singleton_bn_eval_fallback_count": 0,
+            "all_candidates_forwarded_once": True,
+            "descriptor_order_preserved": True,
+        }
+        result = (base, 0)
+        return (*result, empty_audit) if return_audit else result
     selected = images.index_select(0, indices)
-    descriptors = forward_descriptor_chunks(
-        model, selected, chunk_size, teacher=teacher
+    descriptors, forward_audit = forward_descriptor_chunks(
+        model,
+        selected,
+        chunk_size,
+        teacher=teacher,
+        return_audit=True,
     )
-    return base.index_copy(0, indices, descriptors), int(indices.numel())
+    result = (base.index_copy(0, indices, descriptors), int(indices.numel()))
+    return (*result, forward_audit) if return_audit else result
 
 
 def _snapshot_batch_norm_running_state(model):
@@ -1370,6 +1484,7 @@ def compute_g4_batch_loss(
     d2s_enabled,
     s2d_enabled,
     chunk_size,
+    audit_gradient=False,
 ):
     student_drone, student_satellite = split_paired_features(
         local_features, pair_batch_size
@@ -1391,6 +1506,8 @@ def compute_g4_batch_loss(
 
     directions = {}
     extra_forward_count = 0
+    student_forward_audits = []
+    student_negative_descriptors = []
     bn_before_extra = _snapshot_batch_norm_running_state(model)
     if not bn_before_extra:
         raise RuntimeError("G4 student model must contain BatchNorm modules")
@@ -1410,7 +1527,11 @@ def compute_g4_batch_loss(
                 student_anchor, student_positive = student_satellite, student_drone
                 teacher_anchor, teacher_positive = teacher_satellite, teacher_drone
             valid_mask = g4_batch[f"{direction}_valid"]
-            student_negative, student_forward_count = (
+            (
+                student_negative,
+                student_forward_count,
+                student_forward_audit,
+            ) = (
                 forward_valid_extra_descriptors(
                     model,
                     extra_images,
@@ -1418,8 +1539,11 @@ def compute_g4_batch_loss(
                     student_positive,
                     chunk_size,
                     teacher=False,
+                    return_audit=True,
                 )
             )
+            student_forward_audits.append(student_forward_audit)
+            student_negative_descriptors.append(student_negative)
             teacher_negative = None
             teacher_forward_count = 0
             if teacher_online_gate:
@@ -1467,6 +1591,33 @@ def compute_g4_batch_loss(
         temperature=temperature,
         teacher_online_gate=teacher_online_gate,
     )
+    candidate_count_partition_audit_required = any(
+        item["valid_extra_candidate_count"] == 1
+        or (
+            item["valid_extra_candidate_count"] >= chunk_size + 1
+            and item["valid_extra_candidate_count"] % chunk_size == 1
+        )
+        for item in student_forward_audits
+    )
+    if audit_gradient or candidate_count_partition_audit_required:
+        descriptor_gradients = torch.autograd.grad(
+            loss,
+            student_negative_descriptors,
+            retain_graph=True,
+            allow_unused=True,
+        )
+        finite = True
+        nonzero = False
+        for gradient in descriptor_gradients:
+            if gradient is None:
+                continue
+            finite = finite and bool(torch.isfinite(gradient).all().item())
+            nonzero = nonzero or bool(torch.count_nonzero(gradient).item())
+        audit["g4_student_descriptor_gradient_finite"] = finite
+        audit["g4_student_descriptor_gradient_nonzero"] = nonzero
+    else:
+        audit["g4_student_descriptor_gradient_finite"] = None
+        audit["g4_student_descriptor_gradient_nonzero"] = None
     for direction in directions:
         valid_mask = g4_batch[f"{direction}_valid"].reshape(-1).bool()
         rank_gap = g4_batch.get(f"{direction}_rank_gap")
@@ -1479,7 +1630,34 @@ def compute_g4_batch_loss(
             )
     audit["extra_forward_image_count"] = extra_forward_count
     audit["extra_forward_chunk_size"] = int(chunk_size)
+    audit["valid_extra_candidate_count"] = sum(
+        item["valid_extra_candidate_count"]
+        for item in student_forward_audits
+    )
+    audit["extra_forward_chunk_sizes"] = [
+        size
+        for item in student_forward_audits
+        for size in item["extra_forward_chunk_sizes"]
+    ]
+    audit["singleton_chunk_count"] = sum(
+        item["singleton_chunk_count"] for item in student_forward_audits
+    )
+    audit["singleton_bn_eval_fallback_count"] = sum(
+        item["singleton_bn_eval_fallback_count"]
+        for item in student_forward_audits
+    )
+    audit["all_candidates_forwarded_once"] = all(
+        item["all_candidates_forwarded_once"]
+        for item in student_forward_audits
+    )
+    audit["descriptor_order_preserved"] = all(
+        item["descriptor_order_preserved"]
+        for item in student_forward_audits
+    )
     audit["teacher_online_forward"] = bool(teacher_online_gate)
+    audit["candidate_count_partition_audit_required"] = (
+        candidate_count_partition_audit_required
+    )
     audit["extra_forward_bn_changed_before_restore"] = (
         before_restore_delta["changed_count"]
     )
@@ -1510,6 +1688,51 @@ def compute_g4_batch_loss(
         or after_restore_delta["num_batches_tracked_delta"] != 0
     ):
         raise RuntimeError("G4 extra forward failed to restore BatchNorm buffers")
+    if candidate_count_partition_audit_required and is_main_process():
+        raw_model = get_raw_model(model)
+        signature = tuple(
+            item["valid_extra_candidate_count"]
+            for item in student_forward_audits
+        )
+        logged = getattr(
+            raw_model, "_g4_logged_abnormal_candidate_counts", set()
+        )
+        if signature not in logged:
+            print("[G4 EXTRA FORWARD CHUNK AUDIT]")
+            for name in (
+                "valid_extra_candidate_count",
+                "extra_forward_chunk_sizes",
+                "singleton_chunk_count",
+                "singleton_bn_eval_fallback_count",
+                "all_candidates_forwarded_once",
+                "descriptor_order_preserved",
+            ):
+                print(f"{name}={audit[name]}")
+            for direction in ("D2S", "S2D"):
+                direction_audit = audit.get(direction)
+                if direction_audit is not None:
+                    print(
+                        f"{direction}_active_coverage="
+                        f"{direction_audit['active_coverage']}"
+                    )
+            print(
+                "extra_forward_bn_changed_after_restore="
+                f"{audit['extra_forward_bn_changed_after_restore']}"
+            )
+            print(
+                "extra_forward_num_batches_tracked_delta_after_restore="
+                f"{audit['extra_forward_num_batches_tracked_delta_after_restore']}"
+            )
+            print(
+                "g4_student_descriptor_gradient_finite="
+                f"{audit['g4_student_descriptor_gradient_finite']}"
+            )
+            print(
+                "g4_student_descriptor_gradient_nonzero="
+                f"{audit['g4_student_descriptor_gradient_nonzero']}"
+            )
+            logged.add(signature)
+            raw_model._g4_logged_abnormal_candidate_counts = logged
     return loss, audit
 
 
@@ -1701,6 +1924,7 @@ def compute_student_batch_losses(
                 d2s_enabled=g4_d2s_enabled,
                 s2d_enabled=g4_s2d_enabled,
                 chunk_size=g4_extra_forward_chunk_size,
+                audit_gradient=audit_runtime,
             )
             loss = loss + float(g4_weight_current) * loss_g4
             kd_runtime_audit["main_forward_bn_changed_count"] = (
@@ -1956,6 +2180,17 @@ def print_first_runtime_audit(model, criterion, batch_meta, images, batch_losses
         print(f"cross_gpu_gather={cross_gpu_effective}")
         print(f"extra_forward_image_count={g4_audit['extra_forward_image_count']}")
         print(f"extra_forward_chunk_size={g4_audit['extra_forward_chunk_size']}")
+        for name in (
+            "valid_extra_candidate_count",
+            "extra_forward_chunk_sizes",
+            "singleton_chunk_count",
+            "singleton_bn_eval_fallback_count",
+            "all_candidates_forwarded_once",
+            "descriptor_order_preserved",
+            "g4_student_descriptor_gradient_finite",
+            "g4_student_descriptor_gradient_nonzero",
+        ):
+            print(f"{name}={g4_audit[name]}")
         g4_batch = batch_meta.get("g4") or {}
         print(f"anchor_identity={g4_batch.get('anchor_id', []).tolist() if torch.is_tensor(g4_batch.get('anchor_id')) else g4_batch.get('anchor_id')}")
         print(f"positive_identity={g4_batch.get('anchor_id', []).tolist() if torch.is_tensor(g4_batch.get('anchor_id')) else g4_batch.get('anchor_id')}")

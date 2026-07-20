@@ -389,6 +389,99 @@ def test_extra_forward_chunking_uses_requested_chunk_size():
     assert output.shape == (10, 12)
 
 
+@pytest.mark.parametrize("candidate_count", range(1, 33))
+def test_extra_forward_partition_1_to_32_has_no_singleton_tail(
+    candidate_count,
+):
+    class IndexedModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.scale = nn.Parameter(torch.tensor(1.0))
+            self.chunk_sizes = []
+            self.indices = []
+
+        def forward(self, images):
+            self.chunk_sizes.append(images.size(0))
+            values = images[:, 0, 0, 0]
+            self.indices.extend(values.detach().tolist())
+            return values[:, None] * self.scale
+
+    sizes = student_train.partition_extra_forward_chunk_sizes(
+        candidate_count, 4
+    )
+    assert sum(sizes) == candidate_count
+    assert all(size <= 4 for size in sizes)
+    if candidate_count >= 2:
+        assert all(size >= 2 for size in sizes)
+
+    forwarded_indices = []
+    start = 0
+    for size in sizes:
+        forwarded_indices.extend(range(start, start + size))
+        start += size
+    assert forwarded_indices == list(range(candidate_count))
+
+    model = IndexedModel()
+    images = torch.zeros(candidate_count, 1, 1, 1)
+    images[:, 0, 0, 0] = torch.arange(candidate_count)
+    output, audit = student_train.forward_descriptor_chunks(
+        model, images, 4, return_audit=True
+    )
+    assert model.chunk_sizes == sizes
+    assert model.indices == list(range(candidate_count))
+    assert output[:, 0].tolist() == list(range(candidate_count))
+    assert audit["all_candidates_forwarded_once"] is True
+    assert audit["descriptor_order_preserved"] is True
+
+
+@pytest.mark.parametrize(
+    ("candidate_count", "expected"),
+    [
+        (1, [1]),
+        (2, [2]),
+        (3, [3]),
+        (4, [4]),
+        (5, [3, 2]),
+        (9, [4, 3, 2]),
+        (13, [4, 4, 3, 2]),
+        (17, [4, 4, 4, 3, 2]),
+        (21, [4, 4, 4, 4, 3, 2]),
+        (25, [4, 4, 4, 4, 4, 3, 2]),
+        (29, [4, 4, 4, 4, 4, 4, 3, 2]),
+    ],
+)
+def test_extra_forward_partition_expected_sizes(candidate_count, expected):
+    assert student_train.partition_extra_forward_chunk_sizes(
+        candidate_count, 4
+    ) == expected
+
+
+def test_extra_forward_preserves_descriptor_order_and_forwards_once():
+    class OrderedModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.scale = nn.Parameter(torch.tensor(1.0))
+            self.seen = []
+
+        def forward(self, images):
+            values = images[:, 0, 0, 0]
+            self.seen.extend(values.detach().tolist())
+            return values[:, None] * self.scale
+
+    model = OrderedModel()
+    images = torch.zeros(13, 1, 1, 1)
+    images[:, 0, 0, 0] = torch.arange(13)
+    output, audit = student_train.forward_descriptor_chunks(
+        model, images, 4, return_audit=True
+    )
+    assert model.seen == list(range(13))
+    assert output[:, 0].tolist() == list(range(13))
+    assert audit["extra_forward_chunk_sizes"] == [4, 4, 3, 2]
+    assert audit["singleton_chunk_count"] == 0
+    assert audit["all_candidates_forwarded_once"] is True
+    assert audit["descriptor_order_preserved"] is True
+
+
 def test_invalid_candidates_are_not_forwarded():
     class CountingModel(nn.Module):
         def __init__(self):
@@ -424,6 +517,37 @@ class _BNDescriptorModel(nn.Module):
     def forward(self, images):
         flattened = images.float().flatten(1)
         return F.normalize(self.neck(self.projection(flattened)), dim=1)
+
+
+def test_single_candidate_temporarily_uses_bn_eval_and_keeps_gradient():
+    torch.manual_seed(11)
+    model = _BNDescriptorModel().train()
+    before = student_train._snapshot_batch_norm_running_state(model)
+    output, audit = student_train.forward_descriptor_chunks(
+        model,
+        torch.randn(1, 3, 2, 2),
+        4,
+        return_audit=True,
+    )
+    after = student_train._snapshot_batch_norm_running_state(model)
+
+    assert audit["extra_forward_chunk_sizes"] == [1]
+    assert audit["singleton_chunk_count"] == 0
+    assert audit["singleton_bn_eval_fallback_count"] == 1
+    assert model.neck.training is True
+    assert student_train._batch_norm_buffer_delta(
+        before, after
+    ) == {
+        "changed_count": 0,
+        "max_delta": 0.0,
+        "mean_delta": 0.0,
+        "num_batches_tracked_delta": 0,
+    }
+
+    output[0, 0].backward()
+    assert model.neck.weight.grad is not None
+    assert torch.isfinite(model.neck.weight.grad).all()
+    assert torch.count_nonzero(model.neck.weight.grad).item() > 0
 
 
 def _g4_tensor_batch(pair_batch):
@@ -476,6 +600,7 @@ def test_g4_restores_bn_bitwise_keeps_main_update_and_student_gradient():
         g4_teacher_online_gate=False,
         g4_extra_forward_chunk_size=2,
         g4_batch=g4_batch,
+        audit_runtime=True,
     )
     actual_after_g4 = student_train._snapshot_batch_norm_running_state(model)
     assert student_train._batch_norm_buffer_delta(
@@ -502,10 +627,48 @@ def test_g4_restores_bn_bitwise_keeps_main_update_and_student_gradient():
     assert audit["extra_forward_bn_changed_after_restore"] == 0
     assert audit["extra_forward_bn_max_delta_after_restore"] == 0.0
     assert audit["extra_forward_num_batches_tracked_delta_after_restore"] == 0
+    assert audit["g4_student_descriptor_gradient_finite"] is True
+    assert audit["g4_student_descriptor_gradient_nonzero"] is True
 
     model.zero_grad(set_to_none=True)
     losses["loss_g4"].backward()
     assert model.projection.weight.grad is not None
+    assert torch.count_nonzero(model.projection.weight.grad).item() > 0
+
+
+def test_g4_thirteen_candidates_use_4432_and_restore_bn():
+    torch.manual_seed(17)
+    model = _BNDescriptorModel().train()
+    pair_batch = 13
+    losses = student_train.compute_student_batch_losses(
+        model,
+        torch.randn(pair_batch * 2, 3, 2, 2),
+        pair_batch,
+        student_train.Sample4GeoLoss(label_smoothing=0.0),
+        teacher_model=None,
+        g4_weight_current=0.01,
+        g4_teacher_online_gate=False,
+        g4_d2s_enabled=True,
+        g4_s2d_enabled=False,
+        g4_extra_forward_chunk_size=4,
+        g4_batch=_g4_tensor_batch(pair_batch),
+        audit_runtime=True,
+    )
+    audit = losses["g4_audit"]
+    assert audit["valid_extra_candidate_count"] == 13
+    assert audit["extra_forward_chunk_sizes"] == [4, 4, 3, 2]
+    assert audit["singleton_chunk_count"] == 0
+    assert audit["all_candidates_forwarded_once"] is True
+    assert audit["descriptor_order_preserved"] is True
+    assert audit["extra_forward_bn_changed_after_restore"] == 0
+    assert audit["extra_forward_num_batches_tracked_delta_after_restore"] == 0
+    assert audit["g4_student_descriptor_gradient_finite"] is True
+    assert audit["g4_student_descriptor_gradient_nonzero"] is True
+
+    model.zero_grad(set_to_none=True)
+    losses["loss_g4"].backward()
+    assert model.projection.weight.grad is not None
+    assert torch.isfinite(model.projection.weight.grad).all()
     assert torch.count_nonzero(model.projection.weight.grad).item() > 0
 
 
