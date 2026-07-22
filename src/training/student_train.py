@@ -20,6 +20,7 @@ from torch.amp import GradScaler, autocast
 
 from src.loss.blocks_infoNCE import Sample4GeoLoss
 from src.loss.g4_hard_negative_kd import g4_hard_negative_kd
+from src.loss.positive_relation_kd import positive_relation_kd_loss
 from src.loss.tagpm_kd import tagpm_kd_loss
 from src.models.student_model import StudentModel
 from src.utils.gather_features_and_labels_and_views import GatherLayer
@@ -142,6 +143,8 @@ def experiment_id(args):
         return "G3-TAGPM-2GPU-3090"
     if getattr(args, "use_g4_hard_negative_kd", False):
         return "G4-HARD-NEGATIVE-2GPU-3090"
+    if getattr(args, "use_positive_relation_kd", False):
+        return "POSITIVE-RELATION-KD-2GPU-3090"
     return B0_EXPERIMENT_ID
 
 
@@ -181,12 +184,14 @@ def print_experiment_configuration(
         if args.use_tagpm_kd
         else "G4 Full-Gallery Hard-Negative KD"
         if args.use_g4_hard_negative_kd
+        else "Positive Relation KD"
+        if getattr(args, "use_positive_relation_kd", False)
         else "None"
     )
     print(f"KD type={kd_type}")
     print(
         "KD enabled="
-        f"{bool(args.use_negrank_kd or args.use_tagpm_kd or args.use_g4_hard_negative_kd)}"
+        f"{bool(args.use_negrank_kd or args.use_tagpm_kd or args.use_g4_hard_negative_kd or getattr(args, 'use_positive_relation_kd', False))}"
     )
     print(f"started_at={started_at}")
     print(f"command={shlex.join(str(part) for part in command_parts)}")
@@ -417,6 +422,7 @@ def teacher_required_for_training(args):
     return bool(
         getattr(args, "use_negrank_kd", False)
         or getattr(args, "use_tagpm_kd", False)
+        or getattr(args, "use_positive_relation_kd", False)
         or (
             getattr(args, "use_g4_hard_negative_kd", False)
             and getattr(args, "g4_teacher_online_gate", True)
@@ -524,6 +530,8 @@ def build_frozen_teacher_from_run(args, device):
     kd_prefix = (
         "[NegRankKD]" if args.use_negrank_kd
         else "[TAGPM]" if args.use_tagpm_kd
+        else "[Positive Relation KD]"
+        if getattr(args, "use_positive_relation_kd", False)
         else "[G4]"
     )
     load_model_checkpoint_compatible(
@@ -545,8 +553,12 @@ def build_frozen_teacher_from_run(args, device):
         kd_type = (
             "Negative Rank KD" if args.use_negrank_kd
             else "TAG-PM KD" if args.use_tagpm_kd
+            else "Positive Relation KD"
+            if getattr(args, "use_positive_relation_kd", False)
             else "G4 Full-Gallery Hard-Negative KD"
         )
+        if getattr(args, "use_positive_relation_kd", False):
+            print("[Positive Relation KD]")
         print(f"{kd_prefix} KD type = {kd_type}")
         print(f"{kd_prefix} KD enabled = True")
         print(f"{kd_prefix} teacher_checkpoint_path = {args.teacher_checkpoint_path}")
@@ -562,6 +574,14 @@ def build_frozen_teacher_from_run(args, device):
             print(f"{kd_prefix} tagpm_positive_weight = {args.tagpm_positive_weight}")
             print(f"{kd_prefix} tagpm_margin_weight = {args.tagpm_margin_weight}")
             print(f"{kd_prefix} tagpm_warmup_epochs = {args.tagpm_warmup_epochs}")
+        elif getattr(args, "use_positive_relation_kd", False):
+            print(f"{kd_prefix} positive_kd_enabled = True")
+            print(f"{kd_prefix} positive_kd_weight = {args.positive_kd_weight}")
+            print(f"{kd_prefix} student_model = RepViT-M1.5")
+            print(
+                f"{kd_prefix} loss_formula = "
+                "InfoNCE + positive_kd_weight * positive_relation_loss"
+            )
         else:
             print(f"{kd_prefix} g4_weight = {args.g4_weight}")
             print(f"{kd_prefix} g4_temperature = {args.g4_temperature}")
@@ -573,10 +593,43 @@ def build_frozen_teacher_from_run(args, device):
             if args.use_negrank_kd
             else "TAG-PM teacher must be fully frozen"
             if args.use_tagpm_kd
+            else "Positive Relation KD teacher must be fully frozen"
+            if getattr(args, "use_positive_relation_kd", False)
             else "G4 teacher must be fully frozen"
         )
         raise RuntimeError(message)
     return teacher
+
+
+def print_positive_relation_kd_configuration(args, teacher_model):
+    if not is_main_process():
+        return
+    enabled = bool(getattr(args, "use_positive_relation_kd", False))
+    trainable_params = (
+        sum(
+            param.numel()
+            for param in teacher_model.parameters()
+            if param.requires_grad
+        )
+        if enabled and teacher_model is not None else "N/A"
+    )
+    print("[Positive Relation KD]")
+    print(f"positive_kd_enabled={enabled}")
+    print(f"positive_kd_weight={args.positive_kd_weight}")
+    print(
+        "teacher_checkpoint_path="
+        f"{args.teacher_checkpoint_path if enabled else 'N/A'}"
+    )
+    print(
+        "teacher_checkpoint_selection="
+        f"{args.teacher_ckpt_type if enabled else 'N/A'}"
+    )
+    print(f"teacher_trainable_params={trainable_params}")
+    print("student_model=RepViT-M1.5")
+    print(
+        "loss_formula=InfoNCE + positive_kd_weight * "
+        "positive_relation_loss"
+    )
 
 
 @torch.no_grad()
@@ -619,6 +672,7 @@ def audit_clean_student_runtime(
     use_tagpm_kd=False,
     use_g4_hard_negative_kd=False,
     g4_teacher_online_gate=True,
+    use_positive_relation_kd=False,
 ):
     raw_model = get_raw_model(model)
     student_class = f"{raw_model.__class__.__module__}.{raw_model.__class__.__name__}"
@@ -654,6 +708,7 @@ def audit_clean_student_runtime(
     teacher_kd_enabled = bool(
         use_negrank_kd
         or use_tagpm_kd
+        or use_positive_relation_kd
         or (use_g4_hard_negative_kd and g4_teacher_online_gate)
     )
     if teacher_present != teacher_kd_enabled:
@@ -663,6 +718,7 @@ def audit_clean_student_runtime(
             f"use_negrank_kd={use_negrank_kd}, use_tagpm_kd={use_tagpm_kd}"
             f", use_g4_hard_negative_kd={use_g4_hard_negative_kd}"
             f", g4_teacher_online_gate={g4_teacher_online_gate}"
+            f", use_positive_relation_kd={use_positive_relation_kd}"
         )
     if extra_student_module_present:
         errors.append(f"unexpected top-level student modules: {extra_child_modules}")
@@ -1082,6 +1138,12 @@ def print_epoch_kd_configuration(args, epoch):
             f"[G4][Epoch Start] epoch={epoch} | "
             f"target_weight={args.g4_weight:.6f} | "
             f"effective_weight={current_g4_weight(args, epoch):.6f}"
+        )
+    elif getattr(args, "use_positive_relation_kd", False):
+        print(
+            f"[Positive Relation KD][Epoch Start] epoch={epoch} | "
+            f"positive_kd_weight={args.positive_kd_weight:.6f} | "
+            "loss_formula=InfoNCE+positive_kd_weight*positive_relation_loss"
         )
 
 
@@ -1764,6 +1826,7 @@ def compute_student_batch_losses(
     g4_s2d_enabled=True,
     g4_extra_forward_chunk_size=4,
     g4_batch=None,
+    positive_kd_weight=0.0,
 ):
     effective_d2s_ratio, effective_s2d_ratio = (
         resolve_rank_kd_directional_keep_ratios(
@@ -1800,6 +1863,7 @@ def compute_student_batch_losses(
     loss_tagpm_positive = None
     loss_tagpm_margin = None
     loss_g4 = None
+    loss_positive_relation = None
     student_drone_feat = None
     student_sat_feat = None
     teacher_runtime_audit = None
@@ -1812,16 +1876,33 @@ def compute_student_batch_losses(
         or tagpm_margin_weight_current > 0.0
     )
     g4_active = g4_requested
-    if sum((negrank_active, tagpm_active, g4_active)) > 1:
+    positive_relation_active = float(positive_kd_weight) > 0.0
+    if positive_relation_active:
+        if teacher_model is None:
+            raise ValueError(
+                "Positive Relation KD requires a frozen online teacher"
+            )
+        if teacher_model.training:
+            raise RuntimeError("Positive Relation KD teacher must be in eval mode")
+        if any(param.requires_grad for param in teacher_model.parameters()):
+            raise RuntimeError("Positive Relation KD teacher must be frozen")
+    if sum((
+        negrank_active,
+        tagpm_active,
+        g4_active,
+        positive_relation_active,
+    )) > 1:
         raise RuntimeError(
-            "Negative Rank KD, TAG-PM KD, and G4 cannot be active together"
+            "Negative Rank KD, TAG-PM KD, G4, and Positive Relation KD "
+            "cannot be active together"
         )
-    if negrank_active or tagpm_active or g4_active:
+    if negrank_active or tagpm_active or g4_active or positive_relation_active:
         teacher_features = None
         teacher_drone_feat = teacher_sat_feat = None
         teacher_forward_required = (
             negrank_active
             or tagpm_active
+            or positive_relation_active
             or (g4_active and g4_teacher_online_gate)
         )
         if teacher_forward_required:
@@ -1851,7 +1932,45 @@ def compute_student_batch_losses(
                 features,
                 global_pair_batch_size,
             )
-        if negrank_active:
+        if positive_relation_active:
+            loss_positive_relation, kd_runtime_audit = (
+                positive_relation_kd_loss(
+                    student_drone_feat,
+                    student_sat_feat,
+                    teacher_drone_feat,
+                    teacher_sat_feat,
+                )
+            )
+            if audit_runtime:
+                descriptor_gradients = torch.autograd.grad(
+                    loss_positive_relation,
+                    (student_drone_feat, student_sat_feat),
+                    retain_graph=True,
+                    allow_unused=True,
+                )
+                finite = True
+                nonzero = False
+                for gradient in descriptor_gradients:
+                    if gradient is None:
+                        continue
+                    finite = finite and bool(
+                        torch.isfinite(gradient).all().item()
+                    )
+                    nonzero = nonzero or bool(
+                        torch.count_nonzero(gradient).item()
+                    )
+                kd_runtime_audit["student_gradient_finite"] = finite
+                kd_runtime_audit["student_gradient_nonzero"] = nonzero
+            else:
+                kd_runtime_audit["student_gradient_finite"] = None
+                kd_runtime_audit["student_gradient_nonzero"] = None
+            # Formula confirmed by the user: minimize positive-relation MSE.
+            # total = InfoNCE + positive_kd_weight * positive_relation_loss
+            loss = (
+                loss
+                + float(positive_kd_weight) * loss_positive_relation
+            )
+        elif negrank_active:
             negrank_output = negative_aware_cross_view_ranking_kd(
                 student_drone_feat,
                 student_sat_feat,
@@ -2008,6 +2127,14 @@ def compute_student_batch_losses(
         )
         result["g4_weight_current"] = float(g4_weight_current)
         result["g4_audit"] = kd_runtime_audit
+    if loss_positive_relation is not None:
+        result["loss"] = loss
+        result["loss_positive_relation"] = loss_positive_relation
+        result["loss_positive_relation_weighted"] = (
+            loss_positive_relation.detach() * float(positive_kd_weight)
+        )
+        result["positive_kd_weight"] = float(positive_kd_weight)
+        result["positive_relation_audit"] = kd_runtime_audit
     return result
 
 
@@ -2191,6 +2318,7 @@ def print_first_runtime_audit(model, criterion, batch_meta, images, batch_losses
             "g4_student_descriptor_gradient_nonzero",
         ):
             print(f"{name}={g4_audit[name]}")
+
         g4_batch = batch_meta.get("g4") or {}
         print(f"anchor_identity={g4_batch.get('anchor_id', []).tolist() if torch.is_tensor(g4_batch.get('anchor_id')) else g4_batch.get('anchor_id')}")
         print(f"positive_identity={g4_batch.get('anchor_id', []).tolist() if torch.is_tensor(g4_batch.get('anchor_id')) else g4_batch.get('anchor_id')}")
@@ -2232,6 +2360,44 @@ def print_first_runtime_audit(model, criterion, batch_meta, images, batch_losses
             "extra_forward_num_batches_tracked_delta_after_restore",
         ):
             print(f"{name}={g4_audit[name]}")
+
+    if batch_losses.get("positive_relation_audit") is not None:
+        positive_audit = batch_losses["positive_relation_audit"]
+        print("[POSITIVE KD AUDIT]")
+        for name in (
+            "teacher_drone_descriptor_shape",
+            "teacher_sat_descriptor_shape",
+            "student_drone_descriptor_shape",
+            "student_sat_descriptor_shape",
+            "teacher_positive_similarity_mean",
+            "student_positive_similarity_mean",
+            "positive_similarity_gap",
+            "positive_relation_loss",
+        ):
+            print(f"{name}={positive_audit[name]}")
+        for label, name in (
+            ("teacher descriptor dtype", "teacher_descriptor_dtype"),
+            ("student descriptor dtype", "student_descriptor_dtype"),
+            ("similarity dtype", "similarity_dtype"),
+            ("loss dtype", "loss_dtype"),
+        ):
+            print(f"{label}={_dtype_name(positive_audit[name])}")
+        print(
+            "teacher_descriptor_requires_grad="
+            f"{positive_audit['teacher_descriptor_requires_grad']}"
+        )
+        print(
+            "student_gradient_finite="
+            f"{positive_audit['student_gradient_finite']}"
+        )
+        print(
+            "student_gradient_nonzero="
+            f"{positive_audit['student_gradient_nonzero']}"
+        )
+        print(
+            "weighted_positive_relation_loss="
+            f"{batch_losses['loss_positive_relation_weighted'].item():.6f}"
+        )
 
     if batch_losses.get("tagpm_audit") is not None:
         tagpm_audit = batch_losses["tagpm_audit"]
@@ -2440,6 +2606,18 @@ def append_g4_diagnostics(output_dir, payload):
         handle.write("\n")
 
 
+def append_positive_relation_diagnostics(output_dir, payload):
+    if not is_main_process():
+        return
+    os.makedirs(output_dir, exist_ok=True)
+    with open(
+        os.path.join(output_dir, "training_positive_relation_kd.jsonl"),
+        "a", encoding="utf-8",
+    ) as handle:
+        handle.write(json.dumps(_json_safe_value(payload), ensure_ascii=False))
+        handle.write("\n")
+
+
 def build_student_validation_metrics(epoch, result):
     return {
         "epoch": epoch,
@@ -2595,6 +2773,10 @@ def train_one_epoch(
     loss_tagpm_positive_meter = AverageMeter()
     loss_tagpm_margin_meter = AverageMeter()
     loss_g4_meter = AverageMeter()
+    loss_positive_relation_meter = AverageMeter()
+    teacher_positive_similarity_meter = AverageMeter()
+    student_positive_similarity_meter = AverageMeter()
+    positive_similarity_gap_meter = AverageMeter()
     kd_weight_meter = AverageMeter()
     end = time.time()
 
@@ -2649,6 +2831,11 @@ def train_one_epoch(
                     args, "g4_extra_forward_chunk_size", 4
                 ),
                 g4_batch=meta.get("g4"),
+                positive_kd_weight=(
+                    args.positive_kd_weight
+                    if getattr(args, "use_positive_relation_kd", False)
+                    else 0.0
+                ),
             )
             loss = batch_losses["loss"]
             validate_tagpm_batch_result(args, batch_losses)
@@ -2690,6 +2877,22 @@ def train_one_epoch(
             )
         if "loss_g4" in batch_losses:
             loss_g4_meter.update(batch_losses["loss_g4"].item(), images.size(0))
+        if "loss_positive_relation" in batch_losses:
+            positive_audit = batch_losses["positive_relation_audit"]
+            loss_positive_relation_meter.update(
+                batch_losses["loss_positive_relation"].item(), images.size(0)
+            )
+            teacher_positive_similarity_meter.update(
+                positive_audit["teacher_positive_similarity_mean"],
+                images.size(0),
+            )
+            student_positive_similarity_meter.update(
+                positive_audit["student_positive_similarity_mean"],
+                images.size(0),
+            )
+            positive_similarity_gap_meter.update(
+                positive_audit["positive_similarity_gap"], images.size(0)
+            )
         batch_time.update(time.time() - end)
         end = time.time()
 
@@ -2701,6 +2904,13 @@ def train_one_epoch(
                     f"({loss_g4_meter.avg:.4f}) | "
                     f"g4_weight_current "
                     f"{current_g4_weight(args, epoch):.6f} | "
+                )
+            elif getattr(args, "use_positive_relation_kd", False):
+                negrank_text = (
+                    f"positive_relation_loss "
+                    f"{loss_positive_relation_meter.val:.6f} "
+                    f"({loss_positive_relation_meter.avg:.6f}) | "
+                    f"positive_kd_weight {args.positive_kd_weight:.6f} | "
                 )
             elif teacher_model is not None:
                 negrank_text = (
@@ -2736,6 +2946,20 @@ def train_one_epoch(
     if getattr(args, "use_g4_hard_negative_kd", False):
         stats["loss_g4"] = loss_g4_meter.avg
         stats["g4_weight_current"] = current_g4_weight(args, epoch)
+    elif getattr(args, "use_positive_relation_kd", False):
+        stats["positive_relation_loss_mean"] = (
+            loss_positive_relation_meter.avg
+        )
+        stats["teacher_positive_similarity_mean"] = (
+            teacher_positive_similarity_meter.avg
+        )
+        stats["student_positive_similarity_mean"] = (
+            student_positive_similarity_meter.avg
+        )
+        stats["positive_similarity_gap_mean"] = (
+            positive_similarity_gap_meter.avg
+        )
+        stats["positive_kd_weight"] = float(args.positive_kd_weight)
     elif teacher_model is not None:
         if args.use_negrank_kd:
             stats["loss_negrank"] = loss_negrank_meter.avg
@@ -2776,6 +3000,11 @@ def train_one_epoch_deepspeed(
     loss_tagpm_margin_weighted_meter = AverageMeter()
     loss_g4_meter = AverageMeter()
     loss_g4_weighted_meter = AverageMeter()
+    loss_positive_relation_meter = AverageMeter()
+    loss_positive_relation_weighted_meter = AverageMeter()
+    teacher_positive_similarity_meter = AverageMeter()
+    student_positive_similarity_meter = AverageMeter()
+    positive_similarity_gap_meter = AverageMeter()
     kd_weight_meter = AverageMeter()
     valid_ranking_pair_meter = AverageMeter()
     total_ranking_pair_meter = AverageMeter()
@@ -2884,6 +3113,11 @@ def train_one_epoch_deepspeed(
                 args, "g4_extra_forward_chunk_size", 4
             ),
             g4_batch=meta.get("g4"),
+            positive_kd_weight=(
+                args.positive_kd_weight
+                if getattr(args, "use_positive_relation_kd", False)
+                else 0.0
+            ),
             audit_runtime=not runtime_audit_printed,
             collect_kd_stats=bool(
                 teacher_model is not None
@@ -2954,6 +3188,26 @@ def train_one_epoch_deepspeed(
             loss_g4_weighted_meter.update(
                 batch_losses["loss_g4_weighted"].item(), images.size(0)
             )
+        if "loss_positive_relation" in batch_losses:
+            positive_audit = batch_losses["positive_relation_audit"]
+            loss_positive_relation_meter.update(
+                batch_losses["loss_positive_relation"].item(), images.size(0)
+            )
+            loss_positive_relation_weighted_meter.update(
+                batch_losses["loss_positive_relation_weighted"].item(),
+                images.size(0),
+            )
+            teacher_positive_similarity_meter.update(
+                positive_audit["teacher_positive_similarity_mean"],
+                images.size(0),
+            )
+            student_positive_similarity_meter.update(
+                positive_audit["student_positive_similarity_mean"],
+                images.size(0),
+            )
+            positive_similarity_gap_meter.update(
+                positive_audit["positive_similarity_gap"], images.size(0)
+            )
         behavior = batch_losses.get("kd_behavior_stats")
         if behavior is not None:
             if args.rank_kd_selection_mode == "margin_incidence":
@@ -2996,11 +3250,27 @@ def train_one_epoch_deepspeed(
         if is_main_process() and should_print:
             negrank_text = ""
             if teacher_model is not None:
-                if args.use_tagpm_kd:
+                if getattr(args, "use_positive_relation_kd", False):
+                    negrank_text = (
+                        f"positive_relation_loss="
+                        f"{loss_positive_relation_meter.val:.6f} "
+                        f"({loss_positive_relation_meter.avg:.6f}) | "
+                        f"weighted_positive_relation_loss="
+                        f"{batch_losses['loss_positive_relation_weighted'].item():.6f} | "
+                        f"positive_kd_weight="
+                        f"{batch_losses['positive_kd_weight']:.6f} | "
+                        f"teacher_positive_similarity="
+                        f"{positive_audit['teacher_positive_similarity_mean']:.6f} | "
+                        f"student_positive_similarity="
+                        f"{positive_audit['student_positive_similarity_mean']:.6f} | "
+                        f"positive_similarity_gap="
+                        f"{positive_audit['positive_similarity_gap']:.6f} | "
+                    )
+                elif args.use_tagpm_kd:
                     weighted_positive, weighted_margin = (
                         tagpm_weighted_loss_values(batch_losses)
                     )
-                negrank_text = (
+                    negrank_text = (
                     f"loss_negrank {loss_negrank_meter.val:.4f} "
                     f"({loss_negrank_meter.avg:.4f}) | "
                     f"rank_kd_weight_current {rank_kd_weight_current:.6f} | "
@@ -3010,7 +3280,7 @@ def train_one_epoch_deepspeed(
                     f"legacy_rank_kd_keep_ratio={args.rank_kd_keep_ratio} | "
                     f"D2S_keep_ratio={effective_d2s_ratio} | "
                     f"S2D_keep_ratio={effective_s2d_ratio} | "
-                ) if args.use_negrank_kd else (
+                    ) if args.use_negrank_kd else (
                     f"tagpm_positive_loss={loss_tagpm_positive_meter.val:.6f} | "
                     f"tagpm_margin_loss={loss_tagpm_margin_meter.val:.6f} | "
                     f"weighted_tagpm_positive="
@@ -3023,13 +3293,13 @@ def train_one_epoch_deepspeed(
                     f"tagpm_margin_weight_current="
                     f"{batch_losses['tagpm_margin_weight_current']:.6f} | "
                     f"tagpm_stats={batch_losses['tagpm_audit']} | "
-                ) if args.use_tagpm_kd else (
+                    ) if args.use_tagpm_kd else (
                     f"loss_g4={loss_g4_meter.val:.6f} "
                     f"({loss_g4_meter.avg:.6f}) | "
                     f"weighted_loss_g4={batch_losses['loss_g4_weighted'].item():.6f} | "
                     f"g4_weight_current={batch_losses['g4_weight_current']:.6f} | "
                     f"g4_stats={batch_losses['g4_audit']} | "
-                )
+                    )
                 if args.use_negrank_kd and args.rank_kd_selection_mode == "margin_incidence":
                     d2s = behavior["D2S"]
                     s2d = behavior["S2D"]
@@ -3150,6 +3420,23 @@ def train_one_epoch_deepspeed(
                         g4_meters[direction][metric_name]
                     )
                 )
+    elif getattr(args, "use_positive_relation_kd", False):
+        stats["positive_relation_loss_mean"] = (
+            loss_positive_relation_meter.avg
+        )
+        stats["positive_relation_loss_weighted_mean"] = (
+            loss_positive_relation_weighted_meter.avg
+        )
+        stats["teacher_positive_similarity_mean"] = (
+            teacher_positive_similarity_meter.avg
+        )
+        stats["student_positive_similarity_mean"] = (
+            student_positive_similarity_meter.avg
+        )
+        stats["positive_similarity_gap_mean"] = (
+            positive_similarity_gap_meter.avg
+        )
+        stats["positive_kd_weight"] = float(args.positive_kd_weight)
     elif teacher_model is not None:
         if args.use_tagpm_kd:
             stats["loss_tagpm_positive"] = loss_tagpm_positive_meter.avg
@@ -3307,6 +3594,17 @@ def train(
                 f" | loss_g4={train_stats['loss_g4']:.4f}"
                 f" | g4_weight_current={train_stats['g4_weight_current']:.6f}"
             )
+        elif getattr(args, "use_positive_relation_kd", False):
+            negrank_text = (
+                f" | positive_relation_loss_mean="
+                f"{train_stats['positive_relation_loss_mean']:.6f}"
+                f" | teacher_positive_similarity_mean="
+                f"{train_stats['teacher_positive_similarity_mean']:.6f}"
+                f" | student_positive_similarity_mean="
+                f"{train_stats['student_positive_similarity_mean']:.6f}"
+                f" | positive_similarity_gap_mean="
+                f"{train_stats['positive_similarity_gap_mean']:.6f}"
+            )
         elif teacher_model is not None:
             negrank_text = (
                 f" | loss_negrank={train_stats['loss_negrank']:.4f}"
@@ -3326,6 +3624,26 @@ def train(
             f"{negrank_text} | "
             f"world_size={get_world_size()}"
         )
+        if getattr(args, "use_positive_relation_kd", False):
+            append_positive_relation_diagnostics(args.output_dir, {
+                "event": "epoch",
+                "epoch": epoch,
+                "formula": (
+                    "InfoNCE + positive_kd_weight * positive_relation_loss"
+                ),
+                "positive_relation_loss_mean": (
+                    train_stats["positive_relation_loss_mean"]
+                ),
+                "teacher_positive_similarity_mean": (
+                    train_stats["teacher_positive_similarity_mean"]
+                ),
+                "student_positive_similarity_mean": (
+                    train_stats["student_positive_similarity_mean"]
+                ),
+                "positive_similarity_gap_mean": (
+                    train_stats["positive_similarity_gap_mean"]
+                ),
+            })
 
         if args.save_last:
             save_model_only_checkpoint(
@@ -3495,6 +3813,22 @@ def format_deepspeed_epoch_g4_text(train_stats):
     return text
 
 
+def format_deepspeed_epoch_positive_relation_text(train_stats):
+    return (
+        f" | positive_relation_loss_mean="
+        f"{train_stats['positive_relation_loss_mean']:.6f}"
+        f" | weighted_positive_relation_loss_mean="
+        f"{train_stats['positive_relation_loss_weighted_mean']:.6f}"
+        f" | positive_kd_weight={train_stats['positive_kd_weight']:.6f}"
+        f" | teacher_positive_similarity_mean="
+        f"{train_stats['teacher_positive_similarity_mean']:.6f}"
+        f" | student_positive_similarity_mean="
+        f"{train_stats['student_positive_similarity_mean']:.6f}"
+        f" | positive_similarity_gap_mean="
+        f"{train_stats['positive_similarity_gap_mean']:.6f}"
+    )
+
+
 def train_deepspeed(
     model_engine,
     train_loader,
@@ -3534,6 +3868,10 @@ def train_deepspeed(
             negrank_text = ""
             if getattr(args, "use_g4_hard_negative_kd", False):
                 negrank_text = format_deepspeed_epoch_g4_text(train_stats)
+            elif getattr(args, "use_positive_relation_kd", False):
+                negrank_text = (
+                    format_deepspeed_epoch_positive_relation_text(train_stats)
+                )
             elif teacher_model is not None:
                 negrank_text = (
                     format_deepspeed_epoch_negrank_text(train_stats)
@@ -3627,6 +3965,32 @@ def train_deepspeed(
                         "event": "epoch",
                         "epoch": epoch,
                         "statistics": train_stats,
+                        "validation": epoch_validation_result,
+                    })
+                elif getattr(args, "use_positive_relation_kd", False):
+                    print(
+                        "Positive Relation KD epoch statistics"
+                        f"{format_deepspeed_epoch_positive_relation_text(train_stats)}"
+                    )
+                    append_positive_relation_diagnostics(args.output_dir, {
+                        "event": "epoch",
+                        "epoch": epoch,
+                        "formula": (
+                            "InfoNCE + positive_kd_weight * "
+                            "positive_relation_loss"
+                        ),
+                        "positive_relation_loss_mean": (
+                            train_stats["positive_relation_loss_mean"]
+                        ),
+                        "teacher_positive_similarity_mean": (
+                            train_stats["teacher_positive_similarity_mean"]
+                        ),
+                        "student_positive_similarity_mean": (
+                            train_stats["student_positive_similarity_mean"]
+                        ),
+                        "positive_similarity_gap_mean": (
+                            train_stats["positive_similarity_gap_mean"]
+                        ),
                         "validation": epoch_validation_result,
                     })
                 elif args.use_tagpm_kd:
@@ -3809,6 +4173,10 @@ def parse_args(argv=None):
     parser.add_argument(
         "--use_g4_hard_negative_kd", action="store_true", default=False
     )
+    parser.add_argument(
+        "--use_positive_relation_kd", action="store_true", default=False
+    )
+    parser.add_argument("--positive_kd_weight", type=float, default=0.01)
     parser.add_argument("--experiment_id", type=str, default=None)
     parser.add_argument("--teacher_model_dir", type=str, default=None)
     parser.add_argument(
@@ -3906,8 +4274,16 @@ def parse_args(argv=None):
         bool(args.use_negrank_kd),
         bool(args.use_tagpm_kd),
         bool(args.use_g4_hard_negative_kd),
+        bool(args.use_positive_relation_kd),
     )) > 1:
-        parser.error("NegRank KD, TAG-PM KD, and G4 are mutually exclusive")
+        parser.error(
+            "NegRank KD, TAG-PM KD, G4, and Positive Relation KD are "
+            "mutually exclusive"
+        )
+    if args.positive_kd_weight < 0.0:
+        parser.error("--positive_kd_weight must be non-negative")
+    if args.use_positive_relation_kd and args.positive_kd_weight <= 0.0:
+        parser.error("Positive Relation KD requires a positive weight")
     if args.tagpm_positive_weight < 0.0:
         parser.error("--tagpm_positive_weight must be non-negative")
     if args.tagpm_margin_weight < 0.0:
@@ -4060,6 +4436,7 @@ def main():
     teacher_model = None
     if teacher_required_for_training(args):
         teacher_model = build_frozen_teacher_from_run(args, device)
+    print_positive_relation_kd_configuration(args, teacher_model)
     audit_clean_student_runtime(
         model,
         criterion,
@@ -4068,6 +4445,7 @@ def main():
         use_tagpm_kd=args.use_tagpm_kd,
         use_g4_hard_negative_kd=args.use_g4_hard_negative_kd,
         g4_teacher_online_gate=args.g4_teacher_online_gate,
+        use_positive_relation_kd=args.use_positive_relation_kd,
     )
 
     if args.deepspeed:
