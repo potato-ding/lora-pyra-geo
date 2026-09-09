@@ -5,9 +5,27 @@ import torch
 from torch import nn
 from src.middle_teacher.checkpoint import safe_load, unwrap_state_dict, sha256
 
+def apply_runtime_precision(model_type, model):
+    """Apply deployment precision after strict load, without changing weights on disk."""
+    if model_type in ('teacher', 'middle'):
+        model.bfloat16()
+    elif model_type != 'student':
+        raise ValueError(model_type)
+    dtypes = sorted({str(p.dtype).removeprefix('torch.') for p in model.parameters() if p.is_floating_point()})
+    return {'parameter_dtype': dtypes[0] if len(dtypes) == 1 else dtypes,
+            'descriptor_dtype': 'float32', 'l2_normalization_dtype': 'float32',
+            'similarity_dtype': 'float32'}
+
+
 class EvaluationEncoder(nn.Module):
-    def __init__(self,model,dimension):
-        super().__init__();self.model=model;self.descriptor_dim=dimension
+    def __init__(self,model,dimension,fp32_input=False):
+        super().__init__()
+        if fp32_input:
+            # Extraction infers image dtype from the first parameter. Preserve
+            # the certified FP32 image input while the actual model uses BF16.
+            self.input_dtype_anchor = nn.Parameter(torch.zeros((), dtype=torch.float32,
+                device=next(model.parameters()).device), requires_grad=False)
+        self.model=model;self.descriptor_dim=dimension
     @torch.no_grad()
     def encode(self,images):
         self.model.eval()
@@ -63,8 +81,10 @@ def load_encoder(model_type,checkpoint,config=None,device='cuda'):
         state=normalize_state(safe_load(checkpoint));result=model.load_state_dict(state,strict=True)
         schema='full RepViT-M1.5 deployment state'
     else:raise ValueError(model_type)
+    runtime_precision = apply_runtime_precision(model_type, model)
     model.to(device).eval()
     for parameter in model.parameters():parameter.requires_grad_(False)
     audit={'checkpoint_type':schema,'checkpoint':str(checkpoint.resolve()),'sha256':sha256(checkpoint),
-           'state_keys':len(state),'missing':list(result.missing_keys),'unexpected':list(result.unexpected_keys)}
-    return EvaluationEncoder(model,dimension).eval(),audit
+           'state_keys':len(state),'missing':list(result.missing_keys),'unexpected':list(result.unexpected_keys),
+           'runtime_precision':runtime_precision}
+    return EvaluationEncoder(model,dimension,fp32_input=model_type in ('teacher','middle')).eval(),audit

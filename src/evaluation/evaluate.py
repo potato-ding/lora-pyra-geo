@@ -38,6 +38,8 @@ def main(argv=None):
         if identity.exists():
             previous=json.loads(identity.read_text())
             if previous['sha256']!=load_audit['sha256']:raise RuntimeError('Cache checkpoint identity mismatch')
+            if args.model_type in ('teacher','middle') and previous.get('runtime_precision')!=load_audit['runtime_precision']:
+                raise RuntimeError('Cache runtime precision mismatch; use a fresh certification cache directory')
         else:
             if args.reuse_certified_cache:raise RuntimeError('No certified model identity')
             identity.write_text(json.dumps(load_audit,indent=2))
@@ -82,7 +84,8 @@ def main(argv=None):
             protocol.update(loaders['D2S'][0].dataset.protocol_audit)
             protocol.update(DIS1_unit='meter (m)',SDM3_scale='percentage')
         payload={'model_type':args.model_type,'checkpoint':str(Path(args.checkpoint).resolve()),'dataset':dataset,
-                 'protocol':protocol,'descriptor':{'dim':model.descriptor_dim,'normalized':True,'dtype':'float32'},'results':results}
+                 'protocol':protocol,'descriptor':{'dim':model.descriptor_dim,'normalized':True,'dtype':'float32'},
+                 'runtime_precision':load_audit['runtime_precision'],'results':results}
         if not args.certification_only:
             (output/name).write_text(json.dumps(payload,indent=2)+'\n');print(json.dumps(payload),flush=True)
     if args.certification_only:
