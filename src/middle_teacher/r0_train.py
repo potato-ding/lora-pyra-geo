@@ -89,6 +89,8 @@ def main(allow_kd=False):
     parser.add_argument('--config',required=True)
     parser.add_argument('--smoke-no-step',action='store_true')
     parser.add_argument('--expected-gpus',required=True)
+    # DeepSpeed injects this legacy spelling for each worker.
+    parser.add_argument('--local_rank','--local-rank',dest='local_rank',type=int,default=0)
     parser.add_argument('--teacher-checkpoint')
     parser.add_argument('--teacher-chunk-size',type=int,default=4)
     args=parser.parse_args()
