@@ -110,7 +110,9 @@ def main(allow_kd=False):
     output=Path(config['checkpoint']['output_dir'])
     if not args.smoke_no_step:
         if rank()==0:
-            assert not any((output/n).exists() for n in ('train.log','best_model.pth','last_model.pth','epoch_metrics.json'))
+            # Shell redirection may create train.log before rank 0 reaches
+            # this guard; only formal checkpoint/epoch assets are protected.
+            assert not any((output/n).exists() for n in ('best_model.pth','last_model.pth','epoch_metrics.json'))
             output.mkdir(parents=True,exist_ok=True)
         barrier();setup_rank0_run_log(str(output),rank()==0)
     model=build_middle_teacher(config)
