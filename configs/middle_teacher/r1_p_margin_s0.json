@@ -1,0 +1,14 @@
+{
+  "experiment": {"name": "R1-P-MARGIN-S0", "epochs": 10},
+  "seed": 0,
+  "model": {"architecture": "dinov3_vitb16", "descriptor_dim": 768},
+  "initialization": {"source": "original_dinov3_vitb_pretrained", "path": "src/models/dinov3-pth/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth", "sha256": "73cec8be7427c8655ceced13ce62f6e20a1fa90d1b4d4a550df17a1144081a7c"},
+  "trainability": {"frozen_blocks": [0,1,2,3,4,5], "lora_blocks": [6,7,8,9], "full_finetune_blocks": [10,11], "lora_target_names": ["attn.qkv","attn.proj"], "lora_rank": 8, "lora_alpha": 16, "lora_dropout": 0.1, "preserve_nonblock_trainability": false},
+  "precision": {"dataloader":"float32","backbone":"bfloat16","descriptor":"float32","gather":"float32","similarity":"float32","loss":"float32"},
+  "data": {"dataset":"University-1652","input_size":224,"world_size":2,"local_pair_batch":16,"global_pair_batch":32,"cross_gpu_gather":true,"num_workers":4},
+  "optimizer": {"type":"DeepSpeedCPUAdam","base_lr":0.0001,"weight_decay":0.01,"betas":[0.9,0.999],"eps":1e-8},
+  "scheduler": {"type":"cosine","warmup_steps":591,"total_optimizer_steps":11820},
+  "checkpoint": {"output_dir":"src/checkpoint/middle_teacher/CERTIFIED_R224/R1-P-MARGIN-S0","best_metric":"U1652_D2S_R1+U1652_S2D_R1","strict_load":true,"save_last":true},
+  "sam": {"enabled":false,"type":"STANDARD","adaptive":false,"rho":0.05,"same_batch":true,"rng_replay":true,"ascent_objective":"FULL_CANONICAL_L020","update_objective":"FULL_CANONICAL_L020"},
+  "distillation": {"base_loss":"pair_infonce","margin":{"enabled":true,"weight":0.1,"operator":"ABS_MARGIN","negative_selection":"teacher_top5_wrong_identity"}}
+}
