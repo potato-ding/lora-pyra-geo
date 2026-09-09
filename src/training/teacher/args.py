@@ -24,6 +24,7 @@ def build_arg_parser():
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--local_rank", type=int, default=0)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--smoke-test", action="store_true", help="One real distributed batch and backward, without updates or checkpoint writes.")
 
     parser.add_argument("--data_dir", type=str, default="data/U1652")
     parser.add_argument("--img_size", type=int, default=224)
@@ -53,9 +54,9 @@ def build_arg_parser():
     parser.add_argument(
         "--training_stage",
         type=str,
-        choices=["auto", "sample4geo", "identity", "identity_hard"],
+        choices=["auto", "paired_cross_view", "identity", "identity_hard"],
         default="auto",
-        help="Use auto curriculum, pure Sample4Geo, identity, or hard-pool identity mode.",
+        help="Use auto curriculum, pure PairedCrossView, identity, or hard-pool identity mode.",
     )
     parser.add_argument("--init_checkpoint", type=str, default=None)
     parser.add_argument(
@@ -96,7 +97,7 @@ def build_arg_parser():
     parser.add_argument("--infonce_weight", type=float, default=1.0)
     parser.add_argument("--identity_loss_weight", type=float, default=1.0)
     parser.add_argument("--same_domain_triplet_weight", type=float, default=0.2)
-    parser.add_argument("--weak_sample4geo_weight", type=float, default=0.2)
+    parser.add_argument("--weak_paired_cross_view_weight", type=float, default=0.2)
     parser.add_argument("--triplet_margin", type=float, default=0.3)
     parser.add_argument("--identity_temperature", type=float, default=0.07)
     parser.add_argument(

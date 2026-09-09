@@ -10,9 +10,9 @@ import torch.distributed as dist
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.sampler import Sampler
 
-class Sample4GeoU1652Dataset(Dataset):
+class PairedCrossViewU1652Dataset(Dataset):
     """
-    Sample4Geo-style University-1652 training dataset.
+    PairedCrossView-style University-1652 training dataset.
 
     Each item is one positive satellite/drone pair. A companion batch sampler
     keeps class ids unique inside every batch, which is required when all other
@@ -39,7 +39,7 @@ class Sample4GeoU1652Dataset(Dataset):
 
         if not self.pids:
             raise RuntimeError(
-                f"Sample4GeoU1652Dataset found no shared satellite/drone ids in {self.data_dir}"
+                f"PairedCrossViewU1652Dataset found no shared satellite/drone ids in {self.data_dir}"
             )
 
         self.pid_to_label = {pid: idx for idx, pid in enumerate(self.pids)}
@@ -63,9 +63,9 @@ class Sample4GeoU1652Dataset(Dataset):
                 self.pair_pids.append(pid)
 
         if not self.pairs:
-            raise RuntimeError(f"Sample4GeoU1652Dataset found no training pairs in {self.data_dir}")
+            raise RuntimeError(f"PairedCrossViewU1652Dataset found no training pairs in {self.data_dir}")
 
-        self.sampling_mode = "sample4geo"
+        self.sampling_mode = "paired_cross_view"
         self.epoch = 0
 
     @staticmethod
@@ -124,9 +124,9 @@ class Sample4GeoU1652Dataset(Dataset):
         return sat_img, drone_img, label, pid
 
 
-class Sample4GeoBatchSampler(Sampler):
+class CrossViewPairSampler(Sampler):
     """
-    Batch sampler for Sample4Geo/InfoNCE training.
+    Batch sampler for PairedCrossView/InfoNCE training.
 
     The sampler builds global batches first and then slices them per rank. This
     keeps every PID unique across the whole distributed batch, not just inside a
@@ -143,7 +143,7 @@ class Sample4GeoBatchSampler(Sampler):
         if batch_size <= 0:
             raise ValueError("batch_size must be greater than 0")
         if not hasattr(dataset, "pair_pids"):
-            raise ValueError("Sample4GeoBatchSampler requires dataset.pair_pids")
+            raise ValueError("CrossViewPairSampler requires dataset.pair_pids")
 
         self.dataset = dataset
         self.batch_size = int(batch_size)
@@ -166,7 +166,7 @@ class Sample4GeoBatchSampler(Sampler):
         if self.global_batch_size > self.num_pids:
             raise ValueError(
                 f"global_batch_size={self.global_batch_size} is larger than PID count={self.num_pids}; "
-                "cannot keep class ids unique inside a Sample4Geo batch"
+                "cannot keep class ids unique inside a PairedCrossView batch"
             )
 
     def set_epoch(self, epoch):
@@ -277,8 +277,8 @@ class IdentityU1652Dataset(Dataset):
 
         self.satellite_dir = os.path.join(self.data_dir, "satellite")
         self.drone_dir = os.path.join(self.data_dir, "drone")
-        self.satellite_dict = Sample4GeoU1652Dataset._collect_view_paths(self.satellite_dir)
-        self.drone_dict = Sample4GeoU1652Dataset._collect_view_paths(self.drone_dir)
+        self.satellite_dict = PairedCrossViewU1652Dataset._collect_view_paths(self.satellite_dir)
+        self.drone_dict = PairedCrossViewU1652Dataset._collect_view_paths(self.drone_dir)
         self.pids = sorted(set(self.satellite_dict.keys()) & set(self.drone_dict.keys()))
 
         if not self.pids:
@@ -540,20 +540,20 @@ class IdentityBatchSampler(Sampler):
 
 
 def create_1652_train_dataset(args):
-    from src.dataset.teacher.transforms import get_sample4geo_train_transforms
+    from src.dataset.teacher.transforms import get_paired_cross_view_train_transforms
 
-    train_sat_tf, train_drone_tf = get_sample4geo_train_transforms(
+    train_sat_tf, train_drone_tf = get_paired_cross_view_train_transforms(
         img_size=[args.img_size, args.img_size],
         mean=[0.485, 0.456, 0.406],
         std=[0.229, 0.224, 0.225],
     )
-    train_dataset = Sample4GeoU1652Dataset(
+    train_dataset = PairedCrossViewU1652Dataset(
         data_dir=os.path.join(args.data_dir, "train"),
         sat_transforms=train_sat_tf,
         drone_transforms=train_drone_tf,
         prob_flip=getattr(args, "prob_flip", 0.5),
     )
-    train_sampler = Sample4GeoBatchSampler(
+    train_sampler = CrossViewPairSampler(
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
@@ -569,9 +569,9 @@ def create_1652_train_dataset(args):
 
 
 def create_identity_1652_train_dataset(args, sampling_mode="identity"):
-    from src.dataset.teacher.transforms import get_sample4geo_train_transforms
+    from src.dataset.teacher.transforms import get_paired_cross_view_train_transforms
 
-    train_sat_tf, train_drone_tf = get_sample4geo_train_transforms(
+    train_sat_tf, train_drone_tf = get_paired_cross_view_train_transforms(
         img_size=[args.img_size, args.img_size],
         mean=[0.485, 0.456, 0.406],
         std=[0.229, 0.224, 0.225],
@@ -612,7 +612,7 @@ def create_1652_teacher_train_dataloaders(args):
     samplers = {}
     loaders = {}
 
-    datasets["sample4geo"], samplers["sample4geo"], loaders["sample4geo"] = create_1652_train_dataset(args)
+    datasets["paired_cross_view"], samplers["paired_cross_view"], loaders["paired_cross_view"] = create_1652_train_dataset(args)
 
     if getattr(args, "enable_identity_stage", False):
         datasets["identity"], samplers["identity"], loaders["identity"] = create_identity_1652_train_dataset(
@@ -631,8 +631,8 @@ def create_1652_teacher_train_dataloaders(args):
 __all__ = [
     "IdentityBatchSampler",
     "IdentityU1652Dataset",
-    "Sample4GeoBatchSampler",
-    "Sample4GeoU1652Dataset",
+    "CrossViewPairSampler",
+    "PairedCrossViewU1652Dataset",
     "collate_identity_u1652_batch",
     "create_1652_teacher_train_dataloaders",
     "create_1652_train_dataset",

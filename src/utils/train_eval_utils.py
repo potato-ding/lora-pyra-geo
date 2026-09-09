@@ -1,9 +1,16 @@
 import math
 import os
+import numpy as np
 
 import torch
 import torch.distributed as dist
 from torch.utils.data.distributed import DistributedSampler
+
+
+def _official_descending_indices(scores):
+    """Match the benchmark NumPy argsort(score)[::-1], including exact ties."""
+    order = np.argsort(scores.detach().float().cpu().numpy(), axis=-1)[..., ::-1].copy()
+    return torch.from_numpy(order).to(scores.device)
 
 
 def _dist_info():
@@ -492,7 +499,7 @@ def getdist_1652_val_and_get_recall(
             score_chunk = torch.matmul(q_f_chunk, g_f_device.t())
 
             # 降序排序
-            sorted_indices = torch.argsort(score_chunk, dim=1, descending=True)
+            sorted_indices = _official_descending_indices(score_chunk)
             sorted_gallery_labels = g_l_device[sorted_indices]
 
             # [chunk_size, real_num_gallery]
@@ -613,7 +620,7 @@ def run_val_and_get_recall(
             score_chunk = torch.matmul(q_f_chunk, g_f_device.t())
 
             # 获取降序索引
-            sorted_indices = torch.argsort(score_chunk, dim=-1, descending=True)
+            sorted_indices = _official_descending_indices(score_chunk)
             sorted_gallery_labels = g_l_device[sorted_indices]
             
             if q_l_chunk.dim() == 1:
@@ -769,7 +776,7 @@ def run_gta_val_and_get_metrics(
             q_c_chunk = local_q_c[i : i + chunk_size].to(device)
 
             score_chunk = torch.matmul(q_f_chunk, g_f_device.t())
-            sorted_indices = torch.argsort(score_chunk, dim=-1, descending=True)
+            sorted_indices = _official_descending_indices(score_chunk)
             sorted_gallery_labels = g_l_device[sorted_indices]
 
             if q_l_chunk.dim() == 1:
@@ -890,7 +897,7 @@ def run_sues_val_and_get_metrics(
             q_l_chunk = local_q_l[i:i + chunk_size].to(device)
 
             score_chunk = torch.matmul(q_f_chunk, g_f_device.t())
-            sorted_indices = torch.argsort(score_chunk, dim=1, descending=True)
+            sorted_indices = _official_descending_indices(score_chunk)
             sorted_gallery_labels = g_l_device[sorted_indices]
             matches = (sorted_gallery_labels == q_l_chunk.unsqueeze(1)).float()
 

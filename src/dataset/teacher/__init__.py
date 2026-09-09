@@ -7,11 +7,11 @@ _EXPORTS = {
     "IdentityBatchSampler": ("src.dataset.teacher.datasets", "IdentityBatchSampler"),
     "IdentityU1652Dataset": ("src.dataset.teacher.datasets", "IdentityU1652Dataset"),
     "IndexedDataset": ("src.dataset.teacher.val_dataloaders", "IndexedDataset"),
-    "Sample4GeoBatchSampler": ("src.dataset.teacher.datasets", "Sample4GeoBatchSampler"),
-    "Sample4GeoU1652Dataset": ("src.dataset.teacher.datasets", "Sample4GeoU1652Dataset"),
-    "Sample4GeoU1652DatasetEval": (
+    "CrossViewPairSampler": ("src.dataset.teacher.datasets", "CrossViewPairSampler"),
+    "PairedCrossViewU1652Dataset": ("src.dataset.teacher.datasets", "PairedCrossViewU1652Dataset"),
+    "PairedCrossViewU1652DatasetEval": (
         "src.dataset.teacher.val_dataloaders",
-        "Sample4GeoU1652DatasetEval",
+        "PairedCrossViewU1652DatasetEval",
     ),
     "build_1652_val_dataloaders": (
         "src.dataset.teacher.val_dataloaders",
@@ -38,13 +38,13 @@ _EXPORTS = {
         "src.dataset.teacher.datasets",
         "create_identity_1652_train_dataset",
     ),
-    "get_sample4geo_train_transforms": (
+    "get_paired_cross_view_train_transforms": (
         "src.dataset.teacher.transforms",
-        "get_sample4geo_train_transforms",
+        "get_paired_cross_view_train_transforms",
     ),
-    "get_sample4geo_val_transforms": (
+    "get_paired_cross_view_val_transforms": (
         "src.dataset.teacher.transforms",
-        "get_sample4geo_val_transforms",
+        "get_paired_cross_view_val_transforms",
     ),
 }
 

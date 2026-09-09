@@ -346,9 +346,9 @@ def print_experiment_configuration(
         mismatches.append(f"effective pair batch expected 32, got {effective_pair_batch}")
     if int(args.epochs) != T0_EXPECTED_EPOCHS:
         mismatches.append(f"epochs expected 10, got {args.epochs}")
-    if getattr(args, "training_stage", None) != "sample4geo":
+    if getattr(args, "training_stage", None) != "paired_cross_view":
         mismatches.append(
-            f"training_stage expected sample4geo, got {getattr(args, 'training_stage', None)}"
+            f"training_stage expected paired_cross_view, got {getattr(args, 'training_stage', None)}"
         )
     if mismatches:
         for mismatch in mismatches:

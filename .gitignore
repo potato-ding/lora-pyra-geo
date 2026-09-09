@@ -1,35 +1,61 @@
-# Python/ML 项目常用忽略
-outputs/
-data/
-.venv/
+# Python / compiled extensions
 __pycache__/
-*.pth
-*.pt
-*.log
-*.ckpt
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
 *.egg-info/
-.ipynb_checkpoints/
-env/
+/build/
+/dist/
+# Environments / editors / OS
+.venv/
 venv/
-dist/
-build/
-# 忽略数据目录
-data/
-# 忽略所有模型权重格式
+env/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+Miniconda3-latest-Linux-x86_64.sh
+# Local model assets and separately supplied upstream runtime
+/src/checkpoint/
+/checkpoint/
+/checkpoints/
+/src/models/dinov3-pth/
+/src/models/dinov3_main/
 *.pth
-*.bin
 *.pt
 *.ckpt
+*.safetensors
+*.bin
 *.onnx
-# 忽略各种日志和临时文件
-__pycache__/
+# Root dataset assets: src/data and src/dataset remain source-controlled
+/data/
+/datasets/
+/dataset/
+/pretrained/
+/assets/
+# Generated experiment outputs
 *.log
-.ipynb_checkpoints/
-outputs/
-checkpoint/
-
-src/models/dinov3_main/
-src/models/repvit/
-src/checkpoint/
-Miniconda3-latest-Linux-x86_64.sh
-Miniconda3-latest-Linux-x86_64.sh
+/results/
+/outputs/
+/runs/
+/wandb/
+# Archives / temporary features
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.npy
+*.npz
+*.pkl
+*.pickle
+*.cache
+# Secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key

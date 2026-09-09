@@ -1,0 +1,28 @@
+{
+  "related_run": "TR-REGLCRD-SAM-L020-BUDGET010-S1",
+  "source": "src/checkpoint/middle_teacher/TRANSFER_RESET_REGLCRD_SAM_L020/TR-REGLCRD-SAM-L020-BUDGET010-S1/best_metrics.json",
+  "local_relation": {
+    "enabled": true,
+    "weight": 0.8195637814793084,
+    "temperature": 0.07,
+    "operator": "POSITIVE_PAIR_CROSS_VIEW_PATCH_RELATION_DISTRIBUTION",
+    "teacher_patch_layer": 39,
+    "student_patch_layer": 9,
+    "confidence": "ONE_MINUS_NORMALIZED_TEACHER_ENTROPY",
+    "d2s_weight": 0.5,
+    "s2d_weight": 0.5,
+    "positive_evidence_gate": false,
+    "pe_gate_mode": "DISABLED",
+    "pe_gate_object": "PAIR_DIRECTION_POSITIVE_EVIDENCE_GAP",
+    "pe_gate_formula": "RELU_TEACHER_POSITIVE_PROB_MINUS_MIDDLE_POSITIVE_PROB",
+    "pe_gate_stop_gradient": true,
+    "residual_evidence_gate": true,
+    "residual_gate_mode": "STANDARDIZED_RESIDUAL",
+    "residual_evidence_source": "PRE_TEMPERATURE_CANONICAL_COSINE_SIMILARITY",
+    "residual_evidence_normalization": "POSITIVE_MINUS_NEGATIVE_MEAN_DIV_NEGATIVE_STD",
+    "residual_gate_middle_state": "UNPERTURBED_FIRST_PASS_W",
+    "residual_gate_stop_gradient": true,
+    "eps_z": 1e-06,
+    "gradient_budget": 0.1
+  }
+}

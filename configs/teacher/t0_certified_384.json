@@ -1,0 +1,20 @@
+{
+  "training_stage": "paired_cross_view",
+  "epochs": 10,
+  "batch_size": 4,
+  "img_size": 384,
+  "seed": 0,
+  "lr": 0.0001,
+  "warmup_ratio": 0.05,
+  "scheduler": "cosine",
+  "lora_start_block": 20,
+  "lora_end_block": 36,
+  "full_finetune_start_block": 36,
+  "full_finetune_end_block": 40,
+  "infonce_weight": 1.0,
+  "triplet_weight": 0.0,
+  "same_domain_triplet_weight": 0.0,
+  "weak_sample4geo_weight": 0.0,
+  "num_workers": 4,
+  "prob_flip": 0.5
+}

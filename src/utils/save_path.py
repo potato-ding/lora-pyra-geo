@@ -16,11 +16,3 @@ def get_save_pth(args):
         getattr(args, "output_root", "src/checkpoint/teacher"),
         run_timestamp,
     )
-
-
-def get_student_save_pth(args):
-    timestamp = datetime.now().strftime("%m%d_%H%M")
-    return os.path.join(
-        getattr(args, "output_root", "src/checkpoint/student"),
-        timestamp,
-    )

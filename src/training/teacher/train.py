@@ -1,11 +1,17 @@
-# train.py
-# Teacher training entrypoint.
+def enforce_formal_task_policy(args):
+    if args.training_stage not in ('auto', 'paired_cross_view'):
+        raise ValueError('Formal T0 supports paired_cross_view only')
+    if args.enable_identity_stage or args.enable_hard_pool_stage or args.triplet_weight != 0 or (args.same_domain_triplet_weight != 0) or (args.identity_preflight_batches != 0):
+        raise ValueError('Historical experimental objectives are not supported in formal T0')
+    if args.infonce_weight != 1.0:
+        raise ValueError('Formal T0 PairInfoNCE weight must be 1.0')
+    args.training_stage = 'paired_cross_view'
 import sys
 import os
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..'))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
-os.environ["NO_ALBUMENTATIONS_UPDATE"] = "1"
+os.environ['NO_ALBUMENTATIONS_UPDATE'] = '1'
 import time
 import torch
 import math
@@ -16,19 +22,10 @@ import inspect
 import json
 from datetime import datetime
 from torch.utils.data import Dataset, DataLoader
-from src.loss.tripletloss import IntraDomainTripletLoss
-from src.loss.blocks_infoNCE import infonce
-from src.loss.identity_losses import (
-    CrossDomainIdentityContrastiveLoss,
-    SameDomainBatchHardTripletLoss,
-    WeakSample4GeoAnchorLoss,
-)
+from src.training.teacher.pair_infonce import TeacherPairInfoNCE as infonce
 from src.utils.initdist import try_init_dist
-from src.utils.gather_features_and_labels_and_views import gather_features_and_labels_and_views 
-from src.utils.train_eval_utils import (
-    getdist_1652_val_and_get_recall,
-    select_model_descriptor,
-)
+from src.utils.gather_features_and_labels_and_views import gather_features_and_labels_and_views
+from src.utils.train_eval_utils import getdist_1652_val_and_get_recall, select_model_descriptor
 from src.dataset.teacher.datasets import create_1652_teacher_train_dataloaders
 from src.dataset.teacher.val_dataloaders import build_1652_val_dataloaders
 from src.models.teacher.model import TeacherModel
@@ -36,102 +33,68 @@ from src.training.teacher.args import parse_args
 from src.training.teacher.hparams import save_training_record
 from src.utils.teacher.optimizer import build_optimizer_and_scale
 from src.utils.teacher.scheduler import get_scheduler
-from src.utils.teacher_experiment_audit import (
-    audit_teacher_runtime_structure,
-    get_runtime_parameter_dtypes,
-    gpu_memory_snapshot,
-    print_experiment_configuration,
-    read_deepspeed_grad_norm,
-    tensor_nonfinite_counts,
-)
+from src.utils.teacher_experiment_audit import audit_teacher_runtime_structure, get_runtime_parameter_dtypes, gpu_memory_snapshot, print_experiment_configuration, read_deepspeed_grad_norm, tensor_nonfinite_counts
 from src.utils.run_logging import resolve_shared_output_dir, setup_rank0_run_log
 from src.utils.save_path import get_save_pth
-from src.utils.teacher_precision_contract import (
-    PRECISION_CONTRACT_NAME,
-    require_contract_dtype,
-)
+from src.utils.teacher_precision_contract import PRECISION_CONTRACT_NAME, require_contract_dtype
 if 'OMP_NUM_THREADS' not in os.environ:
     os.environ['OMP_NUM_THREADS'] = '4'
 
-
 def safe_torch_load(path, map_location):
-    load_kwargs = {"map_location": map_location}
-    if "weights_only" in inspect.signature(torch.load).parameters:
-        load_kwargs["weights_only"] = True
+    load_kwargs = {'map_location': map_location}
+    if 'weights_only' in inspect.signature(torch.load).parameters:
+        load_kwargs['weights_only'] = True
     return torch.load(path, **load_kwargs)
 
-
 def is_teacher_delta_checkpoint_param(name):
-    # Save every trainable teacher delta, including logit_scale, for strict resume.
     return True
 
-
 def collect_teacher_delta_state(model_or_engine):
-    # Collect the raw trainable teacher delta weights (LoRA + unfrozen final
-    # blocks + logit_scale) directly from the live model.
     base_model = get_base_model(model_or_engine)
-    return {
-        name: param.detach().cpu()
-        for name, param in base_model.named_parameters()
-        if param.requires_grad and is_teacher_delta_checkpoint_param(name)
-    }
-
+    return {name: param.detach().cpu() for (name, param) in base_model.named_parameters() if param.requires_grad and is_teacher_delta_checkpoint_param(name)}
 
 def get_required_teacher_delta_keys(model):
-    return {
-        name
-        for name, param in model.named_parameters()
-        if param.requires_grad and is_teacher_delta_checkpoint_param(name)
-    }
-
+    return {name for (name, param) in model.named_parameters() if param.requires_grad and is_teacher_delta_checkpoint_param(name)}
 
 def get_base_model(model_or_engine):
-    return model_or_engine.module if hasattr(model_or_engine, "module") else model_or_engine
+    return model_or_engine.module if hasattr(model_or_engine, 'module') else model_or_engine
 
 def get_logit_scale(model_or_engine):
     base_model = get_base_model(model_or_engine)
-    logit_scale = getattr(base_model, "logit_scale", None)
-    assert logit_scale is not None, "logit_scale was not found in the model"
+    logit_scale = getattr(base_model, 'logit_scale', None)
+    assert logit_scale is not None, 'logit_scale was not found in the model'
     return logit_scale
-
 
 def is_main_process():
     return not dist.is_available() or not dist.is_initialized() or dist.get_rank() == 0
 
-
 def get_dist_rank_world():
     if dist.is_available() and dist.is_initialized():
-        return dist.get_rank(), dist.get_world_size()
-    return 0, 1
-
+        return (dist.get_rank(), dist.get_world_size())
+    return (0, 1)
 
 def _truthy_env(name):
-    value = os.environ.get(name, "0").strip().lower()
-    return value in {"1", "true", "yes", "y", "on"}
-
+    value = os.environ.get(name, '0').strip().lower()
+    return value in {'1', 'true', 'yes', 'y', 'on'}
 
 def teacher_verbose_rank_log():
-    return _truthy_env("TEACHER_VERBOSE_RANK_LOG")
-
+    return _truthy_env('TEACHER_VERBOSE_RANK_LOG')
 
 def teacher_verbose_eval_log():
-    return teacher_verbose_rank_log() or _truthy_env("TEACHER_VERBOSE_EVAL_LOG")
-
+    return teacher_verbose_rank_log() or _truthy_env('TEACHER_VERBOSE_EVAL_LOG')
 
 def rank_log(message, all_ranks=False):
-    rank, world_size = get_dist_rank_world()
-    if rank != 0 and not (all_ranks or teacher_verbose_rank_log()):
+    (rank, world_size) = get_dist_rank_world()
+    if rank != 0 and (not (all_ranks or teacher_verbose_rank_log())):
         return
-    print(f"[Rank {rank}/{world_size}] {message}", flush=True)
-
+    print(f'[Rank {rank}/{world_size}] {message}', flush=True)
 
 def distributed_barrier_with_log(label, local_rank=None):
     if not (dist.is_available() and dist.is_initialized()):
         return
-
     verbose = teacher_verbose_rank_log()
     if verbose:
-        rank_log(f"{label} | barrier enter", all_ranks=True)
+        rank_log(f'{label} | barrier enter', all_ranks=True)
     if torch.cuda.is_available() and local_rank is not None:
         try:
             dist.barrier(device_ids=[int(local_rank)])
@@ -140,8 +103,7 @@ def distributed_barrier_with_log(label, local_rank=None):
     else:
         dist.barrier()
     if verbose:
-        rank_log(f"{label} | barrier exit", all_ranks=True)
-
+        rank_log(f'{label} | barrier exit', all_ranks=True)
 
 def _json_safe_value(value):
     if isinstance(value, (str, int, float, bool)) or value is None:
@@ -149,179 +111,99 @@ def _json_safe_value(value):
     if isinstance(value, (list, tuple)):
         return [_json_safe_value(item) for item in value]
     if isinstance(value, dict):
-        return {str(key): _json_safe_value(val) for key, val in value.items()}
+        return {str(key): _json_safe_value(val) for (key, val) in value.items()}
     return str(value)
 
-
 def _strip_module_prefix(key):
-    return key[7:] if key.startswith("module.") else key
-
+    return key[7:] if key.startswith('module.') else key
 
 def load_teacher_init_checkpoint(model, checkpoint_path, device, strict_trainable=True):
     if not checkpoint_path:
-        return {
-            "loaded": False,
-            "checkpoint_path": None,
-            "trainable_coverage_pass": True,
-            "loaded_trainable": 0,
-            "required_trainable": len(get_required_teacher_delta_keys(model)),
-        }
+        return {'loaded': False, 'checkpoint_path': None, 'trainable_coverage_pass': True, 'loaded_trainable': 0, 'required_trainable': len(get_required_teacher_delta_keys(model))}
     if not os.path.isfile(checkpoint_path):
-        raise FileNotFoundError(f"init checkpoint not found: {checkpoint_path}")
-
-    checkpoint = safe_torch_load(checkpoint_path, map_location="cpu")
-    state_dict = checkpoint.get("state_dict", checkpoint.get("model", checkpoint))
+        raise FileNotFoundError(f'init checkpoint not found: {checkpoint_path}')
+    checkpoint = safe_torch_load(checkpoint_path, map_location='cpu')
+    state_dict = checkpoint.get('state_dict', checkpoint.get('model', checkpoint))
     model_state = model.state_dict()
     mapped_state = {}
     unexpected = []
     incompatible = []
-
-    for raw_key, value in state_dict.items():
+    for (raw_key, value) in state_dict.items():
         key = _strip_module_prefix(raw_key)
         if key not in model_state:
             unexpected.append(raw_key)
             continue
-
         if tuple(model_state[key].shape) != tuple(value.shape):
             incompatible.append((raw_key, tuple(value.shape), tuple(model_state[key].shape)))
             continue
-
         mapped_state[key] = value
-
-    missing, load_unexpected = model.load_state_dict(mapped_state, strict=False)
+    (missing, load_unexpected) = model.load_state_dict(mapped_state, strict=False)
     model.to(device)
-
     required_keys = get_required_teacher_delta_keys(model)
     loaded_required = required_keys & set(mapped_state.keys())
     missing_required = sorted(required_keys - loaded_required)
     missing_nonrequired = sorted(set(missing) - required_keys)
-
     if is_main_process():
-        print(f"[TeacherInitDelta] loaded: {checkpoint_path}")
-        print(
-            f"[TeacherInitDelta] matched={len(mapped_state)} | "
-            f"delta_covered={len(loaded_required)}/{len(required_keys)} | "
-            f"missing_nonrequired={len(missing_nonrequired)} | "
-            f"unexpected={len(unexpected) + len(load_unexpected)} | "
-            f"incompatible={len(incompatible)}"
-        )
-        if not missing_required and not incompatible:
-            print(
-                "[TeacherInitDelta] coverage OK: all saved teacher delta "
-                "parameters were restored; other keys keep their current "
-                "initialization."
-            )
+        print(f'[TeacherInitDelta] loaded: {checkpoint_path}')
+        print(f'[TeacherInitDelta] matched={len(mapped_state)} | delta_covered={len(loaded_required)}/{len(required_keys)} | missing_nonrequired={len(missing_nonrequired)} | unexpected={len(unexpected) + len(load_unexpected)} | incompatible={len(incompatible)}')
+        if not missing_required and (not incompatible):
+            print('[TeacherInitDelta] coverage OK: all saved teacher delta parameters were restored; other keys keep their current initialization.')
         if missing_required:
-            print(
-                "[TeacherInitDelta][WARN] missing teacher delta keys examples: "
-                f"{missing_required[:5]}"
-            )
+            print(f'[TeacherInitDelta][WARN] missing teacher delta keys examples: {missing_required[:5]}')
         if unexpected:
-            print(
-                "[TeacherInitDelta][WARN] unexpected checkpoint keys examples: "
-                f"{unexpected[:5]}"
-            )
+            print(f'[TeacherInitDelta][WARN] unexpected checkpoint keys examples: {unexpected[:5]}')
         if load_unexpected:
-            print(
-                "[TeacherInitDelta][WARN] load unexpected keys examples: "
-                f"{load_unexpected[:5]}"
-            )
+            print(f'[TeacherInitDelta][WARN] load unexpected keys examples: {load_unexpected[:5]}')
         if incompatible:
-            print(
-                "[TeacherInitDelta][WARN] incompatible examples: "
-                f"{incompatible[:3]}"
-            )
-
+            print(f'[TeacherInitDelta][WARN] incompatible examples: {incompatible[:3]}')
     if strict_trainable and (missing_required or incompatible):
-        raise RuntimeError(
-            "init checkpoint did not fully cover the current teacher delta parameters; "
-            f"missing_delta={len(missing_required)}, incompatible={len(incompatible)}. "
-            "Use --init_checkpoint_strict_trainable false only for intentional architecture changes."
-        )
-
-    return {
-        "loaded": True,
-        "checkpoint_path": checkpoint_path,
-        "trainable_coverage_pass": not missing_required and not incompatible,
-        "loaded_trainable": len(loaded_required),
-        "required_trainable": len(required_keys),
-    }
-
+        raise RuntimeError(f'init checkpoint did not fully cover the current teacher delta parameters; missing_delta={len(missing_required)}, incompatible={len(incompatible)}. Use --init_checkpoint_strict_trainable false only for intentional architecture changes.')
+    return {'loaded': True, 'checkpoint_path': checkpoint_path, 'trainable_coverage_pass': not missing_required and (not incompatible), 'loaded_trainable': len(loaded_required), 'required_trainable': len(required_keys)}
 
 def build_validation_metrics(epoch, d2s_metrics, s2d_metrics):
-    d2s_r1, d2s_r5, d2s_r10, d2s_map = d2s_metrics
-    s2d_r1, s2d_r5, s2d_r10, s2d_map = s2d_metrics
-    return {
-        "epoch": epoch,
-        "selection_metric": "D2S_R@1+S2D_R@1",
-        "R@1_sum": d2s_r1 + s2d_r1,
-        "D2S": {
-            "R@1": d2s_r1,
-            "R@5": d2s_r5,
-            "R@10": d2s_r10,
-            "mAP": d2s_map,
-        },
-        "S2D": {
-            "R@1": s2d_r1,
-            "R@5": s2d_r5,
-            "R@10": s2d_r10,
-            "mAP": s2d_map,
-        },
-    }
-
+    (d2s_r1, d2s_r5, d2s_r10, d2s_map) = d2s_metrics
+    (s2d_r1, s2d_r5, s2d_r10, s2d_map) = s2d_metrics
+    return {'epoch': epoch, 'selection_metric': 'D2S_R@1+S2D_R@1', 'R@1_sum': d2s_r1 + s2d_r1, 'D2S': {'R@1': d2s_r1, 'R@5': d2s_r5, 'R@10': d2s_r10, 'mAP': d2s_map}, 'S2D': {'R@1': s2d_r1, 'R@5': s2d_r5, 'R@10': s2d_r10, 'mAP': s2d_map}}
 
 def get_current_lr(optimizer, scheduler=None):
-    if scheduler is not None and hasattr(scheduler, "get_last_lr"):
+    if scheduler is not None and hasattr(scheduler, 'get_last_lr'):
         try:
             lrs = scheduler.get_last_lr()
             if lrs:
                 return lrs[0]
         except Exception:
             pass
-    if optimizer is not None and hasattr(optimizer, "param_groups") and optimizer.param_groups:
-        return optimizer.param_groups[0].get("lr", 0.0)
+    if optimizer is not None and hasattr(optimizer, 'param_groups') and optimizer.param_groups:
+        return optimizer.param_groups[0].get('lr', 0.0)
     return 0.0
 
-
 def get_training_mode_desc(dataset, args):
-    mode = getattr(dataset, "sampling_mode", "unknown")
-    if mode == "sample4geo":
-        return mode, (
-            f"{len(getattr(dataset, 'pairs', []))} sat-drone pairs, "
-            "unique PID per global batch"
-        )
-    if mode in {"identity", "identity_hard"}:
-        hard_text = ""
-        if mode == "identity_hard":
+    mode = getattr(dataset, 'sampling_mode', 'unknown')
+    if mode == 'paired_cross_view':
+        return (mode, f"{len(getattr(dataset, 'pairs', []))} sat-drone pairs, unique PID per global batch")
+    if mode in {'identity', 'identity_hard'}:
+        hard_text = ''
+        if mode == 'identity_hard':
             hard_text = f", hard_pool_ids={len(getattr(dataset, 'hard_pool_paths', {}))}"
-        return mode, (
-            f"{len(getattr(dataset, 'pids', []))} identities, "
-            f"sat_per_id={getattr(dataset, 'sat_per_id', 'unknown')}, "
-            f"drone_per_id={getattr(dataset, 'drone_per_id', 'unknown')}"
-            f"{hard_text}"
-        )
-    return mode, "Sample4Geo dataloader expected"
-
+        return (mode, f"{len(getattr(dataset, 'pids', []))} identities, sat_per_id={getattr(dataset, 'sat_per_id', 'unknown')}, drone_per_id={getattr(dataset, 'drone_per_id', 'unknown')}{hard_text}")
+    return (mode, 'PairedCrossView dataloader expected')
 
 def get_training_mode(epoch, args):
     if not args.enable_identity_stage:
-        return "sample4geo"
+        return 'paired_cross_view'
     if epoch <= args.stage1_end_epoch:
-        return "sample4geo"
-    if getattr(args, "enable_hard_pool_stage", False) and epoch > args.stage2_end_epoch:
-        return "identity_hard"
-    return "identity"
-
+        return 'paired_cross_view'
+    if getattr(args, 'enable_hard_pool_stage', False) and epoch > args.stage2_end_epoch:
+        return 'identity_hard'
+    return 'identity'
 
 def select_epoch_dataloader(train_loaders, epoch, args):
     requested_mode = get_training_mode(epoch, args)
     if not isinstance(train_loaders, dict):
-        return train_loaders, requested_mode, "sample4geo"
-
+        return (train_loaders, requested_mode, 'paired_cross_view')
     if requested_mode in train_loaders:
-        return train_loaders[requested_mode], requested_mode, requested_mode
-    return train_loaders["sample4geo"], requested_mode, "sample4geo"
-
+        return (train_loaders[requested_mode], requested_mode, requested_mode)
+    return (train_loaders['paired_cross_view'], requested_mode, 'paired_cross_view')
 
 def set_epoch_on_dataloader(dataloader, epoch):
     if hasattr(dataloader, 'dataset') and hasattr(dataloader.dataset, 'set_epoch'):
@@ -331,1062 +213,76 @@ def set_epoch_on_dataloader(dataloader, epoch):
     if dist.is_initialized() and hasattr(dataloader, 'sampler') and hasattr(dataloader.sampler, 'set_epoch'):
         dataloader.sampler.set_epoch(epoch)
 
-
 def get_sampler_debug_desc(dataloader):
-    batch_sampler = getattr(dataloader, "batch_sampler", None)
+    batch_sampler = getattr(dataloader, 'batch_sampler', None)
     if batch_sampler is not None:
         return repr(batch_sampler)
-    sampler = getattr(dataloader, "sampler", None)
+    sampler = getattr(dataloader, 'sampler', None)
     if sampler is not None:
         return repr(sampler)
-    return "sampler=None"
-
+    return 'sampler=None'
 
 def get_model_debug_values(model_or_engine):
     base_model = get_base_model(model_or_engine)
     values = {}
     with torch.no_grad():
-        if hasattr(base_model, "logit_scale"):
-            values["scale"] = base_model.logit_scale.exp().item()
+        if hasattr(base_model, 'logit_scale'):
+            values['scale'] = base_model.logit_scale.exp().item()
     return values
 
-
 def format_optional_metric(name, value):
-    return f"{name}={value:.4f}" if value is not None else None
-
+    return f'{name}={value:.4f}' if value is not None else None
 
 def _dtype_name(dtype):
-    return str(dtype).replace("torch.", "") if dtype is not None else "unavailable"
+    return str(dtype).replace('torch.', '') if dtype is not None else 'unavailable'
 
-
-def print_runtime_dtype_audit_once(
-    model_engine,
-    infonce_criterion,
-    batch_meta,
-    final_feats,
-    sat_feats,
-    drone_feats,
-    total_loss,
-):
-    """Print dtypes and finite checks from the first real Sample4Geo forward."""
-
+def print_runtime_dtype_audit_once(model_engine, infonce_criterion, batch_meta, final_feats, sat_feats, drone_feats, total_loss):
+    """Print dtypes and finite checks from the first real PairedCrossView forward."""
     base_model = get_base_model(model_engine)
-    forward_audit = getattr(base_model, "_runtime_forward_audit", None) or {}
-    loss_audit = getattr(infonce_criterion, "last_runtime_audit", None) or {}
+    forward_audit = getattr(base_model, '_runtime_forward_audit', None) or {}
+    loss_audit = getattr(infonce_criterion, 'last_runtime_audit', None) or {}
     parameter_dtypes = get_runtime_parameter_dtypes(model_engine)
-    raw_sat = batch_meta.get("raw_satellite_tensor")
-    raw_drone = batch_meta.get("raw_drone_tensor")
-
-    actual_dtypes = {
-        "raw batch drone image dtype": _dtype_name(getattr(raw_drone, "dtype", None)),
-        "raw batch satellite image dtype": _dtype_name(getattr(raw_sat, "dtype", None)),
-        "teacher forward input dtype": forward_audit.get(
-            "teacher_forward_input_dtype", "unavailable"
-        ),
-        "backbone parameter dtype": parameter_dtypes["backbone_parameter_dtype"],
-        "representative LoRA A dtype": parameter_dtypes["lora_A_dtype"],
-        "representative LoRA B dtype": parameter_dtypes["lora_B_dtype"],
-        "backbone output dtype": forward_audit.get("backbone_output_dtype", "unavailable"),
-        "descriptor dtype": forward_audit.get("descriptor_dtype", _dtype_name(final_feats.dtype)),
-        "gathered drone descriptor dtype": _dtype_name(drone_feats.dtype),
-        "gathered satellite descriptor dtype": _dtype_name(sat_feats.dtype),
-        "similarity/logits dtype": loss_audit.get(
-            "similarity_logits_dtype", "unavailable"
-        ),
-        "D2S loss dtype": loss_audit.get("d2s_loss_dtype", "unavailable"),
-        "S2D loss dtype": loss_audit.get("s2d_loss_dtype", "unavailable"),
-        "total loss dtype": _dtype_name(total_loss.dtype),
-    }
-    print("=" * 80)
-    print(f"[RUNTIME DTYPE AUDIT] contract={PRECISION_CONTRACT_NAME} source=first_real_sample4geo_forward")
-    for name, actual in actual_dtypes.items():
-        print(f"{name}={actual}")
-
-    # These assertions use real tensors/runtime observations and are fatal.
-    checks = (
-        ("raw_drone_image", getattr(raw_drone, "dtype", None), "raw_image"),
-        ("raw_satellite_image", getattr(raw_sat, "dtype", None), "raw_image"),
-        ("teacher_forward_input", forward_audit.get("teacher_forward_input_dtype_value"), "teacher_input"),
-        ("backbone_parameter", parameter_dtypes["backbone_parameter_dtype_value"], "backbone_param"),
-        ("lora_runtime", parameter_dtypes["lora_runtime_dtype_value"], "lora_runtime"),
-        ("backbone_output", forward_audit.get("backbone_output_dtype_value"), "backbone_output"),
-        ("descriptor", final_feats.dtype, "descriptor"),
-        ("gathered_drone_descriptor", drone_feats.dtype, "gathered_descriptor"),
-        ("gathered_satellite_descriptor", sat_feats.dtype, "gathered_descriptor"),
-        ("similarity_logits", loss_audit.get("similarity_logits_dtype_value"), "logits"),
-        ("d2s_loss", loss_audit.get("d2s_loss_dtype_value"), "d2s_loss"),
-        ("s2d_loss", loss_audit.get("s2d_loss_dtype_value"), "s2d_loss"),
-        ("total_loss", total_loss.dtype, "total_loss"),
-    )
-    for tensor_name, actual, expected_key in checks:
+    raw_sat = batch_meta.get('raw_satellite_tensor')
+    raw_drone = batch_meta.get('raw_drone_tensor')
+    actual_dtypes = {'raw batch drone image dtype': _dtype_name(getattr(raw_drone, 'dtype', None)), 'raw batch satellite image dtype': _dtype_name(getattr(raw_sat, 'dtype', None)), 'teacher forward input dtype': forward_audit.get('teacher_forward_input_dtype', 'unavailable'), 'backbone parameter dtype': parameter_dtypes['backbone_parameter_dtype'], 'representative LoRA A dtype': parameter_dtypes['lora_A_dtype'], 'representative LoRA B dtype': parameter_dtypes['lora_B_dtype'], 'backbone output dtype': forward_audit.get('backbone_output_dtype', 'unavailable'), 'descriptor dtype': forward_audit.get('descriptor_dtype', _dtype_name(final_feats.dtype)), 'gathered drone descriptor dtype': _dtype_name(drone_feats.dtype), 'gathered satellite descriptor dtype': _dtype_name(sat_feats.dtype), 'similarity/logits dtype': loss_audit.get('similarity_logits_dtype', 'unavailable'), 'D2S loss dtype': loss_audit.get('d2s_loss_dtype', 'unavailable'), 'S2D loss dtype': loss_audit.get('s2d_loss_dtype', 'unavailable'), 'total loss dtype': _dtype_name(total_loss.dtype)}
+    print('=' * 80)
+    print(f'[RUNTIME DTYPE AUDIT] contract={PRECISION_CONTRACT_NAME} source=first_real_paired_cross_view_forward')
+    for (name, actual) in actual_dtypes.items():
+        print(f'{name}={actual}')
+    checks = (('raw_drone_image', getattr(raw_drone, 'dtype', None), 'raw_image'), ('raw_satellite_image', getattr(raw_sat, 'dtype', None), 'raw_image'), ('teacher_forward_input', forward_audit.get('teacher_forward_input_dtype_value'), 'teacher_input'), ('backbone_parameter', parameter_dtypes['backbone_parameter_dtype_value'], 'backbone_param'), ('lora_runtime', parameter_dtypes['lora_runtime_dtype_value'], 'lora_runtime'), ('backbone_output', forward_audit.get('backbone_output_dtype_value'), 'backbone_output'), ('descriptor', final_feats.dtype, 'descriptor'), ('gathered_drone_descriptor', drone_feats.dtype, 'gathered_descriptor'), ('gathered_satellite_descriptor', sat_feats.dtype, 'gathered_descriptor'), ('similarity_logits', loss_audit.get('similarity_logits_dtype_value'), 'logits'), ('d2s_loss', loss_audit.get('d2s_loss_dtype_value'), 'd2s_loss'), ('s2d_loss', loss_audit.get('s2d_loss_dtype_value'), 's2d_loss'), ('total_loss', total_loss.dtype, 'total_loss'))
+    for (tensor_name, actual, expected_key) in checks:
         require_contract_dtype(tensor_name, actual, expected_key)
-
     finite_reports = {}
     if torch.is_tensor(raw_sat):
-        finite_reports["raw satellite batch"] = tensor_nonfinite_counts(raw_sat)
+        finite_reports['raw satellite batch'] = tensor_nonfinite_counts(raw_sat)
     if torch.is_tensor(raw_drone):
-        finite_reports["raw drone batch"] = tensor_nonfinite_counts(raw_drone)
-    finite_reports["local descriptor"] = tensor_nonfinite_counts(final_feats)
-    finite_reports["gathered satellite descriptor"] = tensor_nonfinite_counts(sat_feats)
-    finite_reports["gathered drone descriptor"] = tensor_nonfinite_counts(drone_feats)
-    finite_reports["total loss"] = tensor_nonfinite_counts(total_loss)
-
-    for prefix in ("teacher_forward_input", "backbone_output", "descriptor"):
-        if f"{prefix}_nan" in forward_audit:
-            finite_reports[prefix.replace("_", " ")] = {
-                "nan": forward_audit[f"{prefix}_nan"],
-                "inf": forward_audit[f"{prefix}_inf"],
-            }
-    for prefix in ("logits", "d2s_loss", "s2d_loss"):
-        if f"{prefix}_nan" in loss_audit:
-            finite_reports[prefix.replace("_", " ")] = {
-                "nan": loss_audit[f"{prefix}_nan"],
-                "inf": loss_audit[f"{prefix}_inf"],
-            }
-
-    for name, counts in finite_reports.items():
+        finite_reports['raw drone batch'] = tensor_nonfinite_counts(raw_drone)
+    finite_reports['local descriptor'] = tensor_nonfinite_counts(final_feats)
+    finite_reports['gathered satellite descriptor'] = tensor_nonfinite_counts(sat_feats)
+    finite_reports['gathered drone descriptor'] = tensor_nonfinite_counts(drone_feats)
+    finite_reports['total loss'] = tensor_nonfinite_counts(total_loss)
+    for prefix in ('teacher_forward_input', 'backbone_output', 'descriptor'):
+        if f'{prefix}_nan' in forward_audit:
+            finite_reports[prefix.replace('_', ' ')] = {'nan': forward_audit[f'{prefix}_nan'], 'inf': forward_audit[f'{prefix}_inf']}
+    for prefix in ('logits', 'd2s_loss', 's2d_loss'):
+        if f'{prefix}_nan' in loss_audit:
+            finite_reports[prefix.replace('_', ' ')] = {'nan': loss_audit[f'{prefix}_nan'], 'inf': loss_audit[f'{prefix}_inf']}
+    for (name, counts) in finite_reports.items():
         print(f"finite_check | tensor={name} | nan={counts['nan']} | inf={counts['inf']}")
-        if counts["nan"] or counts["inf"]:
-            print(
-                f"[EXPERIMENT_AUDIT][ERROR] non-finite values in {name}: "
-                f"nan={counts['nan']}, inf={counts['inf']}"
-            )
-    print("=" * 80)
-
+        if counts['nan'] or counts['inf']:
+            print(f"[EXPERIMENT_AUDIT][ERROR] non-finite values in {name}: nan={counts['nan']}, inf={counts['inf']}")
+    print('=' * 80)
 
 def enforce_epoch_first_batch_precision(model_engine, infonce_criterion, final_feats, total_loss):
-    """Lightweight fatal guard for the first valid Sample4Geo batch each epoch."""
-
+    """Lightweight fatal guard for the first valid PairedCrossView batch each epoch."""
     base_model = get_base_model(model_engine)
-    forward_audit = getattr(base_model, "_runtime_forward_audit", None) or {}
-    loss_audit = getattr(infonce_criterion, "last_runtime_audit", None) or {}
-    checks = (
-        ("teacher_forward_input", forward_audit.get("teacher_forward_input_dtype_value"), "teacher_input"),
-        ("backbone_output", forward_audit.get("backbone_output_dtype_value"), "backbone_output"),
-        ("descriptor", final_feats.dtype, "descriptor"),
-        ("similarity_logits", loss_audit.get("similarity_logits_dtype_value"), "logits"),
-        ("total_loss", total_loss.dtype, "total_loss"),
-    )
-    for tensor_name, actual, expected_key in checks:
+    forward_audit = getattr(base_model, '_runtime_forward_audit', None) or {}
+    loss_audit = getattr(infonce_criterion, 'last_runtime_audit', None) or {}
+    checks = (('teacher_forward_input', forward_audit.get('teacher_forward_input_dtype_value'), 'teacher_input'), ('backbone_output', forward_audit.get('backbone_output_dtype_value'), 'backbone_output'), ('descriptor', final_feats.dtype, 'descriptor'), ('similarity_logits', loss_audit.get('similarity_logits_dtype_value'), 'logits'), ('total_loss', total_loss.dtype, 'total_loss'))
+    for (tensor_name, actual, expected_key) in checks:
         require_contract_dtype(tensor_name, actual, expected_key)
 
-
-def audit_identity_runtime_precision_once(
-    model_engine,
-    batch_meta,
-    model_inputs,
-    local_views,
-    local_descriptors,
-    gathered_satellite_descriptors,
-    gathered_uav_descriptors,
-    identity_criterion,
-    triplet_criterion,
-    weak_criterion,
-    total_loss,
-    identity_enabled,
-    triplet_enabled,
-    weak_enabled,
-):
-    """Validate the first real explicit-Identity batch without changing tensors."""
-
-    base_model = get_base_model(model_engine)
-    forward_audit = getattr(base_model, "_runtime_forward_audit", None) or {}
-    identity_audit = getattr(identity_criterion, "last_runtime_audit", None) or {}
-    triplet_audit = getattr(triplet_criterion, "last_runtime_audit", None) or {}
-    weak_audit = getattr(weak_criterion, "last_runtime_audit", None) or {}
-    parameter_dtypes = get_runtime_parameter_dtypes(model_engine)
-
-    raw_images = batch_meta.get("images")
-    raw_views = batch_meta.get("view_type")
-    raw_uav = raw_images[raw_views == 1] if torch.is_tensor(raw_images) else None
-    raw_satellite = raw_images[raw_views == 0] if torch.is_tensor(raw_images) else None
-    local_uav = local_descriptors[local_views == 1]
-    local_satellite = local_descriptors[local_views == 0]
-
-    backbone_output_shape = forward_audit.get("backbone_output_shape")
-
-    def view_backbone_shape(view_descriptors):
-        if not backbone_output_shape:
-            return None
-        return (view_descriptors.size(0),) + tuple(backbone_output_shape[1:])
-
-    lora_module_name = parameter_dtypes.get("lora_module_name")
-    lora_module = dict(base_model.named_modules()).get(lora_module_name)
-    backbone_parameter = next(
-        (
-            parameter
-            for parameter in base_model.backbone.parameters()
-            if parameter.is_floating_point()
-        ),
-        None,
-    )
-
-    records = []
-    failures = []
-
-    def add_check(
-        name,
-        actual,
-        expected,
-        shape=None,
-        module_name=None,
-        enabled=True,
-        allow_missing=False,
-    ):
-        if not enabled:
-            records.append((name, "disabled", expected, shape, module_name, "SKIP"))
-            return
-        actual_dtype = actual.dtype if torch.is_tensor(actual) else actual
-        if shape is None and torch.is_tensor(actual):
-            shape = tuple(actual.shape)
-        if actual_dtype is None and allow_missing:
-            records.append((name, "not_produced", expected, shape, module_name, "SKIP"))
-            return
-        status = "PASS" if actual_dtype == expected else "FAIL"
-        records.append((name, actual_dtype, expected, shape, module_name, status))
-        if status == "FAIL":
-            failures.append(
-                f"{name}: actual={_dtype_name(actual_dtype)}, "
-                f"expected={_dtype_name(expected)}, module={module_name or 'n/a'}"
-            )
-
-    add_check("raw_uav_images", raw_uav, torch.float32)
-    add_check("raw_satellite_images", raw_satellite, torch.float32)
-    add_check("teacher_forward_uav_input", model_inputs[local_views == 1], torch.bfloat16)
-    add_check("teacher_forward_satellite_input", model_inputs[local_views == 0], torch.bfloat16)
-    add_check("representative_backbone_parameter", backbone_parameter, torch.bfloat16)
-    add_check(
-        "representative_LoRA_A_parameter",
-        getattr(getattr(lora_module, "lora_A", None), "weight", None),
-        torch.bfloat16,
-        module_name=lora_module_name,
-    )
-    add_check(
-        "representative_LoRA_B_parameter",
-        getattr(getattr(lora_module, "lora_B", None), "weight", None),
-        torch.bfloat16,
-        module_name=lora_module_name,
-    )
-    add_check(
-        "representative_LoRA_runtime_input",
-        parameter_dtypes.get("lora_runtime_dtype_value"),
-        torch.bfloat16,
-        module_name=lora_module_name,
-    )
-    add_check(
-        "backbone_output_uav",
-        forward_audit.get("backbone_output_dtype_value"),
-        torch.bfloat16,
-        shape=view_backbone_shape(local_uav),
-    )
-    add_check(
-        "backbone_output_satellite",
-        forward_audit.get("backbone_output_dtype_value"),
-        torch.bfloat16,
-        shape=view_backbone_shape(local_satellite),
-    )
-    add_check("descriptor_uav_before_gather", local_uav, torch.float32)
-    add_check("descriptor_satellite_before_gather", local_satellite, torch.float32)
-    add_check("descriptor_uav_after_gather", gathered_uav_descriptors, torch.float32)
-    add_check(
-        "descriptor_satellite_after_gather",
-        gathered_satellite_descriptors,
-        torch.float32,
-    )
-    add_check(
-        "identity_logits_d2s",
-        identity_audit.get("d2s_logits_dtype_value"),
-        torch.float32,
-        shape=identity_audit.get("d2s_logits_shape"),
-        enabled=identity_enabled,
-    )
-    add_check(
-        "identity_logits_s2d",
-        identity_audit.get("s2d_logits_dtype_value"),
-        torch.float32,
-        shape=identity_audit.get("s2d_logits_shape"),
-        enabled=identity_enabled,
-    )
-    add_check(
-        "identity_loss_d2s",
-        identity_audit.get("d2s_loss_dtype_value"),
-        torch.float32,
-        shape=identity_audit.get("d2s_loss_shape"),
-        enabled=identity_enabled,
-    )
-    add_check(
-        "identity_loss_s2d",
-        identity_audit.get("s2d_loss_dtype_value"),
-        torch.float32,
-        shape=identity_audit.get("s2d_loss_shape"),
-        enabled=identity_enabled,
-    )
-    add_check(
-        "identity_loss_total",
-        identity_audit.get("total_loss_dtype_value"),
-        torch.float32,
-        shape=identity_audit.get("total_loss_shape"),
-        enabled=identity_enabled,
-    )
-    add_check(
-        "uav_triplet_input",
-        triplet_audit.get("uav_input_dtype_value"),
-        torch.float32,
-        shape=triplet_audit.get("uav_input_shape"),
-        enabled=triplet_enabled,
-    )
-    add_check(
-        "uav_triplet_loss",
-        triplet_audit.get("uav_loss_dtype_value"),
-        torch.float32,
-        shape=triplet_audit.get("uav_loss_shape"),
-        enabled=triplet_enabled,
-        allow_missing=True,
-    )
-    add_check(
-        "satellite_triplet_input",
-        triplet_audit.get("satellite_input_dtype_value"),
-        torch.float32,
-        shape=triplet_audit.get("satellite_input_shape"),
-        enabled=triplet_enabled,
-    )
-    add_check(
-        "satellite_triplet_loss",
-        triplet_audit.get("satellite_loss_dtype_value"),
-        torch.float32,
-        shape=triplet_audit.get("satellite_loss_shape"),
-        enabled=triplet_enabled,
-        allow_missing=True,
-    )
-    add_check(
-        "weak_infonce_logits",
-        weak_audit.get("logits_dtype_value"),
-        torch.float32,
-        shape=weak_audit.get("logits_shape"),
-        enabled=weak_enabled,
-    )
-    add_check(
-        "weak_infonce_loss",
-        weak_audit.get("loss_dtype_value"),
-        torch.float32,
-        shape=weak_audit.get("loss_shape"),
-        enabled=weak_enabled,
-    )
-    add_check("total_loss", total_loss, torch.float32)
-
-    if is_main_process():
-        print("=" * 80)
-        print("[Identity Precision Audit] source=first_real_explicit_identity_batch")
-        print(f"representative_LoRA_module={lora_module_name or 'unavailable'}")
-        for name, actual, expected, shape, module_name, status in records:
-            module_text = f" | module={module_name}" if module_name else ""
-            print(
-                f"tensor={name} | actual={_dtype_name(actual)} | "
-                f"expected={_dtype_name(expected)} | shape={shape or 'n/a'} | "
-                f"status={status}{module_text}"
-            )
-        print("=" * 80)
-
-    if failures:
-        raise RuntimeError(
-            "[IDENTITY PRECISION CONTRACT VIOLATION]\n" + "\n".join(failures)
-        )
-
-
-def _diagnostic_stats(values):
-    if values.numel() == 0:
-        return None
-    values = values.detach().float()
-    return {
-        "min": values.min().item(),
-        "mean": values.mean().item(),
-        "max": values.max().item(),
-    }
-
-
-@torch.no_grad()
-def audit_identity_batch_contract_once(
-    args,
-    local_labels,
-    local_views,
-    all_labels,
-    all_views,
-    print_report=True,
-):
-    """Audit Identity batch semantics using tensors already gathered for the loss."""
-
-    local_labels = local_labels.detach()
-    local_views = local_views.detach()
-    all_labels = all_labels.detach()
-    all_views = all_views.detach()
-
-    local_uav_labels = local_labels[local_views == 1]
-    local_satellite_labels = local_labels[local_views == 0]
-    global_uav_labels = all_labels[all_views == 1]
-    global_satellite_labels = all_labels[all_views == 0]
-
-    def direction_candidate_semantics(anchor_labels, candidate_labels):
-        positive_mask = anchor_labels.unsqueeze(1).eq(candidate_labels.unsqueeze(0))
-        valid_anchor_mask = positive_mask.any(dim=1)
-        used_anchor_labels = anchor_labels[valid_anchor_mask]
-        used_positive_mask = positive_mask[valid_anchor_mask]
-        candidate_mask = torch.ones_like(used_positive_mask, dtype=torch.bool)
-        soft_targets = used_positive_mask.float()
-        soft_targets = soft_targets / soft_targets.sum(
-            dim=1, keepdim=True
-        ).clamp_min(1e-12)
-        actual_negative_mask = candidate_mask & soft_targets.eq(0)
-
-        anchor_pid_grid = used_anchor_labels.unsqueeze(1).expand_as(actual_negative_mask)
-        candidate_pid_grid = candidate_labels.unsqueeze(0).expand_as(actual_negative_mask)
-        negative_anchor_pids = anchor_pid_grid[actual_negative_mask]
-        negative_candidate_pids = candidate_pid_grid[actual_negative_mask]
-        same_pid_as_negative_count = int(
-            negative_anchor_pids.eq(negative_candidate_pids).sum().item()
-        )
-
-        negative_identity_counts = [
-            torch.unique(candidate_labels[actual_negative_mask[index]]).numel()
-            for index in range(used_anchor_labels.numel())
-        ]
-        return {
-            "positive_counts": used_positive_mask.sum(dim=1).float(),
-            "negative_counts": actual_negative_mask.sum(dim=1).float(),
-            "negative_identity_counts": negative_identity_counts,
-            "same_pid_as_negative_count": same_pid_as_negative_count,
-        }
-
-    d2s_semantics = direction_candidate_semantics(
-        global_uav_labels, global_satellite_labels
-    )
-    s2d_semantics = direction_candidate_semantics(
-        global_satellite_labels, global_uav_labels
-    )
-    uav_positive_counts = d2s_semantics["positive_counts"]
-    satellite_positive_counts = s2d_semantics["positive_counts"]
-    uav_negative_counts = d2s_semantics["negative_counts"]
-    satellite_negative_counts = s2d_semantics["negative_counts"]
-
-    negative_identity_counts = (
-        d2s_semantics["negative_identity_counts"]
-        + s2d_semantics["negative_identity_counts"]
-    )
-    negative_identity_counts = torch.tensor(
-        negative_identity_counts,
-        dtype=torch.float32,
-        device=all_labels.device,
-    )
-
-    d2s_same_pid_as_negative_count = d2s_semantics["same_pid_as_negative_count"]
-    s2d_same_pid_as_negative_count = s2d_semantics["same_pid_as_negative_count"]
-    same_pid_as_negative_count_total = (
-        d2s_same_pid_as_negative_count + s2d_same_pid_as_negative_count
-    )
-
-    metrics = {
-        "local_unique_pid_count": int(torch.unique(local_labels).numel()),
-        "global_unique_pid_count": int(torch.unique(all_labels).numel()),
-        "local_uav_count": int(local_uav_labels.numel()),
-        "local_satellite_count": int(local_satellite_labels.numel()),
-        "global_uav_count": int(global_uav_labels.numel()),
-        "global_satellite_count": int(global_satellite_labels.numel()),
-        "uav_positive_counts": _diagnostic_stats(uav_positive_counts),
-        "satellite_positive_counts": _diagnostic_stats(satellite_positive_counts),
-        "uav_negative_counts": _diagnostic_stats(uav_negative_counts),
-        "satellite_negative_counts": _diagnostic_stats(satellite_negative_counts),
-        "negative_identity_counts": _diagnostic_stats(negative_identity_counts),
-        "d2s_same_pid_as_negative_count": d2s_same_pid_as_negative_count,
-        "s2d_same_pid_as_negative_count": s2d_same_pid_as_negative_count,
-        "same_pid_as_negative_count_total": same_pid_as_negative_count_total,
-        "same_pid_as_negative_count": same_pid_as_negative_count_total,
-    }
-
-    rank, world_size = get_dist_rank_world()
-    if is_main_process() and print_report:
-        print("=" * 80)
-        print("[Identity Batch Contract]")
-        print(f"training_stage={getattr(args, 'training_stage', 'unavailable')}")
-        print(f"world_size={world_size}")
-        print(f"rank={rank}")
-        print(f"identity_drone_per_id={args.identity_drone_per_id}")
-        print(f"identity_sat_per_id={args.identity_sat_per_id}")
-        print(f"identity_ids_per_batch={args.identity_ids_per_batch}")
-        print(f"local_unique_pid_count={metrics['local_unique_pid_count']}")
-        print(f"global_unique_pid_count={metrics['global_unique_pid_count']}")
-        print(f"local_uav_count={metrics['local_uav_count']}")
-        print(f"local_satellite_count={metrics['local_satellite_count']}")
-        print(f"global_uav_count={metrics['global_uav_count']}")
-        print(f"global_satellite_count={metrics['global_satellite_count']}")
-        for name, values in (
-            ("uav_positive_count_per_anchor", uav_positive_counts),
-            ("satellite_positive_count_per_anchor", satellite_positive_counts),
-            ("uav_negative_sample_count_per_anchor", uav_negative_counts),
-            ("satellite_negative_sample_count_per_anchor", satellite_negative_counts),
-            ("negative_identity_count_per_anchor", negative_identity_counts),
-        ):
-            stats = _diagnostic_stats(values)
-            if stats is None:
-                print(f"{name}=unavailable")
-            else:
-                print(
-                    f"{name}: min={stats['min']:.2f} | "
-                    f"mean={stats['mean']:.2f} | max={stats['max']:.2f}"
-                )
-        print(f"d2s_same_pid_as_negative_count={d2s_same_pid_as_negative_count}")
-        print(f"s2d_same_pid_as_negative_count={s2d_same_pid_as_negative_count}")
-        print(f"same_pid_as_negative_count_total={same_pid_as_negative_count_total}")
-        print("=" * 80)
-
-    if same_pid_as_negative_count_total != 0:
-        raise RuntimeError(
-            "[IDENTITY BATCH CONTRACT VIOLATION] "
-            "same_pid_as_negative_count_total="
-            f"{same_pid_as_negative_count_total}, expected=0"
-        )
-    return metrics
-
-
-def _triplet_domain_diagnostics(feats, labels, margin):
-    if feats.numel() == 0:
-        return {"skipped": True, "reason": "no_domain_samples"}
-
-    feats = F.normalize(feats.detach().float(), p=2, dim=-1, eps=1e-6)
-    labels = labels.detach()
-    similarity = feats @ feats.t()
-    distance = torch.sqrt((2.0 - 2.0 * similarity).clamp_min(1e-12))
-    same_label = labels.unsqueeze(1).eq(labels.unsqueeze(0))
-    eye = torch.eye(labels.size(0), dtype=torch.bool, device=labels.device)
-    positive_mask = same_label & ~eye
-    negative_mask = ~same_label
-    has_positive = positive_mask.any(dim=1)
-    has_negative = negative_mask.any(dim=1)
-    valid_anchor = has_positive & has_negative
-
-    if not has_positive.any():
-        return {"skipped": True, "reason": "no_nonself_positive"}
-    if not has_negative.any():
-        return {"skipped": True, "reason": "no_negative"}
-    if not valid_anchor.any():
-        return {"skipped": True, "reason": "no_anchor_with_positive_and_negative"}
-
-    hardest_positive = distance.masked_fill(~positive_mask, -1.0).max(dim=1).values
-    hardest_negative = distance.masked_fill(~negative_mask, 1e5).min(dim=1).values
-    hardest_positive = hardest_positive[valid_anchor]
-    hardest_negative = hardest_negative[valid_anchor]
-    violations = hardest_positive - hardest_negative + float(margin) > 0
-
-    return {
-        "skipped": False,
-        "active_ratio": valid_anchor.float().mean().item(),
-        "hardest_positive": _diagnostic_stats(hardest_positive),
-        "hardest_negative": _diagnostic_stats(hardest_negative),
-        "margin_violation_ratio": violations.float().mean().item(),
-    }
-
-
-def _audit_scalar(audit, key):
-    value = audit.get(key)
-    if torch.is_tensor(value):
-        return value.detach().float().item()
-    return None
-
-
-@torch.no_grad()
-def print_identity_behavior_diagnostics(
-    args,
-    all_feats,
-    all_labels,
-    all_views,
-    identity_criterion,
-    triplet_criterion,
-    weak_criterion,
-    total_loss,
-):
-    """Print detached Identity behavior diagnostics without new collectives."""
-
-    feats = F.normalize(all_feats.detach().float(), p=2, dim=-1, eps=1e-6)
-    labels = all_labels.detach()
-    views = all_views.detach()
-    satellite_feats = feats[views == 0]
-    satellite_labels = labels[views == 0]
-    uav_feats = feats[views == 1]
-    uav_labels = labels[views == 1]
-
-    similarity = uav_feats @ satellite_feats.t()
-    positive_mask = uav_labels.unsqueeze(1).eq(satellite_labels.unsqueeze(0))
-    negative_mask = ~positive_mask
-    positive_similarities = similarity[positive_mask]
-
-    d2s_valid = negative_mask.any(dim=1)
-    s2d_valid = negative_mask.t().any(dim=1)
-    d2s_hardest_negative = similarity.masked_fill(~negative_mask, -float("inf")).max(dim=1).values
-    s2d_hardest_negative = similarity.t().masked_fill(
-        ~negative_mask.t(), -float("inf")
-    ).max(dim=1).values
-    d2s_hardest_negative = d2s_hardest_negative[d2s_valid]
-    s2d_hardest_negative = s2d_hardest_negative[s2d_valid]
-    combined_hardest_negative = torch.cat(
-        [d2s_hardest_negative, s2d_hardest_negative], dim=0
-    )
-
-    identity_audit = getattr(identity_criterion, "last_runtime_audit", None) or {}
-    triplet_audit = getattr(triplet_criterion, "last_runtime_audit", None) or {}
-    weak_audit = getattr(weak_criterion, "last_runtime_audit", None) or {}
-
-    identity_d2s = _audit_scalar(identity_audit, "d2s_loss_value")
-    identity_s2d = _audit_scalar(identity_audit, "s2d_loss_value")
-    identity_total = _audit_scalar(identity_audit, "total_loss_value")
-    uav_triplet = _audit_scalar(triplet_audit, "uav_loss_value")
-    satellite_triplet = _audit_scalar(triplet_audit, "satellite_loss_value")
-    same_triplet = _audit_scalar(triplet_audit, "total_loss_value")
-    weak_s4g = _audit_scalar(weak_audit, "loss_value")
-
-    identity_enabled = args.identity_loss_weight > 0
-    triplet_enabled = args.same_domain_triplet_weight > 0
-    weak_enabled = args.infonce_weight > 0 and args.weak_sample4geo_weight > 0
-
-    identity_contribution = (
-        args.identity_loss_weight * identity_total
-        if identity_enabled and identity_total is not None
-        else 0.0
-    )
-    triplet_contribution = (
-        args.same_domain_triplet_weight * same_triplet
-        if triplet_enabled and same_triplet is not None
-        else 0.0
-    )
-    weak_contribution = (
-        args.weak_sample4geo_weight * weak_s4g
-        if weak_enabled and weak_s4g is not None
-        else 0.0
-    )
-
-    print("=" * 80)
-    print("[Identity Loss and Behavior Diagnostics]")
-    print(f"L_identity_d2s={identity_d2s if identity_d2s is not None else 'disabled'}")
-    print(f"L_identity_s2d={identity_s2d if identity_s2d is not None else 'disabled'}")
-    print(f"L_identity={identity_total if identity_total is not None else 'disabled'}")
-    print(f"L_uav_triplet={uav_triplet if uav_triplet is not None else 'skipped'}")
-    print(
-        "L_sat_triplet="
-        f"{satellite_triplet if satellite_triplet is not None else 'skipped'}"
-    )
-    print(f"L_same_triplet={same_triplet if same_triplet is not None else 'disabled'}")
-    print(f"L_weak_s4g={weak_s4g if weak_enabled and weak_s4g is not None else 'disabled/0'}")
-    print(f"identity_weight={args.identity_loss_weight}")
-    print(f"triplet_weight={args.same_domain_triplet_weight}")
-    print(f"infonce_weight={args.infonce_weight}")
-    print(f"weak_sample4geo_weight={args.weak_sample4geo_weight}")
-    print(f"weighted_identity_contribution={identity_contribution}")
-    print(f"weighted_triplet_contribution={triplet_contribution}")
-    print(f"weighted_weak_s4g_contribution={weak_contribution}")
-    print(f"L_total={total_loss.detach().float().item()}")
-
-    positive_stats = _diagnostic_stats(positive_similarities)
-    hardest_negative_stats = _diagnostic_stats(combined_hardest_negative)
-    d2s_positive_stats = _diagnostic_stats(similarity[positive_mask])
-    s2d_positive_stats = _diagnostic_stats(similarity.t()[positive_mask.t()])
-    d2s_negative_stats = _diagnostic_stats(d2s_hardest_negative)
-    s2d_negative_stats = _diagnostic_stats(s2d_hardest_negative)
-    if positive_stats is not None:
-        print(f"cross_view_positive_similarity_mean={positive_stats['mean']}")
-        print(f"cross_view_positive_similarity_min={positive_stats['min']}")
-        print(f"cross_view_positive_similarity_max={positive_stats['max']}")
-    if hardest_negative_stats is not None:
-        print(
-            "cross_view_hardest_negative_similarity_mean="
-            f"{hardest_negative_stats['mean']}"
-        )
-    if d2s_positive_stats is not None:
-        print(f"d2s_positive_similarity_mean={d2s_positive_stats['mean']}")
-    if d2s_negative_stats is not None:
-        print(f"d2s_hardest_negative_similarity_mean={d2s_negative_stats['mean']}")
-    if s2d_positive_stats is not None:
-        print(f"s2d_positive_similarity_mean={s2d_positive_stats['mean']}")
-    if s2d_negative_stats is not None:
-        print(f"s2d_hardest_negative_similarity_mean={s2d_negative_stats['mean']}")
-    if positive_stats is not None and hardest_negative_stats is not None:
-        print(
-            "ranking_margin_mean="
-            f"{positive_stats['mean'] - hardest_negative_stats['mean']}"
-        )
-
-    for domain_name, domain_feats, domain_labels in (
-        ("uav", uav_feats, uav_labels),
-        ("sat", satellite_feats, satellite_labels),
-    ):
-        domain_display_name = "UAV" if domain_name == "uav" else "Satellite"
-        if not triplet_enabled:
-            print(f"triplet_domain_skipped={domain_display_name}")
-            print("reason=disabled")
-            continue
-        diagnostics = _triplet_domain_diagnostics(
-            domain_feats, domain_labels, args.triplet_margin
-        )
-        if diagnostics["skipped"]:
-            print(f"triplet_domain_skipped={domain_display_name}")
-            print(f"reason={diagnostics['reason']}")
-            continue
-        positive = diagnostics["hardest_positive"]
-        negative = diagnostics["hardest_negative"]
-        print(f"{domain_name}_triplet_active_ratio={diagnostics['active_ratio']}")
-        print(f"{domain_name}_hardest_positive_distance_mean={positive['mean']}")
-        print(f"{domain_name}_hardest_positive_distance_min={positive['min']}")
-        print(f"{domain_name}_hardest_positive_distance_max={positive['max']}")
-        print(f"{domain_name}_hardest_negative_distance_mean={negative['mean']}")
-        print(f"{domain_name}_hardest_negative_distance_min={negative['min']}")
-        print(f"{domain_name}_hardest_negative_distance_max={negative['max']}")
-        print(
-            f"{domain_name}_margin_violation_ratio="
-            f"{diagnostics['margin_violation_ratio']}"
-        )
-    print("=" * 80)
-
-
-def _compress_block_ranges(indices):
-    if not indices:
-        return []
-    ranges = []
-    start = previous = indices[0]
-    for index in indices[1:]:
-        if index != previous + 1:
-            ranges.append((start, previous + 1))
-            start = index
-        previous = index
-    ranges.append((start, previous + 1))
-    return ranges
-
-
-@torch.no_grad()
-def audit_identity_preflight_parameters(model_engine):
-    base_model = get_base_model(model_engine)
-    parameters = list(base_model.parameters())
-    total_parameter_count = sum(int(parameter.numel()) for parameter in parameters)
-    trainable_parameter_count = sum(
-        int(parameter.numel()) for parameter in parameters if parameter.requires_grad
-    )
-    frozen_parameter_count = total_parameter_count - trainable_parameter_count
-
-    blocks = base_model.backbone.model.blocks
-    lora_start, lora_end = base_model.lora_range
-    full_start, full_end = base_model.full_finetune_range
-    failures = []
-    frozen_block_indices = []
-    allowed_trainable_parameter_ids = {id(base_model.logit_scale)}
-
-    for block_index, block in enumerate(blocks):
-        named_parameters = list(block.named_parameters())
-        if full_start <= block_index < full_end:
-            allowed_trainable_parameter_ids.update(
-                id(parameter) for _, parameter in named_parameters
-            )
-            if not named_parameters or any(
-                not parameter.requires_grad for _, parameter in named_parameters
-            ):
-                failures.append(
-                    f"full_finetune block {block_index} is not fully trainable"
-                )
-            continue
-
-        if lora_start <= block_index < lora_end:
-            lora_parameters = [
-                parameter
-                for name, parameter in named_parameters
-                if "lora_A" in name or "lora_B" in name
-            ]
-            allowed_trainable_parameter_ids.update(
-                id(parameter) for parameter in lora_parameters
-            )
-            non_lora_parameters = [
-                parameter
-                for name, parameter in named_parameters
-                if "lora_A" not in name and "lora_B" not in name
-            ]
-            if not lora_parameters:
-                failures.append(f"LoRA block {block_index} has no LoRA parameters")
-            if any(not parameter.requires_grad for parameter in lora_parameters):
-                failures.append(f"LoRA block {block_index} has frozen LoRA parameters")
-            if any(parameter.requires_grad for parameter in non_lora_parameters):
-                failures.append(
-                    f"LoRA block {block_index} has unexpected trainable base parameters"
-                )
-            continue
-
-        frozen_block_indices.append(block_index)
-        if any(parameter.requires_grad for _, parameter in named_parameters):
-            failures.append(f"frozen block {block_index} has trainable parameters")
-
-    unexpected_trainable_parameters = [
-        name
-        for name, parameter in base_model.named_parameters()
-        if parameter.requires_grad
-        and id(parameter) not in allowed_trainable_parameter_ids
-    ]
-    if unexpected_trainable_parameters:
-        failures.append(
-            "unexpected trainable parameters outside LoRA/full-FT/logit_scale: "
-            + ", ".join(unexpected_trainable_parameters)
-        )
-
-    parameter_dtypes = get_runtime_parameter_dtypes(model_engine)
-    report = {
-        "total_parameter_count": total_parameter_count,
-        "trainable_parameter_count": trainable_parameter_count,
-        "frozen_parameter_count": frozen_parameter_count,
-        "frozen_block_ranges": _compress_block_ranges(frozen_block_indices),
-        "LoRA_block_ranges": [tuple(base_model.lora_range)],
-        "full_finetune_block_ranges": [tuple(base_model.full_finetune_range)],
-        "representative_LoRA_module": parameter_dtypes.get("lora_module_name"),
-        "representative_LoRA_A_dtype": parameter_dtypes.get("lora_A_dtype_value"),
-        "representative_LoRA_B_dtype": parameter_dtypes.get("lora_B_dtype_value"),
-        "frozen_requires_grad_check": not any(
-            "frozen block" in failure or "unexpected trainable" in failure
-            for failure in failures
-        ),
-        "lora_requires_grad_check": not any(
-            failure.startswith("LoRA block") for failure in failures
-        ),
-        "full_finetune_requires_grad_check": not any(
-            failure.startswith("full_finetune block") for failure in failures
-        ),
-    }
-    if failures:
-        raise RuntimeError(
-            "[IDENTITY PREFLIGHT PARAMETER CONTRACT VIOLATION]\n"
-            + "\n".join(failures)
-        )
-    return report
-
-
-@torch.no_grad()
-def run_teacher_identity_preflight(
-    model_engine,
-    train_loaders,
-    args,
-    identity_criterion,
-    triplet_criterion,
-    weak_criterion,
-    init_checkpoint_report,
-):
-    requested_batches = int(args.identity_preflight_batches)
-    identity_loader = train_loaders.get("identity") if isinstance(train_loaders, dict) else None
-    if identity_loader is None:
-        raise RuntimeError("Identity preflight requires an active identity dataloader")
-
-    checkpoint_report = init_checkpoint_report or {}
-    if not checkpoint_report.get("trainable_coverage_pass", False):
-        raise RuntimeError("init checkpoint did not pass trainable-parameter coverage")
-
-    parameter_report = audit_identity_preflight_parameters(model_engine)
-    rank, world_size = get_dist_rank_world()
-    starting_global_steps = int(getattr(model_engine, "global_steps", 0))
-    processed_batches = 0
-    first_contract = None
-    first_runtime = None
-    nan_count = 0
-    inf_count = 0
-    all_descriptors_finite = True
-    all_losses_finite = True
-    cross_gpu_gather_pass = True
-
-    model_engine.train()
-    for batch_index, batch in enumerate(identity_loader):
-        if processed_batches >= requested_batches:
-            break
-
-        imgs, labels, views, batch_meta = unpack_training_batch(
-            batch, "identity", args.device
-        )
-        final_feats = select_model_descriptor(model_engine(imgs))
-        all_feats, all_labels, all_views = gather_features_and_labels_and_views(
-            final_feats, labels, views
-        )
-        satellite_mask = all_views == 0
-        uav_mask = all_views == 1
-        satellite_feats = all_feats[satellite_mask]
-        uav_feats = all_feats[uav_mask]
-
-        contract = audit_identity_batch_contract_once(
-            args,
-            labels,
-            views,
-            all_labels,
-            all_views,
-            print_report=batch_index == 0,
-        )
-        if first_contract is None:
-            first_contract = contract
-
-        local_satellite_count = int((views == 0).sum().item())
-        local_uav_count = int((views == 1).sum().item())
-        gather_pass = (
-            contract["global_satellite_count"] == local_satellite_count * world_size
-            and contract["global_uav_count"] == local_uav_count * world_size
-        )
-        cross_gpu_gather_pass = cross_gpu_gather_pass and gather_pass
-        if not gather_pass:
-            raise RuntimeError(
-                "Identity preflight cross-GPU gather shape/count contract failed"
-            )
-
-        loss_terms = []
-        if args.identity_loss_weight > 0:
-            identity_loss = identity_criterion(all_feats, all_labels, all_views)
-            loss_terms.append(args.identity_loss_weight * identity_loss)
-        if args.same_domain_triplet_weight > 0:
-            same_triplet_loss = triplet_criterion(all_feats, all_labels, all_views)
-            loss_terms.append(args.same_domain_triplet_weight * same_triplet_loss)
-        weak_enabled = args.infonce_weight > 0 and args.weak_sample4geo_weight > 0
-        if weak_enabled:
-            weak_loss = weak_criterion(all_feats, all_labels, all_views)
-            loss_terms.append(args.weak_sample4geo_weight * weak_loss)
-
-        total_loss = sum(loss_terms) if loss_terms else None
-        if not torch.is_tensor(total_loss):
-            raise RuntimeError("Identity preflight produced no active loss tensor")
-
-        if batch_index == 0:
-            audit_identity_runtime_precision_once(
-                model_engine=model_engine,
-                batch_meta=batch_meta,
-                model_inputs=imgs,
-                local_views=views,
-                local_descriptors=final_feats,
-                gathered_satellite_descriptors=satellite_feats,
-                gathered_uav_descriptors=uav_feats,
-                identity_criterion=identity_criterion,
-                triplet_criterion=triplet_criterion,
-                weak_criterion=weak_criterion,
-                total_loss=total_loss,
-                identity_enabled=args.identity_loss_weight > 0,
-                triplet_enabled=args.same_domain_triplet_weight > 0,
-                weak_enabled=weak_enabled,
-            )
-
-        if is_main_process():
-            print_identity_behavior_diagnostics(
-                args=args,
-                all_feats=all_feats,
-                all_labels=all_labels,
-                all_views=all_views,
-                identity_criterion=identity_criterion,
-                triplet_criterion=triplet_criterion,
-                weak_criterion=weak_criterion,
-                total_loss=total_loss,
-            )
-
-        descriptor_tensors = (final_feats, all_feats, satellite_feats, uav_feats)
-        loss_tensors = tuple(loss_terms) + (total_loss,)
-        for tensor in descriptor_tensors:
-            current_nan = int(torch.isnan(tensor.detach()).sum().item())
-            current_inf = int(torch.isinf(tensor.detach()).sum().item())
-            nan_count += current_nan
-            inf_count += current_inf
-            all_descriptors_finite = all_descriptors_finite and not (
-                current_nan or current_inf
-            )
-        for tensor in loss_tensors:
-            current_nan = int(torch.isnan(tensor.detach()).sum().item())
-            current_inf = int(torch.isinf(tensor.detach()).sum().item())
-            nan_count += current_nan
-            inf_count += current_inf
-            all_losses_finite = all_losses_finite and not (current_nan or current_inf)
-
-        if first_runtime is None:
-            identity_audit = getattr(identity_criterion, "last_runtime_audit", None) or {}
-            triplet_audit = getattr(triplet_criterion, "last_runtime_audit", None) or {}
-            weak_audit = getattr(weak_criterion, "last_runtime_audit", None) or {}
-            first_runtime = {
-                "descriptor_dtype": final_feats.dtype,
-                "gathered_descriptor_dtype": all_feats.dtype,
-                "identity_logits_dtype": identity_audit.get("d2s_logits_dtype_value"),
-                "identity_loss_dtype": identity_audit.get("total_loss_dtype_value"),
-                "uav_triplet_dtype": triplet_audit.get("uav_loss_dtype_value"),
-                "sat_triplet_dtype": triplet_audit.get("satellite_loss_dtype_value"),
-                "weak_infonce_logits_dtype": weak_audit.get("logits_dtype_value"),
-                "weak_infonce_loss_dtype": weak_audit.get("loss_dtype_value"),
-                "total_loss_dtype": total_loss.dtype,
-            }
-        processed_batches += 1
-
-    if processed_batches != requested_batches:
-        raise RuntimeError(
-            f"Identity preflight requested {requested_batches} batches, "
-            f"but only processed {processed_batches}"
-        )
-    if not all_descriptors_finite or not all_losses_finite or nan_count or inf_count:
-        raise RuntimeError(
-            "Identity preflight finite-value contract failed: "
-            f"all_descriptors_finite={all_descriptors_finite}, "
-            f"all_losses_finite={all_losses_finite}, "
-            f"NaN_count={nan_count}, Inf_count={inf_count}"
-        )
-
-    ending_global_steps = int(getattr(model_engine, "global_steps", 0))
-    gradient_parameter_count = sum(
-        parameter.grad is not None for parameter in get_base_model(model_engine).parameters()
-    )
-    if ending_global_steps != starting_global_steps or gradient_parameter_count != 0:
-        raise RuntimeError(
-            "Identity preflight unexpectedly updated training state: "
-            f"global_steps={starting_global_steps}->{ending_global_steps}, "
-            f"gradient_parameter_count={gradient_parameter_count}"
-        )
-
-    if is_main_process():
-        positive_uav = first_contract["uav_positive_counts"]
-        positive_satellite = first_contract["satellite_positive_counts"]
-        negative_identity = first_contract["negative_identity_counts"]
-        print("=" * 80)
-        print("[Teacher Identity Preflight]")
-        print("model_initialized=True")
-        print(f"init_checkpoint_loaded={checkpoint_report.get('loaded', False)}")
-        print(f"checkpoint_path={checkpoint_report.get('checkpoint_path')}")
-        print("checkpoint_trainable_coverage=PASS")
-        print(f"training_stage={args.training_stage}")
-        print(f"world_size={world_size}")
-        print(f"identity_drone_per_id={args.identity_drone_per_id}")
-        print(f"identity_sat_per_id={args.identity_sat_per_id}")
-        print(f"identity_ids_per_batch={args.identity_ids_per_batch}")
-        print(f"local_unique_pid={first_contract['local_unique_pid_count']}")
-        print(f"global_unique_pid={first_contract['global_unique_pid_count']}")
-        print(f"local_uav={first_contract['local_uav_count']}")
-        print(f"local_satellite={first_contract['local_satellite_count']}")
-        print(f"global_uav={first_contract['global_uav_count']}")
-        print(f"global_satellite={first_contract['global_satellite_count']}")
-        print(f"positive_count_per_uav_anchor={positive_uav}")
-        print(f"positive_count_per_sat_anchor={positive_satellite}")
-        print(f"negative_identity_count={negative_identity}")
-        print(
-            "same_pid_as_negative_count="
-            f"{first_contract['same_pid_as_negative_count']}"
-        )
-        print(f"cross_gpu_gather={'PASS' if cross_gpu_gather_pass else 'FAIL'}")
-        for key, value in first_runtime.items():
-            print(f"{key}={_dtype_name(value)}")
-        print(f"all_losses_finite={all_losses_finite}")
-        print(f"all_descriptors_finite={all_descriptors_finite}")
-        print(f"NaN_count={nan_count}")
-        print(f"Inf_count={inf_count}")
-        for key, value in parameter_report.items():
-            if key.endswith("_dtype"):
-                value = _dtype_name(value)
-            print(f"{key}={value}")
-        print(f"processed_batches={processed_batches}")
-        print("optimizer_step_called=False")
-        print("scheduler_step_called=False")
-        print("checkpoint_written=False")
-        print("validation_run=False")
-        print("[Teacher Identity Preflight PASSED]")
-        print("=" * 80)
-
-
-def print_distributed_descriptor_audit_once(
-    local_feats,
-    local_views,
-    gathered_sat_feats,
-    gathered_drone_feats,
-):
+def print_distributed_descriptor_audit_once(local_feats, local_views, gathered_sat_feats, gathered_drone_feats):
     dist_initialized = dist.is_available() and dist.is_initialized()
     world_size = dist.get_world_size() if dist_initialized else 1
     local_sat_shape = tuple(local_feats[local_views == 0].shape)
@@ -1395,181 +291,112 @@ def print_distributed_descriptor_audit_once(
     global_drone_shape = tuple(gathered_drone_feats.shape)
     local_pair_count = min(local_sat_shape[0], local_drone_shape[0])
     global_pair_count = min(global_sat_shape[0], global_drone_shape[0])
-    cross_gpu_gather_effective = bool(
-        dist_initialized
-        and world_size > 1
-        and global_sat_shape[0] == local_sat_shape[0] * world_size
-        and global_drone_shape[0] == local_drone_shape[0] * world_size
-    )
-
-    print("=" * 80)
-    print("[DISTRIBUTED DESCRIPTOR AUDIT] source=first_real_distributed_gather")
-    print(f"distributed initialized={dist_initialized}")
-    print(f"world size={world_size}")
-    print(f"local drone descriptor shape={local_drone_shape}")
-    print(f"local satellite descriptor shape={local_sat_shape}")
-    print(f"gathered global drone descriptor shape={global_drone_shape}")
-    print(f"gathered global satellite descriptor shape={global_sat_shape}")
-    print(f"local pair count={local_pair_count}")
-    print(f"global pair count={global_pair_count}")
-    print(f"D2S candidate pool size={global_sat_shape[0]}")
-    print(f"S2D candidate pool size={global_drone_shape[0]}")
-    print(f"cross-GPU gather actually effective={cross_gpu_gather_effective}")
-
-    expected_values = {
-        "world size": (world_size, 8),
-        "local pair count": (local_pair_count, 4),
-        "global pair count": (global_pair_count, 32),
-        "D2S candidate pool size": (global_sat_shape[0], 32),
-        "S2D candidate pool size": (global_drone_shape[0], 32),
-    }
-    for name, (actual, expected) in expected_values.items():
+    cross_gpu_gather_effective = bool(dist_initialized and world_size > 1 and (global_sat_shape[0] == local_sat_shape[0] * world_size) and (global_drone_shape[0] == local_drone_shape[0] * world_size))
+    print('=' * 80)
+    print('[DISTRIBUTED DESCRIPTOR AUDIT] source=first_real_distributed_gather')
+    print(f'distributed initialized={dist_initialized}')
+    print(f'world size={world_size}')
+    print(f'local drone descriptor shape={local_drone_shape}')
+    print(f'local satellite descriptor shape={local_sat_shape}')
+    print(f'gathered global drone descriptor shape={global_drone_shape}')
+    print(f'gathered global satellite descriptor shape={global_sat_shape}')
+    print(f'local pair count={local_pair_count}')
+    print(f'global pair count={global_pair_count}')
+    print(f'D2S candidate pool size={global_sat_shape[0]}')
+    print(f'S2D candidate pool size={global_drone_shape[0]}')
+    print(f'cross-GPU gather actually effective={cross_gpu_gather_effective}')
+    expected_values = {'world size': (world_size, 8), 'local pair count': (local_pair_count, 4), 'global pair count': (global_pair_count, 32), 'D2S candidate pool size': (global_sat_shape[0], 32), 'S2D candidate pool size': (global_drone_shape[0], 32)}
+    for (name, (actual, expected)) in expected_values.items():
         if actual != expected:
-            print(f"[EXPERIMENT_AUDIT][WARNING] {name} expected {expected}, got {actual}")
+            print(f'[EXPERIMENT_AUDIT][WARNING] {name} expected {expected}, got {actual}')
     if not cross_gpu_gather_effective:
-        print("[EXPERIMENT_AUDIT][ERROR] cross-GPU descriptor gather was not effective")
-    print("=" * 80)
-
+        print('[EXPERIMENT_AUDIT][ERROR] cross-GPU descriptor gather was not effective')
+    print('=' * 80)
 
 def get_loss_weight_desc(args):
-    return (
-        f"tri={args.triplet_weight:g}(drone+sat) | "
-        f"infonce={args.infonce_weight:g} | "
-        f"identity={args.identity_loss_weight:g} | "
-        f"same_triplet={args.same_domain_triplet_weight:g} | "
-        f"weak_s4g={args.weak_sample4geo_weight:g}"
-    )
-
+    return f'tri={args.triplet_weight:g}(drone+sat) | infonce={args.infonce_weight:g} | identity={args.identity_loss_weight:g} | same_triplet={args.same_domain_triplet_weight:g} | weak_s4g={args.weak_paired_cross_view_weight:g}'
 
 def validate_loss_weights(args):
-    weight_names = [
-        "triplet_weight",
-        "infonce_weight",
-        "identity_loss_weight",
-        "same_domain_triplet_weight",
-        "weak_sample4geo_weight",
-    ]
+    weight_names = ['triplet_weight', 'infonce_weight', 'identity_loss_weight', 'same_domain_triplet_weight', 'weak_paired_cross_view_weight']
     for name in weight_names:
         if getattr(args, name) < 0:
-            raise ValueError(f"{name} must be non-negative")
+            raise ValueError(f'{name} must be non-negative')
     if args.triplet_margin <= 0:
-        raise ValueError("triplet_margin must be greater than 0")
+        raise ValueError('triplet_margin must be greater than 0')
     if args.identity_temperature <= 0:
-        raise ValueError("identity_temperature must be greater than 0")
-
-    sample4geo_loss_enabled = args.triplet_weight > 0 or args.infonce_weight > 0
-    identity_loss_enabled = (
-        args.identity_loss_weight > 0
-        or args.same_domain_triplet_weight > 0
-        or (args.infonce_weight > 0 and args.weak_sample4geo_weight > 0)
-    )
-
-    will_use_sample4geo = (not args.enable_identity_stage) or args.stage1_end_epoch >= 1
+        raise ValueError('identity_temperature must be greater than 0')
+    paired_cross_view_loss_enabled = args.triplet_weight > 0 or args.infonce_weight > 0
+    identity_loss_enabled = args.identity_loss_weight > 0 or args.same_domain_triplet_weight > 0 or (args.infonce_weight > 0 and args.weak_paired_cross_view_weight > 0)
+    will_use_paired_cross_view = not args.enable_identity_stage or args.stage1_end_epoch >= 1
     will_use_identity = args.enable_identity_stage and args.epochs > args.stage1_end_epoch
-
-    if will_use_sample4geo and not sample4geo_loss_enabled:
-        raise ValueError("all Sample4Geo loss weights are 0; training would have no gradient")
-    if will_use_identity and not identity_loss_enabled:
-        raise ValueError("all identity-stage loss weights are 0; training would have no gradient")
-
+    if will_use_paired_cross_view and (not paired_cross_view_loss_enabled):
+        raise ValueError('all PairedCrossView loss weights are 0; training would have no gradient')
+    if will_use_identity and (not identity_loss_enabled):
+        raise ValueError('all identity-stage loss weights are 0; training would have no gradient')
 
 def validate_scheduler_args(args):
     if args.warmup_ratio < 0 or args.warmup_ratio >= 1:
-        raise ValueError("warmup_ratio must be in [0, 1)")
-
+        raise ValueError('warmup_ratio must be in [0, 1)')
 
 def validate_identity_training_args(args):
-    positive_int_args = [
-        "identity_ids_per_batch",
-        "identity_drone_per_id",
-        "identity_sat_per_id",
-    ]
+    positive_int_args = ['identity_ids_per_batch', 'identity_drone_per_id', 'identity_sat_per_id']
     for name in positive_int_args:
         if getattr(args, name) <= 0:
-            raise ValueError(f"{name} must be greater than 0")
-
+            raise ValueError(f'{name} must be greater than 0')
 
 def normalize_hard_pool_args(args):
-    if getattr(args, "training_stage", "auto") == "identity_hard":
-        args.enable_identity_stage = True
-        args.enable_hard_pool_stage = True
-        args.stage1_end_epoch = 0
-        args.stage2_end_epoch = 0
-
-    if not getattr(args, "enable_hard_pool_stage", False):
+    if not getattr(args, 'enable_hard_pool_stage', False):
         return
-
     args.enable_identity_stage = True
-    if getattr(args, "build_hard_pool_epoch", None) is None:
-        args.build_hard_pool_epoch = int(getattr(args, "stage2_end_epoch", 0))
-
+    if getattr(args, 'build_hard_pool_epoch', None) is None:
+        args.build_hard_pool_epoch = int(getattr(args, 'stage2_end_epoch', 0))
     if args.hard_pool_topk <= 0:
-        raise ValueError("hard_pool_topk must be greater than 0")
+        raise ValueError('hard_pool_topk must be greater than 0')
     if args.hard_pool_topneg_k <= 0:
-        raise ValueError("hard_pool_topneg_k must be greater than 0")
+        raise ValueError('hard_pool_topneg_k must be greater than 0')
     if args.stage2_end_epoch < args.stage1_end_epoch:
-        raise ValueError("stage2_end_epoch must be >= stage1_end_epoch")
-    if (
-        args.stage2_end_epoch <= 0
-        and not args.load_hard_pool_path
-        and not args.build_hard_pool_before_train
-    ):
-        raise ValueError(
-            "identity_hard from epoch 1 requires --load_hard_pool_path "
-            "or --build_hard_pool_before_train"
-        )
-
+        raise ValueError('stage2_end_epoch must be >= stage1_end_epoch')
+    if args.stage2_end_epoch <= 0 and (not args.load_hard_pool_path) and (not args.build_hard_pool_before_train):
+        raise ValueError('identity_hard from epoch 1 requires --load_hard_pool_path or --build_hard_pool_before_train')
 
 def normalize_explicit_training_stage(args):
-    stage = getattr(args, "training_stage", "auto")
-    if stage in (None, "auto"):
+    stage = getattr(args, 'training_stage', 'auto')
+    if stage in (None, 'auto'):
         return
-
-    if stage == "sample4geo":
+    if stage == 'paired_cross_view':
         args.enable_identity_stage = False
         return
-
-    if not getattr(args, "init_checkpoint", None):
-        raise ValueError(f"--training_stage {stage} requires --init_checkpoint from the previous best_model.pth")
-
-    if stage == "identity":
+    if not getattr(args, 'init_checkpoint', None):
+        raise ValueError(f'--training_stage {stage} requires --init_checkpoint from the previous best_model.pth')
+    if stage == 'identity':
         args.enable_identity_stage = True
         args.stage1_end_epoch = 0
         return
-
-    if stage == "identity_hard":
+    if stage == 'identity_hard':
         args.enable_identity_stage = True
         args.enable_hard_pool_stage = True
         args.stage1_end_epoch = 0
         args.stage2_end_epoch = 0
         return
-
-    raise ValueError(f"unsupported training_stage: {stage}")
-
+    raise ValueError(f'unsupported training_stage: {stage}')
 
 def should_run_validation(cur_epoch, args):
     if cur_epoch == args.epochs:
         return True
-
     mode = get_training_mode(cur_epoch, args)
-    if mode == "sample4geo":
+    if mode == 'paired_cross_view':
         return True
-
-    if mode in {"identity", "identity_hard"}:
-        stage_start = int(getattr(args, "stage1_end_epoch", 10)) + 1
+    if mode in {'identity', 'identity_hard'}:
+        stage_start = int(getattr(args, 'stage1_end_epoch', 10)) + 1
         stage_end = args.epochs
     else:
         return cur_epoch % 5 == 0
-
     if cur_epoch < stage_start:
         return False
-
     last_ten_start = max(stage_start, stage_end - 9)
     if cur_epoch >= last_ten_start:
         return cur_epoch % 2 == 0
-
     return cur_epoch % 5 == 0
-
 
 def build_scheduler_plan(train_loader, train_sampler, args, grad_accum_steps):
     if isinstance(train_loader, dict):
@@ -1577,50 +404,30 @@ def build_scheduler_plan(train_loader, train_sampler, args, grad_accum_steps):
         mode_epoch_counts = {}
         mode_batch_counts = {}
         for epoch in range(1, args.epochs + 1):
-            epoch_loader, _, effective_mode = select_epoch_dataloader(train_loader, epoch, args)
+            (epoch_loader, _, effective_mode) = select_epoch_dataloader(train_loader, epoch, args)
             total_train_batches += len(epoch_loader)
             mode_epoch_counts[effective_mode] = mode_epoch_counts.get(effective_mode, 0) + 1
             mode_batch_counts[effective_mode] = len(epoch_loader)
-
-        mode_parts = [
-            f"{mode}_epochs={mode_epoch_counts[mode]}, batches/epoch={mode_batch_counts[mode]}"
-            for mode in sorted(mode_epoch_counts.keys())
-        ]
-        mode_desc = "multi_stage(" + "; ".join(mode_parts) + ")"
+        mode_parts = [f'{mode}_epochs={mode_epoch_counts[mode]}, batches/epoch={mode_batch_counts[mode]}' for mode in sorted(mode_epoch_counts.keys())]
+        mode_desc = 'multi_stage(' + '; '.join(mode_parts) + ')'
     else:
         total_train_batches = len(train_loader) * args.epochs
-        mode_desc = f"sample4geo_epochs={args.epochs}, batches/epoch={len(train_loader)}"
-
+        mode_desc = f'paired_cross_view_epochs={args.epochs}, batches/epoch={len(train_loader)}'
     total_train_steps = math.ceil(total_train_batches / grad_accum_steps)
     warmup_steps = int(total_train_steps * args.warmup_ratio)
-
-    return {
-        "total_train_batches": total_train_batches,
-        "total_train_steps": total_train_steps,
-        "warmup_steps": warmup_steps,
-        "mode_desc": mode_desc,
-    }
-
+    return {'total_train_batches': total_train_batches, 'total_train_steps': total_train_steps, 'warmup_steps': warmup_steps, 'mode_desc': mode_desc}
 
 def print_scheduler_plan(plan, args, grad_accum_steps):
     if is_main_process():
-        print(
-            f"[SchedulerPlan] scheduler={args.scheduler} | {plan['mode_desc']} | "
-            f"grad_accum_steps={grad_accum_steps} | "
-            f"total_batches={plan['total_train_batches']} | "
-            f"total_optimizer_steps={plan['total_train_steps']} | "
-            f"warmup_ratio={args.warmup_ratio:g} | warmup_steps={plan['warmup_steps']}"
-        )
-
+        print(f"[SchedulerPlan] scheduler={args.scheduler} | {plan['mode_desc']} | grad_accum_steps={grad_accum_steps} | total_batches={plan['total_train_batches']} | total_optimizer_steps={plan['total_train_steps']} | warmup_ratio={args.warmup_ratio:g} | warmup_steps={plan['warmup_steps']}")
 
 def clear_memory_cache():
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-
-# Hard-pool feature extraction and ranking helpers for identity-stage training.
 class HardPoolImageDataset(Dataset):
+
     def __init__(self, samples, transform):
         self.samples = samples
         self.transform = transform
@@ -1631,202 +438,132 @@ class HardPoolImageDataset(Dataset):
     @staticmethod
     def _read_rgb(path):
         import cv2
-
         img = cv2.imread(path)
         if img is None:
-            raise RuntimeError(f"Failed to read image: {path}")
+            raise RuntimeError(f'Failed to read image: {path}')
         return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
     def __getitem__(self, idx):
         sample = self.samples[idx]
-        img = self._read_rgb(sample["image_path"])
+        img = self._read_rgb(sample['image_path'])
         if self.transform is not None:
-            img = self.transform(image=img)["image"]
-        return img, sample["pid"], sample["image_path"]
-
+            img = self.transform(image=img)['image']
+        return (img, sample['pid'], sample['image_path'])
 
 def resolve_hard_pool_path(path_template, epoch):
     if path_template is None:
-        path_template = "outputs/hard_pool_epoch{epoch}.json"
+        path_template = 'outputs/hard_pool_epoch{epoch}.json'
     return path_template.format(epoch=epoch)
-
 
 def get_hard_pool_reference_dataset(train_loaders):
     if isinstance(train_loaders, dict):
-        for mode in ("identity_hard", "identity", "sample4geo"):
+        for mode in ('identity_hard', 'identity', 'paired_cross_view'):
             loader = train_loaders.get(mode)
-            dataset = getattr(loader, "dataset", None)
-            if (
-                dataset is not None
-                and hasattr(dataset, "pids")
-                and hasattr(dataset, "satellite_dict")
-                and hasattr(dataset, "drone_dict")
-            ):
+            dataset = getattr(loader, 'dataset', None)
+            if dataset is not None and hasattr(dataset, 'pids') and hasattr(dataset, 'satellite_dict') and hasattr(dataset, 'drone_dict'):
                 return dataset
         return None
-
-    dataset = getattr(train_loaders, "dataset", None)
-    if (
-        dataset is not None
-        and hasattr(dataset, "pids")
-        and hasattr(dataset, "satellite_dict")
-        and hasattr(dataset, "drone_dict")
-    ):
+    dataset = getattr(train_loaders, 'dataset', None)
+    if dataset is not None and hasattr(dataset, 'pids') and hasattr(dataset, 'satellite_dict') and hasattr(dataset, 'drone_dict'):
         return dataset
     return None
 
-
 def build_hard_pool_image_samples(dataset, view_name):
-    view_dict = dataset.satellite_dict if view_name == "satellite" else dataset.drone_dict
+    view_dict = dataset.satellite_dict if view_name == 'satellite' else dataset.drone_dict
     samples = []
     for pid in dataset.pids:
         for path in view_dict.get(pid, []):
-            samples.append({"pid": str(pid), "image_path": path})
+            samples.append({'pid': str(pid), 'image_path': path})
     return samples
-
 
 @torch.no_grad()
 def extract_hard_pool_features(model_engine, samples, transform, args, device, view_name):
     feature_dataset = HardPoolImageDataset(samples, transform)
-    loader = DataLoader(
-        feature_dataset,
-        batch_size=max(1, int(getattr(args, "batch_size", 1))),
-        shuffle=False,
-        num_workers=getattr(args, "num_workers", 0),
-        pin_memory=True,
-    )
-
+    loader = DataLoader(feature_dataset, batch_size=max(1, int(getattr(args, 'batch_size', 1))), shuffle=False, num_workers=getattr(args, 'num_workers', 0), pin_memory=True)
     records = []
     num_batches = len(loader)
-    for batch_idx, (imgs, pids, paths) in enumerate(loader, start=1):
+    for (batch_idx, (imgs, pids, paths)) in enumerate(loader, start=1):
         imgs = imgs.to(device, non_blocking=True).to(torch.bfloat16)
         feats = model_engine(imgs)
         if isinstance(feats, tuple):
             feats = feats[1] if len(feats) > 1 else feats[0]
-        feats = F.normalize(feats.float(), p=2, dim=-1, eps=1e-6).cpu()
-
-        for feat, pid, path in zip(feats, pids, paths):
-            records.append({
-                "pid": str(pid),
-                "image_path": path,
-                "feature": feat,
-            })
-
+        feats = F.normalize(feats.float(), p=2, dim=-1, eps=1e-06).cpu()
+        for (feat, pid, path) in zip(feats, pids, paths):
+            records.append({'pid': str(pid), 'image_path': path, 'feature': feat})
         if is_main_process() and (batch_idx == 1 or batch_idx == num_batches or batch_idx % 100 == 0):
-            print(
-                f"[HardPool] Extract {view_name} features | "
-                f"batch {batch_idx}/{num_batches} | images={len(records)}/{len(samples)}"
-            )
-
+            print(f'[HardPool] Extract {view_name} features | batch {batch_idx}/{num_batches} | images={len(records)}/{len(samples)}')
     return records
-
 
 def compute_hard_pool_from_features(satellite_records, drone_records, args, epoch, model_source):
     sat_features_by_pid = {}
     for record in satellite_records:
-        sat_features_by_pid.setdefault(record["pid"], []).append(record["feature"])
-
+        sat_features_by_pid.setdefault(record['pid'], []).append(record['feature'])
     satellite_proto = {}
-    for pid, features in sat_features_by_pid.items():
+    for (pid, features) in sat_features_by_pid.items():
         proto = torch.stack(features, dim=0).mean(dim=0)
-        satellite_proto[pid] = F.normalize(proto.float(), p=2, dim=-1, eps=1e-6)
-
+        satellite_proto[pid] = F.normalize(proto.float(), p=2, dim=-1, eps=1e-06)
     proto_pids = sorted(satellite_proto.keys())
     if len(proto_pids) < 2:
-        raise RuntimeError("hard_pool needs at least 2 IDs with satellite prototypes to compute negative similarity")
-
+        raise RuntimeError('hard_pool needs at least 2 IDs with satellite prototypes to compute negative similarity')
     proto_mat = torch.stack([satellite_proto[pid] for pid in proto_pids], dim=0)
-    pid_to_proto_idx = {pid: idx for idx, pid in enumerate(proto_pids)}
+    pid_to_proto_idx = {pid: idx for (idx, pid) in enumerate(proto_pids)}
     hard_pool = {}
-
     for record in drone_records:
-        pid = record["pid"]
+        pid = record['pid']
         pos_idx = pid_to_proto_idx.get(pid)
         if pos_idx is None:
             continue
-
-        sims = proto_mat @ record["feature"].float()
+        sims = proto_mat @ record['feature'].float()
         pos_sim = sims[pos_idx].item()
         neg_sims = sims.clone()
-        neg_sims[pos_idx] = -float("inf")
+        neg_sims[pos_idx] = -float('inf')
         neg_count = min(int(args.hard_pool_topneg_k), neg_sims.numel() - 1)
         if neg_count <= 0:
             continue
-
-        top_neg_sims, top_neg_indices = torch.topk(neg_sims, k=neg_count, largest=True)
+        (top_neg_sims, top_neg_indices) = torch.topk(neg_sims, k=neg_count, largest=True)
         topk_neg_mean = top_neg_sims.mean().item()
         top1_neg_sim = top_neg_sims[0].item()
         top1_neg_pid = proto_pids[int(top_neg_indices[0].item())]
         boundary_risk = topk_neg_mean - pos_sim
-
-        hard_pool.setdefault(pid, []).append({
-            "pid": pid,
-            "image_path": record["image_path"],
-            "boundary_risk": float(boundary_risk),
-            "pos_sim": float(pos_sim),
-            "topk_neg_mean": float(topk_neg_mean),
-            "top1_neg_pid": top1_neg_pid,
-            "top1_neg_sim": float(top1_neg_sim),
-        })
-
+        hard_pool.setdefault(pid, []).append({'pid': pid, 'image_path': record['image_path'], 'boundary_risk': float(boundary_risk), 'pos_sim': float(pos_sim), 'topk_neg_mean': float(topk_neg_mean), 'top1_neg_pid': top1_neg_pid, 'top1_neg_sim': float(top1_neg_sim)})
     topk = int(args.hard_pool_topk)
     id_risk = {}
-    for pid, samples in list(hard_pool.items()):
-        samples.sort(key=lambda item: item["boundary_risk"], reverse=True)
+    for (pid, samples) in list(hard_pool.items()):
+        samples.sort(key=lambda item: item['boundary_risk'], reverse=True)
         kept_samples = samples[:topk]
         hard_pool[pid] = kept_samples
-        top_risks = [item["boundary_risk"] for item in kept_samples[:3]]
+        top_risks = [item['boundary_risk'] for item in kept_samples[:3]]
         if top_risks:
             id_risk[pid] = float(sum(top_risks) / len(top_risks))
-
-    return {
-        "meta": {
-            "epoch": epoch,
-            "model_source": model_source,
-            "hard_pool_topk": int(args.hard_pool_topk),
-            "hard_pool_topneg_k": int(args.hard_pool_topneg_k),
-        },
-        "hard_pool": hard_pool,
-        "id_risk": id_risk,
-    }
-
+    return {'meta': {'epoch': epoch, 'model_source': model_source, 'hard_pool_topk': int(args.hard_pool_topk), 'hard_pool_topneg_k': int(args.hard_pool_topneg_k)}, 'hard_pool': hard_pool, 'id_risk': id_risk}
 
 def save_hard_pool_payload(path, payload):
     save_dir = os.path.dirname(path)
     if save_dir:
         os.makedirs(save_dir, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
+    with open(path, 'w', encoding='utf-8') as f:
         json.dump(_json_safe_value(payload), f, indent=2, ensure_ascii=False)
 
-
 def load_hard_pool_payload(path):
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, 'r', encoding='utf-8') as f:
         payload = json.load(f)
-
-    if isinstance(payload, dict) and "hard_pool" in payload:
-        hard_pool = payload.get("hard_pool", {})
-        id_risk = payload.get("id_risk", {})
-        meta = payload.get("meta", {})
+    if isinstance(payload, dict) and 'hard_pool' in payload:
+        hard_pool = payload.get('hard_pool', {})
+        id_risk = payload.get('id_risk', {})
+        meta = payload.get('meta', {})
     else:
         hard_pool = payload
         id_risk = {}
         meta = {}
-
     if not isinstance(hard_pool, dict):
-        raise ValueError(f"invalid hard_pool file format: {path}")
-
-    return {
-        "meta": meta,
-        "hard_pool": hard_pool,
-        "id_risk": id_risk,
-    }
-
+        raise ValueError(f'invalid hard_pool file format: {path}')
+    return {'meta': meta, 'hard_pool': hard_pool, 'id_risk': id_risk}
 
 def summarize_hard_pool_payload(payload):
-    hard_pool = payload.get("hard_pool", {})
-    id_risk = payload.get("id_risk", {})
-    covered_ids = sum(1 for samples in hard_pool.values() if samples)
-    sample_count = sum(len(samples) for samples in hard_pool.values())
+    hard_pool = payload.get('hard_pool', {})
+    id_risk = payload.get('id_risk', {})
+    covered_ids = sum((1 for samples in hard_pool.values() if samples))
+    sample_count = sum((len(samples) for samples in hard_pool.values()))
     avg_samples = sample_count / covered_ids if covered_ids > 0 else 0.0
     risk_values = [float(value) for value in id_risk.values()]
     if risk_values:
@@ -1836,383 +573,151 @@ def summarize_hard_pool_payload(payload):
     else:
         risk_mean = risk_max = risk_min = 0.0
     top_ids = sorted(id_risk.items(), key=lambda item: float(item[1]), reverse=True)[:10]
-    top_ids_text = ", ".join(f"{pid}:{float(risk):.4f}" for pid, risk in top_ids)
-    return {
-        "covered_ids": covered_ids,
-        "avg_samples": avg_samples,
-        "risk_mean": risk_mean,
-        "risk_max": risk_max,
-        "risk_min": risk_min,
-        "top_ids_text": top_ids_text or "none",
-    }
+    top_ids_text = ', '.join((f'{pid}:{float(risk):.4f}' for (pid, risk) in top_ids))
+    return {'covered_ids': covered_ids, 'avg_samples': avg_samples, 'risk_mean': risk_mean, 'risk_max': risk_max, 'risk_min': risk_min, 'top_ids_text': top_ids_text or 'none'}
 
-
-def print_hard_pool_summary(payload, path, prefix="[HardPool]"):
+def print_hard_pool_summary(payload, path, prefix='[HardPool]'):
     summary = summarize_hard_pool_payload(payload)
-    print(
-        f"{prefix} covered_ids={summary['covered_ids']} | "
-        f"avg_hard_samples_per_id={summary['avg_samples']:.2f} | "
-        f"risk_mean={summary['risk_mean']:.4f} | "
-        f"risk_max={summary['risk_max']:.4f} | "
-        f"risk_min={summary['risk_min']:.4f}"
-    )
+    print(f"{prefix} covered_ids={summary['covered_ids']} | avg_hard_samples_per_id={summary['avg_samples']:.2f} | risk_mean={summary['risk_mean']:.4f} | risk_max={summary['risk_max']:.4f} | risk_min={summary['risk_min']:.4f}")
     print(f"{prefix} top10_hardest_ids={summary['top_ids_text']}")
-    print(f"{prefix} path={path}")
-
+    print(f'{prefix} path={path}')
 
 def apply_hard_pool_to_train_loaders(train_loaders, hard_pool):
     updated = 0
     loaders = train_loaders.values() if isinstance(train_loaders, dict) else [train_loaders]
     for loader in loaders:
-        dataset = getattr(loader, "dataset", None)
-        if dataset is not None and hasattr(dataset, "set_hard_pool"):
+        dataset = getattr(loader, 'dataset', None)
+        if dataset is not None and hasattr(dataset, 'set_hard_pool'):
             dataset.set_hard_pool(hard_pool)
             updated += 1
     return updated
 
-
-def dataloader_has_hard_pool(dataloader):
-    dataset = getattr(dataloader, "dataset", None)
-    if dataset is None:
-        return False
-    if hasattr(dataset, "has_hard_pool"):
-        return dataset.has_hard_pool()
-    return bool(getattr(dataset, "hard_pool_paths", {}))
-
-
-def get_hard_pool_id_count(dataloader):
-    dataset = getattr(dataloader, "dataset", None)
-    if dataset is None:
-        return 0
-    return len(getattr(dataset, "hard_pool_paths", {}))
-
-
 def ensure_identity_hard_ready(epoch, stage_mode, effective_mode, dataloader, args, hard_pool_loaded):
-    if (
-        getattr(args, "enable_hard_pool_stage", False)
-        and stage_mode == "identity_hard"
-        and effective_mode != "identity_hard"
-    ):
-        raise RuntimeError(
-            f"Epoch {epoch} requested identity_hard, but no identity_hard "
-            "dataloader is available. Check --enable_hard_pool_stage."
-        )
-
-    if (
-        getattr(args, "enable_hard_pool_stage", False)
-        and effective_mode == "identity_hard"
-        and not dataloader_has_hard_pool(dataloader)
-    ):
-        raise RuntimeError(
-            f"Epoch {epoch} entered identity_hard, but hard_pool is not ready."
-            f" hard_pool_loaded={hard_pool_loaded}; "
-            "Use --load_hard_pool_path or build the pool no later than "
-            "--stage2_end_epoch."
-        )
-
-
-HARD_SAMPLING_STAT_KEYS = (
-    "hard_requested",
-    "hard_from_pool",
-    "hard_fallback",
-    "missing_hard_pool_ids",
-    "short_hard_pool_ids",
-    "random_requested",
-)
-
-
-def reduce_hard_sampling_stats(stats, device):
-    if not (dist.is_available() and dist.is_initialized()):
-        return dict(stats)
-
-    values = [float(stats.get(key, 0)) for key in HARD_SAMPLING_STAT_KEYS]
-    stat_tensor = torch.tensor(values, dtype=torch.float64, device=device)
-    dist.all_reduce(stat_tensor, op=dist.ReduceOp.SUM)
-    return {
-        key: int(stat_tensor[idx].item())
-        for idx, key in enumerate(HARD_SAMPLING_STAT_KEYS)
-    }
-
-
-def format_hard_sampler_epoch_summary(stats):
-    hard_requested = max(stats.get("hard_requested", 0), 1)
-    hard_from_pool = stats.get("hard_from_pool", 0)
-    hard_fallback = stats.get("hard_fallback", 0)
-    fallback_rate = 100.0 * hard_fallback / hard_requested
-    return (
-        f"hard_requested={stats.get('hard_requested', 0)} | "
-        f"hard_from_pool={hard_from_pool} | "
-        f"hard_fallback={hard_fallback} ({fallback_rate:.2f}%) | "
-        f"missing_hard_pool_ids={stats.get('missing_hard_pool_ids', 0)} | "
-        f"short_hard_pool_ids={stats.get('short_hard_pool_ids', 0)} | "
-        f"random_requested={stats.get('random_requested', 0)}"
-    )
-
+    pass
+HARD_SAMPLING_STAT_KEYS = ('hard_requested', 'hard_from_pool', 'hard_fallback', 'missing_hard_pool_ids', 'short_hard_pool_ids', 'random_requested')
 
 def load_initial_hard_pool_if_needed(args, train_loaders):
-    load_path = getattr(args, "load_hard_pool_path", None)
+    load_path = getattr(args, 'load_hard_pool_path', None)
     if not load_path:
         return False
-    if not getattr(args, "enable_identity_stage", False):
+    if not getattr(args, 'enable_identity_stage', False):
         if is_main_process():
-            print("[HardPool] load_hard_pool_path is set but identity stage is disabled; skip loading")
+            print('[HardPool] load_hard_pool_path is set but identity stage is disabled; skip loading')
         return False
-
     payload = load_hard_pool_payload(load_path)
-    updated = apply_hard_pool_to_train_loaders(train_loaders, payload["hard_pool"])
+    updated = apply_hard_pool_to_train_loaders(train_loaders, payload['hard_pool'])
     if is_main_process():
-        print_hard_pool_summary(payload, load_path, prefix="[HardPoolLoad]")
-        print(f"[HardPoolLoad] applied_to_datasets={updated}")
+        print_hard_pool_summary(payload, load_path, prefix='[HardPoolLoad]')
+        print(f'[HardPoolLoad] applied_to_datasets={updated}')
     return True
 
-
 def build_initial_hard_pool_if_needed(model_engine, train_loaders, args, device, hard_pool_loaded):
-    if not getattr(args, "build_hard_pool_before_train", False):
+    if not getattr(args, 'build_hard_pool_before_train', False):
         return hard_pool_loaded
-
-    if not getattr(args, "enable_identity_stage", False) or not getattr(args, "enable_hard_pool_stage", False):
-        raise ValueError("--build_hard_pool_before_train requires identity and hard_pool stages")
-
+    if not getattr(args, 'enable_identity_stage', False) or not getattr(args, 'enable_hard_pool_stage', False):
+        raise ValueError('--build_hard_pool_before_train requires identity and hard_pool stages')
     if hard_pool_loaded:
         if is_main_process():
-            print("[HardPool] build_hard_pool_before_train is set, but hard_pool is already loaded; skip building")
+            print('[HardPool] build_hard_pool_before_train is set, but hard_pool is already loaded; skip building')
         return True
-
-    pool_epoch = int(getattr(args, "build_hard_pool_epoch", 0))
+    pool_epoch = int(getattr(args, 'build_hard_pool_epoch', 0))
     if pool_epoch < 0:
         pool_epoch = 0
-
     if is_main_process():
-        print(f"[HardPool] pre-train build requested | save_epoch_label={pool_epoch}")
-    return build_save_and_apply_hard_pool(
-        model_engine,
-        train_loaders,
-        args,
-        pool_epoch,
-        device,
-    )
-
+        print(f'[HardPool] pre-train build requested | save_epoch_label={pool_epoch}')
+    return build_save_and_apply_hard_pool(model_engine, train_loaders, args, pool_epoch, device)
 
 def should_build_hard_pool(epoch, args, hard_pool_loaded):
-    return (
-        getattr(args, "enable_identity_stage", False)
-        and getattr(args, "enable_hard_pool_stage", False)
-        and not hard_pool_loaded
-        and epoch == int(getattr(args, "build_hard_pool_epoch", -1))
-    )
-
+    return getattr(args, 'enable_identity_stage', False) and getattr(args, 'enable_hard_pool_stage', False) and (not hard_pool_loaded) and (epoch == int(getattr(args, 'build_hard_pool_epoch', -1)))
 
 def build_hard_pool_with_model(model_engine, train_loaders, args, epoch, device):
-    from src.dataset.teacher.transforms import get_sample4geo_val_transforms
-
+    from src.dataset.teacher.transforms import get_paired_cross_view_val_transforms
     reference_dataset = get_hard_pool_reference_dataset(train_loaders)
     if reference_dataset is None:
-        raise RuntimeError("cannot build hard_pool without a dataset containing pids/satellite_dict/drone_dict")
-
-    val_transform = get_sample4geo_val_transforms(
-        img_size=[args.img_size, args.img_size],
-        mean=[0.485, 0.456, 0.406],
-        std=[0.229, 0.224, 0.225],
-    )
-    sat_samples = build_hard_pool_image_samples(reference_dataset, "satellite")
-    drone_samples = build_hard_pool_image_samples(reference_dataset, "drone")
-    model_source = "current"
-
-    was_training = getattr(model_engine, "training", True)
+        raise RuntimeError('cannot build hard_pool without a dataset containing pids/satellite_dict/drone_dict')
+    val_transform = get_paired_cross_view_val_transforms(img_size=[args.img_size, args.img_size], mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    sat_samples = build_hard_pool_image_samples(reference_dataset, 'satellite')
+    drone_samples = build_hard_pool_image_samples(reference_dataset, 'drone')
+    model_source = 'current'
+    was_training = getattr(model_engine, 'training', True)
     try:
         model_engine.eval()
         with torch.no_grad():
-            satellite_records = extract_hard_pool_features(
-                model_engine,
-                sat_samples,
-                val_transform,
-                args,
-                device,
-                view_name="satellite",
-            )
-            drone_records = extract_hard_pool_features(
-                model_engine,
-                drone_samples,
-                val_transform,
-                args,
-                device,
-                view_name="drone",
-            )
-            payload = compute_hard_pool_from_features(
-                satellite_records,
-                drone_records,
-                args,
-                epoch,
-                model_source=model_source,
-            )
+            satellite_records = extract_hard_pool_features(model_engine, sat_samples, val_transform, args, device, view_name='satellite')
+            drone_records = extract_hard_pool_features(model_engine, drone_samples, val_transform, args, device, view_name='drone')
+            payload = compute_hard_pool_from_features(satellite_records, drone_records, args, epoch, model_source=model_source)
     finally:
         if was_training:
             model_engine.train()
         else:
             model_engine.eval()
         clear_memory_cache()
-
     return payload
-
 
 def build_save_and_apply_hard_pool(model_engine, train_loaders, args, epoch, device):
     save_path = resolve_hard_pool_path(args.save_hard_pool_path, epoch)
-
     if is_main_process():
-        print(
-            f"[HardPool] Build start | epoch={epoch} | "
-            f"topk={args.hard_pool_topk} | topneg_k={args.hard_pool_topneg_k}"
-        )
-        payload = build_hard_pool_with_model(
-            model_engine,
-            train_loaders,
-            args,
-            epoch,
-            device,
-        )
+        print(f'[HardPool] Build start | epoch={epoch} | topk={args.hard_pool_topk} | topneg_k={args.hard_pool_topneg_k}')
+        payload = build_hard_pool_with_model(model_engine, train_loaders, args, epoch, device)
         save_hard_pool_payload(save_path, payload)
         print_hard_pool_summary(payload, save_path)
-
     if dist.is_available() and dist.is_initialized():
         dist.barrier()
-
     payload = load_hard_pool_payload(save_path)
-    updated = apply_hard_pool_to_train_loaders(train_loaders, payload["hard_pool"])
+    updated = apply_hard_pool_to_train_loaders(train_loaders, payload['hard_pool'])
     if is_main_process():
-        print(f"[HardPool] applied_to_datasets={updated}")
+        print(f'[HardPool] applied_to_datasets={updated}')
     return True
 
-
 def unpack_training_batch(batch, training_mode, device):
-    if training_mode == "sample4geo":
-        sat_tensors, drone_tensors, labels, pids = batch
+    if training_mode == 'paired_cross_view':
+        (sat_tensors, drone_tensors, labels, pids) = batch
         if sat_tensors.ndim == 4:
             sat_tensors = sat_tensors.unsqueeze(1)
         if drone_tensors.ndim == 4:
             drone_tensors = drone_tensors.unsqueeze(1)
-
         sat_views_per_id = sat_tensors.size(1)
         drone_views_per_id = drone_tensors.size(1)
         sat_imgs = sat_tensors.reshape(-1, *sat_tensors.shape[2:])
         drone_imgs = drone_tensors.reshape(-1, *drone_tensors.shape[2:])
         imgs = torch.cat([sat_imgs, drone_imgs], dim=0).to(device).to(torch.bfloat16)
-
         sat_labels = labels.repeat_interleave(sat_views_per_id)
         drone_labels = labels.repeat_interleave(drone_views_per_id)
         labels = torch.cat([sat_labels, drone_labels], dim=0).to(device)
-
         num_sat = sat_imgs.size(0)
         num_drone = drone_imgs.size(0)
-        views = torch.cat([
-            torch.zeros(num_sat, dtype=torch.long),
-            torch.ones(num_drone, dtype=torch.long)
-        ]).to(device)
+        views = torch.cat([torch.zeros(num_sat, dtype=torch.long), torch.ones(num_drone, dtype=torch.long)]).to(device)
+        meta = {'pids': pids, 'sat_views_per_id': sat_views_per_id, 'drone_views_per_id': drone_views_per_id, 'raw_satellite_tensor': sat_tensors, 'raw_drone_tensor': drone_tensors}
+        return (imgs, labels, views, meta)
+    if training_mode in {'identity', 'identity_hard'}:
+        imgs = batch['images'].to(device).to(torch.bfloat16)
+        labels = batch['labels'].to(device)
+        views = batch['view_type'].to(device)
+        return (imgs, labels, views, batch)
+    raise ValueError(f'unsupported training_mode: {training_mode}')
 
-        meta = {
-            "pids": pids,
-            "sat_views_per_id": sat_views_per_id,
-            "drone_views_per_id": drone_views_per_id,
-            # References are retained only until this batch finishes so the
-            # first runtime audit can inspect the real pre-cast tensors.
-            "raw_satellite_tensor": sat_tensors,
-            "raw_drone_tensor": drone_tensors,
-        }
-        return imgs, labels, views, meta
-
-    if training_mode in {"identity", "identity_hard"}:
-        imgs = batch["images"].to(device).to(torch.bfloat16)
-        labels = batch["labels"].to(device)
-        views = batch["view_type"].to(device)
-        return imgs, labels, views, batch
-
-    raise ValueError(f"unsupported training_mode: {training_mode}")
-
-
-def train(
-    model,
-    dataloader,
-    args,
-    optimizer=None,
-    scheduler=None,
-    val_loaders=None,
-    ds_config=None,
-    init_checkpoint_report=None,
-):
+def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=None, ds_config=None, init_checkpoint_report=None):
     local_rank = int(os.environ.get('LOCAL_RANK', 0)) if 'LOCAL_RANK' in os.environ else 0
-    
     amp_device = args.device
-
-    # Loss terms are enabled and weighted by command-line arguments.
-    triplet_criterion = IntraDomainTripletLoss()
     infonce_criterion = infonce(loss_function=torch.nn.CrossEntropyLoss())
-    identity_contrast_criterion = CrossDomainIdentityContrastiveLoss(
-        temperature=args.identity_temperature
-    )
-    same_domain_triplet_criterion = SameDomainBatchHardTripletLoss(
-        margin=args.triplet_margin
-    )
-    weak_sample4geo_criterion = (
-        WeakSample4GeoAnchorLoss(
-            temperature=args.identity_temperature,
-            repr_mode=args.s4g_anchor_repr,
-        )
-        if args.infonce_weight > 0
-        else None
-    )
-    # Initialize DeepSpeed.
     import deepspeed
-
-    model_engine, optimizer, _, scheduler = deepspeed.initialize(
-        model=model,
-        optimizer=optimizer,
-        lr_scheduler=scheduler,
-        config=ds_config if ds_config is not None else args.deepspeed_config
-    )
+    (model_engine, optimizer, _, scheduler) = deepspeed.initialize(model=model, optimizer=optimizer, lr_scheduler=scheduler, config=ds_config if ds_config is not None else args.deepspeed_config)
     runtime_dtype_audit_printed = False
     identity_precision_audit_printed = False
     identity_batch_contract_printed = False
     distributed_descriptor_audit_printed = False
     if is_main_process():
-        print(
-            "[GradientAudit] exact global NaN/Inf gradient element counts are unavailable "
-            "without gathering ZeRO-2 partitioned gradients; fields will be reported as "
-            "unavailable rather than fabricated."
-        )
-    if getattr(args, "identity_preflight_batches", 0) > 0:
-        run_teacher_identity_preflight(
-            model_engine=model_engine,
-            train_loaders=dataloader,
-            args=args,
-            identity_criterion=identity_contrast_criterion,
-            triplet_criterion=same_domain_triplet_criterion,
-            weak_criterion=weak_sample4geo_criterion,
-            init_checkpoint_report=init_checkpoint_report,
-        )
-        return
-    # Prepare the training run directory.
+        print('[GradientAudit] exact global NaN/Inf gradient element counts are unavailable without gathering ZeRO-2 partitioned gradients; fields will be reported as unavailable rather than fabricated.')
     save_dir = get_save_pth(args)
-    if getattr(args, "save_hard_pool_path", None) is None:
-        args.save_hard_pool_path = os.path.join(save_dir, "hard_pool_epoch{epoch}.json")
-    if is_main_process():
+    if getattr(args, 'save_hard_pool_path', None) is None:
+        args.save_hard_pool_path = os.path.join(save_dir, 'hard_pool_epoch{epoch}.json')
+    if is_main_process() and not args.smoke_test:
         os.makedirs(save_dir, exist_ok=True)
-        save_training_record(
-            save_dir=save_dir,
-            args=args,
-            validation_history=[],
-            best_metrics=None,
-            last_completed_epoch=0,
-        )
-        print(f"[Checkpoint] Save directory: {save_dir}")
-    distributed_barrier_with_log("[Checkpoint] initial training record saved", local_rank)
-
+        save_training_record(save_dir=save_dir, args=args, validation_history=[], best_metrics=None, last_completed_epoch=0)
+        print(f'[Checkpoint] Save directory: {save_dir}')
+    distributed_barrier_with_log('[Checkpoint] initial training record saved', local_rank)
     hard_pool_loaded = load_initial_hard_pool_if_needed(args, dataloader)
-    hard_pool_loaded = build_initial_hard_pool_if_needed(
-        model_engine,
-        dataloader,
-        args,
-        amp_device,
-        hard_pool_loaded,
-    )
+    hard_pool_loaded = build_initial_hard_pool_if_needed(model_engine, dataloader, args, amp_device, hard_pool_loaded)
     best_r1_sum = -1.0
     best_epoch = 0
     best_metrics = None
@@ -2220,521 +725,261 @@ def train(
     train_loaders = dataloader
     for epoch in range(1, args.epochs + 1):
         stage_mode = get_training_mode(epoch, args)
-        epoch_dataloader, _, effective_mode = select_epoch_dataloader(train_loaders, epoch, args)
-        ensure_identity_hard_ready(
-            epoch,
-            stage_mode,
-            effective_mode,
-            epoch_dataloader,
-            args,
-            hard_pool_loaded,
-        )
+        (epoch_dataloader, _, effective_mode) = select_epoch_dataloader(train_loaders, epoch, args)
+        ensure_identity_hard_ready(epoch, stage_mode, effective_mode, epoch_dataloader, args, hard_pool_loaded)
         set_epoch_on_dataloader(epoch_dataloader, epoch)
         model_engine.train()
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats(torch.cuda.current_device())
-        mode_name, mode_desc = get_training_mode_desc(epoch_dataloader.dataset, args)
+        (mode_name, mode_desc) = get_training_mode_desc(epoch_dataloader.dataset, args)
         num_batches = len(epoch_dataloader)
         world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
-        local_pid_batch = (
-            args.batch_size
-            if effective_mode == "sample4geo"
-            else getattr(args, "identity_ids_per_batch", args.batch_size)
-        )
+        local_pid_batch = args.batch_size if effective_mode == 'paired_cross_view' else getattr(args, 'identity_ids_per_batch', args.batch_size)
         epoch_start_time = time.time()
         epoch_validation_metrics = None
         nan_loss_count = 0
         inf_loss_count = 0
         last_grad_norm = None
-        last_grad_norm_source = "unavailable"
-        loss_log_keys = (
-            "total",
-            "d2s_loss",
-            "s2d_loss",
-            "tri_drone",
-            "tri_sat",
-            "infonce",
-            "cross_id",
-            "same_triplet",
-            "weak_s4g",
-        )
+        last_grad_norm_source = 'unavailable'
+        loss_log_keys = ('total', 'd2s_loss', 's2d_loss', 'tri_drone', 'tri_sat', 'infonce', 'cross_id', 'same_triplet', 'weak_s4g')
         loss_sums = {key: 0.0 for key in loss_log_keys}
         loss_counts = {key: 0 for key in loss_log_keys}
         epoch_precision_checked = False
         if is_main_process():
-            fallback_note = " | fallback_to_sample4geo=True" if stage_mode != effective_mode else ""
-            print(
-                f"[TrainMode] Epoch {epoch}/{args.epochs} | "
-                f"mode={stage_mode} | effective_mode={effective_mode}{fallback_note}"
-            )
-            print(
-                f"[Sampler] Epoch {epoch}/{args.epochs} | "
-                f"mode={effective_mode} | {get_sampler_debug_desc(epoch_dataloader)}"
-            )
-            print(
-                f"[Train] Epoch {epoch}/{args.epochs} start | "
-                f"mode={mode_name} ({mode_desc}) | "
-                f"batches={num_batches} | local_pid_batch={local_pid_batch} | "
-                f"global_pid_batch={local_pid_batch * world_size} | "
-                f"loss_weights={get_loss_weight_desc(args)}"
-            )
-
-        for batch_idx, batch in enumerate(epoch_dataloader):
-            imgs, labels, views, batch_meta = unpack_training_batch(batch, effective_mode, amp_device)
-            
+            fallback_note = ' | fallback_to_paired_cross_view=True' if stage_mode != effective_mode else ''
+            print(f'[TrainMode] Epoch {epoch}/{args.epochs} | mode={stage_mode} | effective_mode={effective_mode}{fallback_note}')
+            print(f'[Sampler] Epoch {epoch}/{args.epochs} | mode={effective_mode} | {get_sampler_debug_desc(epoch_dataloader)}')
+            print(f'[Train] Epoch {epoch}/{args.epochs} start | mode={mode_name} ({mode_desc}) | batches={num_batches} | local_pid_batch={local_pid_batch} | global_pid_batch={local_pid_batch * world_size} | loss_weights={get_loss_weight_desc(args)}')
+        for (batch_idx, batch) in enumerate(epoch_dataloader):
+            (imgs, labels, views, batch_meta) = unpack_training_batch(batch, effective_mode, amp_device)
             final_feats = select_model_descriptor(model_engine(imgs))
-
-            # Gather features across distributed ranks.
-            all_feats, all_labels, all_views = gather_features_and_labels_and_views(final_feats, labels, views)
+            (all_feats, all_labels, all_views) = gather_features_and_labels_and_views(final_feats, labels, views)
             loss_terms = []
             loss_values = {}
-            sat_mask = (all_views == 0)
-            drone_mask = (all_views == 1)
-
+            sat_mask = all_views == 0
+            drone_mask = all_views == 1
             sat_labels = all_labels[sat_mask]
             drone_labels = all_labels[drone_mask]
-
             sat_feats = all_feats[sat_mask]
             drone_feats = all_feats[drone_mask]
-
-            if (
-                effective_mode in {"identity", "identity_hard"}
-                and not identity_batch_contract_printed
-            ):
-                audit_identity_batch_contract_once(
-                    args,
-                    labels,
-                    views,
-                    all_labels,
-                    all_views,
-                )
-                identity_batch_contract_printed = True
-
-            if is_main_process() and not distributed_descriptor_audit_printed:
-                print_distributed_descriptor_audit_once(
-                    final_feats,
-                    views,
-                    sat_feats,
-                    drone_feats,
-                )
+            if is_main_process() and (not distributed_descriptor_audit_printed):
+                print_distributed_descriptor_audit_once(final_feats, views, sat_feats, drone_feats)
                 distributed_descriptor_audit_printed = True
-
-            if effective_mode == "sample4geo":
-                if args.triplet_weight > 0:
-                    tri_drone, tri_sat = triplet_criterion(drone_feats, drone_labels, sat_feats, sat_labels)
-                    weighted_tri_drone = args.triplet_weight * tri_drone
-                    weighted_tri_sat = args.triplet_weight * tri_sat
-                    loss_terms.extend([weighted_tri_drone, weighted_tri_sat])
-                    loss_values["tri_drone"] = weighted_tri_drone.item()
-                    loss_values["tri_sat"] = weighted_tri_sat.item()
-
+            if effective_mode == 'paired_cross_view':
                 if args.infonce_weight > 0:
                     logit_scale = get_logit_scale(model_engine)
                     infonce_loss = infonce_criterion(sat_feats, drone_feats, logit_scale)
                     total_infonce_loss = args.infonce_weight * infonce_loss
                     loss_terms.append(total_infonce_loss)
-                    loss_values["infonce"] = total_infonce_loss.item()
-                    if (
-                        infonce_criterion.last_loss_d2s is not None
-                        and infonce_criterion.last_loss_s2d is not None
-                    ):
-                        directional_losses = torch.stack(
-                            [
-                                infonce_criterion.last_loss_d2s,
-                                infonce_criterion.last_loss_s2d,
-                            ]
-                        ).float().cpu().tolist()
-                        loss_values["d2s_loss"] = directional_losses[0]
-                        loss_values["s2d_loss"] = directional_losses[1]
-            elif effective_mode in {"identity", "identity_hard"}:
-                if is_main_process() and batch_idx == 0:
-                    print(
-                        f"[TrainMode] {effective_mode} loss batch | "
-                        f"images={tuple(imgs.shape)} | labels={tuple(labels.shape)} | "
-                        f"views={tuple(views.shape)} | paths={len(batch_meta.get('image_paths', []))}"
-                    )
-
-                if args.identity_loss_weight > 0:
-                    cross_id_loss = identity_contrast_criterion(all_feats, all_labels, all_views)
-                    weighted_cross_id = args.identity_loss_weight * cross_id_loss
-                    loss_terms.append(weighted_cross_id)
-                    loss_values["cross_id"] = weighted_cross_id.item()
-
-                if args.same_domain_triplet_weight > 0:
-                    same_triplet_loss = same_domain_triplet_criterion(all_feats, all_labels, all_views)
-                    weighted_same_triplet = args.same_domain_triplet_weight * same_triplet_loss
-                    loss_terms.append(weighted_same_triplet)
-                    loss_values["same_triplet"] = weighted_same_triplet.item()
-
-                if args.infonce_weight > 0 and args.weak_sample4geo_weight > 0:
-                    weak_s4g_loss = weak_sample4geo_criterion(all_feats, all_labels, all_views)
-                    weighted_weak_s4g = args.weak_sample4geo_weight * weak_s4g_loss
-                    loss_terms.append(weighted_weak_s4g)
-                    loss_values["weak_s4g"] = weighted_weak_s4g.item()
+                    loss_values['infonce'] = total_infonce_loss.item()
+                    if infonce_criterion.last_loss_d2s is not None and infonce_criterion.last_loss_s2d is not None:
+                        directional_losses = torch.stack([infonce_criterion.last_loss_d2s, infonce_criterion.last_loss_s2d]).float().cpu().tolist()
+                        loss_values['d2s_loss'] = directional_losses[0]
+                        loss_values['s2d_loss'] = directional_losses[1]
             else:
-                raise ValueError(f"unsupported effective_mode: {effective_mode}")
-                
-            # Backpropagation and optimizer step.
+                raise ValueError(f'unsupported effective_mode: {effective_mode}')
             loss = sum(loss_terms) if loss_terms else None
             if torch.is_tensor(loss):
-                if (
-                    getattr(args, "training_stage", None) == "identity"
-                    and effective_mode == "identity"
-                    and not identity_precision_audit_printed
-                ):
-                    audit_identity_runtime_precision_once(
-                        model_engine=model_engine,
-                        batch_meta=batch_meta,
-                        model_inputs=imgs,
-                        local_views=views,
-                        local_descriptors=final_feats,
-                        gathered_satellite_descriptors=sat_feats,
-                        gathered_uav_descriptors=drone_feats,
-                        identity_criterion=identity_contrast_criterion,
-                        triplet_criterion=same_domain_triplet_criterion,
-                        weak_criterion=weak_sample4geo_criterion,
-                        total_loss=loss,
-                        identity_enabled=args.identity_loss_weight > 0,
-                        triplet_enabled=args.same_domain_triplet_weight > 0,
-                        weak_enabled=(
-                            args.infonce_weight > 0
-                            and args.weak_sample4geo_weight > 0
-                        ),
-                    )
-                    identity_precision_audit_printed = True
-                if effective_mode == "sample4geo" and not runtime_dtype_audit_printed:
-                    print_runtime_dtype_audit_once(
-                        model_engine,
-                        infonce_criterion,
-                        batch_meta,
-                        final_feats,
-                        sat_feats,
-                        drone_feats,
-                        loss,
-                    )
+                if effective_mode == 'paired_cross_view' and (not runtime_dtype_audit_printed):
+                    print_runtime_dtype_audit_once(model_engine, infonce_criterion, batch_meta, final_feats, sat_feats, drone_feats, loss)
                     runtime_dtype_audit_printed = True
-                if effective_mode == "sample4geo" and not epoch_precision_checked:
-                    enforce_epoch_first_batch_precision(
-                        model_engine, infonce_criterion, final_feats, loss
-                    )
+                if effective_mode == 'paired_cross_view' and (not epoch_precision_checked):
+                    enforce_epoch_first_batch_precision(model_engine, infonce_criterion, final_feats, loss)
                     epoch_precision_checked = True
                 model_engine.backward(loss)
+                if args.smoke_test:
+                    torch.cuda.synchronize()
+                    smoke = dict(resolution=args.img_size, rank=dist.get_rank(),
+                        world_size=world_size, local_pair_batch=local_pid_batch,
+                        global_pair_batch=local_pid_batch * world_size,
+                        gradient_accumulation=model_engine.gradient_accumulation_steps(),
+                        precision='BF16 backbone / FP32 descriptor',
+                        optimizer=type(optimizer).__name__, input_shape=list(imgs.shape),
+                        descriptor_shape=list(final_feats.shape), descriptor_dtype=str(final_feats.dtype),
+                        gather_dtype=str(all_feats.dtype), loss=float(loss.detach()),
+                        global_gathered_pair_count=int(sat_feats.shape[0]),
+                        local_pairs_per_view=int((views == 0).sum()),
+                        loss_finite=bool(torch.isfinite(loss.detach())), backward_pass=True,
+                        optimizer_step_executed=False, scheduler_step_executed=False,
+                        checkpoint_write_executed=False,
+                        peak_allocated_GB=torch.cuda.max_memory_allocated() / 2**30,
+                        peak_reserved_GB=torch.cuda.max_memory_reserved() / 2**30)
+                    smoke['pass'] = (smoke['loss_finite'] and world_size == dist.get_world_size()
+                        and sat_feats.shape[0] == drone_feats.shape[0] == local_pid_batch * world_size
+                        and final_feats.dtype == all_feats.dtype == torch.float32)
+                    print('DEEPSPEED_SMOKE_RESULT=' + json.dumps(smoke), flush=True)
+                    dist.barrier()
+                    if not smoke['pass']:
+                        raise RuntimeError('DeepSpeed smoke failed')
+                    return
                 model_engine.step()
+                if is_main_process() and batch_idx < 3:
+                    print(f'[OptimizerStep] step={model_engine.global_steps} loss={float(loss.detach())} finite={bool(torch.isfinite(loss.detach()))}', flush=True)
                 with torch.no_grad():
                     base_model = get_base_model(model_engine)
-                    if hasattr(base_model, "logit_scale") and base_model.logit_scale is not None:
+                    if hasattr(base_model, 'logit_scale') and base_model.logit_scale is not None:
                         base_model.logit_scale.clamp_(max=4.6)
                 loss_item = loss.item()
                 if math.isnan(loss_item):
                     nan_loss_count += 1
                 if math.isinf(loss_item):
                     inf_loss_count += 1
-                loss_sums["total"] += loss_item
-                loss_counts["total"] += 1
-                for key, value in loss_values.items():
+                loss_sums['total'] += loss_item
+                loss_counts['total'] += 1
+                for (key, value) in loss_values.items():
                     loss_sums[key] += value
                     loss_counts[key] += 1
             else:
                 continue
-                
-            # Log progress on rank 0 only.
             step = batch_idx + 1
-            should_log = (
-                is_main_process()
-                and (
-                    step == 1
-                    or step == num_batches
-                    or (args.log_interval > 0 and step % args.log_interval == 0)
-                )
-            )
+            should_log = is_main_process() and (step == 1 or step == num_batches or (args.log_interval > 0 and step % args.log_interval == 0))
             if should_log:
-                if effective_mode in {"identity", "identity_hard"}:
-                    print_identity_behavior_diagnostics(
-                        args=args,
-                        all_feats=all_feats,
-                        all_labels=all_labels,
-                        all_views=all_views,
-                        identity_criterion=identity_contrast_criterion,
-                        triplet_criterion=same_domain_triplet_criterion,
-                        weak_criterion=weak_sample4geo_criterion,
-                        total_loss=loss,
-                    )
-                last_grad_norm, last_grad_norm_source = read_deepspeed_grad_norm(model_engine)
-                avg_total = loss_sums["total"] / max(loss_counts["total"], 1)
+                (last_grad_norm, last_grad_norm_source) = read_deepspeed_grad_norm(model_engine)
+                avg_total = loss_sums['total'] / max(loss_counts['total'], 1)
                 progress = 100.0 * step / max(num_batches, 1)
                 elapsed_min = (time.time() - epoch_start_time) / 60.0
                 lr = get_current_lr(optimizer, scheduler)
                 debug_values = get_model_debug_values(model_engine)
-
-                metric_keys = (
-                    ("d2s_loss", "s2d_loss", "tri_drone", "tri_sat", "infonce")
-                    if effective_mode == "sample4geo"
-                    else ("cross_id", "same_triplet", "weak_s4g")
-                )
-                metric_parts = [
-                    format_optional_metric(key, loss_values.get(key))
-                    for key in metric_keys
-                ]
+                metric_keys = ('d2s_loss', 's2d_loss', 'tri_drone', 'tri_sat', 'infonce') if effective_mode == 'paired_cross_view' else ('cross_id', 'same_triplet', 'weak_s4g')
+                metric_parts = [format_optional_metric(key, loss_values.get(key)) for key in metric_keys]
                 metric_parts = [part for part in metric_parts if part is not None]
-                metric_text = " | ".join(metric_parts) if metric_parts else "loss_parts=none"
+                metric_text = ' | '.join(metric_parts) if metric_parts else 'loss_parts=none'
                 memory = gpu_memory_snapshot()
-                grad_norm_text = (
-                    f"{last_grad_norm:.6g}" if last_grad_norm is not None else "unavailable"
-                )
-
-                print(
-                    f"[Train] Epoch {epoch}/{args.epochs} | mode={mode_name} | "
-                    f"batch {step}/{num_batches} ({progress:.1f}%) | "
-                    f"loss={loss_item:.4f} avg={avg_total:.4f} | {metric_text} | "
-                    f"lr={lr:.2e} | scale={debug_values.get('scale', 0.0):.3f} | "
-                    f"grad_norm={grad_norm_text} | grad_norm_source={last_grad_norm_source} | "
-                    f"gpu_allocated={memory['allocated_gib']:.3f}GiB | "
-                    f"gpu_reserved={memory['reserved_gib']:.3f}GiB | "
-                    f"gpu_peak_allocated={memory['peak_allocated_gib']:.3f}GiB | "
-                    f"nan_loss_count={nan_loss_count} | inf_loss_count={inf_loss_count} | "
-                    "nan_gradient_count=unavailable | inf_gradient_count=unavailable | "
-                    f"elapsed={elapsed_min:.1f}m"
-                )
+                grad_norm_text = f'{last_grad_norm:.6g}' if last_grad_norm is not None else 'unavailable'
+                print(f"[Train] Epoch {epoch}/{args.epochs} | mode={mode_name} | batch {step}/{num_batches} ({progress:.1f}%) | loss={loss_item:.4f} avg={avg_total:.4f} | {metric_text} | lr={lr:.2e} | scale={debug_values.get('scale', 0.0):.3f} | grad_norm={grad_norm_text} | grad_norm_source={last_grad_norm_source} | gpu_allocated={memory['allocated_gib']:.3f}GiB | gpu_reserved={memory['reserved_gib']:.3f}GiB | gpu_peak_allocated={memory['peak_allocated_gib']:.3f}GiB | nan_loss_count={nan_loss_count} | inf_loss_count={inf_loss_count} | nan_gradient_count=unavailable | inf_gradient_count=unavailable | elapsed={elapsed_min:.1f}m")
         hard_sampler_summary = None
-        if effective_mode == "identity_hard" and hasattr(
-            epoch_dataloader.dataset,
-            "get_hard_sampling_stats",
-        ):
-            stat_device = next(get_base_model(model_engine).parameters()).device
-            hard_stats = reduce_hard_sampling_stats(
-                epoch_dataloader.dataset.get_hard_sampling_stats(),
-                stat_device,
-            )
-            hard_sampler_summary = format_hard_sampler_epoch_summary(hard_stats)
         if is_main_process():
             elapsed_min = (time.time() - epoch_start_time) / 60.0
             memory = gpu_memory_snapshot()
             avg_parts = []
             for key in loss_log_keys:
                 if loss_counts[key] > 0:
-                    avg_parts.append(f"{key}_avg={loss_sums[key] / loss_counts[key]:.4f}")
-            avg_text = " | ".join(avg_parts) if avg_parts else "no_update"
-            print(
-                f"[Train] Epoch {epoch}/{args.epochs} done | mode={mode_name} | "
-                f"updates={loss_counts['total']} | {avg_text} | "
-                f"nan_loss_count={nan_loss_count} | inf_loss_count={inf_loss_count} | "
-                "nan_gradient_count=unavailable | inf_gradient_count=unavailable | "
-                f"peak_gpu_allocated={memory['peak_allocated_gib']:.3f}GiB | "
-                f"time={elapsed_min:.1f}m"
-            )
+                    avg_parts.append(f'{key}_avg={loss_sums[key] / loss_counts[key]:.4f}')
+            avg_text = ' | '.join(avg_parts) if avg_parts else 'no_update'
+            print(f"[Train] Epoch {epoch}/{args.epochs} done | mode={mode_name} | updates={loss_counts['total']} | {avg_text} | nan_loss_count={nan_loss_count} | inf_loss_count={inf_loss_count} | nan_gradient_count=unavailable | inf_gradient_count=unavailable | peak_gpu_allocated={memory['peak_allocated_gib']:.3f}GiB | time={elapsed_min:.1f}m")
             if hard_sampler_summary is not None:
-                print(f"[HardPoolSampler] Epoch {epoch} | {hard_sampler_summary}")
+                print(f'[HardPoolSampler] Epoch {epoch} | {hard_sampler_summary}')
             last_state = collect_teacher_delta_state(model_engine)
             if teacher_verbose_eval_log():
-                rank_log(f"[Checkpoint] last_model.pth save start | epoch={epoch}")
-            torch.save(last_state, os.path.join(save_dir, "last_model.pth"))
+                rank_log(f'[Checkpoint] last_model.pth save start | epoch={epoch}')
+            torch.save(last_state, os.path.join(save_dir, 'last_model.pth'))
             if teacher_verbose_eval_log():
-                rank_log(f"[Checkpoint] last_model.pth save done | epoch={epoch}")
-                rank_log(f"[Checkpoint] best_metrics.json save start | epoch={epoch}")
-            save_training_record(
-                save_dir=save_dir,
-                args=args,
-                validation_history=validation_history,
-                best_metrics=best_metrics,
-                last_completed_epoch=epoch,
-            )
+                rank_log(f'[Checkpoint] last_model.pth save done | epoch={epoch}')
+                rank_log(f'[Checkpoint] best_metrics.json save start | epoch={epoch}')
+            save_training_record(save_dir=save_dir, args=args, validation_history=validation_history, best_metrics=best_metrics, last_completed_epoch=epoch)
             if teacher_verbose_eval_log():
-                rank_log(f"[Checkpoint] best_metrics.json save done | epoch={epoch}")
-                print(
-                    f"[Checkpoint] Saved last_model.pth | epoch={epoch}",
-                    flush=True,
-                )
+                rank_log(f'[Checkpoint] best_metrics.json save done | epoch={epoch}')
+                print(f'[Checkpoint] Saved last_model.pth | epoch={epoch}', flush=True)
         cur_epoch = epoch
-        distributed_barrier_with_log(
-            f"[Checkpoint] epoch={cur_epoch} after last_model save",
-            local_rank,
-        )
+        distributed_barrier_with_log(f'[Checkpoint] epoch={cur_epoch} after last_model save', local_rank)
         if val_loaders is not None and should_run_validation(cur_epoch, args):
             verbose_eval = teacher_verbose_eval_log()
             if verbose_eval:
-                rank_log(f"[Eval] Epoch {cur_epoch}/{args.epochs} enter | weights=current")
-            distributed_barrier_with_log(
-                f"[Eval] epoch={cur_epoch} before validation",
-                local_rank,
-            )
+                rank_log(f'[Eval] Epoch {cur_epoch}/{args.epochs} enter | weights=current')
+            distributed_barrier_with_log(f'[Eval] epoch={cur_epoch} before validation', local_rank)
             try:
                 model_engine.eval()
-                q_loader_d2s, g_loader_d2s = val_loaders["D2S"]
-                q_loader_s2d, g_loader_s2d = val_loaders["S2D"]
-
+                (q_loader_d2s, g_loader_d2s) = val_loaders['D2S']
+                (q_loader_s2d, g_loader_s2d) = val_loaders['S2D']
                 clear_memory_cache()
                 if verbose_eval:
-                    rank_log(f"[Eval] Epoch {cur_epoch}/{args.epochs} D2S start")
-                d2s_r1, d2s_r5, d2s_r10, d2s_map = getdist_1652_val_and_get_recall(
-                    model_engine,
-                    q_loader_d2s,
-                    g_loader_d2s,
-                    amp_device,
-                    task_name="D2S",
-                )
+                    rank_log(f'[Eval] Epoch {cur_epoch}/{args.epochs} D2S start')
+                selection_eval = getdist_1652_val_and_get_recall
+                if args.experiment_id == 'T0-CERTIFIED-R224-S0':
+                    from src.training.teacher.certified_selection import certified_teacher_selection
+                    selection_eval = certified_teacher_selection
+                (d2s_r1, d2s_r5, d2s_r10, d2s_map) = selection_eval(model_engine, q_loader_d2s, g_loader_d2s, amp_device, task_name='D2S')
                 if verbose_eval:
-                    rank_log(f"[Eval] Epoch {cur_epoch}/{args.epochs} D2S done")
+                    rank_log(f'[Eval] Epoch {cur_epoch}/{args.epochs} D2S done')
                 clear_memory_cache()
                 if verbose_eval:
-                    rank_log(f"[Eval] Epoch {cur_epoch}/{args.epochs} S2D start")
-                s2d_r1, s2d_r5, s2d_r10, s2d_map = getdist_1652_val_and_get_recall(
-                    model_engine,
-                    q_loader_s2d,
-                    g_loader_s2d,
-                    amp_device,
-                    task_name="S2D",
-                )
+                    rank_log(f'[Eval] Epoch {cur_epoch}/{args.epochs} S2D start')
+                (s2d_r1, s2d_r5, s2d_r10, s2d_map) = selection_eval(model_engine, q_loader_s2d, g_loader_s2d, amp_device, task_name='S2D')
                 if verbose_eval:
-                    rank_log(f"[Eval] Epoch {cur_epoch}/{args.epochs} S2D done")
+                    rank_log(f'[Eval] Epoch {cur_epoch}/{args.epochs} S2D done')
             finally:
                 model_engine.train()
                 clear_memory_cache()
-
-            distributed_barrier_with_log(
-                f"[Eval] epoch={cur_epoch} before rank0 metric/checkpoint",
-                local_rank,
-            )
+            distributed_barrier_with_log(f'[Eval] epoch={cur_epoch} before rank0 metric/checkpoint', local_rank)
             if is_main_process():
                 trainable_state = collect_teacher_delta_state(model_engine)
-                current_metrics = build_validation_metrics(
-                    cur_epoch,
-                    (d2s_r1, d2s_r5, d2s_r10, d2s_map),
-                    (s2d_r1, s2d_r5, s2d_r10, s2d_map),
-                )
+                current_metrics = build_validation_metrics(cur_epoch, (d2s_r1, d2s_r5, d2s_r10, d2s_map), (s2d_r1, s2d_r5, s2d_r10, s2d_map))
                 epoch_validation_metrics = current_metrics
-                r1_sum = current_metrics["R@1_sum"]
+                r1_sum = current_metrics['R@1_sum']
                 is_best = best_metrics is None or r1_sum > best_r1_sum
                 history_record = dict(current_metrics)
-                history_record["is_best"] = is_best
+                history_record['is_best'] = is_best
                 validation_history.append(history_record)
-
                 if is_best:
                     best_r1_sum = r1_sum
                     best_epoch = cur_epoch
                     best_metrics = current_metrics
                     if verbose_eval:
-                        rank_log(f"[Checkpoint] best_model.pth save start | epoch={cur_epoch}")
-                    torch.save(trainable_state, os.path.join(save_dir, "best_model.pth"))
+                        rank_log(f'[Checkpoint] best_model.pth save start | epoch={cur_epoch}')
+                    torch.save(trainable_state, os.path.join(save_dir, 'best_model.pth'))
                     if verbose_eval:
-                        rank_log(f"[Checkpoint] best_model.pth save done | epoch={cur_epoch}")
-
+                        rank_log(f'[Checkpoint] best_model.pth save done | epoch={cur_epoch}')
                 if verbose_eval:
-                    rank_log(f"[Checkpoint] best_metrics.json save start | epoch={cur_epoch} after eval")
-                save_training_record(
-                    save_dir=save_dir,
-                    args=args,
-                    validation_history=validation_history,
-                    best_metrics=best_metrics,
-                    last_completed_epoch=cur_epoch,
-                )
+                    rank_log(f'[Checkpoint] best_metrics.json save start | epoch={cur_epoch} after eval')
+                save_training_record(save_dir=save_dir, args=args, validation_history=validation_history, best_metrics=best_metrics, last_completed_epoch=cur_epoch)
                 if verbose_eval:
-                    rank_log(f"[Checkpoint] best_metrics.json save done | epoch={cur_epoch} after eval")
-
-                print(
-                    f"[Eval] Epoch {cur_epoch}/{args.epochs} done | "
-                    f"D2S R@1={d2s_r1:.2f} R@5={d2s_r5:.2f} R@10={d2s_r10:.2f} mAP={d2s_map:.2f} | "
-                    f"S2D R@1={s2d_r1:.2f} R@5={s2d_r5:.2f} R@10={s2d_r10:.2f} mAP={s2d_map:.2f} | "
-                    f"R@1_sum={r1_sum:.2f} | best_R@1_sum={best_r1_sum:.2f}@epoch{best_epoch}"
-                )
+                    rank_log(f'[Checkpoint] best_metrics.json save done | epoch={cur_epoch} after eval')
+                print(f'[Eval] Epoch {cur_epoch}/{args.epochs} done | D2S R@1={d2s_r1:.2f} R@5={d2s_r5:.2f} R@10={d2s_r10:.2f} mAP={d2s_map:.2f} | S2D R@1={s2d_r1:.2f} R@5={s2d_r5:.2f} R@10={s2d_r10:.2f} mAP={s2d_map:.2f} | R@1_sum={r1_sum:.2f} | best_R@1_sum={best_r1_sum:.2f}@epoch{best_epoch}')
                 if is_best and verbose_eval:
-                    print(
-                        f"[Checkpoint] Saved best_model.pth | epoch={cur_epoch} | "
-                        f"D2S_R@1={d2s_r1:.2f} | S2D_R@1={s2d_r1:.2f} | R@1_sum={r1_sum:.2f}"
-                    )
-            distributed_barrier_with_log(
-                f"[Eval] epoch={cur_epoch} after rank0 metric/checkpoint",
-                local_rank,
-            )
-
+                    print(f'[Checkpoint] Saved best_model.pth | epoch={cur_epoch} | D2S_R@1={d2s_r1:.2f} | S2D_R@1={s2d_r1:.2f} | R@1_sum={r1_sum:.2f}')
+            distributed_barrier_with_log(f'[Eval] epoch={cur_epoch} after rank0 metric/checkpoint', local_rank)
         if should_build_hard_pool(epoch, args, hard_pool_loaded):
-            hard_pool_loaded = build_save_and_apply_hard_pool(
-                model_engine,
-                train_loaders,
-                args,
-                epoch,
-                amp_device,
-            )
-
+            hard_pool_loaded = build_save_and_apply_hard_pool(model_engine, train_loaders, args, epoch, amp_device)
         if is_main_process():
             memory = gpu_memory_snapshot()
-            avg_total = loss_sums["total"] / max(loss_counts["total"], 1)
-            avg_d2s = (
-                loss_sums["d2s_loss"] / loss_counts["d2s_loss"]
-                if loss_counts["d2s_loss"] > 0
-                else None
-            )
-            avg_s2d = (
-                loss_sums["s2d_loss"] / loss_counts["s2d_loss"]
-                if loss_counts["s2d_loss"] > 0
-                else None
-            )
-            validation_text = (
-                json.dumps(epoch_validation_metrics, ensure_ascii=False, sort_keys=True)
-                if epoch_validation_metrics is not None
-                else "not_run"
-            )
-            best_metric_text = f"{best_r1_sum:.6f}" if best_metrics is not None else "unavailable"
-            best_epoch_text = str(best_epoch) if best_metrics is not None else "unavailable"
-            print("=" * 80)
-            print(f"[EPOCH AUDIT SUMMARY] epoch={epoch}/{args.epochs}")
-            print(f"average total loss={avg_total:.6f}")
-            print(
-                "average D2S loss="
-                + (f"{avg_d2s:.6f}" if avg_d2s is not None else "unavailable")
-            )
-            print(
-                "average S2D loss="
-                + (f"{avg_s2d:.6f}" if avg_s2d is not None else "unavailable")
-            )
-            print(
-                f"NaN/Inf summary | nan_loss_count={nan_loss_count} | "
-                f"inf_loss_count={inf_loss_count} | "
-                "nan_gradient_count=unavailable | inf_gradient_count=unavailable"
-            )
+            avg_total = loss_sums['total'] / max(loss_counts['total'], 1)
+            avg_d2s = loss_sums['d2s_loss'] / loss_counts['d2s_loss'] if loss_counts['d2s_loss'] > 0 else None
+            avg_s2d = loss_sums['s2d_loss'] / loss_counts['s2d_loss'] if loss_counts['s2d_loss'] > 0 else None
+            validation_text = json.dumps(epoch_validation_metrics, ensure_ascii=False, sort_keys=True) if epoch_validation_metrics is not None else 'not_run'
+            best_metric_text = f'{best_r1_sum:.6f}' if best_metrics is not None else 'unavailable'
+            best_epoch_text = str(best_epoch) if best_metrics is not None else 'unavailable'
+            print('=' * 80)
+            print(f'[EPOCH AUDIT SUMMARY] epoch={epoch}/{args.epochs}')
+            print(f'average total loss={avg_total:.6f}')
+            print('average D2S loss=' + (f'{avg_d2s:.6f}' if avg_d2s is not None else 'unavailable'))
+            print('average S2D loss=' + (f'{avg_s2d:.6f}' if avg_s2d is not None else 'unavailable'))
+            print(f'NaN/Inf summary | nan_loss_count={nan_loss_count} | inf_loss_count={inf_loss_count} | nan_gradient_count=unavailable | inf_gradient_count=unavailable')
             print(f"peak GPU allocated memory={memory['peak_allocated_gib']:.3f}GiB")
-            print(f"validation metrics={validation_text}")
-            print(f"current best metric (D2S_R@1+S2D_R@1)={best_metric_text}")
-            print(f"current best epoch={best_epoch_text}")
+            print(f'validation metrics={validation_text}')
+            print(f'current best metric (D2S_R@1+S2D_R@1)={best_metric_text}')
+            print(f'current best epoch={best_epoch_text}')
             print(f"current checkpoint path={os.path.join(save_dir, 'last_model.pth')}")
             print(f"current best checkpoint path={os.path.join(save_dir, 'best_model.pth')}")
-            print("=" * 80)
-
-        # Synchronize all ranks before the next epoch.
-        distributed_barrier_with_log(f"[Train] epoch={epoch} end", local_rank)
+            print('=' * 80)
+        distributed_barrier_with_log(f'[Train] epoch={epoch} end', local_rank)
     if not dist.is_initialized() or local_rank == 0:
-        print("[Train] done")
+        print('[Train] done')
 
 def build_deepspeed_runtime_config(ds_config_path, args, world_size):
-    with open(ds_config_path, "r") as f:
+    with open(ds_config_path, 'r') as f:
         ds_config = json.load(f)
-
     micro_batch_size = int(args.batch_size)
-    grad_accum_steps = int(getattr(args, "grad_accum_steps", 1))
-
+    grad_accum_steps = int(getattr(args, 'grad_accum_steps', 1))
     if micro_batch_size <= 0:
-        raise ValueError("batch_size must be greater than 0")
+        raise ValueError('batch_size must be greater than 0')
     if grad_accum_steps <= 0:
-        raise ValueError("grad_accum_steps must be greater than 0")
+        raise ValueError('grad_accum_steps must be greater than 0')
     if world_size <= 0:
-        raise ValueError("world_size must be greater than 0")
-
+        raise ValueError('world_size must be greater than 0')
     train_batch_size = micro_batch_size * world_size * grad_accum_steps
-    ds_config["train_micro_batch_size_per_gpu"] = micro_batch_size
-    ds_config["gradient_accumulation_steps"] = grad_accum_steps
-    ds_config["train_batch_size"] = train_batch_size
-
-    return ds_config, grad_accum_steps
-
+    ds_config['train_micro_batch_size_per_gpu'] = micro_batch_size
+    ds_config['gradient_accumulation_steps'] = grad_accum_steps
+    ds_config['train_batch_size'] = train_batch_size
+    return (ds_config, grad_accum_steps)
 
 def print_deepspeed_batch_config(ds_config, args, world_size):
     if not is_main_process():
         return
-
-    micro_pid_batch = ds_config["train_micro_batch_size_per_gpu"]
-    grad_accum_steps = ds_config["gradient_accumulation_steps"]
-    global_pid_batch = ds_config["train_batch_size"]
+    micro_pid_batch = ds_config['train_micro_batch_size_per_gpu']
+    grad_accum_steps = ds_config['gradient_accumulation_steps']
+    global_pid_batch = ds_config['train_batch_size']
     active_stage = get_training_mode(1, args)
-    if active_stage in {"identity", "identity_hard"}:
+    if active_stage in {'identity', 'identity_hard'}:
         drone_views_per_pid = int(args.identity_drone_per_id)
         satellite_views_per_pid = int(args.identity_sat_per_id)
     else:
@@ -2743,119 +988,47 @@ def print_deepspeed_batch_config(ds_config, args, world_size):
     total_views_per_pid = drone_views_per_pid + satellite_views_per_pid
     micro_image_batch = micro_pid_batch * total_views_per_pid
     global_image_batch = global_pid_batch * total_views_per_pid
-
-    print(
-        f"[DeepSpeedBatch] local_pid_batch={micro_pid_batch} | "
-        f"world_size={world_size} | grad_accum_steps={grad_accum_steps} | "
-        f"global_pid_batch={global_pid_batch} | "
-        f"drone_views_per_pid={drone_views_per_pid} | "
-        f"satellite_views_per_pid={satellite_views_per_pid} | "
-        f"total_views_per_pid={total_views_per_pid} | "
-        f"views_per_pid={total_views_per_pid} | "
-        f"local_image_batch={micro_image_batch} | global_image_batch={global_image_batch}"
-    )
+    print(f'[DeepSpeedBatch] local_pid_batch={micro_pid_batch} | world_size={world_size} | grad_accum_steps={grad_accum_steps} | global_pid_batch={global_pid_batch} | drone_views_per_pid={drone_views_per_pid} | satellite_views_per_pid={satellite_views_per_pid} | total_views_per_pid={total_views_per_pid} | views_per_pid={total_views_per_pid} | local_image_batch={micro_image_batch} | global_image_batch={global_image_batch}')
 
 def main():
     import traceback
-    run_started_at = datetime.now().astimezone().isoformat(timespec="microseconds")
+    run_started_at = datetime.now().astimezone().isoformat(timespec='microseconds')
     args = parse_args()
+    enforce_formal_task_policy(args)
     try:
         normalize_explicit_training_stage(args)
-        if args.identity_preflight_batches < 0:
-            raise ValueError("identity_preflight_batches must be greater than or equal to 0")
-        if args.identity_preflight_batches > 0 and args.training_stage != "identity":
-            raise ValueError(
-                "identity_preflight_batches can only be enabled when "
-                "training_stage=identity"
-            )
         normalize_hard_pool_args(args)
         validate_loss_weights(args)
         validate_scheduler_args(args)
         validate_identity_training_args(args)
-        device, rank, local_rank, world_size = try_init_dist()
-        resolve_shared_output_dir(
-            args,
-            get_save_pth,
-            is_main_process(),
-        )
-        setup_rank0_run_log(args.output_dir, is_main_process())
-        ds_config, grad_accum_steps = build_deepspeed_runtime_config(
-            args.deepspeed_config,
-            args,
-            world_size
-        )
-        experiment_config_audit = print_experiment_configuration(
-            args,
-            ds_config,
-            rank,
-            local_rank,
-            world_size,
-            PROJECT_ROOT,
-            started_at=run_started_at,
-        )
+        (device, rank, local_rank, world_size) = try_init_dist()
+        if not args.smoke_test:
+            resolve_shared_output_dir(args, get_save_pth, is_main_process())
+            setup_rank0_run_log(args.output_dir, is_main_process())
+        (ds_config, grad_accum_steps) = build_deepspeed_runtime_config(args.deepspeed_config, args, world_size)
+        experiment_config_audit = print_experiment_configuration(args, ds_config, rank, local_rank, world_size, PROJECT_ROOT, started_at=run_started_at)
         if is_main_process() and experiment_config_audit is not None:
-            args.runtime_experiment_configuration_valid = experiment_config_audit["valid"]
+            args.runtime_experiment_configuration_valid = experiment_config_audit['valid']
         print_deepspeed_batch_config(ds_config, args, world_size)
-
-        # Build training dataloaders.
-        train_dataset, train_sampler, train_loader = create_1652_teacher_train_dataloaders(args)
-        # Preflight never constructs or runs validation; default training is unchanged.
+        (train_dataset, train_sampler, train_loader) = create_1652_teacher_train_dataloaders(args)
         val_loaders = None
-        if args.identity_preflight_batches == 0:
-            val_loaders = build_1652_val_dataloaders(
-                data_dir=args.data_dir,
-                img_size=[args.img_size, args.img_size],
-                batch_size=getattr(args, "val_batch_size", 32),
-                num_workers=args.num_workers
-            )
-        # Build teacher model.
+        if args.identity_preflight_batches == 0 and not args.smoke_test:
+            val_loaders = build_1652_val_dataloaders(data_dir=args.data_dir, img_size=[args.img_size, args.img_size], batch_size=getattr(args, 'val_batch_size', 32), num_workers=args.num_workers)
         model = TeacherModel(args)
         model = model.to(device)
-        init_checkpoint_report = load_teacher_init_checkpoint(
-            model,
-            getattr(args, "init_checkpoint", None),
-            device,
-            strict_trainable=getattr(args, "init_checkpoint_strict_trainable", True),
-        )
+        init_checkpoint_report = load_teacher_init_checkpoint(model, getattr(args, 'init_checkpoint', None), device, strict_trainable=getattr(args, 'init_checkpoint_strict_trainable', True))
         if is_main_process():
             structure_audit = audit_teacher_runtime_structure(model)
-            args.runtime_teacher_structure_valid = structure_audit["valid"]
-        # Build optimizer and scheduler for trainable parameters.
+            args.runtime_teacher_structure_valid = structure_audit['valid']
         optimizer = build_optimizer_and_scale(model, args)
-        scheduler_plan = build_scheduler_plan(
-            train_loader,
-            train_sampler,
-            args,
-            grad_accum_steps,
-        )
+        scheduler_plan = build_scheduler_plan(train_loader, train_sampler, args, grad_accum_steps)
         print_scheduler_plan(scheduler_plan, args, grad_accum_steps)
-
-        scheduler = get_scheduler(
-            scheduler_type=args.scheduler,
-            train_steps=scheduler_plan["total_train_steps"],
-            optimizer=optimizer,
-            warmup_steps=scheduler_plan["warmup_steps"],
-            lr_end=args.lr_end
-        )
-        train(
-            model,
-            train_loader,
-            args,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            val_loaders=val_loaders,
-            ds_config=ds_config,
-            init_checkpoint_report=init_checkpoint_report,
-        )
+        scheduler = get_scheduler(scheduler_type=args.scheduler, train_steps=scheduler_plan['total_train_steps'], optimizer=optimizer, warmup_steps=scheduler_plan['warmup_steps'], lr_end=args.lr_end)
+        train(model, train_loader, args, optimizer=optimizer, scheduler=scheduler, val_loaders=val_loaders, ds_config=ds_config, init_checkpoint_report=init_checkpoint_report)
     except Exception as e:
-        if getattr(args, "identity_preflight_batches", 0) > 0:
-            print("\n[Teacher Identity Preflight FAILED]")
-            print(f"reason={e}")
-        print("\n[Error] Exception occurred during training:")
+        print('\n[Error] Exception occurred during training:')
         traceback.print_exc()
         import sys
         sys.exit(1)
-
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

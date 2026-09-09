@@ -1,0 +1,25 @@
+{
+  "LOCAL_COVISIBLE_EVIDENCE_STATUS": "SUPPORTED",
+  "PATCH_AUDIT_STATUS": "PASS",
+  "counter_evidence": [
+    "SAM_height_gain_exceeds_T0"
+  ],
+  "fixed_directional_evidence_rubric": {
+    "SAM_height_gain_exceeds_T0": false,
+    "SAM_residual_improves_150_to_200": true,
+    "SAM_residual_weaker_than_control": true,
+    "identity_recovery_majority": true
+  },
+  "quantitative": {
+    "SAM_residual_minus_control_patch_maxsim_mean_median_at_150": -0.01515573263168335,
+    "SAM_residual_patch_maxsim_mean_median_change_200_minus_150": 0.019574880599975586,
+    "T0_residual_patch_maxsim_mean_median_change_200_minus_150": 0.028525173664093018,
+    "residual_identity_any_200_recovery_fraction": 0.9545454545454546
+  },
+  "supporting_evidence": [
+    "SAM_residual_weaker_than_control",
+    "SAM_residual_improves_150_to_200",
+    "identity_recovery_majority"
+  ],
+  "warning": "Patch values are interpreted within model only; no raw cross-model threshold is used."
+}

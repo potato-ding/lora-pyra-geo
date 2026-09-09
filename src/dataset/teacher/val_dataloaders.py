@@ -13,7 +13,7 @@ from torchvision import transforms
 from torchvision.datasets import ImageFolder
 
 GTA_SATE_LENGTH = 24576
-GTA_TILE_LENGTH = 512
+GTA_TILE_LENGTH = 256
 
 
 class IndexedDataset(Dataset):
@@ -34,21 +34,26 @@ class IndexedDataset(Dataset):
         return img, label, idx
 
 
-def get_sample4geo_folder_data(path):
+def get_paired_cross_view_folder_data(path):
     data = {}
-    for root, dirs, files in os.walk(path, topdown=False):
-        for name in dirs:
-            folder = os.path.join(root, name)
-            folder_files = []
-            for _, _, child_files in os.walk(folder, topdown=False):
-                folder_files = child_files
-            data[name] = {"path": folder, "files": folder_files}
+    # Match torchvision ImageFolder's class/path ordering. Exact-score ties
+    # otherwise depend on filesystem enumeration rather than benchmark order.
+    for name in sorted(os.listdir(path)):
+        folder = os.path.join(path, name)
+        if not os.path.isdir(folder):
+            continue
+        folder_files = []
+        for root, _, files in sorted(os.walk(folder)):
+            for filename in sorted(files):
+                if filename.lower().endswith((".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp")):
+                    folder_files.append(os.path.relpath(os.path.join(root, filename), folder))
+        data[name] = {"path": folder, "files": folder_files}
     return data
 
 
-class Sample4GeoU1652DatasetEval(Dataset):
+class PairedCrossViewU1652DatasetEval(Dataset):
     def __init__(self, data_folder, mode, transform=None, sample_ids=None, gallery_n=-1):
-        self.data_dict = get_sample4geo_folder_data(data_folder)
+        self.data_dict = get_paired_cross_view_folder_data(data_folder)
         self.ids = list(self.data_dict.keys())
         self.transform = transform
         self.given_sample_ids = sample_ids
@@ -72,8 +77,8 @@ class Sample4GeoU1652DatasetEval(Dataset):
 
         sample_id = self.sample_ids[idx]
         label = int(sample_id)
-        if self.given_sample_ids is not None and sample_id not in self.given_sample_ids:
-            label = -1
+        # Non-query identities are formal distractors, not junk. Keep their
+        # true folder label so they participate in the full gallery ranking.
 
         return img, label
 
@@ -82,17 +87,17 @@ class Sample4GeoU1652DatasetEval(Dataset):
 
 
 def build_1652_val_dataloaders(data_dir="data/U1652", img_size=[224, 224], batch_size=32, num_workers=8):
-    from src.dataset.teacher.transforms import get_sample4geo_val_transforms
+    from src.dataset.teacher.transforms import get_paired_cross_view_val_transforms
 
-    val_transform = get_sample4geo_val_transforms(img_size=img_size)
+    val_transform = get_paired_cross_view_val_transforms(img_size=img_size)
 
     # ==================== 任务 1: D2S (无人机找卫星) ====================
-    val_q_drone_ds = Sample4GeoU1652DatasetEval(
+    val_q_drone_ds = PairedCrossViewU1652DatasetEval(
         os.path.join(data_dir, "test/query_drone"),
         mode="query",
         transform=val_transform,
     )
-    val_g_sat_ds = Sample4GeoU1652DatasetEval(
+    val_g_sat_ds = PairedCrossViewU1652DatasetEval(
         os.path.join(data_dir, "test/gallery_satellite"),
         mode="gallery",
         transform=val_transform,
@@ -100,12 +105,12 @@ def build_1652_val_dataloaders(data_dir="data/U1652", img_size=[224, 224], batch
     )
 
     # ==================== 任务 2: S2D (卫星找无人机) ====================
-    val_q_sat_ds = Sample4GeoU1652DatasetEval(
+    val_q_sat_ds = PairedCrossViewU1652DatasetEval(
         os.path.join(data_dir, "test/query_satellite"),
         mode="query",
         transform=val_transform,
     )
-    val_g_drone_ds = Sample4GeoU1652DatasetEval(
+    val_g_drone_ds = PairedCrossViewU1652DatasetEval(
         os.path.join(data_dir, "test/gallery_drone"),
         mode="gallery",
         transform=val_transform,
@@ -292,9 +297,9 @@ def build_gta_val_dataloaders(
     query_mode="D2S",
     mode="pos",
 ):
-    from src.dataset.teacher.transforms import get_sample4geo_val_transforms
+    from src.dataset.teacher.transforms import get_paired_cross_view_val_transforms
 
-    val_transforms = get_sample4geo_val_transforms(img_size=img_size)
+    val_transforms = get_paired_cross_view_val_transforms(img_size=img_size)
     satellite_dir = os.path.join(data_dir, "satellite")
     json_path = os.path.join(data_dir, f"{split_type}-drone2sate-test.json")
     if not os.path.isfile(json_path):
@@ -330,20 +335,35 @@ def build_gta_val_dataloaders(
         query_paths, query_labels, query_coords = [], [], []
 
         for item in json_data:
+            if "drone_loc_x_y" not in item:
+                raise KeyError(f"GTA-UAV query lacks drone_loc_x_y: {item.get('drone_img_name')}")
+            coord = np.asarray(item["drone_loc_x_y"], dtype=np.float64)
+            if coord.shape != (2,) or not np.isfinite(coord).all():
+                raise ValueError("GTA-UAV query coordinate must be a finite XY pair")
             pos_list = item.get(pair_key, [])
             if not pos_list:
                 continue
 
-            valid_ids = [sate_name_to_id[name] for name in pos_list if name in sate_name_to_id]
-            if not valid_ids:
-                continue
+            missing = [name for name in pos_list if name not in sate_name_to_id]
+            if missing:
+                raise ValueError(f"GTA-UAV positive gallery images missing: {missing}")
+            valid_ids = [sate_name_to_id[name] for name in pos_list]
 
             query_paths.append(os.path.join(data_dir, item["drone_img_dir"], item["drone_img_name"]))
             query_labels.append(valid_ids + [-1] * (max_pos - len(valid_ids)))
-            query_coords.append(item.get("drone_loc_x_y", [0.0, 0.0]))
+            query_coords.append(coord.tolist())
 
         query_dataset = GTAUAVDataset(query_paths, query_labels, coords=query_coords, transform=val_transforms)
         gallery_dataset = GTAUAVDataset(all_sate_paths, sate_labels, coords=sate_coords, transform=val_transforms)
+        query_dataset.protocol_audit = {
+            "raw_json_queries": len(json_data),
+            "queries_with_positive": sum(bool(item[pair_key]) for item in json_data),
+            "formal_query_count": len(query_paths),
+            "gallery_count": len(all_sate_paths),
+            "coordinate_unit": "meter (m)",
+            "tile_length": GTA_TILE_LENGTH,
+        }
+        print(f"GTA_PROTOCOL_COUNTS={query_dataset.protocol_audit}", flush=True)
         return make_loader(query_dataset), make_loader(gallery_dataset)
 
     def build_s2d():
@@ -358,7 +378,7 @@ def build_gta_val_dataloaders(
             drone_name = item["drone_img_name"]
             drone_names.append(drone_name)
             drone_paths.append(os.path.join(data_dir, item["drone_img_dir"], drone_name))
-            drone_coords.append(item.get("drone_loc_x_y", [0.0, 0.0]))
+            drone_coords.append(item["drone_loc_x_y"])
 
             for sate_name in pos_list:
                 if sate_name in sate_name_to_id:
@@ -401,12 +421,12 @@ def build_gta_val_dataloaders(
 __all__ = [
     "GTAUAVDataset",
     "IndexedDataset",
-    "Sample4GeoU1652DatasetEval",
+    "PairedCrossViewU1652DatasetEval",
     "build_1652_val_dataloaders",
     "build_gta_val_dataloaders",
     "build_sues200_val_dataloaders",
     "get_gta_sate_paths",
-    "get_sample4geo_folder_data",
+    "get_paired_cross_view_folder_data",
     "gta_sate2loc",
     "gta_sate_center_from_path",
 ]

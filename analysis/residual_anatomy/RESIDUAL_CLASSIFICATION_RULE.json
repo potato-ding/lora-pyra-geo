@@ -1,0 +1,14 @@
+{
+  "classification": "After the rank/positive-percentile/negative-percentile/standardized-margin directional guard: POSITIVE_EVIDENCE_DOMINANT if positive advantage > 0.10 and > 2*max(negative advantage,0); NEGATIVE_CONFUSION_DOMINANT if negative advantage > 0.10 and > 2*max(positive advantage,0); MIXED if both > 0.10 and neither dominates by >2x; otherwise AMBIGUOUS. A failed guard is AMBIGUOUS.",
+  "dominance_ratio": 2.0,
+  "required_directional_guard": "T0 positive rank better than SAM; T0 positive percentile >= SAM; SAM negative percentile >= T0; T0 standardized margin > SAM",
+  "rule_is_spec_driven_not_outcome_tuned": true,
+  "standardized_feature_definitions": {
+    "negative_suppression_advantage": "SAM top-negative z - T0 top-negative z",
+    "positive_advantage": "T0 best-positive z - SAM best-positive z",
+    "standardized_margin_advantage": "T0 standardized margin - SAM standardized margin"
+  },
+  "threshold": 0.1,
+  "threshold_sweep_performed": false,
+  "version": 2
+}

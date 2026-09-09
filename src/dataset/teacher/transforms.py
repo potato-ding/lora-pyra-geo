@@ -20,7 +20,7 @@ def _image_compression_90_100(p=0.5):
     return A.ImageCompression(quality_lower=90, quality_upper=100, p=p)
 
 
-def _sample4geo_coarse_dropout(img_size, p=1.0):
+def _paired_cross_view_coarse_dropout(img_size, p=1.0):
     min_h = int(0.1 * img_size[0])
     max_h = int(0.2 * img_size[0])
     min_w = int(0.1 * img_size[1])
@@ -43,7 +43,7 @@ def _sample4geo_coarse_dropout(img_size, p=1.0):
     )
 
 
-def get_sample4geo_train_transforms(
+def get_paired_cross_view_train_transforms(
     img_size=[224, 224],
     mean=[0.485, 0.456, 0.406],
     std=[0.229, 0.224, 0.225],
@@ -65,7 +65,7 @@ def get_sample4geo_train_transforms(
             ], p=0.3),
             A.OneOf([
                 A.GridDropout(ratio=grid_ratio, p=1.0),
-                _sample4geo_coarse_dropout(img_size, p=1.0),
+                _paired_cross_view_coarse_dropout(img_size, p=1.0),
             ], p=0.3),
         ]
 
@@ -85,7 +85,7 @@ def get_sample4geo_train_transforms(
     return train_sat_transforms, train_drone_transforms
 
 
-def get_sample4geo_val_transforms(
+def get_paired_cross_view_val_transforms(
     img_size=[224, 224],
     mean=[0.485, 0.456, 0.406],
     std=[0.229, 0.224, 0.225],
@@ -98,6 +98,6 @@ def get_sample4geo_val_transforms(
 
 
 __all__ = [
-    "get_sample4geo_train_transforms",
-    "get_sample4geo_val_transforms",
+    "get_paired_cross_view_train_transforms",
+    "get_paired_cross_view_val_transforms",
 ]
