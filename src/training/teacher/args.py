@@ -36,7 +36,7 @@ def build_arg_parser():
     parser.add_argument("--output_root", type=str, default="src/checkpoint/teacher")
     parser.add_argument("--output_dir", type=str, default=None)
 
-    parser.add_argument("--deepspeed_config", type=str, default="ds_config.json")
+    parser.add_argument("--deepspeed_config", type=str, default="configs/deepspeed/teacher_zero2.json")
     parser.add_argument(
         "--grad_accum_steps",
         "--gradient_accumulation_steps",

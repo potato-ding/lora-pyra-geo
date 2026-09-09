@@ -909,6 +909,8 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                 is_best = best_metrics is None or r1_sum > best_r1_sum
                 history_record = dict(current_metrics)
                 history_record['is_best'] = is_best
+                history_record['train_loss'] = loss_sums['total'] / max(loss_counts['total'], 1)
+                history_record['learning_rate'] = [float(group['lr']) for group in optimizer.param_groups]
                 validation_history.append(history_record)
                 if is_best:
                     best_r1_sum = r1_sum

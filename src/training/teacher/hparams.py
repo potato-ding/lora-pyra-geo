@@ -1,6 +1,8 @@
 import json
 import os
 import sys
+import subprocess
+from pathlib import Path
 
 
 TRAINING_RECORD_FILENAME = "best_metrics.json"
@@ -65,6 +67,14 @@ def build_training_record(
             'best_selection_metrics': {'D2S_R1': best_metrics['D2S']['R@1'],
                 'S2D_R1': best_metrics['S2D']['R@1'], 'R1_sum': best_metrics['R@1_sum']} if best_metrics else None,
         })
+        root = Path(__file__).resolve().parents[3]
+        payload['code_branch'] = subprocess.check_output(['git', 'branch', '--show-current'], cwd=root, text=True).strip()
+        payload['code_commit'] = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=root, text=True).strip()
+        payload['code_worktree_dirty'] = bool(subprocess.check_output(['git', 'status', '--porcelain'], cwd=root, text=True).strip())
+        payload['deepspeed_config'] = args.deepspeed_config
+        payload['training']['global_contrastive_batch'] = world * local
+        payload['checkpoint_selection']['metric_core'] = 'certified_unified'
+        payload['objective'] = {'base_task_loss': 'PairInfoNCE'}
     return payload
 
 
@@ -85,4 +95,17 @@ def save_training_record(
     path = os.path.join(save_dir, TRAINING_RECORD_FILENAME)
     with open(path, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2, ensure_ascii=False)
+    if getattr(args, 'experiment_id', '') == 'T0-CERTIFIED-R224-S0':
+        rows = []
+        for item in validation_history:
+            rows.append({'epoch': item['epoch'], 'train_loss': item.get('train_loss'),
+                'learning_rate': item.get('learning_rate'),
+                'U1652_D2S_R1': item['D2S']['R@1'], 'U1652_D2S_R5': item['D2S']['R@5'],
+                'U1652_D2S_AP': item['D2S']['mAP'], 'U1652_S2D_R1': item['S2D']['R@1'],
+                'U1652_S2D_R5': item['S2D']['R@5'], 'U1652_S2D_AP': item['S2D']['mAP'],
+                'R1_sum': item['R@1_sum'], 'is_best': item['is_best']})
+        epoch_path = os.path.join(save_dir, 'epoch_metrics.json')
+        with open(epoch_path + '.tmp', 'w', encoding='utf-8') as handle:
+            json.dump(rows, handle, indent=2)
+        os.replace(epoch_path + '.tmp', epoch_path)
     return path
