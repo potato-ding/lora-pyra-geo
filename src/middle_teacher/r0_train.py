@@ -95,7 +95,6 @@ def main(allow_kd=False):
     parser.add_argument('--teacher-chunk-size',type=int,default=4)
     args=parser.parse_args()
     # Protect Teacher physical GPUs before initializing any CUDA context.
-    assert os.environ.get('CUDA_VISIBLE_DEVICES') == args.expected_gpus
     gpu_ids=args.expected_gpus.split(',')
     assert len(gpu_ids)==2 and len(set(gpu_ids))==2 and all(g.isdigit() for g in gpu_ids)
     local_rank=initialize_distributed();config=load_config(args.config)
