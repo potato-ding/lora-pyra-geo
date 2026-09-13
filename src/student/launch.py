@@ -13,6 +13,9 @@ def main(argv=None):
     p.add_argument("--config",required=True)
     args=p.parse_args(argv)
     cfg=load_config(args.config)
+    visible=os.environ.get("CUDA_VISIBLE_DEVICES")
+    if visible is not None and len(visible.split(",")) != 1:
+        raise ValueError("STU-1G-B32-R224-v1 requires exactly one visible GPU")
     seal=None
     if cfg.get("sealed_provenance_file"):
         seal=json.loads(Path(cfg["sealed_provenance_file"]).read_text())
@@ -30,7 +33,7 @@ def main(argv=None):
     log=run/"train.log"
     env=dict(os.environ,STUDENT_RESERVED_OUTPUT=str(run),PYTHONUNBUFFERED="1")
     if seal:env["STUDENT_SEALED_COMMIT"]=seal["SEALED_COMMIT"]
-    command=[sys.executable,"-m","torch.distributed.run","--standalone","--nproc_per_node=2",
+    command=[sys.executable,"-m","torch.distributed.run","--standalone","--nproc_per_node=1",
              "-m","src.student.train","--config",str(Path(args.config).resolve())]
     with log.open("xb") as sink:
         child=subprocess.Popen(command,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,env=env)

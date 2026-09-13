@@ -2,9 +2,9 @@
   "mode": "baseline",
   "epochs": 30,
   "seed": 2,
-  "world_size": 2,
-  "batch_size": 16,
-  "cross_gpu_gather": true,
+  "world_size": 1,
+  "batch_size": 32,
+  "cross_gpu_gather": false,
   "img_size": 224,
   "lr": 0.0001,
   "weight_decay": 0.0001,
@@ -27,6 +27,9 @@
   "checkpoint_selection_frequency": "every_epoch",
   "SUES_USED_FOR_SELECTION": false,
   "GTA_USED_FOR_SELECTION": false,
-  "sealed_provenance_file": "/home/dingyi/lora-pyra-geo/src/checkpoint/student/CERTIFIED_R224/_PREFLIGHT/B0_FINAL_SEAL.json",
-  "git_commit_policy": "resolve_and_verify_sealed_HEAD_at_launch"
+  "sealed_provenance_file": "/home/dingyi/lora-pyra-geo/src/checkpoint/student/CERTIFIED_R224/_PREFLIGHT/STU_1G_B32_R224_V1_SOURCE_SEAL.json",
+  "git_commit_policy": "resolve_and_verify_sealed_HEAD_at_launch",
+  "protocol_id": "STU-1G-B32-R224-v1",
+  "gpu_count": 1,
+  "u1652_eval_batch_size": 32
 }

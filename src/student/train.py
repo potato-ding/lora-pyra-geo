@@ -10,7 +10,7 @@ import torch.distributed as dist
 from torch import nn
 
 from .model import StudentModel
-from .artifacts import deployment_state_dict, file_sha256, resolved_config, write_json, best_record, selection_metadata, U1652_EVAL_BATCH_SIZE
+from .artifacts import file_sha256, resolved_config, write_json, selection_metadata
 from .data import create_student_train_dataset_and_loader
 from .objective import PairInfoNCE
 from .optimizer import build_student_optimizer
@@ -20,10 +20,10 @@ from .runtime import _seed_all, _seed_stst_worker, _gather_grad
 
 def load_config(path):
     cfg=json.loads(Path(path).read_text())
-    expected={'epochs':30,'batch_size':16,'world_size':2,'img_size':224,
+    expected={'epochs':30,'batch_size':32,'world_size':1,'protocol_id':'STU-1G-B32-R224-v1','gpu_count':1,'img_size':224,
               'lr':1e-4,'weight_decay':1e-4,'warmup_epochs':0.1,
               'min_lr_ratio':0.01,'temperature':0.07,'label_smoothing':0.1,
-              'grad_accum_steps':1,'cross_gpu_gather':True,'precision':'bfloat16'}
+              'u1652_eval_batch_size':32,'grad_accum_steps':1,'cross_gpu_gather':False,'precision':'bfloat16'}
     if cfg.get('mode') not in ('baseline','dual_stst'):
         raise ValueError('Only baseline and dual_stst are supported')
     for key,value in expected.items():
@@ -63,7 +63,7 @@ def batch_loss(engine,teacher,images,local_pairs,criterion,cfg,epoch):
 
 
 def deepspeed_config():
-    return {'train_batch_size':32,'train_micro_batch_size_per_gpu':16,'gradient_accumulation_steps':1,
+    return {'train_batch_size':32,'train_micro_batch_size_per_gpu':32,'gradient_accumulation_steps':1,
         'zero_optimization':{'stage':1},'zero_allow_untested_optimizer':True,
         'bf16':{'enabled':True},'fp16':{'enabled':False},'gradient_clipping':0.0,'steps_per_print':1000000}
 
@@ -82,6 +82,8 @@ def sync_student_buffers_from_rank0(student):
 def assert_student_validation_state_synced(student, epoch):
     """Fail collectively before selection if parameters or buffers diverge."""
     distributed = dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
+    if not distributed:
+        return dict(epoch=epoch, bn_protocol="single_rank_native_bn", cross_rank_buffer_sync=False, assertion_noop=True)
     maxima = {}
     for name, tensors in (("parameter", student.parameters()), ("buffer", student.buffers())):
         groups = {}
@@ -126,17 +128,15 @@ def main():
             raise FileExistsError(output)
     if not reserved:
         raise RuntimeError('Use src.student.launch to capture complete stdout/stderr')
-    if int(os.environ.get('WORLD_SIZE','1'))!=2:
-        raise RuntimeError('Launch using torchrun --nproc_per_node=2 -m src.student.train')
+    if int(os.environ.get('WORLD_SIZE','1'))!=1:
+        raise RuntimeError('Launch using torchrun --nproc_per_node=1 -m src.student.train')
     import deepspeed
-    from src.evaluation.metrics import getdist_1652_val_and_get_recall
-    from src.dataset.teacher.val_dataloaders import build_1652_val_dataloaders
+    from .canonical_selection import select_epoch
     rank=int(os.environ['LOCAL_RANK']);torch.cuda.set_device(rank)
     deepspeed.init_distributed(dist_backend='nccl');device=torch.device('cuda',rank)
     _seed_all(cfg['seed']);args=SimpleNamespace(**cfg)
     train_loader=create_student_train_dataset_and_loader(args)
     train_loader.worker_init_fn=_seed_stst_worker
-    val=build_1652_val_dataloaders(data_dir=cfg['val_data_dir'],img_size=[224,224],batch_size=U1652_EVAL_BATCH_SIZE,num_workers=cfg['num_workers'])
     student=StudentModel(temperature=cfg['temperature'],ckpt_path=cfg['student_pretrained']).to(device)
     teacher=None;supervision=None
     if cfg['mode']=='dual_stst':
@@ -173,21 +173,12 @@ def main():
                 print(json.dumps({'epoch':epoch,'step':step,'loss':float(loss.detach()),'loss_finite':bool(torch.isfinite(loss)),'nan_loss_count':int(torch.isnan(loss)),'inf_loss_count':int(torch.isinf(loss)),**{k:float(v) for k,v in components.items()}}),flush=True)
         sync_student_buffers_from_rank0(engine.module.student)
         assert_student_validation_state_synced(engine.module.student, epoch)
-        engine.eval();metrics={}
-        for direction,pair in val.items():
-            r1,r5,_,ap=getdist_1652_val_and_get_recall(engine.module.student,*pair,device)
-            metrics[direction]={'R@1':r1,'R@5':r5,'AP':ap}
-        score=metrics['D2S']['R@1']+metrics['S2D']['R@1']
-        if dist.get_rank()==0:
-            payload={'epoch':epoch,'model':deployment_state_dict(engine)}
-            torch.save(payload,output/'last_model.pth')
-            if score>best:
-                best=score;torch.save(payload,output/'best_model.pth')
-                write_json(output/'best_metrics.json',best_record(epoch,metrics))
-            history.append({'epoch':epoch,'metrics':metrics})
-            write_json(output/'epoch_metrics.json',history)
-            print(json.dumps({'epoch':epoch,'metrics':metrics,'best_R1_sum':best}),flush=True)
-        dist.barrier()
+        engine.eval()
+        best, row = select_epoch(engine, output, epoch, best, cfg['val_data_dir'], cfg['num_workers'])
+        history.append(row)
+        write_json(output/'epoch_metrics.json',history)
+        print(json.dumps({'epoch':epoch,'metrics':row['metrics'],'best_R1_sum':best}),flush=True)
+
 
 
 if __name__=='__main__':main()

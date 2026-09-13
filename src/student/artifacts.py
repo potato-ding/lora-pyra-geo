@@ -74,6 +74,9 @@ def resolved_config(cfg, steps_per_epoch=None):
     metadata.update(selection_metadata())
     require_u1652_eval_batch_size(cfg.get("u1652_eval_batch_size", U1652_EVAL_BATCH_SIZE))
     metadata.update(u1652_eval_batch_size=U1652_EVAL_BATCH_SIZE, validation_buffer_source="rank0")
+    if cfg.get("protocol_id") == "STU-1G-B32-R224-v1":
+        from .canonical_selection import evaluator_metadata
+        metadata.update(evaluator_metadata(), bn_protocol="single_rank_native_bn", cross_rank_buffer_sync=False, bn_buffer_broadcast_required=False)
     return dict(metadata, experiment_name=Path(cfg["output_dir"]).name,
         method=cfg["mode"], git_commit=commit, sealed_commit=expected or commit,
         source_sha256=source_identity(),
@@ -91,7 +94,7 @@ def resolved_config(cfg, steps_per_epoch=None):
         checkpoint_selection={"metric":"D2S_R1 + S2D_R1","rule":"strict_greater_than","dataset":"University-1652","split":"test","frequency":"every_epoch"},
         early_stop=False)
 
-def best_record(epoch, metrics):
+def best_record(epoch, metrics, canonical=False):
     score = float(metrics["D2S"]["R@1"] + metrics["S2D"]["R@1"])
     row = dict(best_epoch=epoch,best_score=score,selection_metric="D2S_R1 + S2D_R1",
                selection_rule="strict_greater_than",selection_dataset="University-1652")
@@ -102,6 +105,9 @@ def best_record(epoch, metrics):
             row[direction+"_"+target]=float(metrics[direction][source])
     if not all(math.isfinite(v) for v in row.values() if isinstance(v,(int,float))):
         raise ValueError("Nonfinite validation result")
+    if canonical:
+        from .canonical_selection import evaluator_metadata
+        row.update(evaluator_metadata())
     return row
 
 def validate_training_complete(run):
@@ -113,7 +119,7 @@ def validate_training_complete(run):
         raise ValueError("Complete thirty-epoch history required")
     best=json.loads((run/"best_metrics.json").read_text())
     expected=max(history,key=lambda row:row["metrics"]["D2S"]["R@1"]+row["metrics"]["S2D"]["R@1"])
-    if best != best_record(expected["epoch"],expected["metrics"]):
+    if best != best_record(expected["epoch"],expected["metrics"], canonical=cfg.get("protocol_id") == "STU-1G-B32-R224-v1"):
         raise ValueError("Best metadata violates first strict maximum selection")
     for name in ("best_model.pth","last_model.pth","train.log"):
         if not (run/name).is_file(): raise FileNotFoundError(run/name)

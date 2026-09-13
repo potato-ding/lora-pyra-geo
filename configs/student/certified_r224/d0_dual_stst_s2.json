@@ -1,7 +1,7 @@
 {
-  "mode": "baseline",
+  "mode": "dual_stst",
   "epochs": 30,
-  "seed": 0,
+  "seed": 2,
   "world_size": 1,
   "batch_size": 32,
   "cross_gpu_gather": false,
@@ -18,7 +18,7 @@
   "student_pretrained": "/home/dingyi/lora-pyra-geo/src/models/repvit/repvit_m1_5_distill_450e.pth",
   "train_data_dir": "/home/dingyi/lora-pyra-geo/data/U1652/train",
   "val_data_dir": "/home/dingyi/lora-pyra-geo/data/U1652",
-  "output_dir": "/home/dingyi/lora-pyra-geo/src/checkpoint/student/CERTIFIED_R224/B0-BASELINE-S0",
+  "output_dir": "/home/dingyi/lora-pyra-geo/src/checkpoint/student/CERTIFIED_R224/D0-DUAL-STST-S2",
   "student_pretrained_sha256": "d645a2de5481c9aac1639d0e97b04cd4bdb0df9d7347920b132dd0ed45de8b39",
   "checkpoint_selection_dataset": "University-1652",
   "checkpoint_selection_split": "test",
@@ -31,5 +31,10 @@
   "git_commit_policy": "resolve_and_verify_sealed_HEAD_at_launch",
   "protocol_id": "STU-1G-B32-R224-v1",
   "gpu_count": 1,
-  "u1652_eval_batch_size": 32
+  "u1652_eval_batch_size": 32,
+  "middle_checkpoint": "/home/dingyi/lora-pyra-geo/src/checkpoint/middle_teacher/CERTIFIED_R224/SAM-MABV2-RHO010-S0/best_model.pth",
+  "middle_config": "/home/dingyi/lora-pyra-geo/src/checkpoint/middle_teacher/CERTIFIED_R224/SAM-MABV2-RHO010-S0/run_config.json",
+  "stst_asset": "/home/dingyi/lora-pyra-geo/src/checkpoint/student/CERTIFIED_R224/STST_ASSETS/SAM-MABV2-RHO010-S0_train_shared_k32.pt",
+  "stst_weight": 0.2,
+  "stst_warmup_epochs": 5
 }

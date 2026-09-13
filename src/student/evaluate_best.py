@@ -12,6 +12,8 @@ NAMES={"u1652":("test_1652.json","test_1652_best.json"),
 def publish_result(run,dataset,payload,checkpoint_sha):
     run=Path(run)
     require_valid_run(run)
+    if payload.get("protocol",{}).get("audit_subset_only"):
+        raise ValueError("Audit subsets cannot issue formal results")
     if dataset=="u1652":
         require_u1652_eval_batch_size(payload.get("u1652_eval_batch_size"))
     if payload["model_type"]!="student" or Path(payload["checkpoint"]).resolve()!=run/"best_model.pth":
@@ -43,6 +45,14 @@ def main(argv=None):
     for dataset in datasets:
         if (run/NAMES[dataset][1]).exists():raise FileExistsError(run/NAMES[dataset][1])
     for dataset in datasets:
+        if dataset == "u1652":
+            from .canonical_selection import evaluate_checkpoint
+            config=json.loads((run/"run_config.json").read_text())
+            payload=evaluate_checkpoint(checkpoint,config.get("val_data_dir",str(ROOT/"data/U1652")),
+                                        args.num_workers,device=args.device)
+            if file_sha256(checkpoint)!=initial:raise RuntimeError("Checkpoint changed during evaluation")
+            publish_result(run,dataset,payload,initial)
+            continue
         with tempfile.TemporaryDirectory(prefix="student_formal_eval_") as temporary:
             unified_main(["--model-type","student","--checkpoint",str(checkpoint),
                 "--dataset",dataset,"--data-root",str(ROOT/"data"),"--device",args.device,"--batch-size",str(args.batch_size),
