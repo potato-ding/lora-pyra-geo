@@ -1,4 +1,4 @@
-"""Certified single-pass core. R0 defaults to no Teacher; KD is opt-in."""
+"""Matched Full-FT route using the certified R0 core and unchanged KD runtimes."""
 import argparse
 import json
 import math
@@ -84,45 +84,40 @@ def write_json(path, payload):
     temporary.replace(path)
 
 
-def main(allow_kd=False,allow_abv=False):
+def main(allow_kd=True,allow_abv=False):
     parser=argparse.ArgumentParser()
     parser.add_argument('--config',required=True)
-    parser.add_argument('--smoke-no-step',action='store_true')
+    parser.add_argument('--smoke-one-step',action='store_true')
     parser.add_argument('--expected-gpus',required=True)
     # DeepSpeed injects this legacy spelling for each worker.
     parser.add_argument('--local_rank','--local-rank',dest='local_rank',type=int,default=0)
     parser.add_argument('--teacher-checkpoint')
     parser.add_argument('--teacher-chunk-size',type=int,default=4)
     args=parser.parse_args()
+    assert allow_kd
+    assert os.environ.get('CUDA_VISIBLE_DEVICES')==args.expected_gpus
     if allow_abv:
         assert os.environ.get('CUDA_VISIBLE_DEVICES')==args.expected_gpus,'ABV physical GPU mapping mismatch'
     # Protect Teacher physical GPUs before initializing any CUDA context.
     gpu_ids=args.expected_gpus.split(',')
     assert len(gpu_ids)==2 and len(set(gpu_ids))==2 and all(g.isdigit() for g in gpu_ids)
     local_rank=initialize_distributed();config=load_config(args.config)
-    if allow_abv:
-        from src.middle_teacher.abv_runtime import validate_stage3
-        validate_stage3(config,validate_r0)
-    elif allow_kd:
-        from src.middle_teacher.historical_kd_runtime import validate_stage2
-        validate_stage2(config,validate_r0)
-    else:
-        validate_r0(config)
+    from src.middle_teacher.sam_mabv2_runtime import validate_sam,SAMMABV2Runtime,fingerprints,sam_iteration
+    validate_sam(config,validate_r0)
+    component=config['experiment']['name']
+    allow_abv=config['distillation'].get('adaptive_bridge_v2',{}).get('enabled',False)
     assert world_size()==2
     seed=int(config['seed'])
     random.seed(seed);np.random.seed(seed);torch.manual_seed(seed);torch.cuda.manual_seed_all(seed)
     output=Path(config['checkpoint']['output_dir'])
-    if not args.smoke_no_step:
+    if not args.smoke_one_step:
         if rank()==0:
             # Shell redirection may create train.log before rank 0 reaches
             # this guard; only formal checkpoint/epoch assets are protected.
             assert not any((output/n).exists() for n in ('best_model.pth','last_model.pth','epoch_metrics.json'))
             output.mkdir(parents=True,exist_ok=True)
         barrier()
-        if allow_abv and os.environ.get('ABV_EXTERNAL_TRAIN_LOG'):
-            assert Path(os.environ['ABV_EXTERNAL_TRAIN_LOG']).resolve()==(output/'train.log').resolve()
-        else:
-            setup_rank0_run_log(str(output),rank()==0)
+        assert Path(os.environ['SAM_MABV2_EXTERNAL_TRAIN_LOG']).resolve()==(output/'train.log').resolve()
     if allow_abv:
         from src.middle_teacher.abv_runtime import build_stage3_model
         model=build_stage3_model(config)
@@ -134,19 +129,15 @@ def main(allow_kd=False,allow_abv=False):
     expected=14327809 if config['trainability']['lora_blocks'] else 85669633
     if allow_abv:
         extra=sum(p.numel() for p in model.layer_semantic_projectors.parameters() if p.requires_grad)
-        assert sum(p.numel() for n,p in model.named_parameters() if p.requires_grad and not n.startswith('layer_semantic_projectors.'))==14327809
+        assert sum(p.numel() for n,p in model.named_parameters() if p.requires_grad and not n.startswith('layer_semantic_projectors.'))==85669633
         expected+=extra
     assert audit['trainable_params']==expected,(audit,expected)
     scheduler=warmup_cosine_scheduler(optimizer,11820,591)
     engine,optimizer,scheduler,ds=initialize_deepspeed(model,optimizer,scheduler,config)
     device=torch.device('cuda',local_rank)
     kd=None
-    if allow_abv or (allow_kd and any(config['distillation'].get(n,{}).get('enabled') for n in ('nrkd','margin'))):
-        from src.middle_teacher.historical_kd_runtime import HistoricalKDRuntime
-        runtime_class=HistoricalKDRuntime
-        if allow_abv:
-            from src.middle_teacher.abv_runtime import ABVRuntime
-            runtime_class=ABVRuntime
+    if True:
+        runtime_class=SAMMABV2Runtime
         assert args.teacher_chunk_size > 0
         # Building a frozen Teacher must not shift the R0 augmentation/dropout RNG.
         py_state=random.getstate();np_state=np.random.get_state()
@@ -157,7 +148,7 @@ def main(allow_kd=False,allow_abv=False):
         assert not any(id(p) in optimizer_ids for p in kd.teacher.parameters())
     _,loader=create_middle_teacher_train_dataset_and_loader(config)
     assert len(loader)==1182,len(loader)
-    controller=CheckpointController(output,objective='pair_infonce_hierarchical' if kd is None else 'pair_infonce_historical_retrieval_kd')
+    controller=CheckpointController(output,objective='pair_infonce_'+component)
     metadata={'experiment':config['experiment']['name'],'seed':seed,'img_size':224,'epochs':10,
         'code':{'branch':subprocess.check_output(['git','branch','--show-current'],text=True).strip(),
                 'commit_sha':subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),
@@ -168,24 +159,22 @@ def main(allow_kd=False,allow_abv=False):
                     'optimizer':config['optimizer'],'optimizer_groups':audit['optimizer_groups'],
                     'scheduler':config['scheduler'],'precision':config['precision'],'gather':True,
                     'gpu_ids':args.expected_gpus,'deepspeed':ds},
-        'objective':{'task_loss':'PairInfoNCE','KD':False,'SAM':False},
+        'objective':{'task_loss':'PairInfoNCE','KD':False,'SAM':True},
         'checkpoint_selection':{'dataset':'University-1652','criterion':'D2S_R1 + S2D_R1',
             'metric_core':'certified_unified','parameter_dtype':'bfloat16','descriptor_dtype':'float32','update_rule':'strict_greater_than'},
         'formal_test_status':{'u1652':'NOT_RUN','sues200':'NOT_RUN','gta_uav':'NOT_RUN'}}
-    if allow_abv:
-        from src.middle_teacher.abv_runtime import fingerprints
-        metadata['source_sha256']=fingerprints(args.config,kd.name)
-        metadata['model'].update(base_r0p_trainable_params=14327809,abv_extra_trainable_params=extra)
+    metadata['source_sha256']=fingerprints(args.config)
+    metadata['sam']=dict(config['sam'],teacher_forward_policy='RECOMPUTE_EACH_PASS',bridge_perturbed=True,logit_scale_perturbed=True,historical_source_sha256='5b1c2c9a40d16dc56b7e7466c3ce9f2773fb7739c417e422016d6eb475471739')
     if kd is not None:
         metadata['teacher']=dict(kd.audit,frozen=True,strict_load=True)
-        metadata['objective']=dict(task_loss='PairInfoNCE',KD=True,SAM=False,distillation=config['distillation'])
+        metadata['objective']=dict(task_loss='PairInfoNCE',KD=True,SAM=True,distillation=config['distillation'])
         print('KD_RUNTIME='+json.dumps(metadata),flush=True)
     else:
         print('R0_RUNTIME='+json.dumps(metadata),flush=True)
     rows=[];step=0
-    if not args.smoke_no_step and rank()==0:
+    if not args.smoke_one_step and rank()==0:
         write_json(output/'run_config.json',config)
-        if allow_abv:metadata['source_sha256'][str(output/'run_config.json')]=sha256(output/'run_config.json')
+        metadata['source_sha256'][str(output/'run_config.json')]=sha256(output/'run_config.json')
         write_json(output/'best_metrics.json',metadata);write_json(output/'epoch_metrics.json',rows)
     val_loaders=None
     for epoch in range(1,11):
@@ -194,71 +183,17 @@ def main(allow_kd=False,allow_abv=False):
         for batch_index,(drone,satellite,labels,pids) in enumerate(loader):
             images=torch.cat((drone,satellite),0).to(device=device,dtype=next(engine.module.parameters()).dtype)
             ids=torch.as_tensor(labels,device=device,dtype=torch.long)
-            if allow_abv:
-                hidden_output=engine(images,return_layer_features=True)
-                descriptor=hidden_output['final_descriptor']
-            else:
-                descriptor=engine(images)
-            assert descriptor.dtype==torch.float32 and tuple(descriptor.shape)==(32,768)
-            md=torch.cat(GatherLayer.apply(descriptor[:16]),0)
-            ms=torch.cat(GatherLayer.apply(descriptor[16:]),0)
-            global_ids=concat_all_gather(ids)
-            assert md.shape==ms.shape==(32,768) and global_ids.unique().numel()==32
-            loss,d2s,s2d=r0_pair_loss(md,ms,engine.module.logit_scale)
-            base_loss=loss
-            kd_stats={}
-            if allow_abv:
-                loss,kd_stats=kd.compose_hidden(loss,images,hidden_output,engine.module,step)
-            elif kd is not None:
-                loss,kd_stats=kd.compose(loss,md,ms,images,global_ids,step)
-            assert bool(torch.isfinite(loss)), 'nonfinite loss'
-            gradient_seen=[]
-            bridge_gradient_seen=[]
-            hooks=[]
-            if args.smoke_no_step:
-                def record_gradient(grad):
-                    gradient_seen.append(bool(torch.isfinite(grad).all() and grad.float().abs().sum()>0))
-                hooks=[p.register_hook(record_gradient) for p in engine.module.parameters() if p.requires_grad]
-                if allow_abv:
-                    def record_bridge_gradient(grad):
-                        bridge_gradient_seen.append(bool(torch.isfinite(grad).all() and grad.float().abs().sum()>0))
-                    hooks.extend(p.register_hook(record_bridge_gradient) for p in engine.module.layer_semantic_projectors.parameters() if p.requires_grad)
-            engine.backward(loss)
-            if args.smoke_no_step:
-                for hook in hooks:hook.remove()
-                assert any(gradient_seen),'no nonzero Middle gradient'
-                if allow_abv:
-                    assert bridge_gradient_seen and all(bridge_gradient_seen),'missing/nonfinite/zero ABV bridge gradient'
-                    kd_stats['bridge_gradient_present']=True
-                if kd is not None:
-                    assert all(p.grad is None and not p.requires_grad for p in kd.teacher.parameters())
-                    assert all(math.isfinite(v) for k,v in kd_stats.items() if k.endswith('_loss'))
-                    print('KD_SMOKE_RESULT='+json.dumps(dict(kd_stats,rank=rank(),pass_check=True,
-                        base_loss=float(base_loss.detach()),total_loss=float(loss.detach()),
-                        middle_gradient_present=True,teacher_grad_count=0,global_pool=32,
-                        peak_allocated=torch.cuda.max_memory_allocated(device),
-                        peak_reserved=torch.cuda.max_memory_reserved(device),
-                        strict_load=kd.audit,optimizer_step=False,scheduler_step=False,checkpoint_save=False)),flush=True)
-                assert all(p.dtype==torch.bfloat16 for p in engine.module.parameters() if p.is_floating_point())
-                assert md.dtype==ms.dtype==torch.float32
-                print('R0_SMOKE_RESULT='+json.dumps({'rank':rank(),'pass':True,'objective':'PairInfoNCE_ONLY' if kd is None else 'PairInfoNCE_HISTORICAL_KD',
-                    'trainable_params':audit['trainable_params'],'parent_sha256':parent_hash,
-                    'world_size':2,'local_pair_batch':16,'global_pool':32,'loss':float(loss.detach()),
-                    'loss_finite':True,'backward_pass':True,'optimizer_step':False,'scheduler_step':False,
-                    'checkpoint_save':False,'gpu_ids':args.expected_gpus,'seed':seed,
-                    'parameter_dtype':'bfloat16','descriptor_dtype':'float32'}),flush=True)
+            record,kd_stats=sam_iteration(engine,kd,images,ids,step,float(config['sam']['rho']),smoke=args.smoke_one_step)
+            step+=1
+            if args.smoke_one_step:
+                record.update(rank=rank(),pass_check=True,parameter_dtype=str(next(engine.module.parameters()).dtype),descriptor_dtype='float32',trainable_params=audit['trainable_params'],teacher_sha256=kd.audit['sha256'],P0_sha256=parent_hash,global_pool=32)
+                print('SAM_SMOKE_RESULT='+json.dumps(record),flush=True)
                 barrier();dist.destroy_process_group();return
-            engine.step();step+=1
-            with torch.no_grad():engine.module.logit_scale.clamp_(0,math.log(100))
-            running+=float(loss.detach())
-            if kd is not None:
-                for key,value in dict(kd_stats,base_loss=float(base_loss.detach())).items():
-                    if key.endswith('_loss'):component_sums[key]=component_sums.get(key,0.)+value
+            running+=record['SECOND_TOTAL']
+            for key,value in record.items():
+                if isinstance(value,(int,float)) and not isinstance(value,bool):component_sums[key]=component_sums.get(key,0.)+value
             if rank()==0 and (batch_index<3 or step%20==0):
-                if kd is not None:print('KD_COMPONENTS='+json.dumps(dict(kd_stats,step=step,base_loss=float(base_loss.detach()),total_loss=float(loss.detach()))),flush=True)
-                print('R0_OPTIMIZER_STEP='+json.dumps({'epoch':epoch,'step':step,'engine_global_steps':engine.global_steps,
-                    'loss':float(loss.detach()),'d2s':float(d2s.detach()),'s2d':float(s2d.detach()),
-                    'finite':True,'lr':[g['lr'] for g in optimizer.param_groups],'global_pool':32}),flush=True)
+                print('SAM_STEP='+json.dumps(dict(record,epoch=epoch,step=step,engine_global_steps=int(engine.global_steps),loss_finite=True,global_pool=32,learning_rates=[g['lr'] for g in optimizer.param_groups])),flush=True)
         barrier();engine.eval()
         if val_loaders is None:
             val_loaders=build_1652_val_dataloaders('data/U1652',[224,224],32,4)
@@ -269,7 +204,8 @@ def main(allow_kd=False,allow_abv=False):
             row={'epoch':epoch,'train_loss':running/len(loader),'learning_rate':[g['lr'] for g in optimizer.param_groups],
                  'R1_sum':metrics['R1_sum'],'is_best':improved}
             row.update({f'U1652_{k}':v for k,v in metrics.items() if k!='R1_sum'})
-            if kd is not None:row['loss_components']={k:v/len(loader) for k,v in component_sums.items()}
+            if kd is not None:row['sam_epoch_means']={k:v/len(loader) for k,v in component_sums.items()}
+            row.update(BASE_OPTIMIZER_STEP_COUNT=step,FIRST_BACKWARD_COUNT=step,SECOND_BACKWARD_COUNT=step,EPOCH_OPTIMIZER_STEPS=len(loader))
             if allow_abv:row['last_batch_abv_audit']=kd_stats['abv_audit']
             rows.append(row)
             metadata.update(best_epoch=controller.best_epoch,best_selection_metrics=controller.best_metrics,

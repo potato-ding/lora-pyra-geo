@@ -1,4 +1,4 @@
-"""Certified single-pass core. R0 defaults to no Teacher; KD is opt-in."""
+"""Matched Full-FT route using the certified R0 core and unchanged KD runtimes."""
 import argparse
 import json
 import math
@@ -84,7 +84,7 @@ def write_json(path, payload):
     temporary.replace(path)
 
 
-def main(allow_kd=False,allow_abv=False):
+def main(allow_kd=True,allow_abv=False):
     parser=argparse.ArgumentParser()
     parser.add_argument('--config',required=True)
     parser.add_argument('--smoke-no-step',action='store_true')
@@ -94,20 +94,18 @@ def main(allow_kd=False,allow_abv=False):
     parser.add_argument('--teacher-checkpoint')
     parser.add_argument('--teacher-chunk-size',type=int,default=4)
     args=parser.parse_args()
+    assert allow_kd
+    assert os.environ.get('CUDA_VISIBLE_DEVICES')==args.expected_gpus
     if allow_abv:
         assert os.environ.get('CUDA_VISIBLE_DEVICES')==args.expected_gpus,'ABV physical GPU mapping mismatch'
     # Protect Teacher physical GPUs before initializing any CUDA context.
     gpu_ids=args.expected_gpus.split(',')
     assert len(gpu_ids)==2 and len(set(gpu_ids))==2 and all(g.isdigit() for g in gpu_ids)
     local_rank=initialize_distributed();config=load_config(args.config)
-    if allow_abv:
-        from src.middle_teacher.abv_runtime import validate_stage3
-        validate_stage3(config,validate_r0)
-    elif allow_kd:
-        from src.middle_teacher.historical_kd_runtime import validate_stage2
-        validate_stage2(config,validate_r0)
-    else:
-        validate_r0(config)
+    from src.middle_teacher.fchain_runtime import validate_fchain,FChainRuntime,fingerprints
+    validate_fchain(config,validate_r0)
+    component=config['experiment']['name']
+    allow_abv=config['distillation'].get('adaptive_bridge_v2',{}).get('enabled',False)
     assert world_size()==2
     seed=int(config['seed'])
     random.seed(seed);np.random.seed(seed);torch.manual_seed(seed);torch.cuda.manual_seed_all(seed)
@@ -119,10 +117,7 @@ def main(allow_kd=False,allow_abv=False):
             assert not any((output/n).exists() for n in ('best_model.pth','last_model.pth','epoch_metrics.json'))
             output.mkdir(parents=True,exist_ok=True)
         barrier()
-        if allow_abv and os.environ.get('ABV_EXTERNAL_TRAIN_LOG'):
-            assert Path(os.environ['ABV_EXTERNAL_TRAIN_LOG']).resolve()==(output/'train.log').resolve()
-        else:
-            setup_rank0_run_log(str(output),rank()==0)
+        assert Path(os.environ['FCHAIN_EXTERNAL_TRAIN_LOG']).resolve()==(output/'train.log').resolve()
     if allow_abv:
         from src.middle_teacher.abv_runtime import build_stage3_model
         model=build_stage3_model(config)
@@ -134,19 +129,15 @@ def main(allow_kd=False,allow_abv=False):
     expected=14327809 if config['trainability']['lora_blocks'] else 85669633
     if allow_abv:
         extra=sum(p.numel() for p in model.layer_semantic_projectors.parameters() if p.requires_grad)
-        assert sum(p.numel() for n,p in model.named_parameters() if p.requires_grad and not n.startswith('layer_semantic_projectors.'))==14327809
+        assert sum(p.numel() for n,p in model.named_parameters() if p.requires_grad and not n.startswith('layer_semantic_projectors.'))==85669633
         expected+=extra
     assert audit['trainable_params']==expected,(audit,expected)
     scheduler=warmup_cosine_scheduler(optimizer,11820,591)
     engine,optimizer,scheduler,ds=initialize_deepspeed(model,optimizer,scheduler,config)
     device=torch.device('cuda',local_rank)
     kd=None
-    if allow_abv or (allow_kd and any(config['distillation'].get(n,{}).get('enabled') for n in ('nrkd','margin'))):
-        from src.middle_teacher.historical_kd_runtime import HistoricalKDRuntime
-        runtime_class=HistoricalKDRuntime
-        if allow_abv:
-            from src.middle_teacher.abv_runtime import ABVRuntime
-            runtime_class=ABVRuntime
+    if True:
+        runtime_class=FChainRuntime
         assert args.teacher_chunk_size > 0
         # Building a frozen Teacher must not shift the R0 augmentation/dropout RNG.
         py_state=random.getstate();np_state=np.random.get_state()
@@ -157,7 +148,7 @@ def main(allow_kd=False,allow_abv=False):
         assert not any(id(p) in optimizer_ids for p in kd.teacher.parameters())
     _,loader=create_middle_teacher_train_dataset_and_loader(config)
     assert len(loader)==1182,len(loader)
-    controller=CheckpointController(output,objective='pair_infonce_hierarchical' if kd is None else 'pair_infonce_historical_retrieval_kd')
+    controller=CheckpointController(output,objective='pair_infonce_'+component)
     metadata={'experiment':config['experiment']['name'],'seed':seed,'img_size':224,'epochs':10,
         'code':{'branch':subprocess.check_output(['git','branch','--show-current'],text=True).strip(),
                 'commit_sha':subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),
@@ -172,10 +163,7 @@ def main(allow_kd=False,allow_abv=False):
         'checkpoint_selection':{'dataset':'University-1652','criterion':'D2S_R1 + S2D_R1',
             'metric_core':'certified_unified','parameter_dtype':'bfloat16','descriptor_dtype':'float32','update_rule':'strict_greater_than'},
         'formal_test_status':{'u1652':'NOT_RUN','sues200':'NOT_RUN','gta_uav':'NOT_RUN'}}
-    if allow_abv:
-        from src.middle_teacher.abv_runtime import fingerprints
-        metadata['source_sha256']=fingerprints(args.config,kd.name)
-        metadata['model'].update(base_r0p_trainable_params=14327809,abv_extra_trainable_params=extra)
+    metadata['source_sha256']=fingerprints(args.config)
     if kd is not None:
         metadata['teacher']=dict(kd.audit,frozen=True,strict_load=True)
         metadata['objective']=dict(task_loss='PairInfoNCE',KD=True,SAM=False,distillation=config['distillation'])
@@ -185,7 +173,7 @@ def main(allow_kd=False,allow_abv=False):
     rows=[];step=0
     if not args.smoke_no_step and rank()==0:
         write_json(output/'run_config.json',config)
-        if allow_abv:metadata['source_sha256'][str(output/'run_config.json')]=sha256(output/'run_config.json')
+        metadata['source_sha256'][str(output/'run_config.json')]=sha256(output/'run_config.json')
         write_json(output/'best_metrics.json',metadata);write_json(output/'epoch_metrics.json',rows)
     val_loaders=None
     for epoch in range(1,11):
@@ -207,18 +195,27 @@ def main(allow_kd=False,allow_abv=False):
             loss,d2s,s2d=r0_pair_loss(md,ms,engine.module.logit_scale)
             base_loss=loss
             kd_stats={}
-            if allow_abv:
-                loss,kd_stats=kd.compose_hidden(loss,images,hidden_output,engine.module,step)
-            elif kd is not None:
-                loss,kd_stats=kd.compose(loss,md,ms,images,global_ids,step)
+            loss,kd_stats=kd.compose_all(loss,md,ms,images,global_ids,engine.module,step,hidden_output if allow_abv else None)
             assert bool(torch.isfinite(loss)), 'nonfinite loss'
             gradient_seen=[]
             bridge_gradient_seen=[]
             hooks=[]
             if args.smoke_no_step:
+                block_grads={i:{'parameter_count':0,'squared_norm':0.0,'finite':True} for i in range(12)}
+                def block_hook(index):
+                    def capture(grad):
+                        rec=block_grads[index];rec['parameter_count']+=1
+                        rec['finite']=rec['finite'] and bool(torch.isfinite(grad).all())
+                        rec['squared_norm']+=float(grad.detach().float().square().sum())
+                    return capture
+                import re
+                for name,param in engine.module.named_parameters():
+                    match=re.match(r'backbone.model.blocks\.(\d+)\.',name)
+                    if match and param.requires_grad:hooks.append(param.register_hook(block_hook(int(match[1]))))
+                teacher_versions={n:p._version for n,p in kd.teacher.named_parameters()}
                 def record_gradient(grad):
                     gradient_seen.append(bool(torch.isfinite(grad).all() and grad.float().abs().sum()>0))
-                hooks=[p.register_hook(record_gradient) for p in engine.module.parameters() if p.requires_grad]
+                hooks.extend(p.register_hook(record_gradient) for p in engine.module.parameters() if p.requires_grad)
                 if allow_abv:
                     def record_bridge_gradient(grad):
                         bridge_gradient_seen.append(bool(torch.isfinite(grad).all() and grad.float().abs().sum()>0))
@@ -227,6 +224,12 @@ def main(allow_kd=False,allow_abv=False):
             if args.smoke_no_step:
                 for hook in hooks:hook.remove()
                 assert any(gradient_seen),'no nonzero Middle gradient'
+                coverage=all(v['parameter_count']>0 and v['finite'] and v['squared_norm']>0 for v in block_grads.values())
+                assert coverage,block_grads
+                assert teacher_versions=={n:p._version for n,p in kd.teacher.named_parameters()}
+                kd_stats['full_ft_gradient_coverage_pass']=coverage
+                kd_stats['block_gradients']={str(i):dict(grad_parameter_count=v['parameter_count'],grad_norm=math.sqrt(v['squared_norm']),finite=v['finite']) for i,v in block_grads.items()}
+                kd_stats['teacher_parameter_versions_unchanged']=True
                 if allow_abv:
                     assert bridge_gradient_seen and all(bridge_gradient_seen),'missing/nonfinite/zero ABV bridge gradient'
                     kd_stats['bridge_gradient_present']=True
@@ -253,7 +256,7 @@ def main(allow_kd=False,allow_abv=False):
             running+=float(loss.detach())
             if kd is not None:
                 for key,value in dict(kd_stats,base_loss=float(base_loss.detach())).items():
-                    if key.endswith('_loss'):component_sums[key]=component_sums.get(key,0.)+value
+                    if key.endswith(('_loss','_effective_weight','_to_infonce_ratio')):component_sums[key]=component_sums.get(key,0.)+value
             if rank()==0 and (batch_index<3 or step%20==0):
                 if kd is not None:print('KD_COMPONENTS='+json.dumps(dict(kd_stats,step=step,base_loss=float(base_loss.detach()),total_loss=float(loss.detach()))),flush=True)
                 print('R0_OPTIMIZER_STEP='+json.dumps({'epoch':epoch,'step':step,'engine_global_steps':engine.global_steps,
