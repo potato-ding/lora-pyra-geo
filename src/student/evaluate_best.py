@@ -3,7 +3,7 @@ import argparse
 import json
 from pathlib import Path
 import tempfile
-from .artifacts import file_sha256,write_json,package_results,validate_training_complete,ROOT
+from .artifacts import file_sha256,write_json,package_results,validate_training_complete,ROOT,U1652_EVAL_BATCH_SIZE,require_u1652_eval_batch_size,require_valid_run
 
 NAMES={"u1652":("test_1652.json","test_1652_best.json"),
        "sues200":("test_sues200.json","test_sues200_all_best.json"),
@@ -11,6 +11,9 @@ NAMES={"u1652":("test_1652.json","test_1652_best.json"),
 
 def publish_result(run,dataset,payload,checkpoint_sha):
     run=Path(run)
+    require_valid_run(run)
+    if dataset=="u1652":
+        require_u1652_eval_batch_size(payload.get("u1652_eval_batch_size"))
     if payload["model_type"]!="student" or Path(payload["checkpoint"]).resolve()!=run/"best_model.pth":
         raise ValueError("Only Student best checkpoint results accepted")
     destination=run/NAMES[dataset][1]
@@ -24,10 +27,12 @@ def main(argv=None):
     p.add_argument("--run-dir",required=True)
     p.add_argument("--dataset",choices=["u1652","sues200","gta","all"],default="all")
     p.add_argument("--device",default="cuda")
-    p.add_argument("--batch-size",type=int,default=32)
+    p.add_argument("--batch-size",type=int,default=U1652_EVAL_BATCH_SIZE)
     p.add_argument("--num-workers",type=int,default=8)
     p.add_argument("--package-only",action="store_true")
     args=p.parse_args(argv)
+    if args.dataset in ("u1652","all") and not args.package_only:
+        require_u1652_eval_batch_size(args.batch_size)
     run=Path(args.run_dir).resolve()
     validate_training_complete(run)
     if args.package_only:

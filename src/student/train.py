@@ -10,7 +10,7 @@ import torch.distributed as dist
 from torch import nn
 
 from .model import StudentModel
-from .artifacts import deployment_state_dict, file_sha256, resolved_config, write_json, best_record, selection_metadata
+from .artifacts import deployment_state_dict, file_sha256, resolved_config, write_json, best_record, selection_metadata, U1652_EVAL_BATCH_SIZE
 from .data import create_student_train_dataset_and_loader
 from .objective import PairInfoNCE
 from .optimizer import build_student_optimizer
@@ -68,6 +68,45 @@ def deepspeed_config():
         'bf16':{'enabled':True},'fp16':{'enabled':False},'gradient_clipping':0.0,'steps_per_print':1000000}
 
 
+@torch.no_grad()
+def sync_student_buffers_from_rank0(student):
+    """Choose rank0 buffers before validation; never synchronize parameters here."""
+    if not dist.is_available() or not dist.is_initialized() or dist.get_world_size() <= 1:
+        return
+    for buffer in student.buffers():
+        dist.broadcast(buffer, src=0)
+    dist.barrier()
+
+
+@torch.no_grad()
+def assert_student_validation_state_synced(student, epoch):
+    """Fail collectively before selection if parameters or buffers diverge."""
+    distributed = dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
+    maxima = {}
+    for name, tensors in (("parameter", student.parameters()), ("buffer", student.buffers())):
+        groups = {}
+        for tensor in tensors:
+            groups.setdefault((tensor.device, tensor.dtype), []).append(tensor.detach().reshape(-1))
+        maximum = 0.0
+        for values in groups.values():
+            local = torch.cat(values)
+            low, high = local.clone(), local.clone()
+            if distributed:
+                dist.all_reduce(low, op=dist.ReduceOp.MIN)
+                dist.all_reduce(high, op=dist.ReduceOp.MAX)
+            difference = (high.double() - low.double()).abs()
+            if not torch.isfinite(difference).all():
+                raise RuntimeError("Nonfinite Student validation " + name + " state")
+            maximum = max(maximum, difference.max().item() if difference.numel() else 0.0)
+        maxima[name + "_rank_max_diff"] = maximum
+    if any(value != 0 for value in maxima.values()):
+        raise RuntimeError("Student validation state differs across ranks: " + repr(maxima))
+    record = dict(epoch=epoch, buffers_synced=True, canonical_buffer_source="rank0", **maxima)
+    if not distributed or dist.get_rank() == 0:
+        print("[ValidationState] " + json.dumps(record), flush=True)
+    return record
+
+
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config',required=True)
@@ -97,7 +136,7 @@ def main():
     _seed_all(cfg['seed']);args=SimpleNamespace(**cfg)
     train_loader=create_student_train_dataset_and_loader(args)
     train_loader.worker_init_fn=_seed_stst_worker
-    val=build_1652_val_dataloaders(data_dir=cfg['val_data_dir'],img_size=[224,224],batch_size=32,num_workers=cfg['num_workers'])
+    val=build_1652_val_dataloaders(data_dir=cfg['val_data_dir'],img_size=[224,224],batch_size=U1652_EVAL_BATCH_SIZE,num_workers=cfg['num_workers'])
     student=StudentModel(temperature=cfg['temperature'],ckpt_path=cfg['student_pretrained']).to(device)
     teacher=None;supervision=None
     if cfg['mode']=='dual_stst':
@@ -132,6 +171,8 @@ def main():
             engine.backward(loss);engine.step()
             if dist.get_rank()==0 and step%200==0:
                 print(json.dumps({'epoch':epoch,'step':step,'loss':float(loss.detach()),'loss_finite':bool(torch.isfinite(loss)),'nan_loss_count':int(torch.isnan(loss)),'inf_loss_count':int(torch.isinf(loss)),**{k:float(v) for k,v in components.items()}}),flush=True)
+        sync_student_buffers_from_rank0(engine.module.student)
+        assert_student_validation_state_synced(engine.module.student, epoch)
         engine.eval();metrics={}
         for direction,pair in val.items():
             r1,r5,_,ap=getdist_1652_val_and_get_recall(engine.module.student,*pair,device)

@@ -51,7 +51,7 @@ def test_slim_archive_allowlist_and_actual_external_hash(tmp_path):
 
 def test_result_identity_and_no_overwrite(tmp_path):
     run,_=fixture_run(tmp_path)
-    payload=dict(model_type="student",checkpoint=str(run/"last_model.pth"))
+    payload=dict(model_type="student",checkpoint=str(run/"last_model.pth"),u1652_eval_batch_size=32)
     with pytest.raises(ValueError):publish_result(run,"u1652",payload,"fixture")
     payload["checkpoint"]=str(run/"best_model.pth")
     target=publish_result(run,"u1652",payload,"fixture")

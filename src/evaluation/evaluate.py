@@ -21,11 +21,20 @@ def parse_args(argv=None):
     p.add_argument('--certification-only',action='store_true',help='Extract once and compare independent metrics, without issuing formal results')
     p.add_argument('--feature-cache-dir',help='Explicit certification cache directory, not included in result packages')
     p.add_argument('--reuse-certified-cache',action='store_true',help='Formal metrics from hash-verified previously certified descriptors')
-    return p.parse_args(argv)
+    args=p.parse_args(argv)
+    if args.model_type=="student" and args.dataset in ("u1652","all"):
+        from src.student.artifacts import require_u1652_eval_batch_size
+        require_u1652_eval_batch_size(args.batch_size)
+        if args.reuse_certified_cache:
+            raise ValueError("Student U1652 requires fresh batch=32 extraction; cached batch provenance is unavailable")
+    return args
 
 @torch.no_grad()
 def main(argv=None):
     args=parse_args(argv);device=torch.device(args.device)
+    if args.model_type=="student":
+        from src.student.artifacts import require_valid_run
+        require_valid_run(Path(args.checkpoint).resolve().parent)
     model,load_audit=load_encoder(args.model_type,args.checkpoint,args.config,device)
     output=Path(args.output_dir);output.mkdir(parents=True,exist_ok=True)
     (output/'checkpoint_load.json').write_text(json.dumps(load_audit,indent=2))
@@ -86,6 +95,8 @@ def main(argv=None):
         payload={'model_type':args.model_type,'checkpoint':str(Path(args.checkpoint).resolve()),'dataset':dataset,
                  'protocol':protocol,'descriptor':{'dim':model.descriptor_dim,'normalized':True,'dtype':'float32'},
                  'runtime_precision':load_audit['runtime_precision'],'results':results}
+        if args.model_type=="student" and dataset=="u1652":
+            payload["u1652_eval_batch_size"]=args.batch_size
         if not args.certification_only:
             (output/name).write_text(json.dumps(payload,indent=2)+'\n');print(json.dumps(payload),flush=True)
     if args.certification_only:

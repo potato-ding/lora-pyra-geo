@@ -10,6 +10,19 @@ import tarfile
 
 ROOT = Path(__file__).resolve().parents[2]
 RESULT_FILES = ("test_1652_best.json", "test_sues200_all_best.json", "test_gta_cross_area_d2s_best.json")
+U1652_EVAL_BATCH_SIZE = 32
+
+
+def require_u1652_eval_batch_size(batch_size):
+    if batch_size != U1652_EVAL_BATCH_SIZE:
+        raise ValueError("Canonical Student U1652 evaluation requires batch_size=32")
+
+
+def require_valid_run(run):
+    if (Path(run) / "INVALIDATED.json").exists():
+        raise ValueError("INVALIDATED Student run cannot issue formal results: " + str(run))
+
+
 SLIM_FILES = ("train.log", "run_config.json", "best_metrics.json", "epoch_metrics.json") + RESULT_FILES
 
 def file_sha256(path):
@@ -59,6 +72,8 @@ def resolved_config(cfg, steps_per_epoch=None):
         raise RuntimeError("HEAD changed after sealed launch")
     metadata=dict(cfg)
     metadata.update(selection_metadata())
+    require_u1652_eval_batch_size(cfg.get("u1652_eval_batch_size", U1652_EVAL_BATCH_SIZE))
+    metadata.update(u1652_eval_batch_size=U1652_EVAL_BATCH_SIZE, validation_buffer_source="rank0")
     return dict(metadata, experiment_name=Path(cfg["output_dir"]).name,
         method=cfg["mode"], git_commit=commit, sealed_commit=expected or commit,
         source_sha256=source_identity(),
@@ -81,6 +96,7 @@ def best_record(epoch, metrics):
     row = dict(best_epoch=epoch,best_score=score,selection_metric="D2S_R1 + S2D_R1",
                selection_rule="strict_greater_than",selection_dataset="University-1652")
     row.update(selection_metadata())
+    row["u1652_eval_batch_size"] = U1652_EVAL_BATCH_SIZE
     for direction in ("D2S","S2D"):
         for source,target in (("R@1","R1"),("R@5","R5"),("AP","AP")):
             row[direction+"_"+target]=float(metrics[direction][source])
@@ -89,6 +105,7 @@ def best_record(epoch, metrics):
     return row
 
 def validate_training_complete(run):
+    require_valid_run(run)
     run=Path(run)
     cfg=json.loads((run/"run_config.json").read_text())
     history=json.loads((run/"epoch_metrics.json").read_text())
