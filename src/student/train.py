@@ -57,9 +57,11 @@ def batch_loss(engine,teacher,images,local_pairs,criterion,cfg,epoch):
     from .dual_stst import stst_total_loss
     with torch.no_grad():
         teacher_descriptor=teacher(images.to(dtype=torch.bfloat16)).detach().float()
-    kd,_=engine.module.stst(descriptor.float(),teacher_descriptor,local_pairs)
+    kd,kd_audit=engine.module.stst(descriptor.float(),teacher_descriptor,local_pairs)
     total,weight=stst_total_loss(info,kd,cfg['stst_weight'],epoch,cfg['stst_warmup_epochs'])
-    return total,{'infonce':info.detach(),'dual_stst':kd.detach(),'effective_weight':weight}
+    return total,{'infonce':info.detach(),'top32_loss':kd_audit['top_loss'].detach(),
+                  'random32_loss':kd_audit['random_loss'].detach(),'dual_stst':kd.detach(),
+                  'weighted_stst_loss':(weight*kd).detach(),'effective_weight':weight}
 
 
 def deepspeed_config():
@@ -147,6 +149,10 @@ def main():
         if any(p.requires_grad for p in teacher.parameters()):raise RuntimeError('Middle must be frozen')
     model=StudentTrainingModel(student,supervision).to(device)
     optimizer=build_student_optimizer(model,lr=cfg['lr'],weight_decay=cfg['weight_decay'])
+    if teacher is not None:
+        teacher_ids={id(p) for p in teacher.parameters()}
+        if teacher.training or any(p.requires_grad for p in teacher.parameters()) or any(id(p) in teacher_ids for group in optimizer.param_groups for p in group['params']):
+            raise RuntimeError('Teacher must remain eval/frozen and outside the optimizer')
     scheduler=build_student_scheduler(optimizer,args,steps_per_epoch=len(train_loader))
     ds=deepspeed_config()
     engine,_,_,_=deepspeed.initialize(model=model,optimizer=optimizer,lr_scheduler=scheduler,config=ds)

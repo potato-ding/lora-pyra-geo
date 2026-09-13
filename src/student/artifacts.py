@@ -65,6 +65,22 @@ def source_identity():
         "scripts/train_student.sh", "scripts/train_student_certified.sh"))
     return {str(p.relative_to(ROOT)):file_sha256(p) for p in sorted(paths)}
 
+def dual_stst_metadata(cfg):
+    # Bind D0 metadata to the actual validated train-only bank and Teacher.
+    from .dual_stst import load_stst_asset
+    teacher_sha = file_sha256(cfg["middle_checkpoint"])
+    bank = load_stst_asset(cfg["stst_asset"], teacher_sha)
+    if bank["metadata"].get("train_rows") != 1402:
+        raise ValueError("Original Dual-STST requires 1402 train rows")
+    return dict(middle_teacher_run=Path(cfg["middle_checkpoint"]).parent.name,
+                middle_teacher_checkpoint=str(Path(cfg["middle_checkpoint"]).resolve()),
+                middle_teacher_sha256=teacher_sha, middle_teacher_descriptor_dim=768,
+                stst_asset_path=str(Path(cfg["stst_asset"]).resolve()),
+                stst_asset_sha256=file_sha256(cfg["stst_asset"]),
+                top_dim=32, random_dim=32, random_seed=bank["metadata"]["random_seed"],
+                teacher_frozen=True, teacher_trainable_params=0)
+
+
 def resolved_config(cfg, steps_per_epoch=None):
     commit = subprocess.check_output(["git","rev-parse","HEAD"], cwd=ROOT, text=True).strip()
     expected=os.environ.get("STUDENT_SEALED_COMMIT")
@@ -72,6 +88,8 @@ def resolved_config(cfg, steps_per_epoch=None):
         raise RuntimeError("HEAD changed after sealed launch")
     metadata=dict(cfg)
     metadata.update(selection_metadata())
+    if cfg["mode"] == "dual_stst":
+        metadata.update(dual_stst_metadata(cfg))
     require_u1652_eval_batch_size(cfg.get("u1652_eval_batch_size", U1652_EVAL_BATCH_SIZE))
     metadata.update(u1652_eval_batch_size=U1652_EVAL_BATCH_SIZE, validation_buffer_source="rank0")
     if cfg.get("protocol_id") == "STU-1G-B32-R224-v1":

@@ -27,7 +27,7 @@
   "checkpoint_selection_frequency": "every_epoch",
   "SUES_USED_FOR_SELECTION": false,
   "GTA_USED_FOR_SELECTION": false,
-  "sealed_provenance_file": "/home/dingyi/lora-pyra-geo/src/checkpoint/student/CERTIFIED_R224/_PREFLIGHT/STU_1G_B32_R224_V1_SOURCE_SEAL.json",
+  "sealed_provenance_file": "/home/dingyi/lora-pyra-geo/src/checkpoint/student/CERTIFIED_R224/_PREFLIGHT/D0_ORIGINAL_SOURCE_SEAL.json",
   "git_commit_policy": "resolve_and_verify_sealed_HEAD_at_launch",
   "protocol_id": "STU-1G-B32-R224-v1",
   "gpu_count": 1,
