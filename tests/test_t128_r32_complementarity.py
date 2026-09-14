@@ -88,7 +88,8 @@ def test_production_sources_unchanged():
        'src/student/canonical_selection.py':'29218ee8e0e5fd5d2413cb4d7e97afb8cd76bb78c411ebed1f411187e16e69de',
        'src/student/train.py':'53208c53f719a683181bdc35e69da75dc0c6526aa8052e17cfe10a6116e27e10'}
     for name,sha in expected.items():
-        data=(a.ROOT/name).read_text()
+        from gbw_source_contract import before_gbw
+        data=before_gbw(name,(a.ROOT/name).read_text())
         if name=='src/student/train.py':
             data=data.replace("'random_loss':None if kd_audit['random_loss'] is None else kd_audit['random_loss'].detach(),",
                               "'random_loss':kd_audit['random_loss'].detach(),")

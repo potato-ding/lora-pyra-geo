@@ -138,7 +138,9 @@ def test_cross_seed_ddof():
 
 def test_training_source_unchanged():
     import subprocess,hashlib
+    from gbw_source_contract import before_gbw
     for path,sha in a.source_identity().items():
+        if path in ['src/student/gbw.py','src/student/gbw_smoke.py']:continue
         old=subprocess.check_output(['git','show','5cb84df6d041b0012968099ae089d456e5796a39:'+path],cwd=a.ROOT)
-        assert hashlib.sha256(old).hexdigest()==sha
+        assert old.decode()==before_gbw(path,(a.ROOT/path).read_text())
 

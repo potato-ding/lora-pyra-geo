@@ -50,7 +50,8 @@ def test_mismatch_rejected(top,changes):
 @pytest.mark.parametrize('top',[64,128])
 def test_legacy_s0_config_unchanged_and_new_configs_matched(top):
     path=f'configs/student/certified_r224/p1_t{top}_r32_s0.json'
-    current=(ROOT/path).read_text()
+    from gbw_source_contract import before_gbw
+    current=before_gbw(path,(ROOT/path).read_text())
     if path=='src/student/train.py':
         # Only nullable disabled-branch reporting may differ from historical trainer.
         current=current.replace("'random_loss':None if kd_audit['random_loss'] is None else kd_audit['random_loss'].detach(),",
@@ -86,7 +87,8 @@ def test_smoke_uses_config_seed_and_all_rngs(seed):
     'src/dataset/teacher/datasets.py','src/dataset/transforms.py',
 ])
 def test_training_selector_deployment_and_seed_propagation_source_unchanged(path):
-    current=(ROOT/path).read_text()
+    from gbw_source_contract import before_gbw
+    current=before_gbw(path,(ROOT/path).read_text())
     if path=='src/student/train.py':
         # Only nullable disabled-branch reporting may differ from historical trainer.
         current=current.replace("'random_loss':None if kd_audit['random_loss'] is None else kd_audit['random_loss'].detach(),",

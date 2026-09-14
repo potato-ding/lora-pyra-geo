@@ -61,12 +61,18 @@ def batch_loss(engine,teacher,images,local_pairs,criterion,cfg,epoch):
     with torch.no_grad():
         teacher_descriptor=teacher(images.to(dtype=torch.bfloat16)).detach().float()
     kd,kd_audit=engine.module.stst(descriptor.float(),teacher_descriptor,local_pairs)
+    gbw_metrics={}
+    if cfg.get('part') == 'Part-I':
+        from .gbw import apply_branch_coefficients
+        kd,gbw_metrics=apply_branch_coefficients(cfg,kd,kd_audit)
     total,weight=stst_total_loss(info,kd,cfg['stst_weight'],epoch,cfg['stst_warmup_epochs'])
     if cfg.get('part') == 'Part-I':
         metrics={'infonce':info.detach(),'top_loss':kd_audit['top_loss'].detach(),
             'random_loss':None if kd_audit['random_loss'] is None else kd_audit['random_loss'].detach(),'dual_stst':kd.detach(),
             'weighted_stst_loss':(weight*kd).detach(),'effective_weight':weight,
             'teacher_grad_count':sum(p.grad is not None for p in teacher.parameters())}
+        if gbw_metrics:
+            metrics.update(gbw_metrics,retrieval_loss=info.detach(),total_loss=total.detach())
         for key in ('random_A_loss','random_B_loss'):
             if key in kd_audit: metrics[key]=kd_audit[key].detach()
         return total,metrics
