@@ -42,19 +42,30 @@ def compatibility(cfg,student_descriptor,teacher_descriptor,info):
                 real_train_pair_batch=32,head_storage='bfloat16',projection_dtype='float32')
 
 
+def seed_smoke_runtime(cfg):
+    """Use the same configured seed entry point as formal Student training."""
+    seed=cfg['seed']
+    if type(seed) is not int or seed not in (0,1,2):
+        raise ValueError('Invalid smoke seed')
+    _seed_all(seed)
+    assert torch.initial_seed()==seed
+    return seed
+
+
 def main():
     p=argparse.ArgumentParser(description=__doc__);p.add_argument('--config',required=True)
     args=p.parse_args();cfg=load_config(args.config)
     root=Path(__file__).resolve().parents[2]
-    out=root/'src/checkpoint/student/CERTIFIED_R224/_PREFLIGHT/P1_ROUND1'/cfg['part1_variant']
+    out=root/'src/checkpoint/student/CERTIFIED_R224/_PREFLIGHT/P1_TOP_BANDWIDTH_3SEED/SMOKES'/Path(cfg['output_dir']).name
     if out.exists() and any(out.iterdir()): raise FileExistsError(out)
-    out.mkdir(exist_ok=True)
+    out.mkdir(parents=True,exist_ok=True)
     import deepspeed
     from deepspeed.utils import safe_get_full_grad
     from src.evaluation.model_loader import load_encoder
     torch.cuda.set_device(0);torch.set_num_threads(4);deepspeed.init_distributed(dist_backend='nccl')
     assert dist.get_world_size()==1
-    device=torch.device('cuda:0');_seed_all(0)
+    device=torch.device('cuda:0');runtime_seed=seed_smoke_runtime(cfg)
+    print('SMOKE_RUNTIME_SEED='+str(runtime_seed),flush=True)
     metadata=part1_metadata(cfg)
     protected={k:file_sha256(cfg[k]) for k in ['middle_checkpoint','stst_asset','original_stst_asset','student_pretrained']}
     loader=create_student_train_dataset_and_loader(SimpleNamespace(**cfg));loader.worker_init_fn=_seed_stst_worker
@@ -122,7 +133,7 @@ def main():
     assert set(state)==set(student.state_dict())
     assert sum(p.numel() for p in student.parameters())==13617409
     assert all(file_sha256(cfg[k])==v for k,v in protected.items())
-    report=dict(SMOKE_PASS=True,config=cfg,metadata=metadata,teacher_strict_load=teacher_audit,steps=rows,
+    report=dict(SMOKE_PASS=True,runtime_seed=runtime_seed,config=cfg,metadata=metadata,teacher_strict_load=teacher_audit,steps=rows,
         PEAK_VRAM_GIB=torch.cuda.max_memory_allocated()/2**30,PEAK_RESERVED_GIB=torch.cuda.max_memory_reserved()/2**30,
         STEP_TIME=sum(r['step_time_seconds'] for r in rows[1:])/2,shapes=shapes,teacher_frozen=True,teacher_grad=0,
         target_shapes=dict(top=list(top_target[0].shape),random=list(random_target[0].shape),

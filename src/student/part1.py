@@ -152,7 +152,18 @@ def validate_part1_config(cfg):
     key=cfg.get('part1_variant')
     if key not in VARIANTS: raise ValueError('Unknown Part-I variant')
     top,layout,name=VARIANTS[key]
-    expected=dict(part='Part-I',round=1,research_axis='knowledge_interface',seed=0,
+    seed=cfg.get('seed')
+    if type(seed) is not int or seed not in (0,1,2):
+        raise ValueError('Part-I seed must be an integer in {0,1,2}')
+    # Only the approved Top bandwidth axis gains additional certified seeds.
+    if layout != 'single32' and seed != 0:
+        raise ValueError('Additional Random organization seeds are not certified')
+    name=name.rsplit('-S',1)[0]+f'-S{seed}'
+    # Historical S0 input configs omit this field; their resolved name is unchanged.
+    experiment_name=cfg.get('experiment_name',name if seed == 0 else None)
+    if experiment_name != name:
+        raise ValueError('Part-I experiment name/seed mismatch')
+    expected=dict(part='Part-I',round=1,research_axis='knowledge_interface',
                   top_dim=top,random_layout=layout,random_total_dim=32 if layout=='single32' else 64,
                   stst_weight=.2,stst_warmup_epochs=5)
     if any(cfg.get(k)!=v for k,v in expected.items()): raise ValueError('Part-I fixed config mismatch')
