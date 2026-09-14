@@ -5,7 +5,9 @@ from torch import nn
 import torch.nn.functional as F
 from .dual_stst import DualSTSTSupervision, file_sha256, load_stst_asset
 
-VARIANTS = {'p1_t64_r32_s0': (64, 'single32', 'P1-T64-R32-S0'),
+VARIANTS = {'p1_t128_r0_s0': (128, 'disabled', 'P1-T128-R0-S0'),
+            'p1_t128_r64_s0': (128, 'single64', 'P1-T128-R64-S0'),
+            'p1_t64_r32_s0': (64, 'single32', 'P1-T64-R32-S0'),
             'p1_t128_r32_s0': (128, 'single32', 'P1-T128-R32-S0'),
             'p1_t32_r64_s0': (32, 'single64', 'P1-T32-R64-S0'),
             'p1_t32_r2x32_s0': (32, 'two32', 'P1-T32-R2X32-S0')}
@@ -100,14 +102,14 @@ class BandProjector(nn.Module):
 class PartISupervision(DualSTSTSupervision):
     """Same two semantic branches; two32 averages its two Random losses."""
     def __init__(self,asset_path,original_path,teacher_sha,top_dim,random_layout):
-        if top_dim not in [32,64,128] or random_layout not in ['single32','single64','two32']:
+        if top_dim not in [32,64,128] or random_layout not in ['disabled','single32','single64','two32']:
             raise ValueError('Unsupported fixed Part-I interface')
         # Preserve the exact D0 constructor RNG consumption and A/Top32 initial rows.
         super().__init__(original_path,expected_teacher_sha256=teacher_sha)
         asset=load_extended_asset(asset_path,original_path,teacher_sha)
         self.asset_path=str(Path(asset_path).resolve());self.asset_sha256=file_sha256(asset_path)
         self.metadata=asset['metadata'];self.top_dim=top_dim;self.random_layout=random_layout
-        self.random_total_dim=32 if random_layout=='single32' else 64
+        self.random_total_dim=0 if random_layout=='disabled' else (32 if random_layout=='single32' else 64)
         old_top=self.projector_top;old_random=self.projector_random
         with torch.random.fork_rng(devices=[]):
             torch.manual_seed(20260914)
@@ -127,11 +129,40 @@ class PartISupervision(DualSTSTSupervision):
         self.top32_basis=asset['top128_basis'][:,:top_dim].clone()
         self.random32_basis=asset['random64_basis' if random_layout=='single64' else 'random32_A'].clone()
         self.register_buffer('random_b_basis',asset['random32_B'].clone(),persistent=False)
+        if random_layout=='disabled':
+            # Consume the historical constructor RNG identically, then remove the
+            # transient Random head before optimizer construction or any forward.
+            del self.projector_random
+
+    @torch.no_grad()
+    def teacher_targets(self,descriptor):
+        if self.random_layout!='disabled':
+            return super().teacher_targets(descriptor)
+        if self.teacher_mean.dtype!=torch.float32 or self.top32_basis.dtype!=torch.float32:
+            raise RuntimeError('Part-I targets require FP32 mean/basis')
+        raw=(descriptor.detach().float()-self.teacher_mean)@self.top32_basis
+        if raw.dtype!=torch.float32:raise RuntimeError('Part-I projection requires FP32')
+        return (F.normalize(raw,dim=-1).detach(),raw.detach()),None
+
     def _apply(self,fn):
         super()._apply(fn)
         if hasattr(self,'random_b_basis'): self.random_b_basis=self.random_b_basis.float()
         return self
     def forward(self,student_descriptor,teacher_descriptor,pair_batch_size):
+        if self.random_layout=='disabled':
+            if student_descriptor.shape[0]!=2*pair_batch_size or teacher_descriptor.shape[0]!=student_descriptor.shape[0]:
+                raise ValueError('Part-I expects concatenated matching paired batches')
+            prediction,raw=self.projector_top(student_descriptor.float())
+            (target,target_raw),unused=self.teacher_targets(teacher_descriptor)
+            top=self._branch_loss(prediction,target,pair_batch_size)
+            loss=top[0]
+            if not torch.isfinite(loss):raise FloatingPointError('Nonfinite Part-I Top loss')
+            return loss,dict(loss_total=loss,top_loss=loss,top_drone_loss=top[1],
+                top_satellite_loss=top[2],random_loss=None,random_branch_active=False,
+                random_loss_aggregation='disabled',top_dim=self.top_dim,
+                random_layout='disabled',random_total_dim=0,
+                top_target_shape=tuple(target.shape),random_target_shape=None,
+                teacher_targets_detached=not target.requires_grad,loss_dtype=loss.dtype)
         dual,audit=super().forward(student_descriptor,teacher_descriptor,pair_batch_size)
         audit.update(top_dim=self.top_dim,random_layout=self.random_layout,random_total_dim=self.random_total_dim)
         if self.random_layout=='two32':
@@ -164,7 +195,7 @@ def validate_part1_config(cfg):
     if experiment_name != name:
         raise ValueError('Part-I experiment name/seed mismatch')
     expected=dict(part='Part-I',round=1,research_axis='knowledge_interface',
-                  top_dim=top,random_layout=layout,random_total_dim=32 if layout=='single32' else 64,
+                  top_dim=top,random_layout=layout,random_total_dim=0 if layout=='disabled' else (32 if layout=='single32' else 64),
                   stst_weight=.2,stst_warmup_epochs=5)
     if any(cfg.get(k)!=v for k,v in expected.items()): raise ValueError('Part-I fixed config mismatch')
     if Path(cfg['output_dir']).name!=name: raise ValueError('Part-I run name mismatch')
@@ -188,7 +219,7 @@ def part1_metadata(cfg):
         extended_asset_path=str(Path(cfg['stst_asset']).resolve()),extended_asset_sha256=file_sha256(cfg['stst_asset']),
         original_asset_sha256=asset['metadata']['original_stst_asset_sha256'],top_dim=cfg['top_dim'],
         random_layout=cfg['random_layout'],random_total_dim=dim,random_A_seed=20260808,random_B_seed=20260914,
-        random_loss_aggregation='0.5*(A+B)' if cfg['random_layout']=='two32' else 'single_branch',
+        random_loss_aggregation='disabled' if cfg['random_layout']=='disabled' else ('0.5*(A+B)' if cfg['random_layout']=='two32' else 'single_branch'),
         RANDOM_COVERAGE_MATCHED=dim==64,RANDOM_FACTORIZATION_DIFFERENT=dim==64,
         training_only_head_params=(cfg['top_dim']+dim)*513,deployment_model='bare RepViT-M1.5',
         inference_overhead=False,DEPLOYMENT_PARAM_DELTA_VS_D0=0,

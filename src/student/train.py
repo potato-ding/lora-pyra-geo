@@ -64,7 +64,7 @@ def batch_loss(engine,teacher,images,local_pairs,criterion,cfg,epoch):
     total,weight=stst_total_loss(info,kd,cfg['stst_weight'],epoch,cfg['stst_warmup_epochs'])
     if cfg.get('part') == 'Part-I':
         metrics={'infonce':info.detach(),'top_loss':kd_audit['top_loss'].detach(),
-            'random_loss':kd_audit['random_loss'].detach(),'dual_stst':kd.detach(),
+            'random_loss':None if kd_audit['random_loss'] is None else kd_audit['random_loss'].detach(),'dual_stst':kd.detach(),
             'weighted_stst_loss':(weight*kd).detach(),'effective_weight':weight,
             'teacher_grad_count':sum(p.grad is not None for p in teacher.parameters())}
         for key in ('random_A_loss','random_B_loss'):
@@ -193,7 +193,7 @@ def main():
             if not torch.isfinite(loss):raise FloatingPointError('Nonfinite Student objective')
             engine.backward(loss);engine.step()
             if dist.get_rank()==0 and step%200==0:
-                print(json.dumps({'epoch':epoch,'step':step,'loss':float(loss.detach()),'loss_finite':bool(torch.isfinite(loss)),'nan_loss_count':int(torch.isnan(loss)),'inf_loss_count':int(torch.isinf(loss)),**{k:float(v) for k,v in components.items()}}),flush=True)
+                print(json.dumps({'epoch':epoch,'step':step,'loss':float(loss.detach()),'loss_finite':bool(torch.isfinite(loss)),'nan_loss_count':int(torch.isnan(loss)),'inf_loss_count':int(torch.isinf(loss)),**{k:('DISABLED' if v is None else float(v)) for k,v in components.items()}}),flush=True)
         sync_student_buffers_from_rank0(engine.module.student)
         assert_student_validation_state_synced(engine.module.student, epoch)
         engine.eval()

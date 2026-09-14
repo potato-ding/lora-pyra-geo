@@ -143,3 +143,65 @@ def test_configs_matched_to_d0_except_explicit_interface_and_metadata():
             if k not in allowed:assert cfg[k]==v,(variant,k)
         assert cfg['top_dim']==top and cfg['random_layout']==layout
         assert cfg['seed']==0 and cfg['stst_weight']==.2 and cfg['stst_warmup_epochs']==5
+
+@pytest.mark.parametrize('layout',['disabled','single64'])
+def test_random_control_deployment_and_top_only_math(banks,layout):
+    from src.student.optimizer import build_student_optimizer
+    torch.manual_seed(0);supervision=make(banks,128,layout).bfloat16()
+    rng=torch.get_rng_state()
+    torch.manual_seed(0);reference=make(banks,128,'single32').bfloat16()
+    assert torch.equal(rng,torch.get_rng_state())
+    assert torch.equal(supervision.projector_top.linear.weight,reference.projector_top.linear.weight)
+    student=nn.Linear(2,512)
+    model=StudentTrainingModel(student,supervision)
+    opt=build_student_optimizer(model)
+    state=deployment_state_dict(model)
+    assert set(state)==set(student.state_dict())
+    assert all(torch.equal(v,student.state_dict()[k]) for k,v in state.items())
+    assert not hasattr(supervision,'projector_random_b')
+    x=F.normalize(torch.randn(64,512),dim=1).requires_grad_()
+    y=F.normalize(torch.randn(64,768),dim=1).requires_grad_()
+    loss,audit=supervision(x,y,32)
+    total,_=stst_total_loss(torch.tensor(1.),loss,.2,1,5)
+    if layout=='disabled':
+        assert not hasattr(supervision,'projector_random')
+        assert not any('random' in n for n,p in model.named_parameters())
+        assert supervision.teacher_targets(y)[1] is None
+        assert audit['random_loss'] is None
+        assert torch.equal(loss,audit['top_loss'])
+        assert torch.equal(total,1+.04*audit['top_loss'])
+        # Corrupt unused Random buffers: disabled forward must not read them.
+        supervision.random32_basis.fill_(float('nan'))
+        again,_=supervision(x,y,32)
+        assert torch.equal(loss,again)
+    else:
+        assert supervision.projector_random.linear.out_features==64
+        expected=F.normalize((y.detach()-supervision.teacher_mean)@supervision.random32_basis,dim=1)
+        assert torch.equal(supervision.teacher_targets(y)[1][0],expected)
+        assert torch.equal(loss,audit['top_loss']+audit['random_loss'])
+    total.backward()
+    assert y.grad is None
+    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in supervision.parameters())
+    assert torch.isfinite(x.grad).all()
+
+def test_random_control_configs_are_seed0_and_matched():
+    from src.student.part1 import validate_part1_config
+    reference=load_config('configs/student/certified_r224/p1_t128_r32_s0.json')
+    allowed={'part1_variant','experiment_name','output_dir','random_layout','random_total_dim','random_loss_aggregation','sealed_provenance_file'}
+    for dim,layout in [(0,'disabled'),(64,'single64')]:
+        cfg=load_config(f'configs/student/certified_r224/p1_t128_r{dim}_s0.json')
+        assert {k:v for k,v in cfg.items() if k not in allowed}=={k:v for k,v in reference.items() if k not in allowed}
+        assert cfg['seed']==0 and cfg['random_layout']==layout and cfg['random_total_dim']==dim
+        for seed in [1,2]:
+            wrong=dict(cfg,seed=seed)
+            with pytest.raises(ValueError):validate_part1_config(wrong)
+
+def test_historical_r32_r64_exact_cpu(banks,monkeypatch):
+    from src.student import random_control_smoke as smoke
+    monkeypatch.setattr(smoke,'file_sha256',lambda path:banks[2])
+    cfg=dict(stst_asset=str(banks[1]),original_stst_asset=str(banks[0]),middle_checkpoint='test')
+    x=F.normalize(torch.randn(64,512),dim=1)
+    y=F.normalize(torch.randn(64,768),dim=1)
+    result=smoke.compatibility(cfg,x,y,torch.tensor(1.))
+    assert result['T128_R32_BACKWARD_COMPATIBLE']
+    assert result['JOINT_R64_BRANCH_BACKWARD_COMPATIBLE']
