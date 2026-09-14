@@ -34,6 +34,9 @@ def load_config(path):
             raise ValueError('Canonical Dual-STST weight/timing mismatch')
         for key in ('middle_checkpoint','middle_config','stst_asset'):
             if not cfg.get(key):raise ValueError(f'{key} is required')
+        if cfg.get('part') == 'Part-I':
+            from .part1 import validate_part1_config
+            validate_part1_config(cfg)
     if cfg['mode']=='baseline':
         if any(cfg.get(k) for k in ('middle_checkpoint','middle_config','stst_asset')):
             raise ValueError('Baseline must not bind a teacher or KD asset')
@@ -59,6 +62,14 @@ def batch_loss(engine,teacher,images,local_pairs,criterion,cfg,epoch):
         teacher_descriptor=teacher(images.to(dtype=torch.bfloat16)).detach().float()
     kd,kd_audit=engine.module.stst(descriptor.float(),teacher_descriptor,local_pairs)
     total,weight=stst_total_loss(info,kd,cfg['stst_weight'],epoch,cfg['stst_warmup_epochs'])
+    if cfg.get('part') == 'Part-I':
+        metrics={'infonce':info.detach(),'top_loss':kd_audit['top_loss'].detach(),
+            'random_loss':kd_audit['random_loss'].detach(),'dual_stst':kd.detach(),
+            'weighted_stst_loss':(weight*kd).detach(),'effective_weight':weight,
+            'teacher_grad_count':sum(p.grad is not None for p in teacher.parameters())}
+        for key in ('random_A_loss','random_B_loss'):
+            if key in kd_audit: metrics[key]=kd_audit[key].detach()
+        return total,metrics
     return total,{'infonce':info.detach(),'top32_loss':kd_audit['top_loss'].detach(),
                   'random32_loss':kd_audit['random_loss'].detach(),'dual_stst':kd.detach(),
                   'weighted_stst_loss':(weight*kd).detach(),'effective_weight':weight}
@@ -144,7 +155,13 @@ def main():
     if cfg['mode']=='dual_stst':
         from .dual_stst import DualSTSTSupervision
         from src.evaluation.model_loader import load_encoder
-        supervision=DualSTSTSupervision(cfg['stst_asset'],expected_teacher_sha256=file_sha256(cfg['middle_checkpoint'])).to(device)
+        if cfg.get('part') == 'Part-I':
+            from .part1 import PartISupervision, part1_metadata
+            part1_metadata(cfg)  # Bind both bank SHAs before using any target.
+            supervision=PartISupervision(cfg['stst_asset'],cfg['original_stst_asset'],
+                file_sha256(cfg['middle_checkpoint']),cfg['top_dim'],cfg['random_layout']).to(device)
+        else:
+            supervision=DualSTSTSupervision(cfg['stst_asset'],expected_teacher_sha256=file_sha256(cfg['middle_checkpoint'])).to(device)
         teacher,_=load_encoder('middle',cfg['middle_checkpoint'],cfg['middle_config'],device)
         if any(p.requires_grad for p in teacher.parameters()):raise RuntimeError('Middle must be frozen')
     model=StudentTrainingModel(student,supervision).to(device)

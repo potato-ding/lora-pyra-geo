@@ -89,7 +89,12 @@ def resolved_config(cfg, steps_per_epoch=None):
     metadata=dict(cfg)
     metadata.update(selection_metadata())
     if cfg["mode"] == "dual_stst":
-        metadata.update(dual_stst_metadata(cfg))
+        if cfg.get("part") == "Part-I":
+            from .part1 import part1_metadata
+            metadata.update(part1_metadata(cfg))
+            metadata['source_commit'] = commit
+        else:
+            metadata.update(dual_stst_metadata(cfg))
     require_u1652_eval_batch_size(cfg.get("u1652_eval_batch_size", U1652_EVAL_BATCH_SIZE))
     metadata.update(u1652_eval_batch_size=U1652_EVAL_BATCH_SIZE, validation_buffer_source="rank0")
     if cfg.get("protocol_id") == "STU-1G-B32-R224-v1":
