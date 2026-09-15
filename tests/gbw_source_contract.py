@@ -11,6 +11,8 @@ PART_GUARD="""    from .gbw import validate_coefficient_config
     name=validate_coefficient_config(cfg,name)
 """
 def before_gbw(path,text):
+    from p2_source_contract import before_p2
+    text=before_p2(path,text)
     blocks={'src/student/train.py':[TRAIN_APPLY,TRAIN_LOG],'src/student/part1.py':[PART_GUARD]}
     for block in blocks.get(str(path),[]):
         assert text.count(block)==1

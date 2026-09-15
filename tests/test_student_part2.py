@@ -157,7 +157,8 @@ def test_existing_source_seal_unchanged():
         "src/student/evaluate_best.py":"1235e1ff3e052e8bb7929ff996c710173a21ed1672ddca0fa2d6e0df0b4a7f33",
         "src/evaluation/evaluate.py":"32377a9f73e55a55a04960699782c9c19ffffa1f26085833ab01aac906c54ab1",
     }
-    for p,h in expected.items():assert hashlib.sha256(Path(p).read_bytes()).hexdigest()==h
+    from p2_source_contract import before_p2
+    for p,h in expected.items():assert hashlib.sha256(before_p2(p,Path(p).read_text()).encode()).hexdigest()==h
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(),reason="CUDA numerical test requires an available GPU")

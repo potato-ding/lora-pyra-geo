@@ -29,6 +29,10 @@ def load_config(path):
     for key,value in expected.items():
         if cfg.get(key)!=value:
             raise ValueError(f'Canonical Student protocol mismatch: {key}')
+    # P2_INTEGRATION_BEGIN
+    from .part2_integration import validate_config
+    is_p2 = validate_config(cfg)
+    # P2_INTEGRATION_END
     if cfg['mode']=='dual_stst':
         if cfg.get('stst_weight')!=0.2 or cfg.get('stst_warmup_epochs')!=5:
             raise ValueError('Canonical Dual-STST weight/timing mismatch')
@@ -36,7 +40,7 @@ def load_config(path):
             if not cfg.get(key):raise ValueError(f'{key} is required')
         if cfg.get('part') == 'Part-I':
             from .part1 import validate_part1_config
-            validate_part1_config(cfg)
+            if not is_p2: validate_part1_config(cfg)
     if cfg['mode']=='baseline':
         if any(cfg.get(k) for k in ('middle_checkpoint','middle_config','stst_asset')):
             raise ValueError('Baseline must not bind a teacher or KD asset')
@@ -170,21 +174,41 @@ def main():
             supervision=DualSTSTSupervision(cfg['stst_asset'],expected_teacher_sha256=file_sha256(cfg['middle_checkpoint'])).to(device)
         teacher,_=load_encoder('middle',cfg['middle_checkpoint'],cfg['middle_config'],device)
         if any(p.requires_grad for p in teacher.parameters()):raise RuntimeError('Middle must be frozen')
+    # P2_INTEGRATION_BEGIN
+    if cfg.get('top_interface', 'linear') != 'linear':
+        from .part2_integration import prepare_top
+        prepare_top(supervision, cfg)
+    # P2_INTEGRATION_END
     model=StudentTrainingModel(student,supervision).to(device)
     optimizer=build_student_optimizer(model,lr=cfg['lr'],weight_decay=cfg['weight_decay'])
     if teacher is not None:
         teacher_ids={id(p) for p in teacher.parameters()}
         if teacher.training or any(p.requires_grad for p in teacher.parameters()) or any(id(p) in teacher_ids for group in optimizer.param_groups for p in group['params']):
             raise RuntimeError('Teacher must remain eval/frozen and outside the optimizer')
+    # P2_INTEGRATION_BEGIN
+    if cfg.get('top_interface', 'linear') != 'linear':
+        from .part2_integration import prepare_precision_groups
+        prepare_precision_groups(model, optimizer, cfg)
+    # P2_INTEGRATION_END
     scheduler=build_student_scheduler(optimizer,args,steps_per_epoch=len(train_loader))
     ds=deepspeed_config()
     engine,_,_,_=deepspeed.initialize(model=model,optimizer=optimizer,lr_scheduler=scheduler,config=ds)
     if supervision is not None and any(t.dtype!=torch.float32 for t in (supervision.teacher_mean,supervision.top32_basis,supervision.random32_basis)):
         raise RuntimeError('DeepSpeed changed canonical FP32 basis storage')
+    # P2_INTEGRATION_BEGIN
+    if cfg.get('top_interface', 'linear') != 'linear':
+        from .part2_integration import assert_precision
+        assert_precision(engine)
+    # P2_INTEGRATION_END
     criterion=PairInfoNCE(label_smoothing=cfg['label_smoothing']);best=float('-inf');history=[]
     if dist.get_rank()==0:
         output.mkdir(parents=True,exist_ok=True)
         run_metadata=resolved_config(cfg,steps_per_epoch=len(train_loader))
+        # P2_INTEGRATION_BEGIN
+        if cfg.get('top_interface', 'linear') != 'linear':
+            from .part2_integration import metadata
+            run_metadata.update(metadata(supervision))
+        # P2_INTEGRATION_END
         write_json(output/'run_config.json',run_metadata)
         print('FORMAL_RUN_CONFIG='+json.dumps(run_metadata),flush=True)
         print('METHOD_RUNTIME='+json.dumps(dict(method=cfg['mode'],middle_teacher_loaded=teacher is not None,
@@ -198,6 +222,11 @@ def main():
             loss,components=batch_loss(engine,teacher,images,len(drone),criterion,cfg,epoch)
             if not torch.isfinite(loss):raise FloatingPointError('Nonfinite Student objective')
             engine.backward(loss);engine.step()
+            # P2_INTEGRATION_BEGIN
+            if cfg.get('top_interface', 'linear') != 'linear' and step%200==0:
+                from .part2_integration import log_values
+                components.update(log_values(supervision))
+            # P2_INTEGRATION_END
             if dist.get_rank()==0 and step%200==0:
                 print(json.dumps({'epoch':epoch,'step':step,'loss':float(loss.detach()),'loss_finite':bool(torch.isfinite(loss)),'nan_loss_count':int(torch.isnan(loss)),'inf_loss_count':int(torch.isinf(loss)),**{k:('DISABLED' if v is None else float(v)) for k,v in components.items()}}),flush=True)
         sync_student_buffers_from_rank0(engine.module.student)

@@ -144,7 +144,8 @@ def test_training_source_unchanged():
         # Part-I.5 seal. Keep the byte comparison for every pre-existing source.
         if path in ['src/student/gbw.py','src/student/gbw_smoke.py',
                     'src/student/part2.py','src/student/part2_input_audit.py',
-                    'src/student/part2_smoke.py']:continue
+                    'src/student/part2_smoke.py','src/student/part2_integration.py',
+                    'src/student/part2_formal_smoke.py']:continue
         old=subprocess.check_output(['git','show','5cb84df6d041b0012968099ae089d456e5796a39:'+path],cwd=a.ROOT)
         assert old.decode()==before_gbw(path,(a.ROOT/path).read_text())
 
