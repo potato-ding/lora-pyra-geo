@@ -68,3 +68,33 @@ def test_only_approved_source_insertions():
         old=subprocess.check_output(['git','show','e3f352a78c79860363fc67a83a32d99f32896cd2:'+name],cwd=ROOT)
         assert (ROOT/name).read_bytes()==old
 
+
+@pytest.mark.parametrize('seed',[0,1,2])
+def test_matched_gbw_seed_configs(seed):
+    base=cfg()
+    config=load_config(ROOT/f'configs/student/certified_r224/p1_5_t128_r32_gbw_s{seed}.json')
+    expected=set() if seed==0 else {'seed','experiment_name','output_dir'}
+    assert {k for k in base.keys()|config.keys() if base.get(k)!=config.get(k)}==expected
+    assert validate_coefficient_config(config,'unused')==f'P1.5-T128-R32-GBW-S{seed}'
+    a=torch.tensor(.7,requires_grad=True);b=torch.tensor(.2,requires_grad=True)
+    value,_=apply_branch_coefficients(config,a+b,{'top_loss':a,'random_loss':b})
+    assert torch.equal(value,1.247*a+.753*b)
+
+@pytest.mark.parametrize('seed,name,weights',[
+    (3,'P1.5-T128-R32-GBW-S3',(1.247,.753)),
+    (1,'P1.5-T128-R32-GBW-S2',(1.247,.753)),
+    (2,'P1.5-T128-R32-GBW-S1',(1.247,.753)),
+    (True,'P1.5-T128-R32-GBW-S1',(1.247,.753)),
+    (1,'P1.5-T128-R32-GBW-S1',(1.,1.)),
+    (2,'P1.5-T128-R32-GBW-S2',(1.248,.752)),
+    (1,'OTHER',(1.247,.753)),
+])
+def test_gbw_family_rejects_invalid_mapping_or_weights(seed,name,weights):
+    config=dict(cfg(),seed=seed,experiment_name=name,lambda_top=weights[0],lambda_random=weights[1])
+    with pytest.raises(ValueError):validate_coefficient_config(config,'P1-T128-R32-S0')
+
+@pytest.mark.parametrize('seed',[0,1,2])
+def test_original_equal_weight_configs_remain_valid(seed):
+    config=load_config(ROOT/f'configs/student/certified_r224/p1_t128_r32_s{seed}.json')
+    name=f'P1-T128-R32-S{seed}'
+    assert validate_coefficient_config(config,name)==name

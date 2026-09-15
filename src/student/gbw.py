@@ -1,6 +1,7 @@
 """The sole approved Part-I.5 branch coefficient control; historical default unchanged."""
 GBW_NAME='P1.5-T128-R32-GBW-S0'
 GBW_WEIGHTS=(1.247,.753)
+GBW_RUN_SEEDS={f'P1.5-T128-R32-GBW-S{seed}':seed for seed in (0,1,2)}
 
 def validate_coefficient_config(cfg,default_name):
     top=cfg.get('lambda_top',1.)
@@ -8,12 +9,13 @@ def validate_coefficient_config(cfg,default_name):
     if type(top) not in (int,float) or type(random) not in (int,float):
         raise ValueError('Branch coefficients must be numbers')
     name=cfg.get('experiment_name',default_name)
-    if name==GBW_NAME:
-        if (top,random)!=GBW_WEIGHTS or cfg.get('seed')!=0 or cfg.get('part1_variant')!='p1_t128_r32_s0':
-            raise ValueError('Only the fixed GBW S0 is certified')
+    if name in GBW_RUN_SEEDS:
+        seed=cfg.get('seed')
+        if (top,random)!=GBW_WEIGHTS or type(seed) is not int or seed!=GBW_RUN_SEEDS[name] or cfg.get('part1_variant')!='p1_t128_r32_s0':
+            raise ValueError('Only fixed GBW weights with matched seeds 0/1/2 are certified')
         if cfg.get('top_dim')!=128 or cfg.get('random_layout')!='single32' or cfg.get('random_total_dim')!=32:
             raise ValueError('GBW requires exact Top128 + Random32_A')
-        return GBW_NAME
+        return name
     if (top,random)!=(1.,1.):
         raise ValueError('No other weighting candidate is certified')
     return default_name
