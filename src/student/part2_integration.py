@@ -12,6 +12,9 @@ AUDIT = ROOT/"src/checkpoint/student/CERTIFIED_R224/_AUDITS/P2_RESIDUAL_IMPLEMEN
 
 def validate_config(cfg):
     interface = cfg.get("top_interface", "linear")
+    if interface.startswith('factorial_'):
+        from .part2_factorial import validate_config as validate_factorial
+        return validate_factorial(cfg)
     if interface == "linear":
         if any(k.startswith("p2_") for k in cfg):
             raise ValueError("P2 metadata requires a residual interface")
@@ -36,6 +39,9 @@ def validate_config(cfg):
 
 
 def prepare_top(supervision, cfg):
+    if cfg.get('top_interface', '').startswith('factorial_'):
+        from .part2_factorial import prepare
+        return prepare(supervision, cfg)
     if cfg.get("top_interface", "linear") == "linear":
         return
     validate_config(cfg)
@@ -66,6 +72,9 @@ def prepare_precision_groups(model, optimizer, cfg):
 
 def assert_precision(engine):
     supervision = engine.module.stst
+    if hasattr(supervision, 'factorial_interface'):
+        from .part2_factorial import assert_precision as assert_factorial_precision
+        return assert_factorial_precision(engine)
     if not hasattr(supervision.projector_top, "residual"):
         return
     assert all(p.dtype==torch.bfloat16 for p in engine.module.student.parameters())
@@ -76,6 +85,9 @@ def assert_precision(engine):
 
 
 def metadata(supervision):
+    if hasattr(supervision, 'factorial_interface'):
+        from .part2_factorial import metadata as factorial_metadata
+        return factorial_metadata(supervision)
     top = supervision.projector_top
     return dict(part="Part-II", research_axis="top_alignment_interface",
         training_only_head_params=trainable_count(supervision),
@@ -89,5 +101,8 @@ def metadata(supervision):
 
 
 def log_values(supervision):
+    if hasattr(supervision, 'factorial_interface'):
+        from .part2_factorial import log_values as factorial_log_values
+        return factorial_log_values(supervision)
     top = supervision.projector_top
     return dict(p2_alpha=float(top.alpha.detach()))
