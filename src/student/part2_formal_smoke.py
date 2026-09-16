@@ -20,12 +20,13 @@ from src.evaluation.model_loader import load_encoder
 def main():
     parser=argparse.ArgumentParser();parser.add_argument('--config',required=True)
     args=parser.parse_args();cfg=load_config(args.config)
-    out=ROOT/'src/checkpoint/student/CERTIFIED_R224/_PREFLIGHT/P2_S0'/Path(cfg['output_dir']).name
+    preflight='P2_TOP_RMLP_MULTI_SEED' if cfg['seed'] in (1,2) else 'P2_S0'
+    out=ROOT/'src/checkpoint/student/CERTIFIED_R224/_PREFLIGHT'/preflight/Path(cfg['output_dir']).name
     if out.exists() and any(out.iterdir()):raise FileExistsError(out)
     assert not Path(cfg['output_dir']).exists()
     out.mkdir(parents=True,exist_ok=True)
     torch.cuda.set_device(0);torch.set_num_threads(4)
-    deepspeed.init_distributed(dist_backend='nccl');_seed_all(0)
+    deepspeed.init_distributed(dist_backend='nccl');_seed_all(cfg['seed'])
     protected={k:file_sha256(cfg[k]) for k in ['middle_checkpoint','student_pretrained','stst_asset','original_stst_asset','p2_calibration_path']}
     loader=create_student_train_dataset_and_loader(SimpleNamespace(**cfg));loader.worker_init_fn=_seed_stst_worker
     student=StudentModel(ckpt_path=cfg['student_pretrained'],temperature=cfg['temperature']).cuda()
@@ -53,10 +54,14 @@ def main():
         capture['ratio']=float((o[1].detach()-base).norm()/base.norm())
         capture['dtype']=str(o[1].dtype)
     hook=supervision.projector_top.register_forward_hook(capture_top)
+    student_input_shapes=[]
+    student_hook=student.register_forward_pre_hook(lambda module,args:student_input_shapes.append(tuple(args[0].shape)))
     engine.train();loader.batch_sampler.set_epoch(1);batch=next(iter(loader))
     images=torch.cat(batch[:2]).cuda();assert images.shape==(64,3,224,224)
     criterion=PairInfoNCE(label_smoothing=cfg['label_smoothing'])
     loss,parts=batch_loss(engine,teacher,images,32,criterion,cfg,1)
+    student_hook.remove()
+    assert student_input_shapes==[(64,3,224,224)]
     assert loss.dtype==torch.float32 and torch.isfinite(loss)
     assert all(torch.isfinite(v).all() for v in parts.values() if torch.is_tensor(v))
     assert capture['dtype']=='torch.float32' and math.isfinite(capture['ratio'])
@@ -83,6 +88,9 @@ def main():
     assert set(state)==set(student.state_dict())
     assert all(file_sha256(cfg[k])==h for k,h in protected.items())
     report=dict(SMOKE_PASS=True,config=cfg,metadata=metadata(supervision),loss=float(loss),
+        seed=cfg['seed'],sampler_seed=loader.batch_sampler.seed,
+        student_forward_shapes=student_input_shapes,
+        protected_sha256=protected,total_trainable_params=sum(p.numel() for p in model.parameters() if p.requires_grad),
         components={k:None if v is None else float(v) for k,v in parts.items()},
         gradient_norms=grads,updated_parameter_counts=changed,teacher_grad=0,
         residual_base_ratio=capture['ratio'],alpha_after_step=float(supervision.projector_top.alpha),

@@ -1,4 +1,4 @@
-"""Fixed P2 S0 dispatch and precision grouping; existing P1 execution is untouched."""
+"""Fixed P2 dispatch and precision grouping; shared Top MLP supports seeds 0/1/2."""
 import json
 from pathlib import Path
 import torch
@@ -21,16 +21,24 @@ def validate_config(cfg):
         return False
     if interface not in KINDS:
         raise ValueError("Only the two frozen P2 S0 interfaces are supported")
+    seed = cfg.get('seed')
+    allowed_seeds = (0, 1, 2) if interface == 'residual_mlp' else (0,)
+    if type(seed) is not int or seed not in allowed_seeds:
+        raise ValueError('Only matched Top-RMLP seeds 0/1/2; other P2 paths remain S0')
     reference = json.loads((ROOT/"configs/student/certified_r224/p1_t128_r32_s0.json").read_text())
     allowed = {"experiment_name", "output_dir", "sealed_provenance_file",
                "top_interface", "p2_calibration_path", "p2_calibration_sha256"}
-    if {k:v for k,v in cfg.items() if k not in allowed} != {k:v for k,v in reference.items() if k not in allowed}:
+    normalized = dict(cfg, seed=0)
+    if {k:v for k,v in normalized.items() if k not in allowed} != {k:v for k,v in reference.items() if k not in allowed}:
         raise ValueError("P2 must inherit every reference training field exactly")
-    name = KINDS[interface][1]
+    if interface == 'residual_mlp':
+        s0 = json.loads((ROOT/'configs/student/certified_r224/p2_top_rmlp_s0.json').read_text())
+        identity_fields = {'seed', 'experiment_name', 'output_dir', 'sealed_provenance_file'}
+        if {k:v for k,v in cfg.items() if k not in identity_fields} != {k:v for k,v in s0.items() if k not in identity_fields}:
+            raise ValueError('Shared Top-RMLP must match every S0 training field')
+    name = f'P2-TOP-RMLP-S{seed}' if interface == 'residual_mlp' else KINDS[interface][1]
     if cfg.get("experiment_name") != name or Path(cfg["output_dir"]).resolve() != ROOT/"src/checkpoint/student/CERTIFIED_R224"/name:
         raise ValueError("P2 run/output name mismatch")
-    if type(cfg.get("seed")) is not int or cfg["seed"] != 0:
-        raise ValueError("P2 is seed0 only")
     if Path(cfg["p2_calibration_path"]).resolve() != AUDIT/"diagnostic_inputs.pt":
         raise ValueError("P2 must use the frozen TRAIN calibration")
     if file_sha256(cfg["p2_calibration_path"]) != cfg["p2_calibration_sha256"]:
