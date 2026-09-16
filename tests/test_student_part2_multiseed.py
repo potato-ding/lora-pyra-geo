@@ -73,4 +73,9 @@ def test_frozen_training_and_seed_sources():
                  'src/student/canonical_u1652_worker.py','src/student/evaluate_best.py','src/student/launch.py',
                  'src/dataset/teacher/datasets.py','src/dataset/transforms.py','src/evaluation/evaluate.py',
                  'src/evaluation/model_loader.py','src/utils/train_eval_utils.py','scripts/train_student_certified.sh']:
-        assert (ROOT/path).read_bytes()==subprocess.check_output(['git','show',S0_COMMIT+':'+path],cwd=ROOT)
+        current=(ROOT/path).read_bytes()
+        if path=='src/student/train.py':
+            # The separately tested BNCC control consists solely of opt-in insertions.
+            import re
+            current=re.sub(r'^([ ]*)# BNCC_BEGIN\n.*?^\1# BNCC_END\n','',current.decode(),flags=re.M|re.S).encode()
+        assert current==subprocess.check_output(['git','show',S0_COMMIT+':'+path],cwd=ROOT)

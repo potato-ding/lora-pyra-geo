@@ -11,6 +11,9 @@ AUDIT = ROOT/"src/checkpoint/student/CERTIFIED_R224/_AUDITS/P2_RESIDUAL_IMPLEMEN
 
 
 def validate_config(cfg):
+    if any(k.startswith('bncc_') for k in cfg) or cfg.get('experiment_name') == 'FINAL-ADUAL-BNCC-S0':
+        from .bncc import validate_config as validate_bncc
+        return validate_bncc(cfg)
     interface = cfg.get("top_interface", "linear")
     if interface.startswith('factorial_'):
         from .part2_factorial import validate_config as validate_factorial
