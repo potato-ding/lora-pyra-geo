@@ -142,7 +142,7 @@ def validate_training_complete(run):
         raise ValueError("Complete thirty-epoch history required")
     best=json.loads((run/"best_metrics.json").read_text())
     expected=max(history,key=lambda row:row["metrics"]["D2S"]["R@1"]+row["metrics"]["S2D"]["R@1"])
-    if best != best_record(expected["epoch"],expected["metrics"], canonical=cfg.get("protocol_id") == "STU-1G-B32-R224-v1"):
+    if best != best_record(expected["epoch"],expected["metrics"], canonical=cfg.get("protocol_id") in ("STU-1G-B32-R224-v1", "STU-2G-B32-R224-REPRO-v1")):
         raise ValueError("Best metadata violates first strict maximum selection")
     for name in ("best_model.pth","last_model.pth","train.log"):
         if not (run/name).is_file(): raise FileNotFoundError(run/name)
