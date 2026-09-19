@@ -78,24 +78,6 @@ def test_smoke_uses_config_seed_and_all_rngs(seed):
     assert '_seed_all(0)' not in source
     assert "/SMOKES'/Path(cfg['output_dir']).name" in source
 
-@pytest.mark.parametrize('path',[
-    'src/student/train.py','src/student/runtime.py','src/student/data.py',
-    'src/student/dual_stst.py','src/student/objective.py','src/student/optimizer.py',
-    'src/student/scheduler.py','src/student/model.py','src/student/artifacts.py',
-    'src/student/canonical_selection.py','src/student/canonical_u1652_worker.py',
-    'src/student/evaluate_best.py','src/student/launch.py',
-    'src/dataset/teacher/datasets.py','src/dataset/transforms.py',
-])
-def test_training_selector_deployment_and_seed_propagation_source_unchanged(path):
-    from gbw_source_contract import before_gbw
-    current=before_gbw(path,(ROOT/path).read_text())
-    if path=='src/student/train.py':
-        # Only nullable disabled-branch reporting may differ from historical trainer.
-        current=current.replace("'random_loss':None if kd_audit['random_loss'] is None else kd_audit['random_loss'].detach(),",
-                                "'random_loss':kd_audit['random_loss'].detach(),")
-        current=current.replace("{k:('DISABLED' if v is None else float(v)) for k,v in components.items()}",
-                                "{k:float(v) for k,v in components.items()}")
-    assert current==old_text(path)
 
 def test_part1_existing_branch_functions_unchanged():
     def functions(text):

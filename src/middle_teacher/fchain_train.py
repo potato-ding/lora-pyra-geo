@@ -50,7 +50,7 @@ def r0_pair_loss(drone, satellite, logit_scale):
 class SelectionEncoder(nn.Module):
     def __init__(self, model):
         super().__init__()
-        self.input_dtype_anchor = nn.Parameter(torch.zeros((),device=next(model.parameters()).device),requires_grad=False)
+        self.input_dtype_anchor = nn.Parameter(torch.zeros((),dtype=torch.float32,device=next(model.parameters()).device),requires_grad=False)
         self.encoder = EvaluationEncoder(model,768)
     def forward(self, images):
         return self.encoder(images)
@@ -67,6 +67,10 @@ def grouped_loader(loader):
 
 @torch.no_grad()
 def selection(engine, loaders, device):
+    engine.module.selection_image_size=getattr(engine.module,'selection_image_size',224)
+    from src.evaluation.precision_contract import selection_signature
+    signature=selection_signature(engine.module,'middle',engine.module.selection_image_size)
+    print('PRECISION_SIGNATURE='+json.dumps(signature),flush=True)
     encoder = SelectionEncoder(engine.module).eval()
     metrics = {}
     for direction,(query,gallery) in loaders.items():
@@ -136,7 +140,7 @@ def main(allow_kd=True,allow_abv=False):
     engine,optimizer,scheduler,ds=initialize_deepspeed(model,optimizer,scheduler,config)
     device=torch.device('cuda',local_rank)
     kd=None
-    if True:
+    if len(config['distillation'])>1:
         runtime_class=FChainRuntime
         assert args.teacher_chunk_size > 0
         # Building a frozen Teacher must not shift the R0 augmentation/dropout RNG.
@@ -148,6 +152,7 @@ def main(allow_kd=True,allow_abv=False):
         assert not any(id(p) in optimizer_ids for p in kd.teacher.parameters())
     _,loader=create_middle_teacher_train_dataset_and_loader(config)
     assert len(loader)==1182,len(loader)
+    engine.module.selection_image_size=config['data']['input_size']
     controller=CheckpointController(output,objective='pair_infonce_'+component)
     metadata={'experiment':config['experiment']['name'],'seed':seed,'img_size':224,'epochs':10,
         'code':{'branch':subprocess.check_output(['git','branch','--show-current'],text=True).strip(),
@@ -195,7 +200,8 @@ def main(allow_kd=True,allow_abv=False):
             loss,d2s,s2d=r0_pair_loss(md,ms,engine.module.logit_scale)
             base_loss=loss
             kd_stats={}
-            loss,kd_stats=kd.compose_all(loss,md,ms,images,global_ids,engine.module,step,hidden_output if allow_abv else None)
+            if kd is not None:
+                loss,kd_stats=kd.compose_all(loss,md,ms,images,global_ids,engine.module,step,hidden_output if allow_abv else None)
             assert bool(torch.isfinite(loss)), 'nonfinite loss'
             gradient_seen=[]
             bridge_gradient_seen=[]
@@ -244,7 +250,7 @@ def main(allow_kd=True,allow_abv=False):
                         strict_load=kd.audit,optimizer_step=False,scheduler_step=False,checkpoint_save=False)),flush=True)
                 assert all(p.dtype==torch.bfloat16 for p in engine.module.parameters() if p.is_floating_point())
                 assert md.dtype==ms.dtype==torch.float32
-                print('R0_SMOKE_RESULT='+json.dumps({'rank':rank(),'pass':True,'objective':'PairInfoNCE_ONLY' if kd is None else 'PairInfoNCE_HISTORICAL_KD',
+                print('R0_SMOKE_RESULT='+json.dumps({'rank':rank(),'pass':True,'objective':'PairInfoNCE_ONLY' if kd is None else 'PairInfoNCE_HRD_SEMANTIC',
                     'trainable_params':audit['trainable_params'],'parent_sha256':parent_hash,
                     'world_size':2,'local_pair_batch':16,'global_pool':32,'loss':float(loss.detach()),
                     'loss_finite':True,'backward_pass':True,'optimizer_step':False,'scheduler_step':False,
@@ -264,7 +270,7 @@ def main(allow_kd=True,allow_abv=False):
                     'finite':True,'lr':[g['lr'] for g in optimizer.param_groups],'global_pool':32}),flush=True)
         barrier();engine.eval()
         if val_loaders is None:
-            val_loaders=build_1652_val_dataloaders('data/U1652',[224,224],32,4)
+            val_loaders=build_1652_val_dataloaders(config['data'].get('val_dir','data/U1652'),[config['data']['input_size']]*2,32,4)
         metrics=selection(engine,val_loaders,device)
         improved=controller.save_best_if_improved(engine,epoch,step,metrics)
         if epoch==10:controller.save_last(engine,epoch,step,metrics)

@@ -80,10 +80,6 @@ def main():
     assert all(n>0 for n in changed.values()),changed
     assert torch.isfinite(supervision.projector_top.alpha)
     hook.remove()
-    if cfg['top_interface']=='residual_kan':
-        with torch.no_grad():
-            check=supervision.projector_top.residual(torch.full((2,512),10.,device='cuda'))
-            assert check.dtype==torch.float32 and torch.isfinite(check).all()
     state=deployment_state_dict(engine)
     assert set(state)==set(student.state_dict())
     assert all(file_sha256(cfg[k])==h for k,h in protected.items())

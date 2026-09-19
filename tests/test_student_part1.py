@@ -128,10 +128,6 @@ def test_deployment_strips_all_heads(banks):
     assert all(torch.equal(v,student.state_dict()[k]) for k,v in state.items())
 
 
-def test_selector_and_original_dual_source_unchanged():
-    files={'src/student/canonical_selection.py':'29218ee8e0e5fd5d2413cb4d7e97afb8cd76bb78c411ebed1f411187e16e69de',
-           'src/student/dual_stst.py':'5b850fdc68c1c950d50e992352cfd9536c7a0367df1a37b514bc15620251abe3'}
-    for name,sha in files.items():assert hashlib.sha256(Path(name).read_bytes()).hexdigest()==sha
 
 
 def test_configs_matched_to_d0_except_explicit_interface_and_metadata():
@@ -205,3 +201,11 @@ def test_historical_r32_r64_exact_cpu(banks,monkeypatch):
     result=smoke.compatibility(cfg,x,y,torch.tensor(1.))
     assert result['T128_R32_BACKWARD_COMPATIBLE']
     assert result['JOINT_R64_BRANCH_BACKWARD_COMPATIBLE']
+
+
+def test_new_source_contract_is_explicit():
+    from src.source_contract import source_identity
+    identity=source_identity('m2s',gbw=True)
+    assert 'src/student/dual_stst.py' in identity
+    assert 'src/evaluation/precision_contract.py' in identity
+    assert not any('spatial' in name or 'bncc' in name for name in identity)

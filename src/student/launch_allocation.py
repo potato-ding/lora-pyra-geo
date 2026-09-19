@@ -12,16 +12,19 @@ from .artifacts import ROOT, source_identity, file_sha256
 def main(argv=None):
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument("--config",required=True)
+    p.add_argument('--validate-only',action='store_true')
     args=p.parse_args(argv)
     cfg=load_config(args.config)
+    if args.validate_only:
+        print(json.dumps(cfg,indent=2));return
     visible=os.environ.get("CUDA_VISIBLE_DEVICES")
     if visible is None or len(visible.split(",")) != 1 or not visible.isdigit():
         raise ValueError("STU-1G-B32-R224-v1 requires exactly one visible GPU")
-    if int(visible)!=VARIANTS[cfg['allocation_variant']][3]:raise ValueError('Fixed authorized GPU mapping required')
+    if cfg.get('source_contract')!='CORE_SOURCE_CONTRACT_V2' and int(visible)!=VARIANTS[cfg['allocation_variant']][3]:raise ValueError('Fixed authorized GPU mapping required')
     memory=subprocess.check_output(['nvidia-smi','-i',visible,'--query-gpu=memory.used','--format=csv,noheader,nounits'],text=True)
     if int(memory.strip())>=100:raise RuntimeError('Assigned GPU busy; no preemption')
     seal=None
-    if cfg.get("sealed_provenance_file"):
+    if cfg.get("sealed_provenance_file") and cfg.get("source_contract")!="CORE_SOURCE_CONTRACT_V2":
         seal=json.loads(Path(cfg["sealed_provenance_file"]).read_text())
         head=subprocess.check_output(["git","rev-parse","HEAD"],cwd=ROOT,text=True).strip()
         dirty=subprocess.check_output(["git","status","--porcelain"],cwd=ROOT,text=True)

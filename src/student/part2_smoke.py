@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from .artifacts import ROOT, write_json, file_sha256, deployment_state_dict
 from .model import StudentModel
 from .part1 import PartISupervision
-from .part2 import install_residual_top, trainable_count, matched_hidden_dim, ALPHA_INIT
+from .part2 import install_residual_top, trainable_count, RMLP_HIDDEN_DIM, ALPHA_INIT
 from .runtime import _seed_all
 from .train import StudentTrainingModel
 
@@ -41,7 +41,7 @@ def main():
         file_sha256(cfg["middle_checkpoint"]),128,"single32").cuda().bfloat16()
     target = F.normalize(torch.randn(16,768,device="cuda",dtype=torch.float32),dim=1)
     reports = {}
-    for kind in ["linear","rmlp","rkan"]:
+    for kind in ["linear","rmlp"]:
         supervision = copy.deepcopy(reference)
         if kind != "linear":
             install_residual_top(supervision,kind,calibration)
@@ -78,13 +78,10 @@ def main():
             gradient_norms=grads, initialization=init,random_unchanged=True,
             base_linear_unchanged=True,deployment_strip_pass=True,
             optimizer_step_calls=0,benchmark_evaluations=0)
-    k,m=reports["rkan"]["residual_params"],reports["rmlp"]["residual_params"]
-    report=dict(smokes=reports,KAN_GRID_RANGE=dist["grid_range"],KAN_GRID_SIZE=5,KAN_SPLINE_ORDER=3,
-        P_LINEAR_BASE=reports["linear"]["top_head_params"],P_KAN_RESIDUAL=k,
-        P_TOTAL_RKAN_TOP_HEAD=reports["rkan"]["top_head_params"],
-        MLP_HIDDEN_DIM=matched_hidden_dim(k),P_MLP_RESIDUAL=m,
-        PARAM_MISMATCH_PERCENT=100*abs(k-m)/k,ALPHA_INIT=ALPHA_INIT,ALPHA_LEARNABLE=True,
-        KAN_FORWARD_PASS=True,KAN_BACKWARD_PASS=True,KAN_CUDA_PASS=True,
+    report=dict(smokes=reports,
+        P_LINEAR_BASE=reports["linear"]["top_head_params"],
+        MLP_HIDDEN_DIM=RMLP_HIDDEN_DIM,P_MLP_RESIDUAL=reports["rmlp"]["residual_params"],
+        ALPHA_INIT=ALPHA_INIT,ALPHA_LEARNABLE=True,
         MLP_FORWARD_PASS=True,MLP_BACKWARD_PASS=True,DEPLOYMENT_STRIP_PASS=True,
         BASELINE_REGRESSION_PASS=True,formal_training_started=False,
         source_sha256={str(p.relative_to(ROOT)):file_sha256(p) for p in

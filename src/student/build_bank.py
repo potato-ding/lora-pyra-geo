@@ -13,14 +13,11 @@ from .subspace import construct_train_subspace
 from .dual_stst import file_sha256, load_stst_asset
 
 ROOT = Path(__file__).resolve().parents[2]
-TEACHER = ROOT / "src/checkpoint/middle_teacher/CERTIFIED_R224/SAM-MABV2-RHO010-S0"
-ASSETS = ROOT / "src/checkpoint/student/CERTIFIED_R224/STST_ASSETS"
-DEFAULT_BANK = ASSETS / "SAM-MABV2-RHO010-S0_train_shared_k32.pt"
 
 class TrainImages(Dataset):
-    def __init__(self, domain):
-        self.root = ROOT / "data/U1652/train" / domain
-        self.transform = get_test_transforms([224, 224])
+    def __init__(self, domain, train_root=None, image_size=224):
+        self.root = Path(train_root or ROOT / "data/U1652/train") / domain
+        self.transform = get_test_transforms([image_size, image_size])
         self.ids = sorted(p.name for p in self.root.iterdir() if p.is_dir())
         self.rows = []
         for pid in self.ids:
@@ -41,16 +38,25 @@ def main(argv=None):
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--num-workers", type=int, default=8)
+    p.add_argument('--middle-checkpoint',required=True)
+    p.add_argument('--middle-run-config',required=True)
+    p.add_argument('--asset-output',required=True)
+    p.add_argument('--train-root',default=str(ROOT/'data/U1652/train'))
+    p.add_argument('--image-size',type=int,default=224)
     args = p.parse_args(argv)
+    DEFAULT_BANK=Path(args.asset_output).resolve();ASSETS=DEFAULT_BANK.parent
+    checkpoint=Path(args.middle_checkpoint).resolve();middle_config=Path(args.middle_run_config).resolve()
+    config=json.loads(middle_config.read_text())
+    if config.get('sam',{}).get('enabled'):raise ValueError('New chain requires without-SAM Middle')
+    if config['data']['input_size']!=args.image_size:raise ValueError('Middle/input resolution mismatch')
     if DEFAULT_BANK.exists(): raise FileExistsError(DEFAULT_BANK)
     torch.set_num_threads(8)
     ASSETS.mkdir(parents=True, exist_ok=True)
-    checkpoint = TEACHER/"best_model.pth"
     initial_sha = file_sha256(checkpoint)
-    datasets = {d: TrainImages(d) for d in ("drone", "satellite")}
+    datasets = {d: TrainImages(d,args.train_root,args.image_size) for d in ("drone", "satellite")}
     if datasets["drone"].ids != datasets["satellite"].ids or len(datasets["drone"].ids) != 701:
         raise ValueError("Exactly 701 matching TRAIN identities required")
-    model, audit = load_encoder("middle", checkpoint, TEACHER/"run_config.json", args.device)
+    model, audit = load_encoder("middle", checkpoint, middle_config, args.device)
     if audit["missing"] or audit["unexpected"] or audit["sha256"] != initial_sha:
         raise RuntimeError("Teacher strict load/identity failed")
     if model.training or any(p.requires_grad for p in model.parameters()):
@@ -80,16 +86,16 @@ def main(argv=None):
     bank = construct_train_subspace(features["drone"], labels["drone"],
             features["satellite"], labels["satellite"], middle_sha256=initial_sha, split="train")
     bank["metadata"].update(teacher_checkpoint=str(checkpoint),
-        teacher_config=str(TEACHER/"run_config.json"),
-        teacher_config_sha256=file_sha256(TEACHER/"run_config.json"),
+        teacher_config=str(middle_config),
+        teacher_config_sha256=file_sha256(middle_config),
         teacher_architecture="dinov3_vitb16", teacher_descriptor_dim=768,
         source_code_sha256=file_sha256(Path(__file__)),
         canonical_subspace_sha256=file_sha256(Path(__file__).with_name("subspace.py")),
-        train_root=str(ROOT/"data/U1652/train"), image_size=224,
+        train_root=str(Path(args.train_root)), image_size=args.image_size,
         preprocessing="deterministic canonical test transform applied to TRAIN images only",
         input_dtype="float32", parameter_dtype="bfloat16", descriptor_dtype="float32",
         image_counts={d:len(ds) for d,ds in datasets.items()},
-        train_path_identity_sha256={d:hashlib.sha256("\n".join(str(path.relative_to(ROOT/"data/U1652/train"))+":"+str(label)
+        train_path_identity_sha256={d:hashlib.sha256("\n".join(str(path.relative_to(Path(args.train_root)))+":"+str(label)
             for path,label in ds.rows).encode()).hexdigest() for d,ds in datasets.items()})
     checks = dict(teacher_sha_match=file_sha256(checkpoint)==initial_sha,
         mean_shape=list(bank["teacher_mean"].shape),

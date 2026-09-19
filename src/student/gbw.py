@@ -4,6 +4,9 @@ GBW_WEIGHTS=(1.247,.753)
 GBW_RUN_SEEDS={f'P1.5-T128-R32-GBW-S{seed}':seed for seed in (0,1,2)}
 
 def validate_coefficient_config(cfg,default_name):
+    if cfg.get('source_contract')=='CORE_SOURCE_CONTRACT_V2':
+        if (cfg.get('lambda_top'),cfg.get('lambda_random')) not in ((1.,1.),(1.247,.753)):raise ValueError('Invalid fixed coefficients')
+        return cfg['experiment_name']
     top=cfg.get('lambda_top',1.)
     random=cfg.get('lambda_random',1.)
     if type(top) not in (int,float) or type(random) not in (int,float):

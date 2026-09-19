@@ -80,8 +80,8 @@ def test_student_batch_guard_and_metadata(tmp_path):
     assert parse_args(base).batch_size==32
     with pytest.raises(ValueError):parse_args(base+["--batch-size","16"])
     with pytest.raises(ValueError):parse_args(base+["--reuse-certified-cache"])
-    # Teacher/Middle contract is unaffected by the Student guard.
-    assert parse_args([*base[:1],"middle",*base[2:],"--batch-size","16"]).batch_size==16
+    # Middle uses the same batch=32 reload consistency contract.
+    with pytest.raises(ValueError):parse_args([*base[:1],"middle",*base[2:],"--batch-size","16"])
     metrics={d:{"R@1":10.,"R@5":20.,"AP":5.} for d in ["D2S","S2D"]}
     assert best_record(1,metrics)["u1652_eval_batch_size"]==32
     cfg=dict(mode="baseline",temperature=.07,u1652_eval_batch_size=32,img_size=224,batch_size=16,world_size=2,output_dir=str(tmp_path),

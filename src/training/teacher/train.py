@@ -884,10 +884,9 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                 clear_memory_cache()
                 if verbose_eval:
                     rank_log(f'[Eval] Epoch {cur_epoch}/{args.epochs} D2S start')
-                selection_eval = getdist_1652_val_and_get_recall
-                if args.experiment_id == 'T0-CERTIFIED-R224-S0':
-                    from src.training.teacher.certified_selection import certified_teacher_selection
-                    selection_eval = certified_teacher_selection
+                from src.training.teacher.certified_selection import certified_teacher_selection
+                get_base_model(model_engine).selection_image_size = args.img_size
+                selection_eval = certified_teacher_selection
                 (d2s_r1, d2s_r5, d2s_r10, d2s_map) = selection_eval(model_engine, q_loader_d2s, g_loader_d2s, amp_device, task_name='D2S')
                 if verbose_eval:
                     rank_log(f'[Eval] Epoch {cur_epoch}/{args.epochs} D2S done')
@@ -904,6 +903,8 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
             if is_main_process():
                 trainable_state = collect_teacher_delta_state(model_engine)
                 current_metrics = build_validation_metrics(cur_epoch, (d2s_r1, d2s_r5, d2s_r10, d2s_map), (s2d_r1, s2d_r5, s2d_r10, s2d_map))
+                from src.evaluation.precision_contract import selection_signature
+                current_metrics['precision_signature']=selection_signature(get_base_model(model_engine),'teacher',args.img_size)
                 epoch_validation_metrics = current_metrics
                 r1_sum = current_metrics['R@1_sum']
                 is_best = best_metrics is None or r1_sum > best_r1_sum
@@ -918,7 +919,13 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                     best_metrics = current_metrics
                     if verbose_eval:
                         rank_log(f'[Checkpoint] best_model.pth save start | epoch={cur_epoch}')
-                    torch.save(trainable_state, os.path.join(save_dir, 'best_model.pth'))
+                    from src.evaluation.precision_contract import selection_signature, flat_selection_metrics
+                    teacher_model=get_base_model(model_engine)
+                    signature=selection_signature(teacher_model,'teacher',args.img_size)
+                    torch.save(dict(model={n:t.detach().cpu() for n,t in teacher_model.state_dict().items()},
+                        precision_signature=signature,selection_metrics=flat_selection_metrics(current_metrics)),
+                        os.path.join(save_dir,'best_model.pth'))
+                    current_metrics['precision_signature']=signature
                     if verbose_eval:
                         rank_log(f'[Checkpoint] best_model.pth save done | epoch={cur_epoch}')
                 if verbose_eval:

@@ -24,16 +24,21 @@ def loaders(args,config):
     heights=["150","200","250","300"] if args.sues_height=="all" else [args.sues_height]
     return build_sues200_val_dataloaders(size,str(path),args.batch_size,args.num_workers,heights)
 def main(argv=None):
-    args=parse_args(argv); config=load_config(args.config); device=torch.device(args.device if torch.cuda.is_available() else "cpu")
-    model=build_middle_teacher(config,load_foundation=False).to(device); load_middle_teacher_checkpoint(model,args.checkpoint,strict=True); model.eval(); result={}
-    with torch.no_grad():
-        built=loaders(args,config)
-        if args.dataset=="1652":
-            for direction,pair in built.items():
-                r1,r5,r10,ap=getdist_1652_val_and_get_recall(model,*pair,device,task_name=f"U1652:{direction}"); result[direction]={"R@1":r1,"R@5":r5,"R@10":r10,"AP":ap}
-        elif args.dataset=="GTA-UAV":
-            for direction,pair in built.items(): result[direction]=run_gta_val_and_get_metrics(model,*pair,device)
-        else:
-            for height,directions in built.items(): result[height]={direction:run_sues_val_and_get_metrics(model,*pair,device,horizontal_flip=False) for direction,pair in directions.items()}
-    output=Path(args.output_json or Path(args.checkpoint).parent/DEFAULTS[args.dataset]); output.parent.mkdir(parents=True,exist_ok=True); output.write_text(json.dumps({"checkpoint":args.checkpoint,"dataset":args.dataset,"results":result},indent=2)); print(f"[MiddleEval] wrote {output}")
-if __name__=="__main__": main()
+    args=parse_args(argv)
+    if args.gta_split!='cross-area' or args.gta_query_mode!='D2S' or args.sues_height!='all':
+        raise ValueError('Formal protocol requires cross-area D2S and all SUES heights')
+    from .evaluate import main as unified_main
+    datasets={'1652':'u1652','SUES-200':'sues200','GTA-UAV':'gta'}
+    names={'1652':'test_1652.json','SUES-200':'test_sues200.json','GTA-UAV':'test_gta_cross_area_d2s.json'}
+    output=Path(args.output_json or Path(args.checkpoint).parent/DEFAULTS[args.dataset])
+    if output.exists():raise FileExistsError(output)
+    directory=output.parent/(output.stem+'_precision_v1')
+    if directory.exists():raise FileExistsError(directory)
+    forwarded=['--model-type','middle','--checkpoint',args.checkpoint,'--config',args.config,
+        '--dataset',datasets[args.dataset],'--data-root',args.data_root,'--device',args.device,
+        '--batch-size',str(args.batch_size),'--num-workers',str(args.num_workers),'--output-dir',str(directory)]
+    if args.data_dir:forwarded+=['--'+datasets[args.dataset]+'-dir',args.data_dir]
+    unified_main(forwarded)
+    with output.open('x') as handle:handle.write((directory/names[args.dataset]).read_text())
+    print(f'[MiddleEval] wrote {output}')
+if __name__=='__main__': main()

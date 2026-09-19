@@ -50,7 +50,7 @@ def r0_pair_loss(drone, satellite, logit_scale):
 class SelectionEncoder(nn.Module):
     def __init__(self, model):
         super().__init__()
-        self.input_dtype_anchor = nn.Parameter(torch.zeros((),device=next(model.parameters()).device),requires_grad=False)
+        self.input_dtype_anchor = nn.Parameter(torch.zeros((),dtype=torch.float32,device=next(model.parameters()).device),requires_grad=False)
         self.encoder = EvaluationEncoder(model,768)
     def forward(self, images):
         return self.encoder(images)
@@ -67,6 +67,10 @@ def grouped_loader(loader):
 
 @torch.no_grad()
 def selection(engine, loaders, device):
+    engine.module.selection_image_size=getattr(engine.module,'selection_image_size',224)
+    from src.evaluation.precision_contract import selection_signature
+    signature=selection_signature(engine.module,'middle',engine.module.selection_image_size)
+    print('PRECISION_SIGNATURE='+json.dumps(signature),flush=True)
     encoder = SelectionEncoder(engine.module).eval()
     metrics = {}
     for direction,(query,gallery) in loaders.items():
@@ -148,6 +152,7 @@ def main(allow_kd=True,allow_abv=False):
         assert not any(id(p) in optimizer_ids for p in kd.teacher.parameters())
     _,loader=create_middle_teacher_train_dataset_and_loader(config)
     assert len(loader)==1182,len(loader)
+    engine.module.selection_image_size=config['data']['input_size']
     controller=CheckpointController(output,objective='pair_infonce_'+component)
     metadata={'experiment':config['experiment']['name'],'seed':seed,'img_size':224,'epochs':10,
         'code':{'branch':subprocess.check_output(['git','branch','--show-current'],text=True).strip(),
@@ -267,7 +272,7 @@ def main(allow_kd=True,allow_abv=False):
                     'finite':True,'lr':[g['lr'] for g in optimizer.param_groups],'global_pool':32}),flush=True)
         barrier();engine.eval()
         if val_loaders is None:
-            val_loaders=build_1652_val_dataloaders('data/U1652',[224,224],32,4)
+            val_loaders=build_1652_val_dataloaders(config['data'].get('val_dir','data/U1652'),[config['data']['input_size']]*2,32,4)
         metrics=selection(engine,val_loaders,device)
         improved=controller.save_best_if_improved(engine,epoch,step,metrics)
         if epoch==10:controller.save_last(engine,epoch,step,metrics)

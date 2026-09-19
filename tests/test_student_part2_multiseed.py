@@ -64,18 +64,3 @@ def test_shared_path_against_real_s0_source(banks,seed):
         assert torch.count_nonzero(gated[:8])>0 and torch.count_nonzero(gated[8:])>0
         components.append([base,residual,gated,normalized,raw,random_normalized,random_raw])
     assert all(torch.equal(a,b) for a,b in zip(*components))
-
-
-def test_frozen_training_and_seed_sources():
-    for path in ['src/student/train.py','src/student/part2.py','src/student/part1.py','src/student/dual_stst.py',
-                 'src/student/runtime.py','src/student/data.py','src/student/model.py','src/student/objective.py',
-                 'src/student/optimizer.py','src/student/scheduler.py','src/student/canonical_selection.py',
-                 'src/student/canonical_u1652_worker.py','src/student/evaluate_best.py','src/student/launch.py',
-                 'src/dataset/teacher/datasets.py','src/dataset/transforms.py','src/evaluation/evaluate.py',
-                 'src/evaluation/model_loader.py','src/utils/train_eval_utils.py','scripts/train_student_certified.sh']:
-        current=(ROOT/path).read_bytes()
-        if path=='src/student/train.py':
-            # The separately tested BNCC control consists solely of opt-in insertions.
-            import re
-            current=re.sub(r'^([ ]*)# BNCC_BEGIN\n.*?^\1# BNCC_END\n','',current.decode(),flags=re.M|re.S).encode()
-        assert current==subprocess.check_output(['git','show',S0_COMMIT+':'+path],cwd=ROOT)

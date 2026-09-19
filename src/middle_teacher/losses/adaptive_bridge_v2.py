@@ -75,21 +75,6 @@ class ClsPatchBridge(nn.Module):
         return fused, cls_projected, patch_projected, attention
 
 
-class ClsOnlyBridge(nn.Module):
-    def __init__(self, teacher_dim, middle_dim, hidden_dim):
-        super().__init__()
-        self.teacher_dim = int(teacher_dim)
-        self.bridge = _mlp(teacher_dim, hidden_dim, middle_dim)
-
-    def forward(self, cls_feature, patch_feature=None):
-        if cls_feature.ndim != 2 or int(cls_feature.shape[-1]) != self.teacher_dim:
-            raise ValueError(
-                f"CLS features must have shape [B,{self.teacher_dim}]"
-            )
-        projected = self.bridge(
-            cls_feature.detach().to(dtype=next(self.bridge.parameters()).dtype)
-        ).float()
-        return projected, projected, None, None
 
 
 class AdaptiveBridgeV2Bank(nn.Module):
@@ -104,7 +89,9 @@ class AdaptiveBridgeV2Bank(nn.Module):
         self.gate_type = str(component["gate_type"])
         self.fusion_mode = str(component["fusion_mode"])
         hidden_dim = int(component["bridge_hidden_dim"])
-        bridge_class = ClsPatchBridge if self.feature_mode == "CLS_PATCH" else ClsOnlyBridge
+        if (self.feature_mode,self.gate_type,self.fusion_mode) != ('CLS_PATCH','GLOBAL_SOFTMAX','GATED_FEATURE_FUSION'):
+            raise ValueError('Semantic Adaptation requires CLS_PATCH, GLOBAL_SOFTMAX, GATED_FEATURE_FUSION')
+        bridge_class = ClsPatchBridge
         self.bridges = nn.ModuleDict(
             {
                 str(layer): bridge_class(
@@ -117,50 +104,21 @@ class AdaptiveBridgeV2Bank(nn.Module):
             [float(component["gate_init_values"][str(layer)]) for layer in self.teacher_layers],
             dtype=torch.float32,
         )
-        if self.gate_type == "GLOBAL_SOFTMAX":
-            self.gate_logits = nn.Parameter(prior.log())
-            self.sample_gate = None
-        elif self.gate_type == "SAMPLE_SOFTMAX":
-            self.register_buffer("gate_prior_logits", prior.log())
-            self.sample_gate = nn.Linear(self.middle_dim, len(self.teacher_layers))
-            nn.init.zeros_(self.sample_gate.weight)
-            nn.init.zeros_(self.sample_gate.bias)
-            self.gate_logits = None
-        elif self.gate_type == "DISABLED":
-            self.register_buffer("fixed_alpha", prior)
-            self.gate_logits = None
-            self.sample_gate = None
-        else:
-            raise ValueError(f"unsupported V2 gate type: {self.gate_type}")
+        self.gate_logits = nn.Parameter(prior.log())
+        self.sample_gate = None
 
     @property
     def parameter_count(self):
         return sum(parameter.numel() for parameter in self.parameters())
 
     def alpha(self, middle_feature):
-        if self.gate_type == "GLOBAL_SOFTMAX":
-            return torch.softmax(self.gate_logits.float(), dim=0)
-        if self.gate_type == "SAMPLE_SOFTMAX":
-            # DeepSpeed/AMP may cast the module parameters to BF16 while the
-            # gate input is deliberately evaluated in FP32.  Use functional
-            # linear with FP32 views so the gate stays numerically stable and
-            # gradients still flow to the original learnable parameters.
-            logits = F.linear(
-                middle_feature.float(),
-                self.sample_gate.weight.float(),
-                None if self.sample_gate.bias is None else self.sample_gate.bias.float(),
-            ) + self.gate_prior_logits.float()
-            return torch.softmax(logits, dim=-1)
-        return self.fixed_alpha.float()
+        return torch.softmax(self.gate_logits.float(), dim=0)
 
     def forward(self, teacher_cls, teacher_patches, middle_feature):
         if len(teacher_cls) != len(self.teacher_layers):
             raise ValueError("V2 teacher CLS feature count mismatch")
-        if self.feature_mode == "CLS_PATCH":
-            if teacher_patches is None or len(teacher_patches) != len(self.teacher_layers):
-                raise ValueError("V2 CLS_PATCH mode requires paired patch features")
-        elif teacher_patches is not None and len(teacher_patches) != 0:
-            raise ValueError("V2 CLS_ONLY mode must not receive patch features")
+        if teacher_patches is None or len(teacher_patches) != len(self.teacher_layers):
+            raise ValueError("V2 CLS_PATCH mode requires paired patch features")
         projected, semantic, spatial, attentions = [], [], [], []
         for index, (layer, cls_feature) in enumerate(zip(self.teacher_layers, teacher_cls)):
             patch_feature = None if teacher_patches is None else teacher_patches[index]
@@ -200,14 +158,10 @@ def adaptive_bridge_v2_loss(
     alpha_per_sample = (
         alpha.unsqueeze(0).expand(target.shape[0], -1) if alpha.ndim == 1 else alpha
     )
-    if bridge_bank.fusion_mode == "PER_LAYER_LOSS":
-        weighted_per_sample = alpha_per_sample * raw_per_sample
-        loss = weighted_per_sample.sum(dim=1).mean()
-    else:
-        stacked = torch.stack(projected, dim=1)
-        fused = (alpha_per_sample.unsqueeze(-1) * stacked).sum(dim=1)
-        loss = _cosine_per_sample(fused, target).mean()
-        weighted_per_sample = alpha_per_sample * raw_per_sample
+    stacked = torch.stack(projected, dim=1)
+    fused = (alpha_per_sample.unsqueeze(-1) * stacked).sum(dim=1)
+    loss = _cosine_per_sample(fused, target).mean()
+    weighted_per_sample = alpha_per_sample * raw_per_sample
 
     semantic_per_sample = torch.stack(
         [_cosine_per_sample(feature, target) for feature in semantic], dim=1

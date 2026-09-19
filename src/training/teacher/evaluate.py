@@ -177,7 +177,14 @@ def load_teacher_checkpoint(model, checkpoint_path, device):
 
         mapped_state[key] = value
 
-    missing, load_unexpected = model.load_state_dict(mapped_state, strict=False)
+    complete=model.state_dict()
+    required=get_required_teacher_delta_keys(model)
+    if unexpected or incompatible or required-set(mapped_state):
+        raise RuntimeError('Teacher delta key/shape mismatch')
+    missing=sorted(set(complete)-set(mapped_state))
+    complete.update(mapped_state)
+    result=model.load_state_dict(complete,strict=True)
+    load_unexpected=result.unexpected_keys
     model.to(device)
 
     required_keys = get_required_teacher_delta_keys(model)
@@ -432,36 +439,22 @@ def parse_args():
 
 
 def main():
-    args = parse_args()
-    if args.device == "cuda" and not torch.cuda.is_available():
-        args.device = "cpu"
-    device = torch.device(args.device)
-    local_rank = int(getattr(args, "local_rank", 0))
-    rank = 0
+    args=parse_args()
+    if args.gta_split!='cross-area' or args.gta_query_mode!='D2S' or args.sues_height!='all' or args.sues_horizontal_flip:
+        raise ValueError('Formal precision contract requires canonical evaluation preprocessing/protocol')
+    if args.no_checkpoint_hparams or any(x.split('=')[0].lstrip('-') in MODEL_HPARAM_KEYS for x in sys.argv[1:]):
+        raise ValueError('Formal reload architecture must come from checkpoint metadata')
+    from src.evaluation.evaluate import main as unified_main
+    datasets={'1652':'u1652','SUES-200':'sues200','GTA-UAV':'gta'}
+    names={'1652':'test_1652.json','SUES-200':'test_sues200.json','GTA-UAV':'test_gta_cross_area_d2s.json'}
+    output=Path(args.output_json or Path(args.checkpoint).parent/'teacher_test_results.json')
+    directory=output.parent/(output.stem+'_precision_v1')
+    if output.exists() or directory.exists():raise FileExistsError(output)
+    forwarded=['--model-type','teacher','--checkpoint',args.checkpoint,'--dataset',datasets[args.dataset],
+        '--data-root',args.data_root,'--device',args.device,'--batch-size',str(args.batch_size),
+        '--image-size',str(args.img_size),'--num-workers',str(args.num_workers),'--output-dir',str(directory)]
+    if args.data_dir:forwarded+=['--'+datasets[args.dataset]+'-dir',args.data_dir]
+    unified_main(forwarded)
+    with output.open('x') as handle:handle.write((directory/names[args.dataset]).read_text())
 
-    if is_main_process():
-        print(f"[Eval] single-card device={device} | dataset={args.dataset}")
-
-    loaders = build_loaders_for_dataset(args.dataset, args)
-    print_loader_summary(args.dataset, loaders)
-    distributed_barrier(local_rank)
-
-    model = TeacherModel(args)
-    model.to(device)
-    load_teacher_checkpoint(model, args.checkpoint, device)
-    model.eval()
-
-    results = {}
-    with torch.no_grad():
-        results[args.dataset] = evaluate_dataset(model, args, args.dataset, device, loaders=loaders)
-        distributed_barrier(local_rank)
-
-    write_results(args, results)
-    distributed_barrier(local_rank)
-
-    if rank == 0:
-        print("[Eval] done")
-
-
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':main()

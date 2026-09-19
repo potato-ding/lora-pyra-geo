@@ -1,6 +1,13 @@
-from .pair_infonce import PairInfoNCE
-from .nrkd import nrkd
-from .margin_kd import margin_kd
-from .retrieval_distribution_kd import retrieval_distribution_kd
-from .local_covision_relation_kd import local_covision_relation_kd, residual_evidence_gates
-__all__ = ["PairInfoNCE", "nrkd", "margin_kd", "retrieval_distribution_kd", "local_covision_relation_kd", "residual_evidence_gates"]
+"""Loss modules load only when explicitly selected by a consumer."""
+from importlib import import_module
+_EXPORTS={'PairInfoNCE':('pair_infonce','PairInfoNCE'),'nrkd':('nrkd','nrkd'),
+ 'margin_kd':('margin_kd','margin_kd'),'retrieval_distribution_kd':('retrieval_distribution_kd','retrieval_distribution_kd'),
+ 'local_covision_relation_kd':('local_covision_relation_kd','local_covision_relation_kd'),
+ 'residual_evidence_gates':('local_covision_relation_kd','residual_evidence_gates')}
+__all__=list(_EXPORTS)
+def __getattr__(name):
+    if name not in _EXPORTS:raise AttributeError(name)
+    module,attr=_EXPORTS[name]
+    value=getattr(import_module('.'+module,__name__),attr)
+    globals()[name]=value
+    return value

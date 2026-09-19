@@ -5,7 +5,6 @@ import torch
 from torch import nn
 from src.models.dinov3_vitb_backbone import DINOv3ViTB16Backbone
 from .trainability import resolve_trainability
-from .losses.adaptive_bridge_v1 import AdaptiveBridgeBank
 from .losses.adaptive_bridge_v2 import AdaptiveBridgeV2Bank
 
 class MiddleTeacherModel(nn.Module):
@@ -22,6 +21,7 @@ class MiddleTeacherModel(nn.Module):
         if bridge:
             historical=dict(bridge)
             if historical["mode"]=="adaptive_bridge_v1":
+                from .losses.adaptive_bridge_v1 import AdaptiveBridgeBank
                 layers=historical["teacher_layers"]; priors=historical["gate_init_values"]
                 setattr(self,checkpoint_bridge_name,AdaptiveBridgeBank(historical["teacher_dim"],historical["middle_dim"],layers,[priors[str(x)] for x in layers]))
             elif historical["mode"]=="adaptive_bridge_v2": setattr(self,checkpoint_bridge_name,AdaptiveBridgeV2Bank(historical))

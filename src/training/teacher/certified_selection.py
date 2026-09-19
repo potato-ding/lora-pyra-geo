@@ -47,6 +47,8 @@ def canonical_loader(loader):
 @torch.no_grad()
 def certified_teacher_selection(model, query_loader, gallery_loader, device, task_name=None):
     teacher = model.module if hasattr(model, 'module') else model
+    from src.evaluation.precision_contract import selection_signature
+    signature=selection_signature(teacher,'teacher',getattr(teacher,'selection_image_size',224))
     training = teacher.training
     try:
         encoder = CanonicalSelectionEncoder(teacher).eval()

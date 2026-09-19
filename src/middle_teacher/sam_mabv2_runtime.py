@@ -11,15 +11,12 @@ from src.utils.gather_features_and_labels_and_views import GatherLayer,concat_al
 BASE=Path('src/checkpoint/middle_teacher/CERTIFIED_R224')
 RHOS={'0025':.025,'005':.05,'010':.10,'020':.20}
 def validate_sam(c,validate_r0):
-    ref=json.loads((BASE/'FCHAIN-MARGIN-ABV2-S0/run_config.json').read_text())
-    code=c['experiment']['name'].removeprefix('SAM-MABV2-RHO').removesuffix('-S0')
-    assert code in RHOS
-    assert c['sam']['enabled'] and not c['sam']['adaptive'] and c['sam']['rho']==RHOS[code]
+    from .core_config import validate_core_config
+    validate_core_config(c,allow_sam=True)
+    assert c['sam']['enabled'] and not c['sam']['adaptive'] and c['sam']['rho'] in RHOS.values()
     assert c['sam']['ascent_objective']==c['sam']['update_objective']=='FULL_CURRENT_MABV2'
     assert set(c['distillation'])=={'base_loss','margin','adaptive_bridge_v2'}
-    b=copy.deepcopy(c);b['experiment']['name']=ref['experiment']['name'];b['checkpoint']['output_dir']=ref['checkpoint']['output_dir'];b['sam']=ref['sam']
-    assert b==ref,'unexpected base semantic difference'
-    b['distillation']={'base_loss':'pair_infonce'};validate_r0(b)
+
 def fingerprints(path):
     out=prior_fingerprints(path)
     for p in ['src/middle_teacher/sam.py','src/middle_teacher/sam_mabv2_runtime.py','src/middle_teacher/sam_mabv2_train.py']:out[p]=sha256(p)

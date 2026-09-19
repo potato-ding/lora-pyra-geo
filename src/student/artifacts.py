@@ -54,16 +54,10 @@ def selection_metadata():
         checkpoint_selection_frequency="every_epoch",
         SUES_USED_FOR_SELECTION=False, GTA_USED_FOR_SELECTION=False)
 
-def source_identity():
-    paths=set((ROOT/"src/student").glob("*.py"))
-    paths.update(ROOT/p for p in (
-        "src/models/repvit_backbone.py", "src/models/repvit_module.py",
-        "src/dataset/transforms.py", "src/dataset/teacher/datasets.py",
-        "src/dataset/teacher/transforms.py", "src/dataset/teacher/val_dataloaders.py",
-        "src/utils/gather_features_and_labels_and_views.py", "src/utils/train_eval_utils.py",
-        "src/evaluation/metrics.py", "src/evaluation/evaluate.py", "src/evaluation/model_loader.py",
-        "scripts/train_student.sh", "scripts/train_student_certified.sh"))
-    return {str(p.relative_to(ROOT)):file_sha256(p) for p in sorted(paths)}
+def source_identity(gbw=False):
+    from src.source_contract import source_identity as explicit_identity
+    return explicit_identity('m2s',gbw=gbw)
+
 
 def dual_stst_metadata(cfg):
     # Bind D0 metadata to the actual validated train-only bank and Teacher.
@@ -102,7 +96,7 @@ def resolved_config(cfg, steps_per_epoch=None):
         metadata.update(evaluator_metadata(), bn_protocol="single_rank_native_bn", cross_rank_buffer_sync=False, bn_buffer_broadcast_required=False)
     return dict(metadata, experiment_name=Path(cfg["output_dir"]).name,
         method=cfg["mode"], git_commit=commit, sealed_commit=expected or commit,
-        source_sha256=source_identity(),
+        source_sha256=source_identity(gbw=cfg.get('allocation_variant') is not None),source_contract='CORE_SOURCE_CONTRACT_V2',
         student_architecture="RepViT-M1.5", student_pretrained_path=str(Path(cfg["student_pretrained"]).resolve()),
         student_pretrained_sha256=file_sha256(cfg["student_pretrained"]),
         image_size=cfg["img_size"], local_pair_batch=cfg["batch_size"],
@@ -142,7 +136,9 @@ def validate_training_complete(run):
         raise ValueError("Complete thirty-epoch history required")
     best=json.loads((run/"best_metrics.json").read_text())
     expected=max(history,key=lambda row:row["metrics"]["D2S"]["R@1"]+row["metrics"]["S2D"]["R@1"])
-    if best != best_record(expected["epoch"],expected["metrics"], canonical=cfg.get("protocol_id") in ("STU-1G-B32-R224-v1", "STU-2G-B32-R224-REPRO-v1")):
+    expected_best=best_record(expected["epoch"],expected["metrics"],canonical=cfg.get("protocol_id")=="STU-1G-B32-R224-v1")
+    if 'precision_signature' in expected: expected_best['precision_signature']=expected['precision_signature']
+    if best != expected_best:
         raise ValueError("Best metadata violates first strict maximum selection")
     for name in ("best_model.pth","last_model.pth","train.log"):
         if not (run/name).is_file(): raise FileNotFoundError(run/name)

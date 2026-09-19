@@ -31,11 +31,11 @@ def test_precision_contract_after_strict_load(kind):
     assert torch.allclose(descriptor.norm(dim=-1),torch.ones(2),atol=1e-6)
     assert (descriptor @ descriptor.T).dtype==torch.float32
 
-def test_student_precision_unchanged():
+def test_student_precision_matches_live_bf16():
     model=TinyDescriptor(); before={k:v.clone() for k,v in model.state_dict().items()}
     apply_runtime_precision('student',model)
-    assert all(p.dtype==torch.float32 for p in model.parameters())
-    assert all(torch.equal(v,before[k]) for k,v in model.state_dict().items())
+    assert all(p.dtype==torch.bfloat16 for p in model.parameters())
+    assert all(torch.equal(v,before[k].bfloat16()) for k,v in model.state_dict().items())
 
 def test_formal_cache_precision_is_part_of_identity():
     from src.evaluation import evaluate

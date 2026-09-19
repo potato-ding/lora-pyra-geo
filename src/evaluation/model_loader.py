@@ -5,20 +5,15 @@ import torch
 from torch import nn
 from src.middle_teacher.checkpoint import safe_load, unwrap_state_dict, sha256
 
+from .precision_contract import (apply_runtime_precision as apply_contract, inspect_precision_signature,
+    selection_signature, forward_context)
+
 def apply_runtime_precision(model_type, model):
-    """Apply deployment precision after strict load, without changing weights on disk."""
-    if model_type in ('teacher', 'middle'):
-        model.bfloat16()
-    elif model_type != 'student':
-        raise ValueError(model_type)
-    dtypes = sorted({str(p.dtype).removeprefix('torch.') for p in model.parameters() if p.is_floating_point()})
-    return {'parameter_dtype': dtypes[0] if len(dtypes) == 1 else dtypes,
-            'descriptor_dtype': 'float32', 'l2_normalization_dtype': 'float32',
-            'similarity_dtype': 'float32'}
+    return apply_contract(model,model_type)
 
 
 class EvaluationEncoder(nn.Module):
-    def __init__(self,model,dimension,fp32_input=False):
+    def __init__(self,model,dimension,fp32_input=True):
         super().__init__()
         if fp32_input:
             # Extraction infers image dtype from the first parameter. Preserve
@@ -30,8 +25,8 @@ class EvaluationEncoder(nn.Module):
     def encode(self,images):
         self.model.eval()
         device=next(self.model.parameters()).device
-        with torch.autocast(device.type,dtype=torch.bfloat16,enabled=device.type=='cuda'):
-            output=self.model(images.to(device))
+        with forward_context(device):
+            output=self.model(images.to(device=device,dtype=next(self.model.parameters()).dtype if device.type=='cpu' else images.dtype))
         if output.dtype!=torch.float32 or output.ndim!=2 or output.shape[1]!=self.descriptor_dim:
             raise RuntimeError('Descriptor contract violated: expected normalized FP32 descriptor')
         if not torch.isfinite(output).all() or not torch.allclose(output.norm(dim=1),torch.ones(output.shape[0],device=device),atol=1e-4):
@@ -51,9 +46,12 @@ def normalize_state(payload):
         output[key]=value
     return output
 
-def load_encoder(model_type,checkpoint,config=None,device='cuda'):
+def load_encoder(model_type,checkpoint,config=None,device='cuda',image_size=224):
     checkpoint=Path(checkpoint)
     if not checkpoint.is_file():raise FileNotFoundError(checkpoint)
+    payload=safe_load(checkpoint)
+    expected=payload.get('precision_signature') if isinstance(payload,dict) else None
+    if expected is not None: image_size=expected['image_size']
     if model_type=='teacher':
         from src.models.teacher.model import TeacherModel
         from src.training.teacher.args import build_arg_parser
@@ -61,8 +59,10 @@ def load_encoder(model_type,checkpoint,config=None,device='cuda'):
         args=build_arg_parser().parse_args([])
         for key,value in metadata['hyperparameters'].items():setattr(args,key,value)
         args.device=str(device);model=TeacherModel(args);dimension=4096
-        state=normalize_state(safe_load(checkpoint));complete=model.state_dict()
+        state=normalize_state(payload);complete=model.state_dict()
         required={name for name,p in model.named_parameters() if p.requires_grad}
+        if expected is not None and set(state)!=set(complete):
+            raise RuntimeError('New Teacher checkpoint must contain every inference parameter/buffer')
         if set(state)-set(complete) or required-set(state):
             raise RuntimeError('T0 delta checkpoint has missing adapted keys or unexpected keys')
         complete.update(state)
@@ -73,18 +73,20 @@ def load_encoder(model_type,checkpoint,config=None,device='cuda'):
         from src.middle_teacher.model import build_middle_teacher
         if config is None:raise ValueError('--config is required for Middle architecture identity')
         model=build_middle_teacher(load_config(config),load_foundation=False);dimension=768
-        state=normalize_state(safe_load(checkpoint));result=model.load_state_dict(state,strict=True)
+        state=normalize_state(payload);result=model.load_state_dict(state,strict=True)
         schema='full Middle deployment state'
     elif model_type=='student':
         from src.student.model import StudentModel
         model=StudentModel(ckpt_path=None);dimension=512
-        state=normalize_state(safe_load(checkpoint));result=model.load_state_dict(state,strict=True)
+        state=normalize_state(payload);result=model.load_state_dict(state,strict=True)
         schema='full RepViT-M1.5 deployment state'
     else:raise ValueError(model_type)
-    runtime_precision = apply_runtime_precision(model_type, model)
+    runtime_precision = apply_contract(model,model_type,expected,image_size)
     model.to(device).eval()
     for parameter in model.parameters():parameter.requires_grad_(False)
     audit={'checkpoint_type':schema,'checkpoint':str(checkpoint.resolve()),'sha256':sha256(checkpoint),
            'state_keys':len(state),'missing':list(result.missing_keys),'unexpected':list(result.unexpected_keys),
-           'runtime_precision':runtime_precision}
-    return EvaluationEncoder(model,dimension,fp32_input=model_type in ('teacher','middle')).eval(),audit
+           'runtime_precision':runtime_precision,
+           'precision_signature':inspect_precision_signature(model,model_type,image_size),
+           'selection_metrics':payload.get('selection_metrics') if isinstance(payload,dict) else None}
+    return EvaluationEncoder(model,dimension,fp32_input=True).eval(),audit

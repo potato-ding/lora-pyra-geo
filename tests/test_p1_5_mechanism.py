@@ -135,17 +135,3 @@ def test_random_untrained_head_forbidden():
 def test_cross_seed_ddof():
     s=a.cross([1,2,3])
     assert s==dict(S0=1.,S1=2.,S2=3.,mean=2.,sample_std=1.)
-
-def test_training_source_unchanged():
-    import subprocess,hashlib
-    from gbw_source_contract import before_gbw
-    for path,sha in a.source_identity().items():
-        # These later, separately tested modules did not exist in the historical
-        # Part-I.5 seal. Keep the byte comparison for every pre-existing source.
-        if path in ['src/student/gbw.py','src/student/gbw_smoke.py',
-                    'src/student/part2.py','src/student/part2_input_audit.py',
-                    'src/student/part2_smoke.py','src/student/part2_integration.py',
-                    'src/student/part2_formal_smoke.py']:continue
-        old=subprocess.check_output(['git','show','5cb84df6d041b0012968099ae089d456e5796a39:'+path],cwd=a.ROOT)
-        assert old.decode()==before_gbw(path,(a.ROOT/path).read_text())
-

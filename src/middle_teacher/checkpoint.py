@@ -1,5 +1,6 @@
 """Portable model checkpoints and DeepSpeed resume state for Middle Teacher."""
 from __future__ import annotations
+from src.evaluation.precision_contract import selection_signature, flat_selection_metrics
 
 import hashlib
 import inspect
@@ -77,7 +78,9 @@ class CheckpointController:
         torch.save({"model": portable_state(model_or_engine), "epoch": int(epoch),
                     "global_step": int(global_step), "train_objective": self.objective,
                     "best_score": float(self.best_score), "best_epoch": int(self.best_epoch),
-                    "best_metrics": self.best_metrics, "metrics": metrics}, self.output_dir / filename)
+                    "best_metrics": self.best_metrics, "metrics": metrics,
+                    "precision_signature": selection_signature(raw_model(model_or_engine),'middle',getattr(raw_model(model_or_engine),'selection_image_size',224)),
+                    "selection_metrics": flat_selection_metrics(metrics) if metrics else None}, self.output_dir / filename)
 
     def save_last(self, model_or_engine, epoch, global_step, metrics=None):
         self._save_portable(model_or_engine, "last_model.pth", epoch, global_step, metrics)

@@ -32,6 +32,11 @@ def make_config(variant):
     return cfg
 
 def validate_config(cfg):
+    if cfg.get('source_contract')=='CORE_SOURCE_CONTRACT_V2':
+        from .core_config import validate_config as validate_new
+        validate_new(cfg)
+        if cfg['paper_mode'] not in ('fixed','learnable'):raise ValueError('Allocation entry requires GBW family')
+        return cfg
     if cfg != make_config(cfg.get('allocation_variant')):
         raise ValueError('Exact matched S0 P2 protocol and fixed allocation controls required')
     return cfg
@@ -39,7 +44,7 @@ def validate_config(cfg):
 def load_config(path):return validate_config(json.loads(Path(path).read_text()))
 
 def prepare_top(supervision,cfg):
-    historical_prepare_top(supervision,reference_config())
+    historical_prepare_top(supervision,cfg if cfg.get('source_contract')=='CORE_SOURCE_CONTRACT_V2' else reference_config())
 
 class AllocationGate(nn.Module):
     def __init__(self,kind,initial):
@@ -123,12 +128,13 @@ def objective_from_descriptors(student,supervision,z,y,criterion,cfg,epoch,gate=
     return total,gate_loss,metrics
 
 def batch_loss(engine,teacher,images,criterion,cfg,epoch,gate=None):
-    assert images.shape==(64,3,224,224)
+    size=int(cfg.get('img_size',224))
+    assert images.shape==(64,3,size,size)
     calls=[]
     h=engine.module.student.register_forward_pre_hook(lambda m,a:calls.append(tuple(a[0].shape)))
     try:z=engine(images.to(dtype=next(engine.module.student.parameters()).dtype))
     finally:h.remove()
-    assert calls==[(64,3,224,224)]
+    assert calls==[(64,3,size,size)]
     with torch.no_grad():y=teacher(images.to(dtype=torch.bfloat16)).detach().float()
     assert not teacher.training and all(not p.requires_grad and p.grad is None for p in teacher.parameters())
     total,gate_loss,metrics=objective_from_descriptors(engine.module.student,engine.module.stst,z,y,criterion,cfg,epoch,gate)
@@ -146,6 +152,9 @@ def metadata(cfg):
         spatial_kd_enabled=False,launch_runtime='direct Python; canonical DeepSpeed stage1 world_size1')
 
 def assert_assets(cfg):
+    if cfg.get('source_contract')=='CORE_SOURCE_CONTRACT_V2':
+        from .core_config import assert_assets as assert_new_assets
+        return assert_new_assets(cfg)
     checks={'middle_checkpoint':TEACHER_SHA,
         'student_pretrained':'d645a2de5481c9aac1639d0e97b04cd4bdb0df9d7347920b132dd0ed45de8b39',
         'stst_asset':'3fdcd8bc62f7204a36469ba05c0cd65d4792fcf7dafeda8d4ffb6780f769b50c',

@@ -39,44 +39,8 @@ def test_all_seed_configs_matched_and_one_gpu():
     assert train.deepspeed_config()["zero_optimization"]["stage"]==1
 
 
-def test_atomic_selection_strict_tie_and_reload(tmp_path,monkeypatch):
-    model=nn.BatchNorm1d(4).bfloat16()
-    wrapper=nn.Module();wrapper.student=model
-    metrics={d:{"R@1":30.,"R@5":50.,"AP":20.} for d in ("D2S","S2D")}
-    scores=[metrics,metrics,{d:dict(v,**{"R@1":31.}) for d,v in metrics.items()}]
-    evaluated=[]
-    def evaluator(checkpoint,*args,**kwargs):
-        payload=torch.load(checkpoint,weights_only=True)
-        assert all(v.dtype==torch.float32 for v in payload["model"].values() if v.is_floating_point())
-        fresh=nn.BatchNorm1d(4)
-        fresh.load_state_dict(payload["model"],strict=True)
-        assert all(torch.equal(v,fresh.state_dict()[k]) for k,v in c.canonical_state(wrapper).items())
-        sha=file_sha256(checkpoint);evaluated.append(sha)
-        return dict(results=scores[len(evaluated)-1],checkpoint_sha256=sha)
-    monkeypatch.setattr(c,"evaluate_checkpoint",evaluator)
-    best,row=c.select_epoch(wrapper,tmp_path,1,float("-inf"),"fixture")
-    assert row["is_best"] and best==60
-    original=file_sha256(tmp_path/"best_model.pth")
-    with torch.no_grad():model.running_mean.add_(1)
-    best,row=c.select_epoch(wrapper,tmp_path,2,best,"fixture")
-    assert not row["is_best"] and file_sha256(tmp_path/"best_model.pth")==original
-    assert torch.load(tmp_path/"last_model.pth",weights_only=True)["epoch"]==2
-    best,row=c.select_epoch(wrapper,tmp_path,3,best,"fixture")
-    assert row["is_best"] and best==62
-    assert file_sha256(tmp_path/"best_model.pth")==evaluated[-1]
-    assert file_sha256(tmp_path/"last_model.pth")==evaluated[-1]
-    assert json.loads((tmp_path/"best_metrics.json").read_text())==best_record(3,scores[-1],canonical=True)
-    assert not list(tmp_path.glob("*candidate*"))
 
 
-def test_evaluator_failure_preserves_best_and_cleans_candidate(tmp_path,monkeypatch):
-    (tmp_path/"best_model.pth").write_bytes(b"prior-best")
-    def fail(*args,**kwargs):raise RuntimeError("evaluator failed")
-    monkeypatch.setattr(c,"evaluate_checkpoint",fail)
-    with pytest.raises(RuntimeError,match="evaluator failed"):
-        c.select_epoch(nn.Linear(2,2),tmp_path,1,0,"unused")
-    assert (tmp_path/"best_model.pth").read_bytes()==b"prior-best"
-    assert not list(tmp_path.glob("*candidate*"))
 
 
 def test_distributed_selector_rejected_before_any_evaluation(tmp_path,monkeypatch):
@@ -129,3 +93,45 @@ def test_eval_batch_mismatch_rejected_at_config_load(tmp_path):
     path.write_text(json.dumps(cfg))
     with pytest.raises(ValueError,match="u1652_eval_batch_size"):
         train.load_config(path)
+
+
+def test_live_selection_strict_tie_and_reload(tmp_path,monkeypatch):
+    from src.evaluation import metrics as metric_module
+    from src.dataset.teacher import val_dataloaders
+    from src.evaluation.precision_contract import apply_runtime_precision,assert_precision_signature,inspect_precision_signature
+    model=nn.BatchNorm1d(4).bfloat16();wrapper=nn.Module();wrapper.student=model
+    monkeypatch.setattr(val_dataloaders,'build_1652_val_dataloaders',lambda *a,**k:{d:(None,None) for d in ('D2S','S2D')})
+    calls=[];score=[30.]
+    def metric(encoder,*args,**kwargs):
+        assert encoder.model is model and not model.training
+        assert next(model.parameters()).dtype==torch.bfloat16
+        calls.append(1);return score[0],50.,60.,20.
+    monkeypatch.setattr(metric_module,'getdist_1652_val_and_get_recall',metric)
+    def forbidden(*a,**k):raise AssertionError('selection must not reload')
+    monkeypatch.setattr(c,'evaluate_checkpoint',forbidden)
+    best,row=c.select_epoch(wrapper,tmp_path,1,float('-inf'),'fixture')
+    assert best==60 and row['is_best'] and model.training
+    prior=file_sha256(tmp_path/'best_model.pth')
+    model.running_mean.add_(1)
+    best,row=c.select_epoch(wrapper,tmp_path,2,best,'fixture')
+    assert not row['is_best'] and file_sha256(tmp_path/'best_model.pth')==prior
+    score[0]=31.
+    best,row=c.select_epoch(wrapper,tmp_path,3,best,'fixture')
+    assert best==62 and row['is_best'] and len(calls)==6
+    saved=torch.load(tmp_path/'best_model.pth',weights_only=True)
+    other=nn.BatchNorm1d(4);other.load_state_dict(saved['model'],strict=True)
+    apply_runtime_precision(other,'student',saved['precision_signature'])
+    assert all(torch.equal(v,other.state_dict()[k]) for k,v in model.state_dict().items())
+    assert_precision_signature(inspect_precision_signature(other,'student'),saved['precision_signature'])
+    assert file_sha256(tmp_path/'last_model.pth')==file_sha256(tmp_path/'best_model.pth')
+
+def test_live_evaluator_failure_preserves_best(tmp_path,monkeypatch):
+    from src.dataset.teacher import val_dataloaders
+    (tmp_path/'best_model.pth').write_bytes(b'prior-best')
+    def fail(*a,**k):raise RuntimeError('evaluator failed')
+    monkeypatch.setattr(val_dataloaders,'build_1652_val_dataloaders',fail)
+    model=nn.Linear(2,2).bfloat16().train()
+    with pytest.raises(RuntimeError,match='evaluator failed'):c.select_epoch(model,tmp_path,1,0,'fixture')
+    assert model.training
+    assert (tmp_path/'best_model.pth').read_bytes()==b'prior-best'
+    assert not (tmp_path/'last_model.pth').exists()

@@ -8,10 +8,9 @@ import copy
 from pathlib import Path
 import torch
 from src.middle_teacher.model import build_middle_teacher
-from src.middle_teacher.losses.adaptive_bridge_v1 import AdaptiveBridgeBank,adaptive_bridge_v1_loss
 from src.middle_teacher.losses.adaptive_bridge_v2 import AdaptiveBridgeV2Bank,adaptive_bridge_v2_loss
 from src.middle_teacher.teacher_features import adaptive_teacher_fused_forward
-from src.middle_teacher.historical_kd_runtime import HistoricalKDRuntime
+from src.middle_teacher.fchain_runtime import FChainRuntime
 from src.middle_teacher.checkpoint import sha256
 
 def component_name(config):
@@ -38,13 +37,12 @@ def build_stage3_model(config):
     model=build_middle_teacher(base)
     c=config['distillation'][component_name(config)]
     with torch.random.fork_rng(devices=[]):
-        if component_name(config)=='adaptive_bridge_v1':
-            bank=AdaptiveBridgeBank(c['teacher_dim'],c['middle_dim'],c['teacher_layers'],[c['gate_init_values'][str(i)] for i in c['teacher_layers']])
-        else:bank=AdaptiveBridgeV2Bank(c)
+        if component_name(config)!='adaptive_bridge_v2':raise ValueError('Core factory requires Semantic Adaptation V2')
+        bank=AdaptiveBridgeV2Bank(c)
     model.layer_semantic_projectors=bank;model.bridge_config=c
     return model
 
-class ABVRuntime(HistoricalKDRuntime):
+class ABVRuntime(FChainRuntime):
     def __init__(self,config,checkpoint,device,chunk_size):
         super().__init__(config,checkpoint,device,chunk_size)
         self.name=component_name(config);self.component=self.config[self.name]
@@ -58,10 +56,8 @@ class ABVRuntime(HistoricalKDRuntime):
         cls=tuple(features[f'layer{i}_cls'] for i in c['teacher_layers'])
         middle=middle_output['middle_features'][0]
         bank=model.layer_semantic_projectors
-        if self.name=='adaptive_bridge_v1':raw,audit=adaptive_bridge_v1_loss(cls,middle,bank,c)
-        else:
-            patches=tuple(features[f'layer{i}_patch'] for i in c['teacher_layers'])
-            raw,audit=adaptive_bridge_v2_loss(cls,patches,middle,bank,c)
+        patches=tuple(features[f'layer{i}_patch'] for i in c['teacher_layers'])
+        raw,audit=adaptive_bridge_v2_loss(cls,patches,middle,bank,c)
         composed=self.composer.compose(base,{self.name:lambda _: (raw,audit)},completed_optimizer_steps=step)
         stats={'teacher_logical_forward_count':1,'teacher_chunk_forward_count':features['timing']['teacher_physical_chunk_forwards'],
             'teacher_requires_grad_count':0,'teacher_optimizer_param_count':0,

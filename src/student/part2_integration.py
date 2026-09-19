@@ -5,19 +5,16 @@ import torch
 from .artifacts import ROOT, file_sha256
 from .part2 import install_residual_top, trainable_count
 
-KINDS = {"residual_mlp": ("rmlp", "P2-TOP-RMLP-S0"),
-         "residual_kan": ("rkan", "P2-TOP-RKAN-S0")}
+KINDS = {"residual_mlp": ("rmlp", "P2-TOP-RMLP-S0")}
 AUDIT = ROOT/"src/checkpoint/student/CERTIFIED_R224/_AUDITS/P2_RESIDUAL_IMPLEMENTATION"
 
 
 def validate_config(cfg):
-    if any(k.startswith('bncc_') for k in cfg) or cfg.get('experiment_name') == 'FINAL-ADUAL-BNCC-S0':
-        from .bncc import validate_config as validate_bncc
-        return validate_bncc(cfg)
+    if cfg.get('source_contract')=='CORE_SOURCE_CONTRACT_V2':
+        from .core_config import validate_config as validate_new
+        validate_new(cfg)
+        return cfg['top_interface']=='residual_mlp'
     interface = cfg.get("top_interface", "linear")
-    if interface.startswith('factorial_'):
-        from .part2_factorial import validate_config as validate_factorial
-        return validate_factorial(cfg)
     if interface == "linear":
         if any(k.startswith("p2_") for k in cfg):
             raise ValueError("P2 metadata requires a residual interface")
@@ -50,14 +47,11 @@ def validate_config(cfg):
 
 
 def prepare_top(supervision, cfg):
-    if cfg.get('top_interface', '').startswith('factorial_'):
-        from .part2_factorial import prepare
-        return prepare(supervision, cfg)
     if cfg.get("top_interface", "linear") == "linear":
         return
     validate_config(cfg)
     calibration = torch.load(cfg["p2_calibration_path"], map_location="cpu", weights_only=True)
-    assert calibration.shape == (768,512) and torch.isfinite(calibration).all()
+    assert calibration.dtype==torch.float32 and calibration.shape == (768,512) and torch.isfinite(calibration).all()
     # Match frozen component audit: canonical base storage was BF16 when calibrated.
     supervision.bfloat16()
     install_residual_top(supervision, KINDS[cfg["top_interface"]][0], calibration)
@@ -83,9 +77,6 @@ def prepare_precision_groups(model, optimizer, cfg):
 
 def assert_precision(engine):
     supervision = engine.module.stst
-    if hasattr(supervision, 'factorial_interface'):
-        from .part2_factorial import assert_precision as assert_factorial_precision
-        return assert_factorial_precision(engine)
     if not hasattr(supervision.projector_top, "residual"):
         return
     assert all(p.dtype==torch.bfloat16 for p in engine.module.student.parameters())
@@ -96,24 +87,17 @@ def assert_precision(engine):
 
 
 def metadata(supervision):
-    if hasattr(supervision, 'factorial_interface'):
-        from .part2_factorial import metadata as factorial_metadata
-        return factorial_metadata(supervision)
     top = supervision.projector_top
     return dict(part="Part-II", research_axis="top_alignment_interface",
         training_only_head_params=trainable_count(supervision),
         p2_top_params=trainable_count(top),p2_residual_params=trainable_count(top.residual),
         p2_alpha_init=.001,p2_alpha_learnable=True,p2_alpha_weight_decay=0.,
-        p2_grid_range=[-.17,.17],p2_grid_size=5,p2_spline_order=3,
         p2_mlp_hidden_dim=920,p2_initialization=top.initialization_audit,
-        p2_parameter_storage="Student/base/Random BF16; residual/gate/grid FP32",
+        p2_parameter_storage="Student/base/Random BF16; residual/gate FP32",
         p2_optimizer_grouping="same AdamW decay/no-decay policy partitioned by dtype",
         p2_projector_compute="FP32",REFERENCE_USES_DEEPSPEED=True,P2_USES_DEEPSPEED=True)
 
 
 def log_values(supervision):
-    if hasattr(supervision, 'factorial_interface'):
-        from .part2_factorial import log_values as factorial_log_values
-        return factorial_log_values(supervision)
     top = supervision.projector_top
     return dict(p2_alpha=float(top.alpha.detach()))

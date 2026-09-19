@@ -100,12 +100,20 @@ class DualSTSTSupervision(nn.Module):
             raise RuntimeError("Dual-STST projectors must have identical values and independent parameters")
         return identical, independent
 
-    def _apply(self, fn):
-        super()._apply(fn)
-        self.teacher_mean = self.teacher_mean.float()
-        self.top32_basis = self.top32_basis.float()
-        self.random32_basis = self.random32_basis.float()
-        return self
+    def _apply(self, fn, recurse=True):
+        # Knowledge buffers must never visit a low-precision dtype. Probe only an
+        # empty tensor to discover the requested device; move original FP32 bits.
+        assets={id(value):value for name,value in self._buffers.items()
+                if name in ('teacher_mean','top32_basis','random32_basis','random_b_basis')
+                and value is not None}
+        def preserve_asset(tensor):
+            if id(tensor) in assets:
+                if tensor.dtype != torch.float32:
+                    raise RuntimeError('Knowledge asset was already quantized')
+                probe=fn(torch.empty(0,device=tensor.device,dtype=torch.float32))
+                return tensor.to(device=probe.device,dtype=torch.float32)
+            return fn(tensor)
+        return super()._apply(preserve_asset,recurse=recurse)
 
     @torch.no_grad()
     def teacher_targets(self, descriptor):

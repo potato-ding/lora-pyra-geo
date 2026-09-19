@@ -20,6 +20,9 @@ from .runtime import _seed_all, _seed_stst_worker, _gather_grad
 
 def load_config(path):
     cfg=json.loads(Path(path).read_text())
+    if cfg.get('source_contract')=='CORE_SOURCE_CONTRACT_V2':
+        from .core_config import validate_config
+        return validate_config(cfg)
     expected={'epochs':30,'batch_size':32,'world_size':1,'protocol_id':'STU-1G-B32-R224-v1','gpu_count':1,'img_size':224,
               'lr':1e-4,'weight_decay':1e-4,'warmup_epochs':0.1,
               'min_lr_ratio':0.01,'temperature':0.07,'label_smoothing':0.1,
@@ -57,10 +60,6 @@ class StudentTrainingModel(nn.Module):
 
 
 def batch_loss(engine,teacher,images,local_pairs,criterion,cfg,epoch):
-    # BNCC_BEGIN
-    if cfg.get('bncc_enabled', False):
-        images=images.to(dtype=next(engine.parameters()).dtype)
-    # BNCC_END
     descriptor=engine(images.to(dtype=next(engine.parameters()).dtype))
     drone,satellite=descriptor.split(local_pairs,dim=0)
     info=criterion(_gather_grad(drone),_gather_grad(satellite),engine.module.student.logit_scale.exp())
@@ -74,12 +73,6 @@ def batch_loss(engine,teacher,images,local_pairs,criterion,cfg,epoch):
         from .gbw import apply_branch_coefficients
         kd,gbw_metrics=apply_branch_coefficients(cfg,kd,kd_audit)
     total,weight=stst_total_loss(info,kd,cfg['stst_weight'],epoch,cfg['stst_warmup_epochs'])
-    # BNCC_BEGIN
-    if cfg.get('bncc_enabled', False):
-        from .bncc import loss_with_shadow
-        bncc,bncc_metrics=loss_with_shadow(engine.module.student,images,descriptor,local_pairs)
-        total=total+cfg['bncc_lambda']*bncc
-    # BNCC_END
     if cfg.get('part') == 'Part-I':
         metrics={'infonce':info.detach(),'top_loss':kd_audit['top_loss'].detach(),
             'random_loss':None if kd_audit['random_loss'] is None else kd_audit['random_loss'].detach(),'dual_stst':kd.detach(),
@@ -89,10 +82,6 @@ def batch_loss(engine,teacher,images,local_pairs,criterion,cfg,epoch):
             metrics.update(gbw_metrics,retrieval_loss=info.detach(),total_loss=total.detach())
         for key in ('random_A_loss','random_B_loss'):
             if key in kd_audit: metrics[key]=kd_audit[key].detach()
-        # BNCC_BEGIN
-        if cfg.get('bncc_enabled', False):
-            metrics.update(bncc_metrics)
-        # BNCC_END
         return total,metrics
     return total,{'infonce':info.detach(),'top32_loss':kd_audit['top_loss'].detach(),
                   'random32_loss':kd_audit['random_loss'].detach(),'dual_stst':kd.detach(),
@@ -151,6 +140,9 @@ def main():
     parser.add_argument('--config',required=True)
     parser.add_argument('--validate-only',action='store_true')
     cli=parser.parse_args();cfg=load_config(cli.config)
+    if cfg.get('source_contract')=='CORE_SOURCE_CONTRACT_V2' and not cli.validate_only:
+        from .core_config import assert_assets
+        assert_assets(cfg)
     if cli.validate_only:
         print(json.dumps(cfg,indent=2));return
     # Never overwrite an existing experiment. Missing assets fail before CUDA initialization.
@@ -230,20 +222,11 @@ def main():
     dist.barrier()
     for epoch in range(1,cfg['epochs']+1):
         engine.train();train_loader.batch_sampler.set_epoch(epoch)
-        # BNCC_BEGIN
-        if cfg.get('bncc_enabled', False):
-            from .bncc import EpochLog
-            bncc_epoch=EpochLog()
-        # BNCC_END
         for step,batch in enumerate(train_loader):
             drone,satellite=batch[:2]
             images=torch.cat((drone,satellite)).to(device,non_blocking=True)
             loss,components=batch_loss(engine,teacher,images,len(drone),criterion,cfg,epoch)
             if not torch.isfinite(loss):raise FloatingPointError('Nonfinite Student objective')
-            # BNCC_BEGIN
-            if cfg.get('bncc_enabled', False):
-                bncc_epoch.add(loss,components)
-            # BNCC_END
             engine.backward(loss);engine.step()
             # P2_INTEGRATION_BEGIN
             if cfg.get('top_interface', 'linear') != 'linear' and step%200==0:
@@ -252,10 +235,6 @@ def main():
             # P2_INTEGRATION_END
             if dist.get_rank()==0 and step%200==0:
                 print(json.dumps({'epoch':epoch,'step':step,'loss':float(loss.detach()),'loss_finite':bool(torch.isfinite(loss)),'nan_loss_count':int(torch.isnan(loss)),'inf_loss_count':int(torch.isinf(loss)),**{k:('DISABLED' if v is None else float(v)) for k,v in components.items()}}),flush=True)
-        # BNCC_BEGIN
-        if cfg.get('bncc_enabled', False):
-            print(json.dumps(bncc_epoch.finish(epoch,engine.optimizer.param_groups[0]['lr'],supervision.projector_top.alpha)),flush=True)
-        # BNCC_END
         sync_student_buffers_from_rank0(engine.module.student)
         assert_student_validation_state_synced(engine.module.student, epoch)
         engine.eval()
@@ -263,11 +242,6 @@ def main():
         history.append(row)
         write_json(output/'epoch_metrics.json',history)
         print(json.dumps({'epoch':epoch,'metrics':row['metrics'],'best_R1_sum':best}),flush=True)
-        # BNCC_BEGIN
-        if cfg.get('bncc_enabled', False):
-            d2s=row['metrics']['D2S']['R@1'];s2d=row['metrics']['S2D']['R@1']
-            print(json.dumps(dict(record='BNCC_SELECTOR',epoch=epoch,D2S_R1=d2s,S2D_R1=s2d,R1_sum=d2s+s2d)),flush=True)
-        # BNCC_END
 
 
 

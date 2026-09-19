@@ -1,0 +1,12 @@
+{
+  "src/student/allocation_gbw.py:AllocationGate": "db4ab37053a2cbc941947a18616d2d19b75b5458696c080bde640d5f8c0ab282",
+  "src/student/allocation_gbw.py:gradient_signal": "5cad40fd9a163139372c99519ddc0f7ae54ef8c8972059e1a9842364b8840e03",
+  "src/student/allocation_gbw.py:gate_objective": "68c43f60dfa82b787bc0fa8cd5b44d93da32c3f103a057f96eea3b730fb8e679",
+  "src/student/allocation_gbw.py:isolated_gradient_signal": "21f89f9b6b1a562c48ed4fbda78ec2f8c63c8d38bd667c9c370f9b6507548eea",
+  "src/student/objective.py:PairInfoNCE": "969997e37a5236e1c5bf194a797ef1d91243c7023fb041c4a90ec9dbe810c842",
+  "src/student/dual_stst.py:stst_warmup_factor": "ac81337f8cb2abb5b19cfa03bc6765008562b78706d9d28040d5369f6012e118",
+  "src/student/dual_stst.py:stst_total_loss": "5be7de33524bcfd973c8bc917b121c99a566fce32209f1439c9a4ffb33322570",
+  "src/student/model.py:StudentModel": "e0534131d6b3c74eb534055d00c15d3b5699d6b3a1b7469c6973eeb3414ae6b6",
+  "src/middle_teacher/losses/adaptive_bridge_v2.py:AttentionPatchPool": "997564e1c915aa31ac553aa6a7b6fb7dc88e9d4985861da2ef4b941898e48d29",
+  "src/middle_teacher/losses/adaptive_bridge_v2.py:ClsPatchBridge": "4bade2e2238629917b6dbdb288fcb5a2d2ab9e6c82774e2c1d8ac73a4ca88c1f"
+}
