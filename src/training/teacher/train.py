@@ -31,6 +31,7 @@ from src.dataset.teacher.val_dataloaders import build_1652_val_dataloaders
 from src.models.teacher.model import TeacherModel
 from src.training.teacher.args import parse_args
 from src.training.teacher.hparams import save_training_record
+from src.training.teacher.artifacts import is_formal_teacher, save_best_checkpoint, validate_training_artifacts
 from src.utils.teacher.optimizer import build_optimizer_and_scale
 from src.utils.teacher.scheduler import get_scheduler
 from src.utils.teacher_experiment_audit import audit_teacher_runtime_structure, get_runtime_parameter_dtypes, gpu_memory_snapshot, print_experiment_configuration, read_deepspeed_grad_norm, tensor_nonfinite_counts
@@ -713,6 +714,8 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
         args.save_hard_pool_path = os.path.join(save_dir, 'hard_pool_epoch{epoch}.json')
     if is_main_process() and not args.smoke_test:
         os.makedirs(save_dir, exist_ok=True)
+        if is_formal_teacher(args):
+            validate_training_artifacts(save_dir, require_best=False)
         save_training_record(save_dir=save_dir, args=args, validation_history=[], best_metrics=None, last_completed_epoch=0)
         print(f'[Checkpoint] Save directory: {save_dir}')
     distributed_barrier_with_log('[Checkpoint] initial training record saved', local_rank)
@@ -859,19 +862,20 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
             print(f"[Train] Epoch {epoch}/{args.epochs} done | mode={mode_name} | updates={loss_counts['total']} | {avg_text} | nan_loss_count={nan_loss_count} | inf_loss_count={inf_loss_count} | nan_gradient_count=unavailable | inf_gradient_count=unavailable | peak_gpu_allocated={memory['peak_allocated_gib']:.3f}GiB | time={elapsed_min:.1f}m")
             if hard_sampler_summary is not None:
                 print(f'[HardPoolSampler] Epoch {epoch} | {hard_sampler_summary}')
-            last_state = collect_teacher_delta_state(model_engine)
-            if teacher_verbose_eval_log():
-                rank_log(f'[Checkpoint] last_model.pth save start | epoch={epoch}')
-            torch.save(last_state, os.path.join(save_dir, 'last_model.pth'))
-            if teacher_verbose_eval_log():
-                rank_log(f'[Checkpoint] last_model.pth save done | epoch={epoch}')
-                rank_log(f'[Checkpoint] best_metrics.json save start | epoch={epoch}')
-            save_training_record(save_dir=save_dir, args=args, validation_history=validation_history, best_metrics=best_metrics, last_completed_epoch=epoch)
-            if teacher_verbose_eval_log():
-                rank_log(f'[Checkpoint] best_metrics.json save done | epoch={epoch}')
-                print(f'[Checkpoint] Saved last_model.pth | epoch={epoch}', flush=True)
+            if not is_formal_teacher(args):
+                last_state = collect_teacher_delta_state(model_engine)
+                if teacher_verbose_eval_log():
+                    rank_log(f'[Checkpoint] last_model.pth save start | epoch={epoch}')
+                torch.save(last_state, os.path.join(save_dir, 'last_model.pth'))
+                if teacher_verbose_eval_log():
+                    rank_log(f'[Checkpoint] last_model.pth save done | epoch={epoch}')
+                    rank_log(f'[Checkpoint] best_metrics.json save start | epoch={epoch}')
+                save_training_record(save_dir=save_dir, args=args, validation_history=validation_history, best_metrics=best_metrics, last_completed_epoch=epoch)
+                if teacher_verbose_eval_log():
+                    rank_log(f'[Checkpoint] best_metrics.json save done | epoch={epoch}')
+                    print(f'[Checkpoint] Saved last_model.pth | epoch={epoch}', flush=True)
         cur_epoch = epoch
-        distributed_barrier_with_log(f'[Checkpoint] epoch={cur_epoch} after last_model save', local_rank)
+        distributed_barrier_with_log(f'[Checkpoint] epoch={cur_epoch} after epoch artifact handling', local_rank)
         if val_loaders is not None and should_run_validation(cur_epoch, args):
             from src.training.teacher.certified_selection import (
                 certified_teacher_selection, selection_metadata, best_selection_update)
@@ -881,7 +885,7 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                 nonlocal best_metrics, best_r1_sum, best_epoch, epoch_validation_metrics
                 print('[TeacherSelection] ' + json.dumps(dict(selection_metadata(args.img_size),
                     mode='SINGLE_GPU_CANONICAL', training_world_size=dist.get_world_size() if dist.is_initialized() else 1,
-                    selection_rank=0, precision='BF16 model; FP32 descriptor/L2/similarity')), flush=True)
+                    precision='BF16 model; FP32 descriptor/L2/similarity')), flush=True)
                 clear_memory_cache()
                 results = certified_teacher_selection(model_engine, image_size=args.img_size,
                     device=amp_device, data_dir=args.data_dir, num_workers=args.num_workers)
@@ -909,24 +913,31 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                     from src.evaluation.precision_contract import selection_signature, flat_selection_metrics
                     teacher_model=get_base_model(model_engine)
                     signature=selection_signature(teacher_model,'teacher',args.img_size)
-                    torch.save(dict(model={n:t.detach().cpu() for n,t in teacher_model.state_dict().items()},
-                        precision_signature=signature,
-                        selection_metrics=dict(flat_selection_metrics(current_metrics), R1_sum=r1_sum),
-                        selection_protocol=selection_metadata(args.img_size)),
-                        os.path.join(save_dir,'best_model.pth'))
+                    if is_formal_teacher(args):
+                        save_best_checkpoint(teacher_model, args, current_metrics, save_dir,
+                            dist.get_world_size() if dist.is_initialized() else 1)
+                    else:
+                        torch.save(dict(model={n:t.detach().cpu() for n,t in teacher_model.state_dict().items()},
+                            precision_signature=signature,
+                            selection_metrics=dict(flat_selection_metrics(current_metrics), R1_sum=r1_sum),
+                            selection_protocol=selection_metadata(args.img_size)),
+                            os.path.join(save_dir,'best_model.pth'))
                     current_metrics['precision_signature']=signature
                     if verbose_eval:
                         rank_log(f'[Checkpoint] best_model.pth save done | epoch={cur_epoch}')
-                if verbose_eval:
+                if verbose_eval and not is_formal_teacher(args):
                     rank_log(f'[Checkpoint] best_metrics.json save start | epoch={cur_epoch} after eval')
                 save_training_record(save_dir=save_dir, args=args, validation_history=validation_history, best_metrics=best_metrics, last_completed_epoch=cur_epoch)
-                if verbose_eval:
+                if verbose_eval and not is_formal_teacher(args):
                     rank_log(f'[Checkpoint] best_metrics.json save done | epoch={cur_epoch} after eval')
                 print(f'[Eval] Epoch {cur_epoch}/{args.epochs} done | D2S R@1={d2s_r1:.2f} R@5={d2s_r5:.2f} R@10={d2s_r10:.2f} mAP={d2s_map:.2f} | S2D R@1={s2d_r1:.2f} R@5={s2d_r5:.2f} R@10={s2d_r10:.2f} mAP={s2d_map:.2f} | R@1_sum={r1_sum:.2f} | best_R@1_sum={best_r1_sum:.2f}@epoch{best_epoch}')
                 if is_best and verbose_eval:
                     print(f'[Checkpoint] Saved best_model.pth | epoch={cur_epoch} | D2S_R@1={d2s_r1:.2f} | S2D_R@1={s2d_r1:.2f} | R@1_sum={r1_sum:.2f}')
-                print('[TeacherSelection] complete ' + json.dumps(dict(results=results,
-                    R1_SUM=r1_sum, best_epoch=best_epoch, best_update=is_best)), flush=True)
+                print('[TeacherSelection] complete ' + ' '.join(f'{k}={v!r}' for k,v in dict(
+                    D2S_R1=d2s_r1, D2S_R5=d2s_r5, D2S_AP=d2s_map,
+                    S2D_R1=s2d_r1, S2D_R5=s2d_r5, S2D_AP=s2d_map,
+                    R1_sum=r1_sum, best_score=best_r1_sum, best_epoch=best_epoch,
+                    best_update='YES' if is_best else 'NO').items()), flush=True)
                 return dict(best_metrics=best_metrics, best_r1_sum=best_r1_sum,
                             best_epoch=best_epoch, selection_metrics=current_metrics)
             try:
@@ -958,12 +969,15 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
             print(f'validation metrics={validation_text}')
             print(f'current best metric (D2S_R@1+S2D_R@1)={best_metric_text}')
             print(f'current best epoch={best_epoch_text}')
-            print(f"current checkpoint path={os.path.join(save_dir, 'last_model.pth')}")
+            print(f"current checkpoint path={os.path.join(save_dir, 'best_model.pth' if is_formal_teacher(args) else 'last_model.pth')}")
             print(f"current best checkpoint path={os.path.join(save_dir, 'best_model.pth')}")
             print('=' * 80)
         distributed_barrier_with_log(f'[Train] epoch={epoch} end', local_rank)
     if not dist.is_initialized() or local_rank == 0:
         print('[Train] done')
+
+    if is_main_process() and is_formal_teacher(args) and not args.smoke_test:
+        validate_training_artifacts(save_dir)
 
 def build_deepspeed_runtime_config(ds_config_path, args, world_size):
     with open(ds_config_path, 'r') as f:

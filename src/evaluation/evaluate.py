@@ -36,6 +36,8 @@ def main(argv=None):
         from src.student.artifacts import require_valid_run
         require_valid_run(Path(args.checkpoint).resolve().parent)
     model,load_audit=load_encoder(args.model_type,args.checkpoint,args.config,device,image_size=args.image_size or 224)
+    if args.model_type=='teacher' and not args.certification_only and load_audit.get('artifact_classification') != 'FORMAL_TEACHER_CHECKPOINT':
+        raise RuntimeError('LEGACY_CHECKPOINT: not certified for new formal Teacher evaluation')
     signature=load_audit['precision_signature']
     image_size=signature['image_size']
     if args.image_size is not None and args.image_size!=image_size:

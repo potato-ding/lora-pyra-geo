@@ -5,7 +5,7 @@ from src.evaluation.precision_contract import selection_signature, VERSION
 from src.evaluation.u1652_canonical import canonical_loader, evaluate_u1652_single_gpu_canonical
 
 def selection_metadata(image_size):
-    return dict(selection_world_size=1, selection_mode='SINGLE_GPU_CANONICAL',
+    return dict(selection_rank=0, selection_world_size=1, selection_mode='SINGLE_GPU_CANONICAL',
                 image_size=int(image_size), eval_batch_size=8, precision_contract=VERSION)
 
 def best_selection_update(results, previous_score, previous_epoch, epoch):

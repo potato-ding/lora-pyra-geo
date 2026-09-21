@@ -55,7 +55,16 @@ def load_encoder(model_type,checkpoint,config=None,device='cuda',image_size=224)
     if model_type=='teacher':
         from src.models.teacher.model import TeacherModel
         from src.training.teacher.args import build_arg_parser
-        metadata=json.loads((checkpoint.parent/'best_metrics.json').read_text())
+        from src.training.teacher.artifacts import checkpoint_metadata
+        teacher_metadata = checkpoint_metadata(payload)
+        if teacher_metadata is not None:
+            metadata = {'hyperparameters': payload['hyperparameters']}
+        else:
+            # Explicit legacy compatibility only; never new-protocol certification.
+            sidecar = checkpoint.parent/'best_metrics.json'
+            if not sidecar.is_file():
+                raise ValueError('LEGACY_CHECKPOINT: Teacher architecture metadata absent; legacy compatibility requires best_metrics.json')
+            metadata = json.loads(sidecar.read_text())
         args=build_arg_parser().parse_args([])
         for key,value in metadata['hyperparameters'].items():setattr(args,key,value)
         args.device=str(device);model=TeacherModel(args);dimension=4096
@@ -90,4 +99,7 @@ def load_encoder(model_type,checkpoint,config=None,device='cuda',image_size=224)
            'precision_signature':inspect_precision_signature(model,model_type,image_size),
            'selection_metrics':payload.get('selection_metrics') if isinstance(payload,dict) else None,
            'selection_protocol':payload.get('selection_protocol', {'selection_mode':'LEGACY_MULTI_GPU_SELECTION'}) if model_type == 'teacher' and isinstance(payload,dict) else None}
+    if model_type == 'teacher':
+        audit['artifact_classification'] = 'FORMAL_TEACHER_CHECKPOINT' if teacher_metadata is not None else 'LEGACY_CHECKPOINT'
+        audit['checkpoint_metadata'] = teacher_metadata
     return EvaluationEncoder(model,dimension,fp32_input=True).eval(),audit

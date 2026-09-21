@@ -85,6 +85,13 @@ def save_training_record(
     best_metrics,
     last_completed_epoch,
 ):
+    from src.training.teacher.artifacts import is_formal_teacher
+    if is_formal_teacher(args):
+        print('[TeacherTrainingRecord] ' + json.dumps(dict(
+            experiment_id=args.experiment_id, last_completed_epoch=last_completed_epoch,
+            hyperparameters=_json_safe_value(vars(args)), best_metrics=_json_safe_value(best_metrics)),
+            ensure_ascii=False), flush=True)
+        return
     payload = build_training_record(
         save_dir=save_dir,
         args=args,
