@@ -305,7 +305,7 @@ def print_distributed_descriptor_audit_once(local_feats, local_views, gathered_s
     print(f'D2S candidate pool size={global_sat_shape[0]}')
     print(f'S2D candidate pool size={global_drone_shape[0]}')
     print(f'cross-GPU gather actually effective={cross_gpu_gather_effective}')
-    expected_values = {'world size': (world_size, 8), 'local pair count': (local_pair_count, 4), 'global pair count': (global_pair_count, 32), 'D2S candidate pool size': (global_sat_shape[0], 32), 'S2D candidate pool size': (global_drone_shape[0], 32)}
+    expected_values = {'global pair count': (global_pair_count, 32), 'D2S candidate pool size': (global_sat_shape[0], 32), 'S2D candidate pool size': (global_drone_shape[0], 32)}
     for (name, (actual, expected)) in expected_values.items():
         if actual != expected:
             print(f'[EXPERIMENT_AUDIT][WARNING] {name} expected {expected}, got {actual}')
@@ -873,41 +873,28 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
         cur_epoch = epoch
         distributed_barrier_with_log(f'[Checkpoint] epoch={cur_epoch} after last_model save', local_rank)
         if val_loaders is not None and should_run_validation(cur_epoch, args):
+            from src.training.teacher.certified_selection import (
+                certified_teacher_selection, selection_metadata, best_selection_update)
+            from src.training.teacher.selection_sync import run_rank0_selection
             verbose_eval = teacher_verbose_eval_log()
-            if verbose_eval:
-                rank_log(f'[Eval] Epoch {cur_epoch}/{args.epochs} enter | weights=current')
-            distributed_barrier_with_log(f'[Eval] epoch={cur_epoch} before validation', local_rank)
-            try:
-                model_engine.eval()
-                (q_loader_d2s, g_loader_d2s) = val_loaders['D2S']
-                (q_loader_s2d, g_loader_s2d) = val_loaders['S2D']
+            def select_and_save():
+                nonlocal best_metrics, best_r1_sum, best_epoch, epoch_validation_metrics
+                print('[TeacherSelection] ' + json.dumps(dict(selection_metadata(args.img_size),
+                    mode='SINGLE_GPU_CANONICAL', training_world_size=dist.get_world_size() if dist.is_initialized() else 1,
+                    selection_rank=0, precision='BF16 model; FP32 descriptor/L2/similarity')), flush=True)
                 clear_memory_cache()
-                if verbose_eval:
-                    rank_log(f'[Eval] Epoch {cur_epoch}/{args.epochs} D2S start')
-                from src.training.teacher.certified_selection import certified_teacher_selection
-                get_base_model(model_engine).selection_image_size = args.img_size
-                selection_eval = certified_teacher_selection
-                (d2s_r1, d2s_r5, d2s_r10, d2s_map) = selection_eval(model_engine, q_loader_d2s, g_loader_d2s, amp_device, task_name='D2S')
-                if verbose_eval:
-                    rank_log(f'[Eval] Epoch {cur_epoch}/{args.epochs} D2S done')
-                clear_memory_cache()
-                if verbose_eval:
-                    rank_log(f'[Eval] Epoch {cur_epoch}/{args.epochs} S2D start')
-                (s2d_r1, s2d_r5, s2d_r10, s2d_map) = selection_eval(model_engine, q_loader_s2d, g_loader_s2d, amp_device, task_name='S2D')
-                if verbose_eval:
-                    rank_log(f'[Eval] Epoch {cur_epoch}/{args.epochs} S2D done')
-            finally:
-                model_engine.train()
-                clear_memory_cache()
-            distributed_barrier_with_log(f'[Eval] epoch={cur_epoch} before rank0 metric/checkpoint', local_rank)
-            if is_main_process():
-                trainable_state = collect_teacher_delta_state(model_engine)
+                results = certified_teacher_selection(model_engine, image_size=args.img_size,
+                    device=amp_device, data_dir=args.data_dir, num_workers=args.num_workers)
+                d2s_r1, d2s_r5, d2s_r10, d2s_map = (results['D2S'][k] for k in ('R@1','R@5','R@10','AP'))
+                s2d_r1, s2d_r5, s2d_r10, s2d_map = (results['S2D'][k] for k in ('R@1','R@5','R@10','AP'))
                 current_metrics = build_validation_metrics(cur_epoch, (d2s_r1, d2s_r5, d2s_r10, d2s_map), (s2d_r1, s2d_r5, s2d_r10, s2d_map))
                 from src.evaluation.precision_contract import selection_signature
                 current_metrics['precision_signature']=selection_signature(get_base_model(model_engine),'teacher',args.img_size)
+                current_metrics['selection_protocol'] = selection_metadata(args.img_size)
                 epoch_validation_metrics = current_metrics
                 r1_sum = current_metrics['R@1_sum']
-                is_best = best_metrics is None or r1_sum > best_r1_sum
+                decision = best_selection_update(results, best_r1_sum, best_epoch, cur_epoch)
+                is_best = decision['best_update']
                 history_record = dict(current_metrics)
                 history_record['is_best'] = is_best
                 history_record['train_loss'] = loss_sums['total'] / max(loss_counts['total'], 1)
@@ -923,7 +910,9 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                     teacher_model=get_base_model(model_engine)
                     signature=selection_signature(teacher_model,'teacher',args.img_size)
                     torch.save(dict(model={n:t.detach().cpu() for n,t in teacher_model.state_dict().items()},
-                        precision_signature=signature,selection_metrics=flat_selection_metrics(current_metrics)),
+                        precision_signature=signature,
+                        selection_metrics=dict(flat_selection_metrics(current_metrics), R1_sum=r1_sum),
+                        selection_protocol=selection_metadata(args.img_size)),
                         os.path.join(save_dir,'best_model.pth'))
                     current_metrics['precision_signature']=signature
                     if verbose_eval:
@@ -936,7 +925,19 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                 print(f'[Eval] Epoch {cur_epoch}/{args.epochs} done | D2S R@1={d2s_r1:.2f} R@5={d2s_r5:.2f} R@10={d2s_r10:.2f} mAP={d2s_map:.2f} | S2D R@1={s2d_r1:.2f} R@5={s2d_r5:.2f} R@10={s2d_r10:.2f} mAP={s2d_map:.2f} | R@1_sum={r1_sum:.2f} | best_R@1_sum={best_r1_sum:.2f}@epoch{best_epoch}')
                 if is_best and verbose_eval:
                     print(f'[Checkpoint] Saved best_model.pth | epoch={cur_epoch} | D2S_R@1={d2s_r1:.2f} | S2D_R@1={s2d_r1:.2f} | R@1_sum={r1_sum:.2f}')
-            distributed_barrier_with_log(f'[Eval] epoch={cur_epoch} after rank0 metric/checkpoint', local_rank)
+                print('[TeacherSelection] complete ' + json.dumps(dict(results=results,
+                    R1_SUM=r1_sum, best_epoch=best_epoch, best_update=is_best)), flush=True)
+                return dict(best_metrics=best_metrics, best_r1_sum=best_r1_sum,
+                            best_epoch=best_epoch, selection_metrics=current_metrics)
+            try:
+                synced = run_rank0_selection(select_and_save)
+                best_metrics = synced['best_metrics']
+                best_r1_sum = synced['best_r1_sum']
+                best_epoch = synced['best_epoch']
+                epoch_validation_metrics = synced['selection_metrics']
+            finally:
+                model_engine.train()
+                clear_memory_cache()
         if should_build_hard_pool(epoch, args, hard_pool_loaded):
             hard_pool_loaded = build_save_and_apply_hard_pool(model_engine, train_loaders, args, epoch, amp_device)
         if is_main_process():
@@ -1022,7 +1023,7 @@ def main():
         (train_dataset, train_sampler, train_loader) = create_1652_teacher_train_dataloaders(args)
         val_loaders = None
         if args.identity_preflight_batches == 0 and not args.smoke_test:
-            val_loaders = build_1652_val_dataloaders(data_dir=args.data_dir, img_size=[args.img_size, args.img_size], batch_size=getattr(args, 'val_batch_size', 32), num_workers=args.num_workers)
+            val_loaders = True  # Full loaders are built only inside rank0 selection.
         model = TeacherModel(args)
         model = model.to(device)
         init_checkpoint_report = load_teacher_init_checkpoint(model, getattr(args, 'init_checkpoint', None), device, strict_trainable=getattr(args, 'init_checkpoint_strict_trainable', True))

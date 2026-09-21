@@ -1,4 +1,20 @@
 import math
+from contextvars import ContextVar
+from contextlib import contextmanager
+
+_SINGLE_PROCESS_EVAL = ContextVar('single_process_eval', default=False)
+
+def _distributed_enabled():
+    return not _SINGLE_PROCESS_EVAL.get() and dist.is_available() and dist.is_initialized()
+
+@contextmanager
+def single_process_evaluation():
+    token = _SINGLE_PROCESS_EVAL.set(True)
+    try:
+        yield
+    finally:
+        _SINGLE_PROCESS_EVAL.reset(token)
+
 import os
 import numpy as np
 
@@ -14,7 +30,7 @@ def _official_descending_indices(scores):
 
 
 def _dist_info():
-    if dist.is_available() and dist.is_initialized():
+    if _distributed_enabled():
         return dist.get_world_size(), dist.get_rank()
     return 1, 0
 
@@ -182,7 +198,7 @@ def _gather_tensor_variable_batch(
 
 
 def _all_reduce_sum(tensor, *, log_prefix=None, tensor_name="tensor"):
-    if not (dist.is_available() and dist.is_initialized()):
+    if not (_distributed_enabled()):
         return
 
     if log_prefix:
@@ -466,7 +482,7 @@ def getdist_1652_val_and_get_recall(
     g_l_device = g_l.to(device)
 
     # 4. 多卡下每张卡负责一部分 query 指标计算
-    if dist.is_available() and dist.is_initialized():
+    if _distributed_enabled():
         world_size = dist.get_world_size()
         rank = dist.get_rank()
     else:
@@ -537,7 +553,7 @@ def getdist_1652_val_and_get_recall(
             local_ap_sum += ap_per_query.sum()
 
     # 7. 多卡汇总统计量
-    if dist.is_available() and dist.is_initialized():
+    if _distributed_enabled():
         metric_log_prefix = f"[Eval:{task_name}:metrics]" if task_name else None
         _all_reduce_sum(local_correct_1, log_prefix=metric_log_prefix, tensor_name="correct@1")
         _all_reduce_sum(local_correct_5, log_prefix=metric_log_prefix, tensor_name="correct@5")

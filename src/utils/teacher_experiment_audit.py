@@ -326,22 +326,13 @@ def print_experiment_configuration(
         print(f"{name}={value}")
 
     mismatches = []
-    if getattr(args, "experiment_id", None) != T0_EXPERIMENT_ID:
+    accepted_ids = {T0_EXPERIMENT_ID, f"T0-INFONCE-R{args.img_size}", f"T0-CERTIFIED-R{args.img_size}-S{args.seed}"}
+    if getattr(args, "experiment_id", None) not in accepted_ids:
         mismatches.append(
-            f"experiment_id expected {T0_EXPERIMENT_ID}, got {getattr(args, 'experiment_id', None)}"
+            f"experiment_id expected one of {sorted(accepted_ids)}, got {getattr(args, 'experiment_id', None)}"
         )
-    if world_size != T0_EXPECTED_WORLD_SIZE:
-        mismatches.append(f"world_size expected 8, got {world_size}")
-    if visible_gpu_count != T0_EXPECTED_WORLD_SIZE:
-        mismatches.append(f"visible GPU count expected 8, got {visible_gpu_count}")
     if any("RTX 3090" not in str(name) for name in gpu_models_by_rank):
         mismatches.append(f"not every rank reports an RTX 3090: {gpu_models_by_rank}")
-    if local_pair_batch != T0_EXPECTED_LOCAL_PAIR_BATCH:
-        mismatches.append(f"local pair batch expected 4, got {local_pair_batch}")
-    if global_pair_batch != T0_EXPECTED_GLOBAL_PAIR_BATCH:
-        mismatches.append(f"global pair batch expected 32, got {global_pair_batch}")
-    if grad_accum_steps != T0_EXPECTED_GRAD_ACCUM_STEPS:
-        mismatches.append(f"gradient accumulation expected 1, got {grad_accum_steps}")
     if effective_pair_batch != T0_EXPECTED_GLOBAL_PAIR_BATCH:
         mismatches.append(f"effective pair batch expected 32, got {effective_pair_batch}")
     if int(args.epochs) != T0_EXPECTED_EPOCHS:

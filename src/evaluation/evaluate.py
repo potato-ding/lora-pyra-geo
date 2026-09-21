@@ -84,12 +84,17 @@ def main(argv=None):
         protocol={'input_size':image_size,'preprocessing':'canonical deterministic','augmentation':False}
         results={}
         if dataset=='u1652':
-            loaders=build_1652_val_dataloaders(**common)
-            if args.model_type=='teacher':
-                from src.training.teacher.certified_selection import canonical_loader
-                loaders={d:tuple(canonical_loader(loader) for loader in pair) for d,pair in loaders.items()}
-            for direction,pair in loaders.items():
-                results[direction]=evaluate_pair(dataset,direction,pair)
+            if args.model_type=='teacher' and not args.certification_only and not args.reuse_certified_cache:
+                from .u1652_canonical import evaluate_u1652_single_gpu_canonical
+                results=evaluate_u1652_single_gpu_canonical(model, image_size=image_size,
+                    device=device, data_dir=roots[dataset], num_workers=args.num_workers)
+            else:
+                loaders=build_1652_val_dataloaders(**common)
+                if args.model_type=='teacher':
+                    from .u1652_canonical import canonical_loader
+                    loaders={d:tuple(canonical_loader(loader) for loader in pair) for d,pair in loaders.items()}
+                for direction,pair in loaders.items():
+                    results[direction]=evaluate_pair(dataset,direction,pair)
             name='test_1652.json';protocol.update(split='test')
             if not args.certification_only:
                 from .precision_contract import assert_best_reload_metrics

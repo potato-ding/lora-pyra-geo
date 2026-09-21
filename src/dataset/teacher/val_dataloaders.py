@@ -86,7 +86,7 @@ class PairedCrossViewU1652DatasetEval(Dataset):
         return set(self.sample_ids)
 
 
-def build_1652_val_dataloaders(data_dir="data/U1652", img_size=[224, 224], batch_size=32, num_workers=8):
+def build_1652_val_dataloaders(data_dir="data/U1652", img_size=[224, 224], batch_size=32, num_workers=8, distributed=None):
     from src.dataset.teacher.transforms import get_paired_cross_view_val_transforms
 
     val_transform = get_paired_cross_view_val_transforms(img_size=img_size)
@@ -122,7 +122,7 @@ def build_1652_val_dataloaders(data_dir="data/U1652", img_size=[224, 224], batch
     val_q_sat_ds = IndexedDataset(val_q_sat_ds)
     val_g_drone_ds = IndexedDataset(val_g_drone_ds)
 
-    is_distributed = dist.is_available() and dist.is_initialized()
+    is_distributed = (dist.is_available() and dist.is_initialized()) if distributed is None else distributed
 
     if is_distributed:
         sampler_q_drone = DistributedSampler(val_q_drone_ds, shuffle=False, drop_last=False)

@@ -88,5 +88,6 @@ def load_encoder(model_type,checkpoint,config=None,device='cuda',image_size=224)
            'state_keys':len(state),'missing':list(result.missing_keys),'unexpected':list(result.unexpected_keys),
            'runtime_precision':runtime_precision,
            'precision_signature':inspect_precision_signature(model,model_type,image_size),
-           'selection_metrics':payload.get('selection_metrics') if isinstance(payload,dict) else None}
+           'selection_metrics':payload.get('selection_metrics') if isinstance(payload,dict) else None,
+           'selection_protocol':payload.get('selection_protocol', {'selection_mode':'LEGACY_MULTI_GPU_SELECTION'}) if model_type == 'teacher' and isinstance(payload,dict) else None}
     return EvaluationEncoder(model,dimension,fp32_input=True).eval(),audit

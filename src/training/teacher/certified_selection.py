@@ -1,59 +1,28 @@
-"""Teacher selection wrapper matching the R224 certified final inference path.
-
-Fixed groups of eight images preserve BF16 kernel batch composition across
-distributed and single-GPU evaluation. Metric mathematics remain shared.
-"""
-import math
+"""Live rank0 selection preserves Teacher precision and uses formal evaluation."""
 import torch
-from torch import nn
-from torch.utils.data import DataLoader
 from src.evaluation.model_loader import EvaluationEncoder
-from src.evaluation.metrics import getdist_1652_val_and_get_recall
+from src.evaluation.precision_contract import selection_signature, VERSION
+from src.evaluation.u1652_canonical import canonical_loader, evaluate_u1652_single_gpu_canonical
 
+def selection_metadata(image_size):
+    return dict(selection_world_size=1, selection_mode='SINGLE_GPU_CANONICAL',
+                image_size=int(image_size), eval_batch_size=8, precision_contract=VERSION)
 
-class CanonicalSelectionEncoder(nn.Module):
-    def __init__(self, teacher):
-        super().__init__()
-        # Shared extraction chooses its input dtype from the first parameter.
-        # The final loader has FP32 logit_scale; DeepSpeed stores it in BF16.
-        # This nontrainable wrapper-only anchor preserves the final FP32 input.
-        self.input_dtype_anchor = nn.Parameter(torch.zeros((), dtype=torch.float32,
-            device=next(teacher.parameters()).device), requires_grad=False)
-        self.encoder = EvaluationEncoder(teacher, 4096)
-
-    def forward(self, images):
-        return self.encoder(images)
-
-
-def canonical_batch_groups(size, rank, world_size, batch_size=8):
-    groups = [list(range(i, min(i + batch_size, size))) for i in range(0, size, batch_size)]
-    if not groups:
-        raise ValueError('Empty certified evaluation dataset')
-    count = math.ceil(len(groups) / world_size) * world_size
-    groups = groups + [groups[-1]] * (count - len(groups))
-    return groups[rank::world_size]
-
-
-def canonical_loader(loader):
-    distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
-    rank = torch.distributed.get_rank() if distributed else 0
-    world = torch.distributed.get_world_size() if distributed else 1
-    return DataLoader(loader.dataset,
-        batch_sampler=canonical_batch_groups(len(loader.dataset), rank, world),
-        num_workers=loader.num_workers, pin_memory=loader.pin_memory,
-        collate_fn=loader.collate_fn)
-
+def best_selection_update(results, previous_score, previous_epoch, epoch):
+    score = results['D2S']['R@1'] + results['S2D']['R@1']
+    update = previous_epoch is None or score > previous_score
+    return dict(score=score, best_score=score if update else previous_score,
+                best_epoch=epoch if update else previous_epoch, best_update=update)
 
 @torch.no_grad()
-def certified_teacher_selection(model, query_loader, gallery_loader, device, task_name=None):
+def certified_teacher_selection(model, *, image_size, device, data_dir='data/U1652',
+                                num_workers=4, loaders=None):
     teacher = model.module if hasattr(model, 'module') else model
-    from src.evaluation.precision_contract import selection_signature
-    signature=selection_signature(teacher,'teacher',getattr(teacher,'selection_image_size',224))
+    selection_signature(teacher, 'teacher', image_size)
     training = teacher.training
     try:
-        encoder = CanonicalSelectionEncoder(teacher).eval()
-        return getdist_1652_val_and_get_recall(encoder,
-            canonical_loader(query_loader), canonical_loader(gallery_loader),
-            device, task_name=task_name)
+        return evaluate_u1652_single_gpu_canonical(EvaluationEncoder(teacher,4096).eval(),
+            image_size=image_size, device=device, data_dir=data_dir,
+            num_workers=num_workers, loaders=loaders)
     finally:
         teacher.train(training)
