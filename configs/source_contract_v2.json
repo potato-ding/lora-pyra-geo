@@ -103,7 +103,15 @@
     "src/models/dinov3_main/dinov3/layers/fp8_linear.py",
     "src/models/dinov3_main/dinov3/layers/rms_norm.py",
     "src/models/dinov3_main/dinov3/utils/__init__.py",
-    "src/models/dinov3_main/dinov3/utils/dtype.py"
+    "src/models/dinov3_main/dinov3/utils/dtype.py",
+    "src/evaluation/student_canonical.py",
+    "src/student/formal_runtime.py",
+    "src/student/formal_launch.py",
+    "src/student/formal_preflight.py",
+    "configs/student/r224/s0-infonce-r224.json",
+    "configs/student/r224/s1-top-rmlp-r224.json",
+    "configs/student/r224/s2-adual-fixed-r224.json",
+    "configs/student/r224/s3-adual-learnable-r224.json"
   ],
   "paper_ablation": [
     "src/middle_teacher/core_config.py",

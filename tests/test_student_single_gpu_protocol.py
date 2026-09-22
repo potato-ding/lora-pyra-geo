@@ -106,7 +106,9 @@ def test_live_selection_strict_tie_and_reload(tmp_path,monkeypatch):
         assert encoder.model is model and not model.training
         assert next(model.parameters()).dtype==torch.bfloat16
         calls.append(1);return score[0],50.,60.,20.
-    monkeypatch.setattr(metric_module,'getdist_1652_val_and_get_recall',metric)
+    from src.evaluation import student_canonical
+    monkeypatch.setattr(student_canonical,'evaluate_student_u1652_canonical',
+        lambda encoder,**kwargs:{d:dict(zip(('R@1','R@5','R@10','AP'),metric(encoder))) for d in ('D2S','S2D')})
     def forbidden(*a,**k):raise AssertionError('selection must not reload')
     monkeypatch.setattr(c,'evaluate_checkpoint',forbidden)
     best,row=c.select_epoch(wrapper,tmp_path,1,float('-inf'),'fixture')
@@ -129,7 +131,8 @@ def test_live_evaluator_failure_preserves_best(tmp_path,monkeypatch):
     from src.dataset.teacher import val_dataloaders
     (tmp_path/'best_model.pth').write_bytes(b'prior-best')
     def fail(*a,**k):raise RuntimeError('evaluator failed')
-    monkeypatch.setattr(val_dataloaders,'build_1652_val_dataloaders',fail)
+    from src.evaluation import student_canonical
+    monkeypatch.setattr(student_canonical,'evaluate_student_u1652_canonical',fail)
     model=nn.Linear(2,2).bfloat16().train()
     with pytest.raises(RuntimeError,match='evaluator failed'):c.select_epoch(model,tmp_path,1,0,'fixture')
     assert model.training

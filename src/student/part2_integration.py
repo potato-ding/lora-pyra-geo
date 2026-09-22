@@ -81,7 +81,8 @@ def assert_precision(engine):
         return
     assert all(p.dtype==torch.bfloat16 for p in engine.module.student.parameters())
     assert all(p.dtype==torch.bfloat16 for p in supervision.projector_top.linear.parameters())
-    assert all(p.dtype==torch.bfloat16 for p in supervision.projector_random.parameters())
+    if hasattr(supervision, "projector_random"):
+        assert all(p.dtype==torch.bfloat16 for p in supervision.projector_random.parameters())
     assert all(p.dtype==torch.float32 for p in supervision.projector_top.residual.parameters())
     assert supervision.projector_top.alpha.dtype==torch.float32
 

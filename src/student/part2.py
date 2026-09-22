@@ -117,7 +117,7 @@ class ResidualTopProjector(nn.Module):
 
 def install_residual_top(supervision, kind, calibration_inputs):
     """Explicit preparation helper; touches only Top, never Random/basis/loss."""
-    if supervision.top_dim != 128 or supervision.random_layout != "single32":
+    if supervision.top_dim != 128 or supervision.random_layout not in ("single32", "disabled"):
         raise ValueError("Part-II requires Top128 + Random32_A")
     wrapper = ResidualTopProjector(supervision.projector_top, kind)
     wrapper.match_initial_amplitude(calibration_inputs)

@@ -5,7 +5,7 @@ GBW_RUN_SEEDS={f'P1.5-T128-R32-GBW-S{seed}':seed for seed in (0,1,2)}
 
 def validate_coefficient_config(cfg,default_name):
     if cfg.get('source_contract')=='CORE_SOURCE_CONTRACT_V2':
-        if (cfg.get('lambda_top'),cfg.get('lambda_random')) not in ((1.,1.),(1.247,.753)):raise ValueError('Invalid fixed coefficients')
+        if (cfg.get('lambda_top'),cfg.get('lambda_random')) not in ((1.,1.),(1.247,.753),(2.,0.)):raise ValueError('Invalid fixed coefficients')
         return cfg['experiment_name']
     top=cfg.get('lambda_top',1.)
     random=cfg.get('lambda_random',1.)
@@ -31,6 +31,9 @@ def apply_branch_coefficients(cfg,unweighted,audit):
         return unweighted,{}
     validate_coefficient_config(cfg,cfg.get('experiment_name'))
     top=audit['top_loss'];random=audit['random_loss']
+    if cfg.get('paper_mode')=='top_only' and (lt,lr)==(2.,0.):
+        if random is not None:raise ValueError('Top-only must not execute Random loss')
+        return lt*top,dict(lambda_top=lt,lambda_random=lr,weighted_top_loss=(lt*top).detach())
     if random is None:raise ValueError('GBW requires an active Random32 branch')
     weighted_top=lt*top;weighted_random=lr*random
     dual=weighted_top+weighted_random

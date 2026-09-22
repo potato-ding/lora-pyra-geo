@@ -16,6 +16,9 @@ def main(argv=None):
     cfg=load_config(args.config)
     if args.validate_only:
         print(json.dumps(cfg,indent=2));return
+    if cfg.get('artifact_contract')=='STUDENT_BEST_ONLY_V1':
+        from .formal_launch import launch
+        return launch(cfg,args.config)
     visible=os.environ.get("CUDA_VISIBLE_DEVICES")
     if visible is not None and len(visible.split(",")) != 1:
         raise ValueError("STU-1G-B32-R224-v1 requires exactly one visible GPU")

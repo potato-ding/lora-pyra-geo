@@ -2,7 +2,7 @@
 import hashlib,json
 from pathlib import Path
 VERSION='CORE_SOURCE_CONTRACT_V2'
-PAPER_MODES=('b0','adual','rmlp','fixed','learnable')
+PAPER_MODES=('b0','adual','rmlp','fixed','learnable','top_only')
 
 def validate_config(cfg,check_assets=False):
     mode=cfg.get('paper_mode')
@@ -14,19 +14,32 @@ def validate_config(cfg,check_assets=False):
         if cfg.get(k)!=v:raise ValueError('Canonical protocol mismatch: '+k)
     if type(cfg.get('seed')) is not int or cfg['seed'] not in (0,1,2):raise ValueError('seed')
     if cfg.get('mode')!=('baseline' if mode=='b0' else 'dual_stst'):raise ValueError('mode')
-    if cfg.get('top_interface')!=('residual_mlp' if mode in ('rmlp','fixed','learnable') else 'linear'):raise ValueError('top interface')
+    if cfg.get('top_interface')!=('residual_mlp' if mode in ('rmlp','fixed','learnable','top_only') else 'linear'):raise ValueError('top interface')
     allocation='fixed' if mode=='fixed' else ('equal' if mode=='learnable' else None)
     if cfg.get('allocation_variant')!=allocation:raise ValueError('allocation variant')
-    coefficients=(1.247,.753) if mode in ('fixed','learnable') else (1.,1.)
+    coefficients=(2.,0.) if mode=='top_only' else ((1.247,.753) if mode in ('fixed','learnable') else (1.,1.))
     if (cfg.get('lambda_top'),cfg.get('lambda_random'))!=coefficients:raise ValueError('coefficient mismatch')
     if mode=='learnable' and (cfg.get('gate_parameterization'),cfg.get('gate_initial_d'))!=('bounded',0.):raise ValueError('gate initialization')
     if mode=='fixed' and any(cfg.get(k) is not None for k in ('gate_parameterization','gate_initial_d')):raise ValueError('fixed must not construct gate')
     if any(any(word in k.lower() for word in ('spatial','bncc','split16','factorial')) for k in cfg):raise ValueError('Removed experiment key')
     if mode!='b0':
-        for k,v in dict(part='Part-I',top_dim=128,random_layout='single32',random_total_dim=32,stst_weight=.2,stst_warmup_epochs=5).items():
+        for k,v in dict(part='Part-I',top_dim=128,random_layout='disabled' if mode=='top_only' else 'single32',random_total_dim=0 if mode=='top_only' else 32,stst_weight=.2,stst_warmup_epochs=5).items():
             if cfg.get(k)!=v:raise ValueError('A-Dual-STST mismatch: '+k)
         for key in ('middle_checkpoint','middle_config','stst_asset','original_stst_asset'):
             if not cfg.get(key):raise ValueError('Missing asset path '+key)
+    if mode=='b0' and any(cfg.get(k) for k in ('middle_checkpoint','middle_config','stst_asset','original_stst_asset','p2_calibration_path')):
+        raise ValueError('Baseline must not bind Teacher or KD assets')
+    if mode not in ('fixed','learnable') and any(cfg.get(k) is not None for k in ('gate_parameterization','gate_initial_d')):
+        raise ValueError('No allocation gate in baseline/Top-only')
+    if cfg.get('artifact_contract')=='STUDENT_BEST_ONLY_V1':
+        from .artifacts import ROOT
+        names={'b0':(0,'S0-INFONCE-R224'),'top_only':(1,'S1-TOP-RMLP-R224'),
+               'fixed':(2,'S2-ADUAL-FIXED-R224'),'learnable':(3,'S3-ADUAL-LEARNABLE-R224')}
+        if mode not in names:raise ValueError('Unknown formal Student experiment')
+        gpu,name=names[mode]
+        if cfg.get('assigned_gpu')!=gpu or cfg.get('experiment_name')!=name or Path(cfg['output_dir'])!=ROOT/'src/checkpoint/student/R224'/name:
+            raise ValueError('Formal Student identity/GPU/output mismatch')
+        if cfg['seed']!=0:raise ValueError('Formal four experiments use matched seed0')
     if check_assets:assert_assets(cfg)
     return cfg
 

@@ -1,4 +1,4 @@
-"""Canonical Student checkpoint selection through the formal standalone evaluator."""
+"""Canonical live Student selection and self-contained best checkpoint persistence."""
 import json
 import os
 from pathlib import Path
@@ -32,7 +32,7 @@ def standalone_environment():
 
 
 def evaluate_checkpoint(checkpoint, data_dir, num_workers=8, device="cuda:0", audit_dir=None):
-    """Selection and formal best evaluation use this exact same fresh-process entry."""
+    """Formal reload calls the same canonical evaluator as live selection."""
     checkpoint = Path(checkpoint).resolve()
     before = file_sha256(checkpoint)
     with tempfile.TemporaryDirectory(prefix="student_canonical_u1652_") as temporary:
@@ -66,11 +66,9 @@ def atomic_copy(source, destination):
 
 
 @torch.no_grad()
-def select_epoch(engine, output, epoch, previous_best, data_dir, num_workers=8, audit_dir=None, image_size=224):
+def select_epoch(engine, output, epoch, previous_best, data_dir, num_workers=8, audit_dir=None, image_size=224, run_metadata=None, allocation=None):
     from src.evaluation.precision_contract import selection_signature
     from src.evaluation.model_loader import EvaluationEncoder
-    from src.dataset.teacher.val_dataloaders import build_1652_val_dataloaders
-    from src.evaluation.metrics import getdist_1652_val_and_get_recall
     if audit_dir is not None:
         raise ValueError('Use injected tiny loaders for selection tests; formal selection cannot use audit subsets')
     if dist.is_initialized() and (dist.get_world_size()!=1 or dist.get_rank()!=0):
@@ -82,23 +80,44 @@ def select_epoch(engine, output, epoch, previous_best, data_dir, num_workers=8, 
         student.eval()
         signature=selection_signature(student,'student',image_size)
         encoder=EvaluationEncoder(student,512).eval()
-        loaders=build_1652_val_dataloaders(data_dir,[image_size,image_size],32,num_workers)
-        metrics={}
-        for direction,pair in loaders.items():
-            r1,r5,r10,ap=getdist_1652_val_and_get_recall(encoder,*pair,next(student.parameters()).device)
-            metrics[direction]={'R@1':r1,'R@5':r5,'R@10':r10,'AP':ap}
+        from src.evaluation.student_canonical import evaluate_student_u1652_canonical
+        metrics=evaluate_student_u1652_canonical(encoder,image_size=image_size,
+            data_dir=data_dir,num_workers=num_workers,device=next(student.parameters()).device)
         record=best_record(epoch,metrics,canonical=True)
         record['precision_signature']=signature
         score=record['best_score'];is_best=score>previous_best
         state=dict(epoch=epoch,model=canonical_state(student),protocol_id=PROTOCOL_ID,
                    precision_signature=signature,selection_metrics=metrics)
-        temporary=output/'_selection_state.tmp'
-        torch.save(state,temporary)
-        os.replace(temporary,output/'last_model.pth')
-        if is_best:
-            atomic_copy(output/'last_model.pth',output/'best_model.pth')
-            write_json(output/'best_metrics.json',record)
+        formal=run_metadata is not None and run_metadata.get('artifact_contract')=='STUDENT_BEST_ONLY_V1'
+        if formal:
+            flat={d+'_'+k:float(metrics[d][source]) for d in ('D2S','S2D')
+                  for k,source in (('R1','R@1'),('R5','R@5'),('AP','AP'))}
+            flat['R1_sum']=score
+            metadata=dict(run_metadata,experiment_id=run_metadata['experiment_name'],
+                image_size=image_size,best_epoch=epoch,best_score=score,
+                selection_mode='SINGLE_GPU_CANONICAL',training_world_size=1,
+                selection_world_size=1,selection_rank=0,eval_batch_size=32,
+                selection_metrics=flat,precision_signature=signature,
+                precision_contract=signature['precision_contract_version'],
+                allocation=allocation)
+            if allocation is not None:
+                metadata.update(allocation_mode=allocation['mode'],lambda_top=allocation['lambda_top'],lambda_random=allocation['lambda_random'])
+            state.update(metadata=metadata,best_epoch=epoch,best_score=score)
+            if is_best:
+                temporary=output/'_selection_state.tmp'
+                try:
+                    torch.save(state,temporary)
+                    os.replace(temporary,output/'best_model.pth')
+                finally:temporary.unlink(missing_ok=True)
+        else:
+            temporary=output/'_selection_state.tmp'
+            torch.save(state,temporary)
+            os.replace(temporary,output/'last_model.pth')
+            if is_best:
+                atomic_copy(output/'last_model.pth',output/'best_model.pth')
+                write_json(output/'best_metrics.json',record)
         row=dict(epoch=epoch,metrics=metrics,is_best=is_best,precision_signature=signature,**evaluator_metadata())
+        print('STUDENT_SELECTION='+json.dumps(dict(epoch=epoch,selection_mode='SINGLE_GPU_CANONICAL',selection_world_size=1,selection_rank=0,image_size=image_size,eval_batch_size=32,metrics=metrics,R1_sum=score,best_score=score if is_best else previous_best,best_update=is_best)),flush=True)
         return (score if is_best else previous_best),row
     finally:
         student.train(was_training)

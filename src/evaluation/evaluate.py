@@ -94,6 +94,10 @@ def main(argv=None):
                 from .middle_canonical import evaluate_middle_u1652_canonical
                 results=evaluate_middle_u1652_canonical(model,image_size=image_size,
                     device=device,data_dir=roots[dataset],num_workers=args.num_workers)
+            elif args.model_type=='student' and not args.certification_only and not args.reuse_certified_cache:
+                from .student_canonical import evaluate_student_u1652_canonical
+                results=evaluate_student_u1652_canonical(model,image_size=image_size,
+                    device=device,data_dir=roots[dataset],num_workers=args.num_workers)
             else:
                 loaders=build_1652_val_dataloaders(**common)
                 if args.model_type=='teacher':

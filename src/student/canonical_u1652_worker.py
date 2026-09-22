@@ -50,7 +50,7 @@ def main():
                             batch_size=32, shuffle=False, num_workers=args.num_workers, pin_memory=True))
                 (audit/"subset_manifest.json").write_text(json.dumps(manifest, indent=2))
                 return pairs
-            def capture_metric(model, query, gallery, device):
+            def capture_metric(model, query, gallery, device, **kwargs):
                 key = "D2S" if not descriptors else "S2D"
                 with torch.no_grad():
                     q, ql, qv = extract_features_dist(model, query, device)
@@ -61,6 +61,9 @@ def main():
                 return result
             stack.enter_context(patch.object(unified, "build_1652_val_dataloaders", subset_builder))
             stack.enter_context(patch.object(unified, "getdist_1652_val_and_get_recall", capture_metric))
+            from src.evaluation import student_canonical
+            stack.enter_context(patch.object(student_canonical, "build_1652_val_dataloaders", subset_builder))
+            stack.enter_context(patch.object(student_canonical, "getdist_1652_val_and_get_recall", capture_metric))
         unified.main(["--model-type", "student", "--checkpoint", args.checkpoint,
                       "--dataset", "u1652", "--u1652-dir", args.data_dir,
                       "--batch-size", "32", "--num-workers", str(args.num_workers),
