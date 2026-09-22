@@ -90,6 +90,10 @@ def main(argv=None):
                 from .u1652_canonical import evaluate_u1652_single_gpu_canonical
                 results=evaluate_u1652_single_gpu_canonical(model, image_size=image_size,
                     device=device, data_dir=roots[dataset], num_workers=args.num_workers)
+            elif args.model_type=='middle' and not args.certification_only and not args.reuse_certified_cache:
+                from .middle_canonical import evaluate_middle_u1652_canonical
+                results=evaluate_middle_u1652_canonical(model,image_size=image_size,
+                    device=device,data_dir=roots[dataset],num_workers=args.num_workers)
             else:
                 loaders=build_1652_val_dataloaders(**common)
                 if args.model_type=='teacher':

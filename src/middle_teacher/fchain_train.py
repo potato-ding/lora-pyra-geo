@@ -11,21 +11,17 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-from torch import nn
-from torch.utils.data import DataLoader
 
 from src.middle_teacher.config import load_config
 from src.middle_teacher.distributed import initialize_distributed, rank, world_size, barrier
 from src.middle_teacher.model import build_middle_teacher
 from src.middle_teacher.optimizer import build_middle_teacher_optimizer
 from src.middle_teacher.runtime import initialize_deepspeed, warmup_cosine_scheduler
-from src.middle_teacher.checkpoint import CheckpointController, sha256
+from src.middle_teacher.checkpoint import sha256
+from src.middle_teacher.artifacts import MiddleCheckpointController
+from src.middle_teacher.selection import select_and_save
 from src.data.middle_teacher import create_middle_teacher_train_dataset_and_loader
 from src.utils.gather_features_and_labels_and_views import GatherLayer, concat_all_gather
-from src.utils.run_logging import setup_rank0_run_log
-from src.evaluation.model_loader import EvaluationEncoder
-from src.evaluation.metrics import getdist_1652_val_and_get_recall
-from src.dataset.teacher.val_dataloaders import build_1652_val_dataloaders
 
 
 def validate_r0(config):
@@ -45,47 +41,6 @@ def r0_pair_loss(drone, satellite, logit_scale):
     d2s = F.cross_entropy(logits, labels, label_smoothing=0.0)
     s2d = F.cross_entropy(logits.t(), labels, label_smoothing=0.0)
     return (d2s+s2d)*0.5, d2s, s2d
-
-
-class SelectionEncoder(nn.Module):
-    def __init__(self, model):
-        super().__init__()
-        self.input_dtype_anchor = nn.Parameter(torch.zeros((),dtype=torch.float32,device=next(model.parameters()).device),requires_grad=False)
-        self.encoder = EvaluationEncoder(model,768)
-    def forward(self, images):
-        return self.encoder(images)
-
-
-def grouped_loader(loader):
-    # Match default unified evaluator batches (32), not rank-strided batches.
-    groups = [list(range(i,min(i+32,len(loader.dataset)))) for i in range(0,len(loader.dataset),32)]
-    count = math.ceil(len(groups)/world_size())*world_size()
-    groups += [groups[-1]]*(count-len(groups))
-    return DataLoader(loader.dataset,batch_sampler=groups[rank()::world_size()],
-                      num_workers=loader.num_workers,pin_memory=True,collate_fn=loader.collate_fn)
-
-
-@torch.no_grad()
-def selection(engine, loaders, device):
-    engine.module.selection_image_size=getattr(engine.module,'selection_image_size',224)
-    from src.evaluation.precision_contract import selection_signature
-    signature=selection_signature(engine.module,'middle',engine.module.selection_image_size)
-    print('PRECISION_SIGNATURE='+json.dumps(signature),flush=True)
-    encoder = SelectionEncoder(engine.module).eval()
-    metrics = {}
-    for direction,(query,gallery) in loaders.items():
-        r1,r5,r10,ap = getdist_1652_val_and_get_recall(encoder,grouped_loader(query),
-            grouped_loader(gallery),device,task_name=direction)
-        metrics.update({f'{direction}_R1':r1,f'{direction}_R5':r5,
-                        f'{direction}_R10':r10,f'{direction}_AP':ap})
-    metrics['R1_sum'] = metrics['D2S_R1']+metrics['S2D_R1']
-    return metrics
-
-
-def write_json(path, payload):
-    temporary = path.with_suffix(path.suffix+'.tmp')
-    temporary.write_text(json.dumps(payload,indent=2))
-    temporary.replace(path)
 
 
 def main(allow_kd=True,allow_abv=False):
@@ -118,7 +73,7 @@ def main(allow_kd=True,allow_abv=False):
         if rank()==0:
             # Shell redirection may create train.log before rank 0 reaches
             # this guard; only formal checkpoint/epoch assets are protected.
-            assert not any((output/n).exists() for n in ('best_model.pth','last_model.pth','epoch_metrics.json'))
+            assert not output.exists() or not any(p.name != 'train.log' for p in output.iterdir()), 'Output is not fresh'
             output.mkdir(parents=True,exist_ok=True)
         barrier()
         assert Path(os.environ['FCHAIN_EXTERNAL_TRAIN_LOG']).resolve()==(output/'train.log').resolve()
@@ -153,7 +108,7 @@ def main(allow_kd=True,allow_abv=False):
     _,loader=create_middle_teacher_train_dataset_and_loader(config)
     assert len(loader)==1182,len(loader)
     engine.module.selection_image_size=config['data']['input_size']
-    controller=CheckpointController(output,objective='pair_infonce_'+component)
+    controller=MiddleCheckpointController(output,config)
     metadata={'experiment':config['experiment']['name'],'seed':seed,'img_size':224,'epochs':10,
         'code':{'branch':subprocess.check_output(['git','branch','--show-current'],text=True).strip(),
                 'commit_sha':subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),
@@ -176,11 +131,6 @@ def main(allow_kd=True,allow_abv=False):
     else:
         print('R0_RUNTIME='+json.dumps(metadata),flush=True)
     rows=[];step=0
-    if not args.smoke_no_step and rank()==0:
-        write_json(output/'run_config.json',config)
-        metadata['source_sha256'][str(output/'run_config.json')]=sha256(output/'run_config.json')
-        write_json(output/'best_metrics.json',metadata);write_json(output/'epoch_metrics.json',rows)
-    val_loaders=None
     for epoch in range(1,11):
         loader.batch_sampler.set_epoch(epoch-1);engine.train();running=0.0
         component_sums={}
@@ -218,7 +168,7 @@ def main(allow_kd=True,allow_abv=False):
                 for name,param in engine.module.named_parameters():
                     match=re.match(r'backbone.model.blocks\.(\d+)\.',name)
                     if match and param.requires_grad:hooks.append(param.register_hook(block_hook(int(match[1]))))
-                teacher_versions={n:p._version for n,p in kd.teacher.named_parameters()}
+                teacher_versions={n:p._version for n,p in kd.teacher.named_parameters()} if kd is not None else {}
                 def record_gradient(grad):
                     gradient_seen.append(bool(torch.isfinite(grad).all() and grad.float().abs().sum()>0))
                 hooks.extend(p.register_hook(record_gradient) for p in engine.module.parameters() if p.requires_grad)
@@ -232,7 +182,7 @@ def main(allow_kd=True,allow_abv=False):
                 assert any(gradient_seen),'no nonzero Middle gradient'
                 coverage=all(v['parameter_count']>0 and v['finite'] and v['squared_norm']>0 for v in block_grads.values())
                 assert coverage,block_grads
-                assert teacher_versions=={n:p._version for n,p in kd.teacher.named_parameters()}
+                assert kd is None or teacher_versions=={n:p._version for n,p in kd.teacher.named_parameters()}
                 kd_stats['full_ft_gradient_coverage_pass']=coverage
                 kd_stats['block_gradients']={str(i):dict(grad_parameter_count=v['parameter_count'],grad_norm=math.sqrt(v['squared_norm']),finite=v['finite']) for i,v in block_grads.items()}
                 kd_stats['teacher_parameter_versions_unchanged']=True
@@ -268,12 +218,8 @@ def main(allow_kd=True,allow_abv=False):
                 print('R0_OPTIMIZER_STEP='+json.dumps({'epoch':epoch,'step':step,'engine_global_steps':engine.global_steps,
                     'loss':float(loss.detach()),'d2s':float(d2s.detach()),'s2d':float(s2d.detach()),
                     'finite':True,'lr':[g['lr'] for g in optimizer.param_groups],'global_pool':32}),flush=True)
-        barrier();engine.eval()
-        if val_loaders is None:
-            val_loaders=build_1652_val_dataloaders(config['data'].get('val_dir','data/U1652'),[config['data']['input_size']]*2,32,4)
-        metrics=selection(engine,val_loaders,device)
-        improved=controller.save_best_if_improved(engine,epoch,step,metrics)
-        if epoch==10:controller.save_last(engine,epoch,step,metrics)
+        engine.eval()
+        metrics,improved=select_and_save(engine,controller,config,epoch,step,device)
         if rank()==0:
             row={'epoch':epoch,'train_loss':running/len(loader),'learning_rate':[g['lr'] for g in optimizer.param_groups],
                  'R1_sum':metrics['R1_sum'],'is_best':improved}
@@ -283,7 +229,7 @@ def main(allow_kd=True,allow_abv=False):
             rows.append(row)
             metadata.update(best_epoch=controller.best_epoch,best_selection_metrics=controller.best_metrics,
                             last_completed_epoch=epoch)
-            write_json(output/'epoch_metrics.json',rows);write_json(output/'best_metrics.json',metadata)
+            print('MIDDLE_TRAINING_RECORD='+json.dumps(metadata),flush=True)
             print('R0_EPOCH_METRICS='+json.dumps(row),flush=True)
         barrier()
     dist.destroy_process_group()

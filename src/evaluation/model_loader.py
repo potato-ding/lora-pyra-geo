@@ -80,8 +80,16 @@ def load_encoder(model_type,checkpoint,config=None,device='cuda',image_size=224)
     elif model_type=='middle':
         from src.middle_teacher.config import load_config
         from src.middle_teacher.model import build_middle_teacher
-        if config is None:raise ValueError('--config is required for Middle architecture identity')
-        model=build_middle_teacher(load_config(config),load_foundation=False);dimension=768
+        from src.middle_teacher.artifacts import checkpoint_metadata as middle_metadata
+        middle_info=middle_metadata(payload)
+        if middle_info is not None:
+            resolved_config=payload['config']
+            if config is not None and load_config(config)!=resolved_config:
+                raise ValueError('Middle config differs from checkpoint configuration')
+        else:
+            if config is None:raise ValueError('--config is required for legacy Middle architecture identity')
+            resolved_config=load_config(config)
+        model=build_middle_teacher(resolved_config,load_foundation=False);dimension=768
         state=normalize_state(payload);result=model.load_state_dict(state,strict=True)
         schema='full Middle deployment state'
     elif model_type=='student':

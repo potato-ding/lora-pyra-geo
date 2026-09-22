@@ -54,7 +54,11 @@
     "src/models/dinov3_main/dinov3/layers/fp8_linear.py",
     "src/models/dinov3_main/dinov3/layers/rms_norm.py",
     "src/models/dinov3_main/dinov3/utils/__init__.py",
-    "src/models/dinov3_main/dinov3/utils/dtype.py"
+    "src/models/dinov3_main/dinov3/utils/dtype.py",
+    "src/evaluation/middle_canonical.py",
+    "src/middle_teacher/artifacts.py",
+    "src/middle_teacher/selection.py",
+    "src/utils/selection_sync.py"
   ],
   "m2s": [
     "src/student/__init__.py",

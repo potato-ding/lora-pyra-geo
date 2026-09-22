@@ -24,6 +24,12 @@ class FChainRuntime:
         if set(config['distillation'])-{'base_loss','margin','adaptive_bridge_v2'}:
             raise ValueError('Non-SAM core supports HRD and Semantic Adaptation only')
         self.encoder,self.audit=load_encoder('teacher',checkpoint,device=device)
+        if config['experiment']['name']=='M2-HRD-SEM-R224':
+            metadata=self.audit.get('checkpoint_metadata',{})
+            required=dict(experiment_id='T0-INFONCE-R224',image_size=224,
+                selection_mode='SINGLE_GPU_CANONICAL',selection_world_size=1,selection_rank=0)
+            if any(metadata.get(k)!=v for k,v in required.items()):
+                raise ValueError('M2 requires the formal R224 Teacher checkpoint')
         self.teacher=self.encoder.model;self.config=config['distillation']
         self.composer=DistillationComposer(self.config);self.chunk_size=chunk_size
         assert all(not p.requires_grad for p in self.teacher.parameters())
