@@ -85,6 +85,12 @@ def test_part1_existing_branch_functions_unchanged():
         return {n.name:n for n in tree.body if isinstance(n,(ast.FunctionDef,ast.ClassDef))}
     old=functions(old_text('src/student/part1.py'))
     new=functions((ROOT/'src/student/part1.py').read_text())
+    # The new schema dispatch is the only allowed change to the historical loader.
+    loader=new['load_extended_asset']
+    dispatch=loader.body[2]
+    expected=ast.parse("if asset.get('metadata',{}).get('schema')=='NESTED_BANDWIDTH_V1':\n    from .bandwidth_assets import validate_asset\n    return validate_asset(asset,original_path,teacher_sha)").body[0]
+    assert ast.dump(dispatch)==ast.dump(expected)
+    loader.body.pop(2)
     for name in ['build_extended_tensors','check_extended_tensors','load_extended_asset','BandProjector']:
         assert ast.dump(old[name])==ast.dump(new[name])
     previous={n.name:n for n in old['PartISupervision'].body if isinstance(n,ast.FunctionDef)}

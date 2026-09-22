@@ -9,12 +9,14 @@ from src.student.objective import PairInfoNCE
 from test_student_part1 import banks
 
 @pytest.mark.parametrize('variant',['fixed','audit','equal','unbound'])
+@pytest.mark.usefixtures('historical_p2_calibration')
 def test_exact_s0_configs(variant):
     cfg=make_config(variant);assert validate_config(cfg)==cfg
     for change in [dict(seed=1),dict(batch_size=16),dict(lambda_top=1.3),dict(stst_weight=.3),
                    dict(top_interface='residual_kan'),dict(gate_initial_d=.2),dict(epochs=2),dict(spatial_kd=True)]:
         with pytest.raises(ValueError):validate_config(dict(cfg,**change))
 
+@pytest.mark.usefixtures('historical_p2_calibration')
 def test_only_allocation_diff_and_no_rng_consumption():
     configs=[make_config(v) for v in ('fixed','audit','equal','unbound')]
     exclude={'experiment_name','output_dir','allocation_variant','gate_parameterization','gate_initial_d'}
@@ -48,6 +50,7 @@ def test_descriptor_view_signal_matches_direct_views():
         assert torch.equal(actual,.5*(grads[0].norm()+grads[1].norm()))
         assert not actual.requires_grad
 
+@pytest.mark.usefixtures('historical_p2_calibration')
 def test_real_heads_loss_and_gradient_isolation(banks):
     cfg=make_config('audit')
     sup=PartISupervision(banks[1],banks[0],banks[2],128,'single32')

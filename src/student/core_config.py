@@ -17,13 +17,24 @@ def validate_config(cfg,check_assets=False):
     if cfg.get('top_interface')!=('residual_mlp' if mode in ('rmlp','fixed','learnable','top_only') else 'linear'):raise ValueError('top interface')
     allocation='fixed' if mode=='fixed' else ('equal' if mode=='learnable' else None)
     if cfg.get('allocation_variant')!=allocation:raise ValueError('allocation variant')
-    coefficients=(2.,0.) if mode=='top_only' else ((1.247,.753) if mode in ('fixed','learnable') else (1.,1.))
+    coefficients=(1.,1.) if mode=='learnable' and cfg.get('subspace_asset_schema')=='NESTED_BANDWIDTH_V1' else (2.,0.) if mode=='top_only' else ((1.247,.753) if mode in ('fixed','learnable') else (1.,1.))
     if (cfg.get('lambda_top'),cfg.get('lambda_random'))!=coefficients:raise ValueError('coefficient mismatch')
     if mode=='learnable' and (cfg.get('gate_parameterization'),cfg.get('gate_initial_d'))!=('bounded',0.):raise ValueError('gate initialization')
     if mode=='fixed' and any(cfg.get(k) is not None for k in ('gate_parameterization','gate_initial_d')):raise ValueError('fixed must not construct gate')
     if any(any(word in k.lower() for word in ('spatial','bncc','split16','factorial')) for k in cfg):raise ValueError('Removed experiment key')
+    bandwidth=cfg.get('subspace_asset_schema')=='NESTED_BANDWIDTH_V1'
+    if cfg.get('subspace_asset_schema') not in (None,'NESTED_BANDWIDTH_V1'):raise ValueError('Unknown bandwidth schema')
+    top=cfg.get('top_dim',128);random=cfg.get('random_total_dim',0 if mode=='top_only' else 32)
+    if bandwidth:
+        if mode not in ('top_only','fixed','learnable') or type(top) is not int or top not in (128,256):raise ValueError('top_dim')
+        if type(random) is not int or random not in (0,32,64,128) or (random==0)!=(mode=='top_only'):raise ValueError('random_total_dim')
+    else:
+        top=128;random=0 if mode=='top_only' else 32
+    # Existing random_total_dim/layout are the authoritative config schema.
+    if 'random_dim' in cfg and cfg['random_dim']!=random:raise ValueError('random_dim conflicts with random_total_dim')
+    if 'use_random' in cfg and cfg['use_random']!=(random>0):raise ValueError('use_random conflicts with layout')
     if mode!='b0':
-        for k,v in dict(part='Part-I',top_dim=128,random_layout='disabled' if mode=='top_only' else 'single32',random_total_dim=0 if mode=='top_only' else 32,stst_weight=.2,stst_warmup_epochs=5).items():
+        for k,v in dict(part='Part-I',top_dim=top,random_layout='disabled' if random==0 else 'single'+str(random),random_total_dim=random,stst_weight=.2,stst_warmup_epochs=5).items():
             if cfg.get(k)!=v:raise ValueError('A-Dual-STST mismatch: '+k)
         for key in ('middle_checkpoint','middle_config','stst_asset','original_stst_asset'):
             if not cfg.get(key):raise ValueError('Missing asset path '+key)
@@ -37,6 +48,13 @@ def validate_config(cfg,check_assets=False):
                'fixed':(2,'S2-ADUAL-FIXED-R224'),'learnable':(3,'S3-ADUAL-LEARNABLE-R224')}
         if mode not in names:raise ValueError('Unknown formal Student experiment')
         gpu,name=names[mode]
+        if bandwidth:
+            identities={('top_only',256,0):(0,'S4-TOP256-R224'),
+                        ('learnable',128,64):(1,'S5-ADUAL-T128-R64-LEARNABLE-R224'),
+                        ('learnable',128,128):(2,'S6-ADUAL-T128-R128-LEARNABLE-R224'),
+                        ('learnable',256,32):(3,'S7-ADUAL-T256-R32-LEARNABLE-R224')}
+            if (mode,top,random) not in identities:raise ValueError('Unknown formal bandwidth experiment')
+            gpu,name=identities[(mode,top,random)]
         if cfg.get('assigned_gpu')!=gpu or cfg.get('experiment_name')!=name or Path(cfg['output_dir'])!=ROOT/'src/checkpoint/student/R224'/name:
             raise ValueError('Formal Student identity/GPU/output mismatch')
         if cfg['seed']!=0:raise ValueError('Formal four experiments use matched seed0')
@@ -54,6 +72,10 @@ def assert_assets(cfg):
     if cfg['mode']!='baseline':
         from .part1 import load_extended_asset
         asset=load_extended_asset(cfg['stst_asset'],cfg['original_stst_asset'],cfg['middle_checkpoint_sha256'])
+        if cfg.get('subspace_asset_schema')=='NESTED_BANDWIDTH_V1':
+            from .bandwidth_assets import validate_manifest
+            if asset['metadata'].get('schema')!=cfg['subspace_asset_schema']:raise ValueError('Bandwidth schema mismatch')
+            validate_manifest(cfg,asset)
         if asset['metadata'].get('image_size',224)!=cfg['img_size']:raise ValueError('Bank image size mismatch')
         from .dual_stst import load_stst_asset
         original=load_stst_asset(cfg['original_stst_asset'],cfg['middle_checkpoint_sha256'])

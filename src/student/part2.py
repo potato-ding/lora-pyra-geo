@@ -1,4 +1,4 @@
-"""Canonical train-only Top128 RMLP with explicitly fixed hidden width 920."""
+"""Canonical train-only Top RMLP with explicitly fixed hidden width 920."""
 import math
 import torch
 from torch import nn
@@ -32,11 +32,11 @@ class FP32Module(nn.Module):
 
 
 class MLPResidual(FP32Module):
-    def __init__(self):
+    def __init__(self, top_dim=128):
         super().__init__()
         self.hidden_dim = RMLP_HIDDEN_DIM
         self.fc1 = nn.Linear(512, self.hidden_dim, bias=True, dtype=torch.float32)
-        self.fc2 = nn.Linear(self.hidden_dim, 128, bias=True, dtype=torch.float32)
+        self.fc2 = nn.Linear(self.hidden_dim, top_dim, bias=True, dtype=torch.float32)
 
     def forward(self, x):
         with torch.autocast(device_type=x.device.type, enabled=False):
@@ -61,15 +61,15 @@ class ResidualTopProjector(nn.Module):
     """
     def __init__(self, base, kind):
         super().__init__()
-        if type(base) is not BandProjector or base.linear.in_features != 512 or base.linear.out_features != 128:
-            raise ValueError("An existing canonical Top128 BandProjector is required")
+        if type(base) is not BandProjector or base.linear.in_features != 512 or base.linear.out_features not in (128,256):
+            raise ValueError("An existing canonical Top128/256 BandProjector is required")
         if kind != "rmlp":
             raise ValueError("Only the Top-RMLP interface is supported")
         self.linear = base.linear
         self.kind = kind
         with torch.random.fork_rng(devices=[]):
             torch.manual_seed(RESIDUAL_INIT_SEED)
-            self.residual = MLPResidual().to(self.linear.weight.device)
+            self.residual = MLPResidual(self.linear.out_features).to(self.linear.weight.device)
         self.gate = ScalarGate().to(self.linear.weight.device)
         self.initialization_audit = None
 
@@ -117,8 +117,8 @@ class ResidualTopProjector(nn.Module):
 
 def install_residual_top(supervision, kind, calibration_inputs):
     """Explicit preparation helper; touches only Top, never Random/basis/loss."""
-    if supervision.top_dim != 128 or supervision.random_layout not in ("single32", "disabled"):
-        raise ValueError("Part-II requires Top128 + Random32_A")
+    if supervision.top_dim not in (128,256) or supervision.random_layout not in ("single32", "single64", "single128", "disabled"):
+        raise ValueError("Top-RMLP requires Top128/256 and one optional Random branch")
     wrapper = ResidualTopProjector(supervision.projector_top, kind)
     wrapper.match_initial_amplitude(calibration_inputs)
     supervision.projector_top = wrapper

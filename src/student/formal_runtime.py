@@ -14,7 +14,7 @@ def construction_rng(cfg, device):
 def snapshot_assets(supervision):
     if supervision is None:return {}
     return {name:value.detach().cpu().clone() for name,value in supervision.named_buffers()
-            if name in ('teacher_mean','top32_basis','random32_basis','random_b_basis')}
+            if (name in ('teacher_mean','top32_basis','random32_basis','random_b_basis') or name.startswith('bandwidth_'))}
 
 def assert_assets_preserved(supervision, originals):
     current={} if supervision is None else dict(supervision.named_buffers())

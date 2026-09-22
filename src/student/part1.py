@@ -82,6 +82,9 @@ def check_extended_tensors(asset,original):
 def load_extended_asset(path,original_path,teacher_sha):
     original=load_stst_asset(original_path,teacher_sha)
     asset=torch.load(path,map_location='cpu',weights_only=True)
+    if asset.get('metadata',{}).get('schema')=='NESTED_BANDWIDTH_V1':
+        from .bandwidth_assets import validate_asset
+        return validate_asset(asset,original_path,teacher_sha)
     expected=dict(dataset='University-1652',split='train',train_only=True,train_ids=701,bank_rows=1402,
         teacher_dim=768,top_max_dim=128,random_A_dim=32,random_A_source='original_D0',random_A_seed=20260808,
         random_B_dim=32,random_B_seed=20260914,random64_dim=64,teacher_sha256=teacher_sha,
@@ -102,20 +105,22 @@ class BandProjector(nn.Module):
 class PartISupervision(DualSTSTSupervision):
     """Same two semantic branches; two32 averages its two Random losses."""
     def __init__(self,asset_path,original_path,teacher_sha,top_dim,random_layout):
-        if top_dim not in [32,64,128] or random_layout not in ['disabled','single32','single64','two32']:
+        if top_dim not in [32,64,128,256] or random_layout not in ['disabled','single32','single64','single128','two32']:
             raise ValueError('Unsupported fixed Part-I interface')
         # Preserve the exact D0 constructor RNG consumption and A/Top32 initial rows.
         super().__init__(original_path,expected_teacher_sha256=teacher_sha)
         asset=load_extended_asset(asset_path,original_path,teacher_sha)
+        if (top_dim==256 or random_layout=='single128') and asset['metadata'].get('schema')!='NESTED_BANDWIDTH_V1':
+            raise ValueError('Requested bandwidth requires nested extended asset')
         self.asset_path=str(Path(asset_path).resolve());self.asset_sha256=file_sha256(asset_path)
         self.metadata=asset['metadata'];self.top_dim=top_dim;self.random_layout=random_layout
-        self.random_total_dim=0 if random_layout=='disabled' else (32 if random_layout=='single32' else 64)
+        self.random_total_dim=0 if random_layout=='disabled' else (128 if random_layout=='single128' else (32 if random_layout=='single32' else 64))
         old_top=self.projector_top;old_random=self.projector_random
         with torch.random.fork_rng(devices=[]):
             torch.manual_seed(20260914)
             new_top=BandProjector(top_dim)
             extra_random=BandProjector(32)
-            new_random=BandProjector(64 if random_layout=='single64' else 32)
+            new_random=BandProjector(32 if random_layout=='two32' else (self.random_total_dim or 32))
             with torch.no_grad():
                 new_top.linear.weight[:32].copy_(old_top.linear.weight)
                 new_top.linear.bias[:32].copy_(old_top.linear.bias)
@@ -126,9 +131,13 @@ class PartISupervision(DualSTSTSupervision):
                     new_random.linear.bias[32:].copy_(extra_random.linear.bias)
         self.projector_top=new_top;self.projector_random=new_random
         if random_layout=='two32': self.projector_random_b=extra_random
-        self.top32_basis=asset['top128_basis'][:,:top_dim].clone()
-        self.random32_basis=asset['random64_basis' if random_layout=='single64' else 'random32_A'].clone()
+        self.top32_basis=asset['top256_basis' if top_dim==256 else 'top128_basis'][:,:top_dim].clone()
+        self.random32_basis=asset[{'single64':'random64_basis','single128':'random128_basis'}.get(random_layout,'random32_A')].clone()
         self.register_buffer('random_b_basis',asset['random32_B'].clone(),persistent=False)
+        if asset['metadata'].get('schema')=='NESTED_BANDWIDTH_V1':
+            from .bandwidth_assets import SHAPES
+            for key in SHAPES:
+                self.register_buffer('bandwidth_'+key,asset[key].clone(),persistent=False)
         if random_layout=='disabled':
             # Consume the historical constructor RNG identically, then remove the
             # transient Random head before optimizer construction or any forward.
@@ -213,7 +222,7 @@ def part1_metadata(cfg):
     if file_sha256(cfg['original_stst_asset'])!=cfg['original_stst_asset_sha256']:
         raise ValueError('Original bank SHA mismatch')
     dim=cfg['random_total_dim']
-    return dict(part='Part-I',round=1,research_axis='knowledge_interface',
+    result = dict(part='Part-I',round=1,research_axis='knowledge_interface',
         middle_teacher_run=Path(cfg['middle_checkpoint']).parent.name,
         middle_teacher_checkpoint=str(Path(cfg['middle_checkpoint']).resolve()),middle_teacher_sha256=teacher_sha,
         middle_teacher_descriptor_dim=768,teacher_frozen=True,teacher_trainable_params=0,
@@ -227,3 +236,14 @@ def part1_metadata(cfg):
         inference_overhead=False,DEPLOYMENT_PARAM_DELTA_VS_D0=0,
         head_initialization='D0 Top32/A exact initial rows and RNG consumption preserved; extra rows fixed seed20260914; '
                             'R64 rows[A,B] exactly match the two separate R2X32 heads at initialization')
+
+    if asset['metadata'].get('schema')=='NESTED_BANDWIDTH_V1':
+        from .bandwidth_assets import validate_manifest
+        validate_manifest(cfg,asset)
+        result.update(use_random=dim>0,random_dim=dim,
+            allocation_mode='learnable' if cfg['paper_mode']=='learnable' else ('fixed' if cfg['paper_mode']=='fixed' else 'top_only'),
+            asset_manifest=cfg['asset_manifest'],asset_manifest_sha256=cfg['asset_manifest_sha256'],
+            random_extension_seed=asset['metadata']['random_extension_seed'],random_B_seed=asset['metadata']['random_extension_seed'],
+            RANDOM_FACTORIZATION_DIFFERENT=False,
+            head_initialization='Original first32 Top/Random rows preserved; Top expansion seed20260914; residual seed0; construction RNG isolated')
+    return result

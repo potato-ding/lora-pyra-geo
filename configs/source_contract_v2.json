@@ -111,7 +111,9 @@
     "configs/student/r224/s0-infonce-r224.json",
     "configs/student/r224/s1-top-rmlp-r224.json",
     "configs/student/r224/s2-adual-fixed-r224.json",
-    "configs/student/r224/s3-adual-learnable-r224.json"
+    "configs/student/r224/s3-adual-learnable-r224.json",
+    "src/student/bandwidth_assets.py",
+    "src/student/build_bandwidth_asset.py"
   ],
   "paper_ablation": [
     "src/middle_teacher/core_config.py",

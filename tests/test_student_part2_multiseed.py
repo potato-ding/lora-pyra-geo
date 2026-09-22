@@ -15,6 +15,7 @@ IDENTITY={'seed','experiment_name','output_dir','sealed_provenance_file'}
 
 
 @pytest.mark.parametrize('seed',[0,1,2])
+@pytest.mark.usefixtures('historical_p2_calibration')
 def test_only_matched_shared_seeds(seed):
     cfg=load_config(ROOT/f'configs/student/certified_r224/p2_top_rmlp_s{seed}.json')
     ref=json.loads((ROOT/'configs/student/certified_r224/p2_top_rmlp_s0.json').read_text())
@@ -28,6 +29,7 @@ def test_only_matched_shared_seeds(seed):
 
 
 @pytest.mark.parametrize('seed',[0,1,2])
+@pytest.mark.usefixtures('historical_p2_calibration')
 def test_shared_path_against_real_s0_source(banks,seed):
     old=types.ModuleType('src.student._historical_p2_integration')
     old.__package__='src.student'

@@ -104,7 +104,7 @@ class DualSTSTSupervision(nn.Module):
         # Knowledge buffers must never visit a low-precision dtype. Probe only an
         # empty tensor to discover the requested device; move original FP32 bits.
         assets={id(value):value for name,value in self._buffers.items()
-                if name in ('teacher_mean','top32_basis','random32_basis','random_b_basis')
+                if (name in ('teacher_mean','top32_basis','random32_basis','random_b_basis') or name.startswith('bandwidth_'))
                 and value is not None}
         def preserve_asset(tensor):
             if id(tensor) in assets:

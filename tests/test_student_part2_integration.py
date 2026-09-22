@@ -14,6 +14,7 @@ from p2_source_contract import before_p2
 
 ROOT=Path(__file__).resolve().parents[1]
 @pytest.mark.parametrize('name',['rmlp'])
+@pytest.mark.usefixtures('historical_p2_calibration')
 def test_configs_strictly_matched(name):
     cfg=load_config(ROOT/f'configs/student/certified_r224/p2_top_{name}_s0.json')
     assert validate_config(cfg)
