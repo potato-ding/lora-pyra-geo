@@ -58,7 +58,9 @@
     "src/evaluation/middle_canonical.py",
     "src/middle_teacher/artifacts.py",
     "src/middle_teacher/selection.py",
-    "src/utils/selection_sync.py"
+    "src/utils/selection_sync.py",
+    "src/middle_teacher/distill_sam.py",
+    "src/middle_teacher/sam.py"
   ],
   "m2s": [
     "src/student/__init__.py",

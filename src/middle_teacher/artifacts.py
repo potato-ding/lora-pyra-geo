@@ -38,6 +38,12 @@ class MiddleCheckpointController(CheckpointController):
         metadata=dict(protocol,experiment_id=self.config['experiment']['name'],best_epoch=self.best_epoch,
             best_score=self.best_score,training_world_size=self.config['data']['world_size'],selection_metrics=refs,
             distillation=self.config['distillation'],sam=self.config['sam']['enabled'])
+        if self.config['sam'].get('framework')=='M2_DISTILL_SAM_V1':
+            metadata.update({k:self.config['sam'][k] for k in (
+                'sharpness_mode','search_direction','perturb_scope','rho',
+                'balanced_task_weight','balanced_kd_weight')})
+            metadata.update(sharpness=self.config['sam'],
+                best_epoch_gradient_diagnostics=raw_model(model_or_engine).sam_epoch_diagnostics)
         payload=dict(artifact_schema=SCHEMA,model=portable_state(model_or_engine),config=self.config,
             metadata=metadata,selection_protocol=protocol,selection_metrics=refs,
             precision_signature=selection_signature(raw_model(model_or_engine),'middle',protocol['image_size']))

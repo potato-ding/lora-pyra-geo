@@ -10,7 +10,13 @@ from src.utils.gather_features_and_labels_and_views import concat_all_gather
 from src.middle_teacher.checkpoint import sha256
 def validate_fchain(c,validate_r0):
     from src.middle_teacher.core_config import validate_core_config
-    return validate_core_config(c,allow_sam=False)
+    from src.middle_teacher.distill_sam import validate_sharpness
+    active=validate_sharpness(c)
+    if active:
+        ref=json.loads((Path(__file__).resolve().parents[2]/'configs/middle_teacher/m2-hrd-sem-r224.json').read_text())
+        if c['distillation'] != ref['distillation']:
+            raise ValueError('Final SAM requires full canonical M2 objective')
+    return validate_core_config(c,allow_sam=active)
 
 def fingerprints(path):
     from src.source_contract import source_identity
@@ -24,7 +30,7 @@ class FChainRuntime:
         if set(config['distillation'])-{'base_loss','margin','adaptive_bridge_v2'}:
             raise ValueError('Non-SAM core supports HRD and Semantic Adaptation only')
         self.encoder,self.audit=load_encoder('teacher',checkpoint,device=device)
-        if config['experiment']['name']=='M2-HRD-SEM-R224':
+        if config['experiment']['name']=='M2-HRD-SEM-R224' or config['sam'].get('framework')=='M2_DISTILL_SAM_V1':
             metadata=self.audit.get('checkpoint_metadata',{})
             required=dict(experiment_id='T0-INFONCE-R224',image_size=224,
                 selection_mode='SINGLE_GPU_CANONICAL',selection_world_size=1,selection_rank=0)
@@ -34,7 +40,7 @@ class FChainRuntime:
         self.composer=DistillationComposer(self.config);self.chunk_size=chunk_size
         assert all(not p.requires_grad for p in self.teacher.parameters())
 
-    def compose_all(self,base,md,ms,images,ids,model,step,hidden=None):
+    def compose_all(self,base,md,ms,images,ids,model,step,hidden=None,return_kd_objective=False):
         self.teacher.eval();abv=self.config.get('adaptive_bridge_v2',{}).get('enabled',False)
         with torch.no_grad():
             if abv:
@@ -59,4 +65,7 @@ class FChainRuntime:
             if k=='margin':stats[k+'_valid_negative_count']=int(audit['D2S']['indices'].numel()+audit['S2D']['indices'].numel())
             if k=='adaptive_bridge_v2':stats['abv_audit']=audit;stats['teacher_forward_time']=features['timing']['teacher_forward_time']
         assert set(raw)==set(self.config)-{'base_loss'}
+        if return_kd_objective:
+            kd_objective=sum(out[k+'_weighted_loss'] for k in raw)
+            return out['total_loss'],stats,kd_objective
         return out['total_loss'],stats

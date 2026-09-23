@@ -47,6 +47,7 @@ def main(allow_kd=True,allow_abv=False):
     parser=argparse.ArgumentParser()
     parser.add_argument('--config',required=True)
     parser.add_argument('--smoke-no-step',action='store_true')
+    parser.add_argument('--smoke-steps',type=int,default=0,choices=range(4))
     parser.add_argument('--expected-gpus',required=True)
     # DeepSpeed injects this legacy spelling for each worker.
     parser.add_argument('--local_rank','--local-rank',dest='local_rank',type=int,default=0)
@@ -63,6 +64,13 @@ def main(allow_kd=True,allow_abv=False):
     local_rank=initialize_distributed();config=load_config(args.config)
     from src.middle_teacher.fchain_runtime import validate_fchain,FChainRuntime,fingerprints
     validate_fchain(config,validate_r0)
+    from src.middle_teacher.distill_sam import validate_sharpness, sam_backward, GradientSummary, parameter_spaces
+    sam_active=validate_sharpness(config)
+    if sam_active and args.smoke_no_step:
+        raise ValueError('Final SAM smoke uses --smoke-steps 1..3')
+    if args.smoke_steps:
+        assert sam_active and not args.smoke_no_step
+        assert Path(config['checkpoint']['output_dir']).resolve().is_relative_to(Path('/tmp'))
     component=config['experiment']['name']
     allow_abv=config['distillation'].get('adaptive_bridge_v2',{}).get('enabled',False)
     assert world_size()==2
@@ -84,6 +92,13 @@ def main(allow_kd=True,allow_abv=False):
         model=build_middle_teacher(config)
     parent_hash=sha256(config['initialization']['path'])
     assert parent_hash==config['initialization']['sha256']
+    if sam_active:
+        all_params,recipient,excluded=parameter_spaces(model)
+        print('SAM_PARAMETER_SCOPE='+json.dumps(dict(
+            total=sum(p.numel() for _,p in all_params),recipient=sum(p.numel() for _,p in recipient),
+            excluded=sum(p.numel() for _,p in excluded),
+            recipient_names=[n for n,_ in recipient],training_only_names=[n for n,_ in excluded])),flush=True)
+        assert not any(isinstance(m,torch.nn.modules.batchnorm._BatchNorm) for m in model.modules())
     optimizer,audit=build_middle_teacher_optimizer(model,config['optimizer'])
     expected=14327809 if config['trainability']['lora_blocks'] else 85669633
     if allow_abv:
@@ -126,32 +141,42 @@ def main(allow_kd=True,allow_abv=False):
     metadata['source_sha256']=fingerprints(args.config)
     if kd is not None:
         metadata['teacher']=dict(kd.audit,frozen=True,strict_load=True)
-        metadata['objective']=dict(task_loss='PairInfoNCE',KD=True,SAM=False,distillation=config['distillation'])
+        metadata['objective']=dict(task_loss='PairInfoNCE',KD=True,SAM=sam_active,distillation=config['distillation'])
         print('KD_RUNTIME='+json.dumps(metadata),flush=True)
     else:
         print('R0_RUNTIME='+json.dumps(metadata),flush=True)
+    if sam_active:
+        metadata['objective']['SAM']=True
+        metadata['sharpness']=config['sam']
+        print('SAM_RUNTIME='+json.dumps(dict(sharpness=config['sam'],teacher_forward_policy='RECOMPUTE_EACH_PASS',gradient_clip='SECOND_PASS_ONLY_1.0',bn_special_handling_required=False)),flush=True)
     rows=[];step=0
     for epoch in range(1,11):
         loader.batch_sampler.set_epoch(epoch-1);engine.train();running=0.0
         component_sums={}
+        gradient_summary=GradientSummary() if sam_active else None
         for batch_index,(drone,satellite,labels,pids) in enumerate(loader):
             images=torch.cat((drone,satellite),0).to(device=device,dtype=next(engine.module.parameters()).dtype)
             ids=torch.as_tensor(labels,device=device,dtype=torch.long)
-            if allow_abv:
-                hidden_output=engine(images,return_layer_features=True)
-                descriptor=hidden_output['final_descriptor']
+            if sam_active:
+                loss,base_loss,d2s,s2d,kd_stats,sam_stats=sam_backward(
+                    engine,kd,images,ids,step,config['sam'],audit_ranks=bool(args.smoke_steps))
+                gradient_summary.add(sam_stats)
             else:
-                descriptor=engine(images)
-            assert descriptor.dtype==torch.float32 and tuple(descriptor.shape)==(32,768)
-            md=torch.cat(GatherLayer.apply(descriptor[:16]),0)
-            ms=torch.cat(GatherLayer.apply(descriptor[16:]),0)
-            global_ids=concat_all_gather(ids)
-            assert md.shape==ms.shape==(32,768) and global_ids.unique().numel()==32
-            loss,d2s,s2d=r0_pair_loss(md,ms,engine.module.logit_scale)
-            base_loss=loss
-            kd_stats={}
-            if kd is not None:
-                loss,kd_stats=kd.compose_all(loss,md,ms,images,global_ids,engine.module,step,hidden_output if allow_abv else None)
+                if allow_abv:
+                    hidden_output=engine(images,return_layer_features=True)
+                    descriptor=hidden_output['final_descriptor']
+                else:
+                    descriptor=engine(images)
+                assert descriptor.dtype==torch.float32 and tuple(descriptor.shape)==(32,768)
+                md=torch.cat(GatherLayer.apply(descriptor[:16]),0)
+                ms=torch.cat(GatherLayer.apply(descriptor[16:]),0)
+                global_ids=concat_all_gather(ids)
+                assert md.shape==ms.shape==(32,768) and global_ids.unique().numel()==32
+                loss,d2s,s2d=r0_pair_loss(md,ms,engine.module.logit_scale)
+                base_loss=loss
+                kd_stats={}
+                if kd is not None:
+                    loss,kd_stats=kd.compose_all(loss,md,ms,images,global_ids,engine.module,step,hidden_output if allow_abv else None)
             assert bool(torch.isfinite(loss)), 'nonfinite loss'
             gradient_seen=[]
             bridge_gradient_seen=[]
@@ -176,7 +201,8 @@ def main(allow_kd=True,allow_abv=False):
                     def record_bridge_gradient(grad):
                         bridge_gradient_seen.append(bool(torch.isfinite(grad).all() and grad.float().abs().sum()>0))
                     hooks.extend(p.register_hook(record_bridge_gradient) for p in engine.module.layer_semantic_projectors.parameters() if p.requires_grad)
-            engine.backward(loss)
+            if not sam_active:
+                engine.backward(loss)
             if args.smoke_no_step:
                 for hook in hooks:hook.remove()
                 assert any(gradient_seen),'no nonzero Middle gradient'
@@ -207,17 +233,32 @@ def main(allow_kd=True,allow_abv=False):
                     'checkpoint_save':False,'gpu_ids':args.expected_gpus,'seed':seed,
                     'parameter_dtype':'bfloat16','descriptor_dtype':'float32'}),flush=True)
                 barrier();dist.destroy_process_group();return
+            before_steps=engine.global_steps
+            before_schedule=scheduler.last_epoch
             engine.step();step+=1
+            if sam_active:
+                assert engine.global_steps==before_steps+1 and scheduler.last_epoch==before_schedule+1
+                sam_stats.update(optimizer_steps_per_batch=1,scheduler_steps_per_batch=1)
             with torch.no_grad():engine.module.logit_scale.clamp_(0,math.log(100))
             running+=float(loss.detach())
             if kd is not None:
                 for key,value in dict(kd_stats,base_loss=float(base_loss.detach())).items():
                     if key.endswith(('_loss','_effective_weight','_to_infonce_ratio')):component_sums[key]=component_sums.get(key,0.)+value
             if rank()==0 and (batch_index<3 or step%20==0):
+                if sam_active:print('SAM_DIAGNOSTICS='+json.dumps(dict(sam_stats,epoch=epoch,step=step)),flush=True)
                 if kd is not None:print('KD_COMPONENTS='+json.dumps(dict(kd_stats,step=step,base_loss=float(base_loss.detach()),total_loss=float(loss.detach()))),flush=True)
                 print('R0_OPTIMIZER_STEP='+json.dumps({'epoch':epoch,'step':step,'engine_global_steps':engine.global_steps,
                     'loss':float(loss.detach()),'d2s':float(d2s.detach()),'s2d':float(s2d.detach()),
                     'finite':True,'lr':[g['lr'] for g in optimizer.param_groups],'global_pool':32}),flush=True)
+            if args.smoke_steps and step>=args.smoke_steps:
+                print('M2_SAM_SMOKE_RESULT='+json.dumps(dict(sam_stats,rank=rank(),steps=step,
+                    experiment=component,P0_sha256=parent_hash,training_world_size=world_size(),
+                    global_pool=32,teacher_frozen=True,peak_allocated=torch.cuda.max_memory_allocated(device),
+                    checkpoint_save=False,pass_check=True)),flush=True)
+                barrier();dist.destroy_process_group();return
+        if sam_active:
+            engine.module.sam_epoch_diagnostics=gradient_summary.result()
+            if rank()==0:print('SAM_EPOCH_DIAGNOSTICS='+json.dumps(dict(engine.module.sam_epoch_diagnostics,epoch=epoch)),flush=True)
         engine.eval()
         metrics,improved=select_and_save(engine,controller,config,epoch,step,device)
         if rank()==0:
