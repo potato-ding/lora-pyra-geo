@@ -28,7 +28,9 @@ def validate_r0(config):
     assert config['experiment']['epochs'] == 10 and config['seed'] in (0, 1)
     assert config['distillation'] == {'base_loss': 'pair_infonce'}
     assert not config['sam']['enabled']
-    for key, value in {'input_size':224, 'world_size':2, 'local_pair_batch':16,
+    from src.middle_teacher.core_config import validate_image_size
+    validate_image_size(config['data']['input_size'])
+    for key, value in { 'world_size':2, 'local_pair_batch':16,
                        'global_pair_batch':32, 'num_workers':4, 'cross_gpu_gather':True}.items():
         assert config['data'][key] == value, key
     assert config['scheduler'] == {'type':'cosine','warmup_steps':591,'total_optimizer_steps':11820}
@@ -69,7 +71,7 @@ def main(allow_kd=True,allow_abv=False):
     if sam_active and args.smoke_no_step:
         raise ValueError('Final SAM smoke uses --smoke-steps 1..3')
     if args.smoke_steps:
-        assert sam_active and not args.smoke_no_step
+        assert not args.smoke_no_step
         assert Path(config['checkpoint']['output_dir']).resolve().is_relative_to(Path('/tmp'))
     component=config['experiment']['name']
     allow_abv=config['distillation'].get('adaptive_bridge_v2',{}).get('enabled',False)
@@ -120,11 +122,14 @@ def main(allow_kd=True,allow_abv=False):
         random.setstate(py_state);np.random.set_state(np_state)
         optimizer_ids={id(p) for group in optimizer.param_groups for p in group['params']}
         assert not any(id(p) in optimizer_ids for p in kd.teacher.parameters())
+    if kd is not None:
+        engine.module.distillation_teacher_identity={k:kd.audit[k] for k in ('checkpoint','sha256','checkpoint_metadata')}
+    print('IMAGE_SIZE = '+str(config['data']['input_size']),flush=True)
     _,loader=create_middle_teacher_train_dataset_and_loader(config)
     assert len(loader)==1182,len(loader)
     engine.module.selection_image_size=config['data']['input_size']
     controller=MiddleCheckpointController(output,config)
-    metadata={'experiment':config['experiment']['name'],'seed':seed,'img_size':224,'epochs':10,
+    metadata={'experiment':config['experiment']['name'],'seed':seed,'img_size':config['data']['input_size'],'epochs':10,
         'code':{'branch':subprocess.check_output(['git','branch','--show-current'],text=True).strip(),
                 'commit_sha':subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),
                 'working_tree_dirty':bool(subprocess.check_output(['git','status','--porcelain'],text=True).strip())},
@@ -156,6 +161,7 @@ def main(allow_kd=True,allow_abv=False):
         gradient_summary=GradientSummary() if sam_active else None
         for batch_index,(drone,satellite,labels,pids) in enumerate(loader):
             images=torch.cat((drone,satellite),0).to(device=device,dtype=next(engine.module.parameters()).dtype)
+            assert tuple(images.shape)==(32,3,config['data']['input_size'],config['data']['input_size'])
             ids=torch.as_tensor(labels,device=device,dtype=torch.long)
             if sam_active:
                 loss,base_loss,d2s,s2d,kd_stats,sam_stats=sam_backward(
@@ -236,9 +242,9 @@ def main(allow_kd=True,allow_abv=False):
             before_steps=engine.global_steps
             before_schedule=scheduler.last_epoch
             engine.step();step+=1
-            if sam_active:
+            if sam_active or args.smoke_steps:
                 assert engine.global_steps==before_steps+1 and scheduler.last_epoch==before_schedule+1
-                sam_stats.update(optimizer_steps_per_batch=1,scheduler_steps_per_batch=1)
+                if sam_active:sam_stats.update(optimizer_steps_per_batch=1,scheduler_steps_per_batch=1)
             with torch.no_grad():engine.module.logit_scale.clamp_(0,math.log(100))
             running+=float(loss.detach())
             if kd is not None:
@@ -251,6 +257,17 @@ def main(allow_kd=True,allow_abv=False):
                     'loss':float(loss.detach()),'d2s':float(d2s.detach()),'s2d':float(s2d.detach()),
                     'finite':True,'lr':[g['lr'] for g in optimizer.param_groups],'global_pool':32}),flush=True)
             if args.smoke_steps and step>=args.smoke_steps:
+                if not sam_active:
+                    assert kd is None or all(not p.requires_grad and p.grad is None for p in kd.teacher.parameters())
+                    print('MIDDLE_SMOKE_RESULT='+json.dumps(dict(rank=rank(),steps=step,image_size=config['data']['input_size'],
+                        input_shape=list(images.shape),descriptor_shape=list(descriptor.shape),
+                        world_size=world_size(),local_pair_batch=16,global_pair_batch=32,
+                        objective='INFONCE_ONLY' if kd is None else 'InfoNCE + 0.1 HRD + 0.05 ABV2',
+                        teacher_frozen=kd is not None,teacher=engine.module.distillation_teacher_identity if kd is not None else None,
+                        kd_stats=kd_stats,loss=float(loss.detach()),optimizer_steps_per_batch=1,scheduler_steps_per_batch=1,
+                        peak_allocated=torch.cuda.max_memory_allocated(device),peak_reserved=torch.cuda.max_memory_reserved(device),
+                        checkpoint_save=False,pass_check=True)),flush=True)
+                    barrier();dist.destroy_process_group();return
                 print('M2_SAM_SMOKE_RESULT='+json.dumps(dict(sam_stats,rank=rank(),steps=step,
                     experiment=component,P0_sha256=parent_hash,training_world_size=world_size(),
                     global_pool=32,teacher_frozen=True,peak_allocated=torch.cuda.max_memory_allocated(device),

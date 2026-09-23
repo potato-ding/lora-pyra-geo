@@ -6,8 +6,8 @@ from src.utils.train_eval_utils import single_process_evaluation, getdist_1652_v
 CANONICAL_MIDDLE_EVAL_BATCH = 32
 
 def evaluate_middle_u1652_canonical(model, *, image_size, device, data_dir='data/U1652', num_workers=4, loaders=None):
-    if image_size != 224:
-        raise ValueError('Formal Middle requires image_size=224')
+    from src.middle_teacher.core_config import validate_image_size
+    validate_image_size(image_size)
     with single_process_evaluation():
         if loaders is None:
             loaders = build_1652_val_dataloaders(data_dir=data_dir, img_size=[image_size]*2,

@@ -12,7 +12,9 @@ def checkpoint_metadata(payload):
     if payload.get('artifact_schema') != SCHEMA:
         return None
     m=payload['metadata'];config=payload['config']
-    expected=selection_metadata(224)
+    from .core_config import validate_image_size, validate_teacher_identity
+    size=validate_image_size(config['data']['input_size'])
+    expected=selection_metadata(size)
     if any(m.get(k)!=v for k,v in expected.items()):raise ValueError('Invalid Middle selection protocol')
     if m['experiment_id']!=config['experiment']['name'] or m['training_world_size']!=2:
         raise ValueError('Invalid Middle experiment metadata')
@@ -23,7 +25,11 @@ def checkpoint_metadata(payload):
     if m['best_score']!=score or m['selection_metrics'].get('R1_sum')!=score:raise ValueError('Invalid Middle best score')
     if payload['selection_metrics']!=m['selection_metrics'] or payload['selection_protocol']!=expected:
         raise ValueError('Conflicting Middle selection reference')
-    if payload['precision_signature']['image_size']!=224:raise ValueError('Middle resolution mismatch')
+    if payload['precision_signature']['image_size']!=size:raise ValueError('Middle resolution mismatch')
+    if 'teacher' in m:
+        validate_teacher_identity(m['teacher']['checkpoint_metadata'],size)
+    elif size!=224 and len(config['distillation'])>1:
+        raise ValueError('Missing Middle Teacher checkpoint identity')
     return m
 
 class MiddleCheckpointController(CheckpointController):
@@ -38,6 +44,8 @@ class MiddleCheckpointController(CheckpointController):
         metadata=dict(protocol,experiment_id=self.config['experiment']['name'],best_epoch=self.best_epoch,
             best_score=self.best_score,training_world_size=self.config['data']['world_size'],selection_metrics=refs,
             distillation=self.config['distillation'],sam=self.config['sam']['enabled'])
+        teacher_identity=getattr(raw_model(model_or_engine),'distillation_teacher_identity',None)
+        if teacher_identity is not None:metadata['teacher']=teacher_identity
         if self.config['sam'].get('framework')=='M2_DISTILL_SAM_V1':
             metadata.update({k:self.config['sam'][k] for k in (
                 'sharpness_mode','search_direction','perturb_scope','rho',
