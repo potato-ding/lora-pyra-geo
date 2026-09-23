@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import torch
+from .top_only import make_supervision
 import torch.distributed as dist
 from torch import nn
 
@@ -176,12 +177,13 @@ def main():
             if cfg.get('part') == 'Part-I':
                 from .part1 import PartISupervision, part1_metadata
                 part1_metadata(cfg)  # Bind both bank SHAs before using any target.
-                supervision=PartISupervision(cfg['stst_asset'],cfg['original_stst_asset'],
-                    file_sha256(cfg['middle_checkpoint']),cfg['top_dim'],cfg['random_layout']).to(device)
+                supervision=make_supervision(cfg,file_sha256(cfg['middle_checkpoint'])).to(device)
             else:
                 supervision=DualSTSTSupervision(cfg['stst_asset'],expected_teacher_sha256=file_sha256(cfg['middle_checkpoint'])).to(device)
             teacher,_=load_encoder('middle',cfg['middle_checkpoint'],cfg['middle_config'],device)
             if any(p.requires_grad for p in teacher.parameters()):raise RuntimeError('Middle must be frozen')
+        from .random_structure import configure_basis
+        configure_basis(supervision,cfg)
         original_assets=snapshot_assets(supervision)
         # P2_INTEGRATION_BEGIN
         if cfg.get('top_interface', 'linear') != 'linear':

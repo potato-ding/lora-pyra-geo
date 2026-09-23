@@ -3,6 +3,7 @@ import argparse,json,os
 from pathlib import Path
 from types import SimpleNamespace
 import torch
+from .top_only import make_supervision
 import torch.distributed as dist
 from .train import StudentTrainingModel,deepspeed_config,sync_student_buffers_from_rank0,assert_student_validation_state_synced
 from .allocation_gbw import load_config,batch_loss,assert_assets,AllocationGate,EpochLog,state_hash,metadata as allocation_metadata
@@ -53,12 +54,13 @@ def main():
             if cfg.get('part') == 'Part-I':
                 from .part1 import PartISupervision, part1_metadata
                 part1_metadata(cfg)  # Bind both bank SHAs before using any target.
-                supervision=PartISupervision(cfg['stst_asset'],cfg['original_stst_asset'],
-                    file_sha256(cfg['middle_checkpoint']),cfg['top_dim'],cfg['random_layout']).to(device)
+                supervision=make_supervision(cfg,file_sha256(cfg['middle_checkpoint'])).to(device)
             else:
                 supervision=DualSTSTSupervision(cfg['stst_asset'],expected_teacher_sha256=file_sha256(cfg['middle_checkpoint'])).to(device)
             teacher,_=load_encoder('middle',cfg['middle_checkpoint'],cfg['middle_config'],device)
             if any(p.requires_grad for p in teacher.parameters()):raise RuntimeError('Middle must be frozen')
+        from .random_structure import configure_basis
+        configure_basis(supervision,cfg)
         original_assets=snapshot_assets(supervision)
         # P2_INTEGRATION_BEGIN
         if cfg.get('top_interface', 'linear') != 'linear':
@@ -104,6 +106,8 @@ def main():
             run_metadata.update(metadata(supervision))
         # P2_INTEGRATION_END
         run_metadata.update(allocation_metadata(cfg),initialization_identity=initial_identity)
+        if cfg.get('random_basis_mode')=='generated_fixed':
+            run_metadata.update(RANDOM_INTERFACE=cfg['random_projector_type'],research_axis='independent_random_realization_and_projector')
         if cfg.get('artifact_contract')!='STUDENT_BEST_ONLY_V1':
             write_json(output/'run_config.json',run_metadata)
         print('FORMAL_RUN_CONFIG='+json.dumps(run_metadata),flush=True)
@@ -143,7 +147,9 @@ def main():
         sync_student_buffers_from_rank0(engine.module.student)
         assert_student_validation_state_synced(engine.module.student, epoch)
         engine.eval()
-        best, row = select_epoch(engine, output, epoch, best, cfg['val_data_dir'], cfg['num_workers'], run_metadata=run_metadata, allocation=dict(mode='learnable' if gate is not None else 'fixed', lambda_top=float(gate()[0].detach()) if gate is not None else cfg['lambda_top'], lambda_random=float(gate()[1].detach()) if gate is not None else cfg['lambda_random']))
+        from .random_structure import capture_training_auxiliary
+        auxiliary=capture_training_auxiliary(supervision,gate) if cfg.get('random_basis_mode')=='generated_fixed' else None
+        best, row = select_epoch(engine, output, epoch, best, cfg['val_data_dir'], cfg['num_workers'], run_metadata=run_metadata, training_auxiliary=auxiliary, allocation=dict(mode='learnable' if gate is not None else 'fixed', lambda_top=float(gate()[0].detach()) if gate is not None else cfg['lambda_top'], lambda_random=float(gate()[1].detach()) if gate is not None else cfg['lambda_random']))
         history.append(row)
         if cfg.get('artifact_contract')!='STUDENT_BEST_ONLY_V1':
             write_json(output/'epoch_metrics.json',history)

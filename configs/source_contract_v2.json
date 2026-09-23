@@ -113,7 +113,14 @@
     "configs/student/r224/s2-adual-fixed-r224.json",
     "configs/student/r224/s3-adual-learnable-r224.json",
     "src/student/bandwidth_assets.py",
-    "src/student/build_bandwidth_asset.py"
+    "src/student/build_bandwidth_asset.py",
+    "src/student/random_structure.py",
+    "src/student/top_only.py",
+    "src/student/build_top_only.py",
+    "configs/student/r224/s12-t128-r32-linear-seed1-r224.json",
+    "configs/student/r224/s13-t128-r32-linear-seed2-r224.json",
+    "configs/student/r224/s14-t128-r32-rmlp-seed3-r224.json",
+    "configs/student/r224/s15-t128-r32-rmlp-seed4-r224.json"
   ],
   "paper_ablation": [
     "src/middle_teacher/core_config.py",
@@ -135,6 +142,9 @@
     "src/student/build_calibration.py",
     "src/student/subspace.py",
     "src/student/part1.py",
-    "src/student/bind_core_assets.py"
+    "src/student/bind_core_assets.py",
+    "src/student/random_structure.py",
+    "src/student/top_only.py",
+    "src/student/build_top_only.py"
   ]
 }

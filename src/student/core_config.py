@@ -5,6 +5,17 @@ VERSION='CORE_SOURCE_CONTRACT_V2'
 PAPER_MODES=('b0','adual','rmlp','fixed','learnable','top_only')
 
 def validate_config(cfg,check_assets=False):
+    generated=cfg.get('random_basis_mode','asset')=='generated_fixed'
+    if cfg.get('random_basis_mode','asset') not in ('asset','generated_fixed'):raise ValueError('random_basis_mode')
+    if generated:
+        if cfg.get('paper_mode')!='learnable' or cfg.get('top_dim')!=128 or cfg.get('random_total_dim')!=32:raise ValueError('generated_fixed requires Learnable Top128 Random32')
+        if type(cfg.get('random_basis_seed')) is not int or not 0<=cfg['random_basis_seed']<2**63:raise ValueError('random_basis_seed')
+        if cfg.get('random_projector_type') not in ('linear','rmlp'):raise ValueError('random_projector_type')
+        if cfg.get('random_projector_type')=='rmlp':
+            if cfg.get('random_rmlp_hidden_dim')!=256 or cfg.get('random_rmlp_beta_init')!=.001:raise ValueError('Random-RMLP contract')
+        elif any(k in cfg for k in ('random_rmlp_hidden_dim','random_rmlp_beta_init')):raise ValueError('Linear has no residual settings')
+        if cfg.get('original_stst_asset') or cfg.get('subspace_asset_schema'):raise ValueError('generated_fixed must use Top-only assets')
+    elif any(k in cfg for k in ('random_basis_seed','random_projector_type','random_rmlp_hidden_dim','random_rmlp_beta_init')):raise ValueError('Random controls require generated_fixed')
     mode=cfg.get('paper_mode')
     if cfg.get('source_contract')!=VERSION or mode not in PAPER_MODES:raise ValueError('Unknown core contract/mode')
     fixed=dict(epochs=30,batch_size=32,world_size=1,cross_gpu_gather=False,img_size=224,
@@ -17,7 +28,7 @@ def validate_config(cfg,check_assets=False):
     if cfg.get('top_interface')!=('residual_mlp' if mode in ('rmlp','fixed','learnable','top_only') else 'linear'):raise ValueError('top interface')
     allocation='fixed' if mode=='fixed' else ('equal' if mode=='learnable' else None)
     if cfg.get('allocation_variant')!=allocation:raise ValueError('allocation variant')
-    coefficients=(1.,1.) if mode=='learnable' and cfg.get('subspace_asset_schema')=='NESTED_BANDWIDTH_V1' else (2.,0.) if mode=='top_only' else ((1.247,.753) if mode in ('fixed','learnable') else (1.,1.))
+    coefficients=(1.,1.) if mode=='learnable' and (generated or cfg.get('subspace_asset_schema')=='NESTED_BANDWIDTH_V1') else (2.,0.) if mode=='top_only' else ((1.247,.753) if mode in ('fixed','learnable') else (1.,1.))
     if (cfg.get('lambda_top'),cfg.get('lambda_random'))!=coefficients:raise ValueError('coefficient mismatch')
     if mode=='learnable' and (cfg.get('gate_parameterization'),cfg.get('gate_initial_d'))!=('bounded',0.):raise ValueError('gate initialization')
     if mode=='fixed' and any(cfg.get(k) is not None for k in ('gate_parameterization','gate_initial_d')):raise ValueError('fixed must not construct gate')
@@ -36,7 +47,7 @@ def validate_config(cfg,check_assets=False):
     if mode!='b0':
         for k,v in dict(part='Part-I',top_dim=top,random_layout='disabled' if random==0 else 'single'+str(random),random_total_dim=random,stst_weight=.2,stst_warmup_epochs=5).items():
             if cfg.get(k)!=v:raise ValueError('A-Dual-STST mismatch: '+k)
-        for key in ('middle_checkpoint','middle_config','stst_asset','original_stst_asset'):
+        for key in (('middle_checkpoint','middle_config','stst_asset') if generated else ('middle_checkpoint','middle_config','stst_asset','original_stst_asset')):
             if not cfg.get(key):raise ValueError('Missing asset path '+key)
     if mode=='b0' and any(cfg.get(k) for k in ('middle_checkpoint','middle_config','stst_asset','original_stst_asset','p2_calibration_path')):
         raise ValueError('Baseline must not bind Teacher or KD assets')
@@ -55,6 +66,12 @@ def validate_config(cfg,check_assets=False):
                         ('learnable',256,32):(3,'S7-ADUAL-T256-R32-LEARNABLE-R224')}
             if (mode,top,random) not in identities:raise ValueError('Unknown formal bandwidth experiment')
             gpu,name=identities[(mode,top,random)]
+        if generated:
+            identities={(3301,'linear'):(0,'S12-T128-R32-LINEAR-SEED1-R224'),(3302,'linear'):(1,'S13-T128-R32-LINEAR-SEED2-R224'),
+                        (3303,'rmlp'):(2,'S14-T128-R32-RMLP-SEED3-R224'),(3304,'rmlp'):(3,'S15-T128-R32-RMLP-SEED4-R224')}
+            key=(cfg['random_basis_seed'],cfg['random_projector_type'])
+            if key not in identities:raise ValueError('Unknown formal independent Random experiment')
+            gpu,name=identities[key]
         if cfg.get('assigned_gpu')!=gpu or cfg.get('experiment_name')!=name or Path(cfg['output_dir'])!=ROOT/'src/checkpoint/student/R224'/name:
             raise ValueError('Formal Student identity/GPU/output mismatch')
         if cfg['seed']!=0:raise ValueError('Formal four experiments use matched seed0')
@@ -62,14 +79,22 @@ def validate_config(cfg,check_assets=False):
     return cfg
 
 def assert_assets(cfg):
+    generated=cfg.get('random_basis_mode','asset')=='generated_fixed'
     mapping={'student_pretrained':'student_pretrained_sha256'}
     if cfg['mode']!='baseline':mapping.update(middle_checkpoint='middle_checkpoint_sha256',middle_config='middle_config_sha256',stst_asset='extended_stst_asset_sha256',original_stst_asset='original_stst_asset_sha256')
+    if generated:mapping.pop('original_stst_asset',None)
     if cfg['top_interface']=='residual_mlp':mapping['p2_calibration_path']='p2_calibration_sha256'
     for path_key,sha_key in mapping.items():
         path=Path(cfg[path_key]);expected=cfg.get(sha_key)
         if not path.is_file():raise FileNotFoundError(path)
         if not expected or hashlib.sha256(path.read_bytes()).hexdigest()!=expected:raise ValueError('Asset SHA mismatch: '+path_key)
-    if cfg['mode']!='baseline':
+    if generated:
+        from .top_only import load_top_source
+        asset=load_top_source(cfg['stst_asset'],cfg['middle_checkpoint_sha256'])
+        if asset['metadata']['teacher_config_sha256']!=cfg['middle_config_sha256']:raise ValueError('Top source Middle config mismatch')
+        middle=json.loads(Path(cfg['middle_config']).read_text())
+        if middle.get('sam',{}).get('enabled') or middle['data']['input_size']!=224:raise ValueError('Middle must be R224 non-SAM')
+    elif cfg['mode']!='baseline':
         from .part1 import load_extended_asset
         asset=load_extended_asset(cfg['stst_asset'],cfg['original_stst_asset'],cfg['middle_checkpoint_sha256'])
         if cfg.get('subspace_asset_schema')=='NESTED_BANDWIDTH_V1':

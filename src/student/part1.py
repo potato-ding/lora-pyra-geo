@@ -215,6 +215,9 @@ def validate_part1_config(cfg):
 
 
 def part1_metadata(cfg):
+    if cfg.get('random_basis_mode','asset')=='generated_fixed':
+        from .top_only import metadata
+        return metadata(cfg)
     teacher_sha=file_sha256(cfg['middle_checkpoint'])
     asset=load_extended_asset(cfg['stst_asset'],cfg['original_stst_asset'],teacher_sha)
     if file_sha256(cfg['stst_asset'])!=cfg['extended_stst_asset_sha256']:

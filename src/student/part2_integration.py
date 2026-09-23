@@ -55,6 +55,8 @@ def prepare_top(supervision, cfg):
     # Match frozen component audit: canonical base storage was BF16 when calibrated.
     supervision.bfloat16()
     install_residual_top(supervision, KINDS[cfg["top_interface"]][0], calibration)
+    from .random_structure import prepare_random
+    prepare_random(supervision,cfg,calibration)
 
 
 def prepare_precision_groups(model, optimizer, cfg):
@@ -82,14 +84,20 @@ def assert_precision(engine):
     assert all(p.dtype==torch.bfloat16 for p in engine.module.student.parameters())
     assert all(p.dtype==torch.bfloat16 for p in supervision.projector_top.linear.parameters())
     if hasattr(supervision, "projector_random"):
-        assert all(p.dtype==torch.bfloat16 for p in supervision.projector_random.parameters())
+        random=supervision.projector_random
+        if hasattr(random,'residual'):
+            assert all(p.dtype==torch.bfloat16 for p in random.linear.parameters())
+            assert all(p.dtype==torch.float32 for p in random.residual.parameters())
+            assert random.beta.dtype==torch.float32 and random.gate.calibration.dtype==torch.float32
+        else:
+            assert all(p.dtype==torch.bfloat16 for p in random.parameters())
     assert all(p.dtype==torch.float32 for p in supervision.projector_top.residual.parameters())
     assert supervision.projector_top.alpha.dtype==torch.float32
 
 
 def metadata(supervision):
     top = supervision.projector_top
-    return dict(part="Part-II", research_axis="top_alignment_interface",
+    result = dict(part="Part-II", research_axis="top_alignment_interface",
         training_only_head_params=trainable_count(supervision),
         p2_top_params=trainable_count(top),p2_residual_params=trainable_count(top.residual),
         p2_alpha_init=.001,p2_alpha_learnable=True,p2_alpha_weight_decay=0.,
@@ -97,8 +105,19 @@ def metadata(supervision):
         p2_parameter_storage="Student/base/Random BF16; residual/gate FP32",
         p2_optimizer_grouping="same AdamW decay/no-decay policy partitioned by dtype",
         p2_projector_compute="FP32",REFERENCE_USES_DEEPSPEED=True,P2_USES_DEEPSPEED=True)
+    if hasattr(supervision,'random_structure_metadata'):
+        result.update(supervision.random_structure_metadata)
+        random=supervision.projector_random
+        result.update(random_training_params=trainable_count(random),
+            random_rmlp_calibration=getattr(random,'initialization_audit',None),
+            random_parameter_storage='base BF16; residual/beta/calibration FP32' if hasattr(random,'residual') else 'BF16',
+            random_rmlp_beta_weight_decay=0. if hasattr(random,'beta') else None)
+    return result
 
 
 def log_values(supervision):
     top = supervision.projector_top
-    return dict(p2_alpha=float(top.alpha.detach()))
+    result=dict(p2_alpha=float(top.alpha.detach()))
+    random=getattr(supervision,'projector_random',None)
+    if hasattr(random,'beta'):result['random_beta']=float(random.beta.detach())
+    return result

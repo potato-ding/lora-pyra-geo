@@ -66,7 +66,7 @@ def atomic_copy(source, destination):
 
 
 @torch.no_grad()
-def select_epoch(engine, output, epoch, previous_best, data_dir, num_workers=8, audit_dir=None, image_size=224, run_metadata=None, allocation=None):
+def select_epoch(engine, output, epoch, previous_best, data_dir, num_workers=8, audit_dir=None, image_size=224, run_metadata=None, allocation=None, training_auxiliary=None):
     from src.evaluation.precision_contract import selection_signature
     from src.evaluation.model_loader import EvaluationEncoder
     if audit_dir is not None:
@@ -103,6 +103,11 @@ def select_epoch(engine, output, epoch, previous_best, data_dir, num_workers=8, 
             if allocation is not None:
                 metadata.update(allocation_mode=allocation['mode'],lambda_top=allocation['lambda_top'],lambda_random=allocation['lambda_random'])
             state.update(metadata=metadata,best_epoch=epoch,best_score=score)
+            if metadata.get('random_basis_mode')=='generated_fixed':
+                from .bandwidth_assets import tensor_sha256
+                if training_auxiliary is None:raise ValueError('Generated basis checkpoint requires actual tensor')
+                if tensor_sha256(training_auxiliary['supervision']['random32_basis'])!=metadata['random_basis_sha256']:raise ValueError('Checkpoint Random identity mismatch')
+                state['training_auxiliary']=training_auxiliary
             if is_best:
                 temporary=output/'_selection_state.tmp'
                 try:
