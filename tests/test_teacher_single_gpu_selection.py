@@ -30,7 +30,7 @@ def test_canonical_never_reads_training_world_or_collectives(monkeypatch,world):
     assert result['D2S']['R@1']==100.0
     assert result['S2D']['AP']==100.0
 
-@pytest.mark.parametrize('size',[224,384,448])
+@pytest.mark.parametrize('size',[224,256,384,448])
 def test_builder_resolution_batch_and_no_distributed_sampler(monkeypatch,size):
     seen={}
     def builder(**kw): seen.update(kw); return toy_loaders()

@@ -5,7 +5,7 @@ from src.evaluation.precision_contract import selection_signature, flat_selectio
 from src.training.teacher.certified_selection import selection_metadata
 
 SCHEMA = 'TEACHER_BEST_MODEL_V2'
-FORMAL_EXPERIMENTS = {'T0-INFONCE-R224', 'T0-INFONCE-R384', 'T0-INFONCE-R448'}
+FORMAL_EXPERIMENTS = {'T0-INFONCE-R224', 'T0-INFONCE-R256', 'T0-INFONCE-R384', 'T0-INFONCE-R448'}
 
 def is_formal_teacher(args):
     return getattr(args, 'experiment_id', None) in FORMAL_EXPERIMENTS

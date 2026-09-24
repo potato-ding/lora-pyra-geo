@@ -30,7 +30,7 @@ def metrics(model):
         image_size=224,device='cpu',loaders={d:(loader,loader) for d in ('D2S','S2D')})
     return dict(value,epoch=3,R1_sum=value['D2S']['R@1']+value['S2D']['R@1'])
 
-@pytest.mark.parametrize('size',[224,384,448])
+@pytest.mark.parametrize('size',[224,256,384,448])
 def test_self_contained_checkpoint_smoke(tmp_path,monkeypatch,size):
     from src.models.teacher import model as module
     from src.evaluation.model_loader import load_encoder
@@ -92,7 +92,7 @@ def test_training_last_save_is_guarded_and_log_fields_exist():
         and 'last_model.pth' in ast.get_source_segment(source,node))
     # Execute the production guard with a sentinel saver, rather than asserting
     # that an unused standalone helper omits a last checkpoint.
-    for size in (224,384,448):
+    for size in (224,256,384,448):
         env={'args':args_for(size),'is_formal_teacher':is_formal_teacher}
         exec(compile(ast.Module(body=[guarded],type_ignores=[]),'<last_save_guard>','exec'),env)
     assert 'best_score=best_r1_sum' in source

@@ -95,7 +95,7 @@ def test_real_model_checkpoint_reload(kind,tmp_path):
     encoder,audit=load_encoder(kind,path,config,device='cpu')
     assert audit['precision_signature']==sig and not audit['missing'] and not audit['unexpected']
     with torch.no_grad():
-        for size in (224,384,448):
+        for size in (224,256,384,448):
             x=torch.randn(1,3,size,size)
             before=EvaluationEncoder(model,dim)(x);after=encoder(x)
             assert before.shape==(1,dim) and before.dtype==torch.float32
