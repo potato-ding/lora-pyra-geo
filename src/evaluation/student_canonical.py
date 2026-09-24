@@ -6,8 +6,8 @@ from src.utils.train_eval_utils import single_process_evaluation, getdist_1652_v
 CANONICAL_STUDENT_EVAL_BATCH = 32
 
 def evaluate_student_u1652_canonical(model, *, image_size, device, data_dir='data/U1652', num_workers=4, loaders=None):
-    if image_size != 224:
-        raise ValueError('Formal Student requires image_size=224')
+    if type(image_size) is not int or image_size not in (224,384):
+        raise ValueError('Formal Student requires image_size in (224,384)')
     with single_process_evaluation():
         if loaders is None:
             loaders = build_1652_val_dataloaders(data_dir=data_dir, img_size=[image_size]*2,

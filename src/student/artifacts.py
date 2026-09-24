@@ -91,7 +91,7 @@ def resolved_config(cfg, steps_per_epoch=None):
             metadata.update(dual_stst_metadata(cfg))
     require_u1652_eval_batch_size(cfg.get("u1652_eval_batch_size", U1652_EVAL_BATCH_SIZE))
     metadata.update(u1652_eval_batch_size=U1652_EVAL_BATCH_SIZE, validation_buffer_source="rank0")
-    if cfg.get("protocol_id") == "STU-1G-B32-R224-v1":
+    if cfg.get("protocol_id") in ("STU-1G-B32-R224-v1", "STU-1G-B32-R384-v1"):
         from .canonical_selection import evaluator_metadata
         metadata.update(evaluator_metadata(), bn_protocol="single_rank_native_bn", cross_rank_buffer_sync=False, bn_buffer_broadcast_required=False)
     return dict(metadata, experiment_name=Path(cfg["output_dir"]).name,
@@ -136,7 +136,7 @@ def validate_training_complete(run):
         raise ValueError("Complete thirty-epoch history required")
     best=json.loads((run/"best_metrics.json").read_text())
     expected=max(history,key=lambda row:row["metrics"]["D2S"]["R@1"]+row["metrics"]["S2D"]["R@1"])
-    expected_best=best_record(expected["epoch"],expected["metrics"],canonical=cfg.get("protocol_id")=="STU-1G-B32-R224-v1")
+    expected_best=best_record(expected["epoch"],expected["metrics"],canonical=cfg.get("protocol_id") in ("STU-1G-B32-R224-v1", "STU-1G-B32-R384-v1"))
     if 'precision_signature' in expected: expected_best['precision_signature']=expected['precision_signature']
     if best != expected_best:
         raise ValueError("Best metadata violates first strict maximum selection")

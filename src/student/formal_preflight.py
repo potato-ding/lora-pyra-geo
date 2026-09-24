@@ -72,7 +72,13 @@ def main():
     from .bandwidth_assets import tensor_sha256
     generated=cfg.get('random_basis_mode')=='generated_fixed'
     basis_hashes=[tensor_sha256(supervision.random32_basis)] if generated else []
-    losses=[];gate_gradients=[];first_batch_hash=None
+    losses=[];gate_gradients=[];first_batch_hash=None;step_records=[]
+    teacher_calls=[]
+    if teacher is not None:
+        teacher_ids={id(p) for p in teacher.parameters()}
+        assert all(id(p) not in teacher_ids for group in optimizer.param_groups for p in group["params"])
+        teacher_hook=teacher.register_forward_hook(lambda m,a,o:teacher_calls.append(dict(no_grad=not torch.is_grad_enabled(),output_requires_grad=o.requires_grad)))
+    torch.cuda.reset_peak_memory_stats()
     calls=[];bn=[]
     hooks=[student.register_forward_pre_hook(lambda m,a:calls.append(tuple(a[0].shape))),student.neck.register_forward_pre_hook(lambda m,a:bn.append(tuple(a[0].shape)))]
     criterion=PairInfoNCE(label_smoothing=cfg['label_smoothing'])
@@ -84,7 +90,10 @@ def main():
             loss,gate_loss,metrics=allocation_loss(engine,teacher,images,criterion,cfg,1,gate)
         else:
             loss,metrics=batch_loss(engine,teacher,images,32,criterion,cfg,1);gate_loss=None
+        assert torch.isfinite(loss) and all(v is None or torch.isfinite(torch.as_tensor(v)).all() for v in metrics.values())
+        previous_global_step=engine.global_steps;previous_scheduler_step=scheduler.last_epoch
         engine.backward(loss);engine.step()
+        assert engine.global_steps==previous_global_step+1 and scheduler.last_epoch==previous_scheduler_step+1
         if gate is not None:
             assert gate.d.grad is None
             gate_loss.backward()
@@ -92,11 +101,18 @@ def main():
             gate_gradients.append(float(gate.d.grad))
             gate_optimizer.step();gate_scheduler.step()
             assert float(sum(gate()))==2.
+        torch.cuda.synchronize()
+        memory=int(__import__('subprocess').check_output(['nvidia-smi','-i',os.environ['CUDA_VISIBLE_DEVICES'],'--query-gpu=memory.used','--format=csv,noheader,nounits'],text=True).strip())
+        row=dict(step=step+1,loss=float(loss.detach()),metrics={k:None if v is None else float(v) for k,v in metrics.items()},optimizer_steps=engine.global_steps,scheduler_steps=scheduler.last_epoch,used_memory_mib=memory,allocated_memory_mib=torch.cuda.memory_allocated()/2**20)
+        step_records.append(row);print('SMOKE_STEP='+json.dumps(row),flush=True)
         losses.append(float(loss.detach()))
         assert_assets_preserved(supervision,originals)
         if generated:basis_hashes.append(tensor_sha256(supervision.random32_basis))
     for hook in hooks:hook.remove()
-    assert calls==[(64,3,224,224)]*cli.steps and bn==[(64,512)]*cli.steps
+    if teacher is not None:
+        teacher_hook.remove()
+        assert len(teacher_calls)==cli.steps and all(x['no_grad'] and not x['output_requires_grad'] for x in teacher_calls)
+    assert calls==[(64,3,cfg['img_size'],cfg['img_size'])]*cli.steps and bn==[(64,512)]*cli.steps
     assert torch.isfinite(loss)
     if teacher is not None:assert not teacher.training and all(not p.requires_grad and p.grad is None for p in teacher.parameters())
     assert_assets_preserved(supervision,originals)
@@ -104,15 +120,15 @@ def main():
     from .canonical_selection import canonical_state
     from src.evaluation.model_loader import EvaluationEncoder
     from src.evaluation.precision_contract import selection_signature,apply_runtime_precision
-    student.eval();signature=selection_signature(student,'student',224)
+    student.eval();signature=selection_signature(student,'student',cfg['img_size'])
     restored=StudentModel(ckpt_path=None).to(device)
     restored.load_state_dict(canonical_state(student),strict=True)
-    apply_runtime_precision(restored,'student',signature,224);restored.eval()
+    apply_runtime_precision(restored,'student',signature,cfg['img_size']);restored.eval()
     with torch.no_grad():
         live=EvaluationEncoder(student,512)(images[:32])
         reload=EvaluationEncoder(restored,512)(images[:32])
     assert torch.equal(live,reload)
-    result=dict(experiment=cfg['experiment_name'],pass_all=True,student_initial_sha256=student_hash,
+    result=dict(steps=step_records,teacher_no_autograd=teacher_calls,student_f4_shape=list(student._runtime_forward_audit['f4_shape']),image_size=cfg['img_size'],experiment=cfg['experiment_name'],pass_all=True,student_initial_sha256=student_hash,
         top_initial_sha256=top_hash,random_initial_sha256=random_hash,loader_rng_sha256=rng_hash,
         first_batch_sha256=first_batch_hash,fp32_assets_bitwise_preserved=True,
         student_forward_shapes=calls,bn_shapes=bn,loss=float(loss.detach()),

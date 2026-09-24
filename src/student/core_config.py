@@ -18,7 +18,10 @@ def validate_config(cfg,check_assets=False):
     elif any(k in cfg for k in ('random_basis_seed','random_projector_type','random_rmlp_hidden_dim','random_rmlp_beta_init')):raise ValueError('Random controls require generated_fixed')
     mode=cfg.get('paper_mode')
     if cfg.get('source_contract')!=VERSION or mode not in PAPER_MODES:raise ValueError('Unknown core contract/mode')
-    fixed=dict(epochs=30,batch_size=32,world_size=1,cross_gpu_gather=False,img_size=224,
+    size=cfg.get('img_size')
+    if type(size) is not int or size not in (224,384):raise ValueError('Unsupported Student image size')
+    if cfg.get('protocol_id')!=f'STU-1G-B32-R{size}-v1':raise ValueError('Student resolution/protocol mismatch')
+    fixed=dict(epochs=30,batch_size=32,world_size=1,cross_gpu_gather=False,img_size=size,
         lr=1e-4,weight_decay=1e-4,warmup_epochs=.1,min_lr_ratio=.01,temperature=.07,
         label_smoothing=.1,grad_accum_steps=1,precision='bfloat16',u1652_eval_batch_size=32)
     for k,v in fixed.items():
@@ -66,13 +69,20 @@ def validate_config(cfg,check_assets=False):
                         ('learnable',256,32):(3,'S7-ADUAL-T256-R32-LEARNABLE-R224')}
             if (mode,top,random) not in identities:raise ValueError('Unknown formal bandwidth experiment')
             gpu,name=identities[(mode,top,random)]
-        if generated:
+        if generated and size==224:
             identities={(3301,'linear'):(0,'S12-T128-R32-LINEAR-SEED1-R224'),(3302,'linear'):(1,'S13-T128-R32-LINEAR-SEED2-R224'),
                         (3303,'rmlp'):(2,'S14-T128-R32-RMLP-SEED3-R224'),(3304,'rmlp'):(3,'S15-T128-R32-RMLP-SEED4-R224')}
             key=(cfg['random_basis_seed'],cfg['random_projector_type'])
             if key not in identities:raise ValueError('Unknown formal independent Random experiment')
             gpu,name=identities[key]
-        if cfg.get('assigned_gpu')!=gpu or cfg.get('experiment_name')!=name or Path(cfg['output_dir'])!=ROOT/'src/checkpoint/student/R224'/name:
+        if size==384:
+            if mode=='learnable' and not generated:raise ValueError('R384 final requires run-specific checkpointed Random32')
+            if mode not in ('b0','learnable') or bandwidth or (generated and cfg['random_projector_type']!='linear'):
+                raise ValueError('R384 supports only baseline and frozen Linear Random final method')
+            if generated and cfg.get('random_seed_provenance')!='OS_ENTROPY_ONCE_BEFORE_TRAINING_NO_METRIC_SELECTION':raise ValueError('R384 run-specific seed provenance required')
+            gpu=6 if mode=='b0' else 7
+            name=name.replace('R224','R384')
+        if cfg.get('assigned_gpu')!=gpu or cfg.get('experiment_name')!=name or Path(cfg['output_dir'])!=ROOT/f'src/checkpoint/student/R{size}'/name:
             raise ValueError('Formal Student identity/GPU/output mismatch')
         if cfg['seed']!=0:raise ValueError('Formal four experiments use matched seed0')
     if check_assets:assert_assets(cfg)
@@ -93,7 +103,8 @@ def assert_assets(cfg):
         asset=load_top_source(cfg['stst_asset'],cfg['middle_checkpoint_sha256'])
         if asset['metadata']['teacher_config_sha256']!=cfg['middle_config_sha256']:raise ValueError('Top source Middle config mismatch')
         middle=json.loads(Path(cfg['middle_config']).read_text())
-        if middle.get('sam',{}).get('enabled') or middle['data']['input_size']!=224:raise ValueError('Middle must be R224 non-SAM')
+        if asset['metadata']['image_size']!=cfg['img_size']:raise ValueError('Top source image size mismatch')
+        if middle.get('sam',{}).get('enabled') or middle['data']['input_size']!=cfg['img_size']:raise ValueError('Middle must be resolution-matched non-SAM')
     elif cfg['mode']!='baseline':
         from .part1 import load_extended_asset
         asset=load_extended_asset(cfg['stst_asset'],cfg['original_stst_asset'],cfg['middle_checkpoint_sha256'])

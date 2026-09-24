@@ -149,7 +149,7 @@ def main():
         engine.eval()
         from .random_structure import capture_training_auxiliary
         auxiliary=capture_training_auxiliary(supervision,gate) if cfg.get('random_basis_mode')=='generated_fixed' else None
-        best, row = select_epoch(engine, output, epoch, best, cfg['val_data_dir'], cfg['num_workers'], run_metadata=run_metadata, training_auxiliary=auxiliary, allocation=dict(mode='learnable' if gate is not None else 'fixed', lambda_top=float(gate()[0].detach()) if gate is not None else cfg['lambda_top'], lambda_random=float(gate()[1].detach()) if gate is not None else cfg['lambda_random']))
+        best, row = select_epoch(engine, output, epoch, best, cfg['val_data_dir'], cfg['num_workers'], image_size=cfg['img_size'], run_metadata=run_metadata, training_auxiliary=auxiliary, allocation=dict(mode='learnable' if gate is not None else 'fixed', lambda_top=float(gate()[0].detach()) if gate is not None else cfg['lambda_top'], lambda_random=float(gate()[1].detach()) if gate is not None else cfg['lambda_random']))
         history.append(row)
         if cfg.get('artifact_contract')!='STUDENT_BEST_ONLY_V1':
             write_json(output/'epoch_metrics.json',history)

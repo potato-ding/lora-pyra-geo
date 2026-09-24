@@ -51,8 +51,8 @@ def load_encoder(model_type,checkpoint,config=None,device='cuda',image_size=None
     if not checkpoint.is_file():raise FileNotFoundError(checkpoint)
     payload=safe_load(checkpoint)
     expected=payload.get('precision_signature') if isinstance(payload,dict) else None
-    if model_type=='middle' and expected is not None and image_size is not None and image_size!=expected['image_size']:
-        raise ValueError('Middle cross-resolution reload mismatch')
+    if model_type in ('middle','student') and expected is not None and image_size is not None and image_size!=expected['image_size']:
+        raise ValueError(f'{model_type.title()} cross-resolution reload mismatch')
     image_size=expected['image_size'] if expected is not None else (224 if image_size is None else image_size)
     if model_type=='teacher':
         from src.models.teacher.model import TeacherModel

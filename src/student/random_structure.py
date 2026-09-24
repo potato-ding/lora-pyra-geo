@@ -76,6 +76,7 @@ def structure_metadata(cfg,basis=None):
         random_projector_type=cfg.get('random_projector_type','linear'),
         random_rmlp_hidden_dim=cfg.get('random_rmlp_hidden_dim'),
         random_rmlp_beta_init=cfg.get('random_rmlp_beta_init'))
+    if cfg.get('random_seed_provenance') is not None:result['random_seed_provenance']=cfg['random_seed_provenance']
     if basis is not None:result['random_basis_sha256']=tensor_sha256(basis)
     return result
 

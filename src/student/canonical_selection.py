@@ -86,7 +86,7 @@ def select_epoch(engine, output, epoch, previous_best, data_dir, num_workers=8, 
         record=best_record(epoch,metrics,canonical=True)
         record['precision_signature']=signature
         score=record['best_score'];is_best=score>previous_best
-        state=dict(epoch=epoch,model=canonical_state(student),protocol_id=PROTOCOL_ID,
+        state=dict(epoch=epoch,model=canonical_state(student),protocol_id=f'STU-1G-B32-R{image_size}-v1',
                    precision_signature=signature,selection_metrics=metrics)
         formal=run_metadata is not None and run_metadata.get('artifact_contract')=='STUDENT_BEST_ONLY_V1'
         if formal:

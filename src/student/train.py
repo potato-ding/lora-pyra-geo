@@ -245,7 +245,7 @@ def main():
         sync_student_buffers_from_rank0(engine.module.student)
         assert_student_validation_state_synced(engine.module.student, epoch)
         engine.eval()
-        best, row = select_epoch(engine, output, epoch, best, cfg['val_data_dir'], cfg['num_workers'], run_metadata=run_metadata)
+        best, row = select_epoch(engine, output, epoch, best, cfg['val_data_dir'], cfg['num_workers'], image_size=cfg['img_size'], run_metadata=run_metadata)
         history.append(row)
         if cfg.get('artifact_contract')!='STUDENT_BEST_ONLY_V1':
             write_json(output/'epoch_metrics.json',history)
