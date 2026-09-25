@@ -19,7 +19,7 @@ def validate_config(cfg,check_assets=False):
     mode=cfg.get('paper_mode')
     if cfg.get('source_contract')!=VERSION or mode not in PAPER_MODES:raise ValueError('Unknown core contract/mode')
     size=cfg.get('img_size')
-    if type(size) is not int or size not in (224,384):raise ValueError('Unsupported Student image size')
+    if type(size) is not int or size not in (224,256,384):raise ValueError('Unsupported Student image size')
     if cfg.get('protocol_id')!=f'STU-1G-B32-R{size}-v1':raise ValueError('Student resolution/protocol mismatch')
     fixed=dict(epochs=30,batch_size=32,world_size=1,cross_gpu_gather=False,img_size=size,
         lr=1e-4,weight_decay=1e-4,warmup_epochs=.1,min_lr_ratio=.01,temperature=.07,
@@ -75,13 +75,13 @@ def validate_config(cfg,check_assets=False):
             key=(cfg['random_basis_seed'],cfg['random_projector_type'])
             if key not in identities:raise ValueError('Unknown formal independent Random experiment')
             gpu,name=identities[key]
-        if size==384:
-            if mode=='learnable' and not generated:raise ValueError('R384 final requires run-specific checkpointed Random32')
+        if size in (256,384):
+            if mode=='learnable' and not generated:raise ValueError('R256/R384 final requires run-specific checkpointed Random32')
             if mode not in ('b0','learnable') or bandwidth or (generated and cfg['random_projector_type']!='linear'):
-                raise ValueError('R384 supports only baseline and frozen Linear Random final method')
-            if generated and cfg.get('random_seed_provenance')!='OS_ENTROPY_ONCE_BEFORE_TRAINING_NO_METRIC_SELECTION':raise ValueError('R384 run-specific seed provenance required')
+                raise ValueError('R256/R384 supports only baseline and frozen Linear Random final method')
+            if generated and cfg.get('random_seed_provenance')!='OS_ENTROPY_ONCE_BEFORE_TRAINING_NO_METRIC_SELECTION':raise ValueError('R256/R384 run-specific seed provenance required')
             gpu=6 if mode=='b0' else 7
-            name=name.replace('R224','R384')
+            name=name.replace('R224','R'+str(size))
         if cfg.get('assigned_gpu')!=gpu or cfg.get('experiment_name')!=name or Path(cfg['output_dir'])!=ROOT/f'src/checkpoint/student/R{size}'/name:
             raise ValueError('Formal Student identity/GPU/output mismatch')
         if cfg['seed']!=0:raise ValueError('Formal four experiments use matched seed0')

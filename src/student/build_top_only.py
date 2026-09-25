@@ -12,18 +12,18 @@ def main():
     from src.evaluation.model_loader import load_encoder
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--inventory',required=True);p.add_argument('--output',required=True)
-    p.add_argument('--image-size',type=int,choices=(224,384),default=224)
+    p.add_argument('--image-size',type=int,choices=(224,256,384),default=224)
     p.add_argument('--middle-checkpoint');p.add_argument('--middle-config')
     a=p.parse_args();out=Path(a.output)
     if out.exists():raise FileExistsError(out)
     inv=json.loads(Path(a.inventory).read_text());meta=inv['bank_validation.json']['content']['metadata']
     checkpoint=meta['teacher_checkpoint'];cfg=meta['teacher_config']
     assert file_sha256(checkpoint)==meta['teacher_sha256'] and file_sha256(cfg)==meta['teacher_config_sha256']
-    if a.image_size==384:
+    if a.image_size in (256,384):
         if not a.middle_checkpoint or not a.middle_config:raise ValueError('R384 refit requires explicit Middle source')
         checkpoint=a.middle_checkpoint;cfg=a.middle_config
         config=json.loads(Path(cfg).read_text())
-        if config['data']['input_size']!=384 or config.get('sam',{}).get('enabled'):raise ValueError('R384 non-SAM required')
+        if config['data']['input_size']!=a.image_size or config.get('sam',{}).get('enabled'):raise ValueError('R256-R384 non-SAM required')
     elif a.middle_checkpoint or a.middle_config:raise ValueError('Historical R224 source must remain unchanged')
     teacher_sha=file_sha256(checkpoint);config_sha=file_sha256(cfg)
     torch.set_num_threads(8)

@@ -11,9 +11,9 @@ def load_top_source(manifest_path,teacher_sha):
     path=Path(manifest_path);meta=json.loads(path.read_text())
     if meta.get('schema')!='TOP128_CANONICAL_V1' or meta.get('teacher_sha256')!=teacher_sha:
         raise ValueError('Canonical Top128 provenance mismatch')
-    expected={224:'historical tensor SHA256 exact',384:'canonical protocol resolution refit'}
+    expected={224:'historical tensor SHA256 exact',256:'canonical protocol resolution refit',384:'canonical protocol resolution refit'}
     if meta.get('compatibility')!=expected.get(meta.get('image_size',224)):raise ValueError('Top source resolution/provenance mismatch')
-    if meta.get('image_size')==384 and (meta.get('split'),meta.get('train_ids'),meta.get('bank_rows'))!=('train',701,1402):raise ValueError('R384 Top source must use canonical TRAIN representatives')
+    if meta.get('image_size') in (256,384) and (meta.get('split'),meta.get('train_ids'),meta.get('bank_rows'))!=('train',701,1402):raise ValueError('R256/R384 Top source must use canonical TRAIN representatives')
     result={}
     for key,shape in [('teacher_mean',(768,)),('top128_basis',(768,128))]:
         v=torch.load(path.parent/(key+'.pt'),map_location='cpu',weights_only=True)
