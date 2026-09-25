@@ -1,6 +1,6 @@
 {
   "experiment": {
-    "name": "M2-ASAM-E6-BALANCED-R224-S0",
+    "name": "M2-SAM-E7-BALANCED-ASAM-R224-S0",
     "epochs": 10
   },
   "seed": 0,
@@ -72,7 +72,7 @@
     "total_optimizer_steps": 11820
   },
   "checkpoint": {
-    "output_dir": "/home/dingyi/lora-pyra-geo/src/checkpoint/middle_teacher/R224/M2-ASAM-E6-BALANCED-R224-S0",
+    "output_dir": "/home/dingyi/lora-pyra-geo/src/checkpoint/middle_teacher/R224/M2-SAM-E7-BALANCED-ASAM-R224-S0",
     "best_metric": "U1652_D2S_R1+U1652_S2D_R1",
     "strict_load": true,
     "save_last": false
@@ -83,7 +83,7 @@
     "sharpness_mode": "asam",
     "search_direction": "balanced",
     "perturb_scope": "all_trainable",
-    "rho": null,
+    "rho": 0.1,
     "adaptive": true,
     "same_batch": true,
     "rng_replay": true,
@@ -91,9 +91,7 @@
     "balanced_task_weight": 0.5,
     "balanced_kd_weight": 0.5,
     "norm_epsilon": 1e-12,
-    "definition_status": "BLOCKED_ON_ASAM_DEFINITION",
-    "eta": null,
-    "scale_transform": null
+    "asam_eta": 0.01
   },
   "distillation": {
     "base_loss": "pair_infonce",

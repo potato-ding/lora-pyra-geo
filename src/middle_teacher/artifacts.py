@@ -50,6 +50,8 @@ class MiddleCheckpointController(CheckpointController):
             metadata.update({k:self.config['sam'][k] for k in (
                 'sharpness_mode','search_direction','perturb_scope','rho',
                 'balanced_task_weight','balanced_kd_weight')})
+            if self.config['sam'].get('sharpness_mode') == 'asam':
+                metadata['asam_eta'] = self.config['sam']['asam_eta']
             metadata.update(sharpness=self.config['sam'],
                 best_epoch_gradient_diagnostics=raw_model(model_or_engine).sam_epoch_diagnostics)
         payload=dict(artifact_schema=SCHEMA,model=portable_state(model_or_engine),config=self.config,

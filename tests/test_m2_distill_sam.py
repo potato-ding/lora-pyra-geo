@@ -107,14 +107,14 @@ def test_configs_inherit_canonical_and_asam_fails_closed():
     base=json.loads((ROOT/'configs/middle_teacher/m2-hrd-sem-r224.json').read_text())
     assert not validate_sharpness(base)
     paths=sorted((ROOT/'configs/middle_teacher').glob('m2-*sam-e*.json'))
-    assert len(paths)==6
+    assert len(paths)==7
     for path in paths:
         c=json.loads(path.read_text())
         for key in base.keys()-{'experiment','checkpoint','sam'}:assert c[key]==base[key]
         assert c['experiment']['epochs']==10 and c['checkpoint']['save_last'] is False
         if c['sam']['sharpness_mode']=='asam':
             assert validate_sharpness(c,allow_blocked=True)
-            with pytest.raises(ValueError,match='ASAM_DEFINITION_BLOCKER'):validate_fchain(c,None)
+            assert validate_fchain(c,None)
         else:validate_fchain(c,None)
 
 
@@ -262,3 +262,37 @@ def test_integrated_two_pass_rng_and_update(monkeypatch):
     optim.step()
     assert all(optim.state[p]['step']==1 for p in model.parameters())
     assert outputs[-1]['second_pass_objective']=='full'
+
+
+def test_asam_analytic_geometry_and_scales():
+    from src.middle_teacher.distill_sam import make_direction
+    w=torch.tensor([2.,-1.]); b=torch.tensor([3.]); scalar=torch.tensor([4.])
+    task=[torch.tensor([1.,2.]),torch.tensor([.5]),torch.tensor([2.])]
+    kd=[torch.tensor([.5,1.]),torch.tensor([.25]),torch.tensor([1.])]
+    named=[('layer.weight',w),('layer.bias',b),('gate_logits',scalar)]
+    o=options('kd'); o.update(adaptive=True,asam_eta=.01)
+    search,eps,stats=make_direction(task,kd,o,named=named)
+    g=torch.cat(kd); s=torch.cat([w.abs()+.01,torch.ones_like(b),torch.ones_like(scalar)])
+    expected=.1*s.square()*g/(torch.linalg.vector_norm(s*g)+1e-12)
+    torch.testing.assert_close(torch.cat(eps),expected,rtol=1e-6,atol=1e-7)
+    assert stats['asam_metric_norm']==pytest.approx(.1,abs=1e-6)
+    assert stats['weightlike_parameter_count']==1 and stats['identity_scale_parameter_count']==2
+    assert stats['euclidean_perturb_norm'] != pytest.approx(.1,abs=1e-4)
+
+
+def test_asam_zero_weight_finite_and_restore():
+    w=torch.tensor([0.,1e-9]); b=torch.tensor([0.])
+    named=[('x.weight',w),('x.bias',b)]
+    o=options('balanced'); o.update(adaptive=True,asam_eta=.01)
+    _,eps,stats=make_direction([torch.ones(2),torch.ones(1)],[torch.ones(2),torch.ones(1)],o,named=named)
+    assert all(torch.isfinite(x).all() for x in eps)
+    assert stats['asam_metric_norm']==pytest.approx(.1,abs=1e-6)
+
+
+def test_asam_direction_contracts():
+    for direction in ('kd','balanced'):
+        o=options(direction); o.update(adaptive=True,asam_eta=.01)
+        named=[('m.weight',torch.tensor([2.,3.])),('m.bias',torch.tensor([1.]))]
+        _,eps,stats=make_direction([torch.tensor([1.,0.]),torch.tensor([1.])],[torch.tensor([0.,2.]),torch.tensor([2.])],o,named=named)
+        assert stats['adaptive'] is True and stats['rho']==.1
+        assert torch.isfinite(torch.cat(eps)).all()
