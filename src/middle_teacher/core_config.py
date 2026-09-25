@@ -3,7 +3,7 @@ import copy,json
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[2]
 
-SUPPORTED_IMAGE_SIZES = (224, 384)
+SUPPORTED_IMAGE_SIZES = (224, 256, 384)
 
 def validate_image_size(image_size):
     if type(image_size) is not int or image_size not in SUPPORTED_IMAGE_SIZES:

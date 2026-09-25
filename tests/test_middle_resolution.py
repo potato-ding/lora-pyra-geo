@@ -9,7 +9,7 @@ ROOT=Path(__file__).resolve().parents[1]
 def config(method='m0-infonce',size=224):
     return json.loads((ROOT/f'configs/middle_teacher/{method}-r{size}.json').read_text())
 
-@pytest.mark.parametrize('size',[224,384])
+@pytest.mark.parametrize('size',[224,256,384])
 @pytest.mark.parametrize('method',['m0-infonce','m2-hrd-sem'])
 def test_config_and_only_resolution_differences(size,method):
     c=config(method,size);validate_core_config(c)
@@ -29,7 +29,7 @@ def test_illegal_mutations(field,value):
     else:c['data']['input_size']=value
     with pytest.raises(ValueError):validate_core_config(c)
 
-@pytest.mark.parametrize('size',[224,384])
+@pytest.mark.parametrize('size',[224,256,384])
 def test_teacher_identity(size):
     m=dict(experiment_id=f'T0-INFONCE-R{size}',image_size=size,selection_mode='SINGLE_GPU_CANONICAL',selection_world_size=1,selection_rank=0)
     assert validate_teacher_identity(m,size)==m
@@ -37,7 +37,7 @@ def test_teacher_identity(size):
     m['experiment_id']='OTHER'
     with pytest.raises(ValueError):validate_teacher_identity(m,size)
 
-@pytest.mark.parametrize('size',[224,384])
+@pytest.mark.parametrize('size',[224,256,384])
 def test_evaluator_uses_requested_transform(size,monkeypatch):
     from src.evaluation import middle_canonical as mod
     from torch.utils.data import DataLoader,TensorDataset
@@ -50,7 +50,7 @@ def test_evaluator_uses_requested_transform(size,monkeypatch):
     assert seen['img_size']==[size,size] and seen['batch_size']==32 and seen['distributed'] is False
     assert x['D2S']['R@1']==100 and x['S2D']['AP']==100
 
-@pytest.mark.parametrize('size',[224,384])
+@pytest.mark.parametrize('size',[224,256,384])
 def test_artifact_and_cross_resolution_reload(size,tmp_path,monkeypatch):
     import src.middle_teacher.model as model_module
     from src.evaluation.model_loader import load_encoder
@@ -70,7 +70,7 @@ def test_artifact_and_cross_resolution_reload(size,tmp_path,monkeypatch):
     bad=copy.deepcopy(x);bad['config']['data']['input_size']=384 if size==224 else 224
     with pytest.raises(ValueError):checkpoint_metadata(bad)
 
-@pytest.mark.parametrize('patch_count',[196,576])
+@pytest.mark.parametrize('patch_count',[196,256,576])
 def test_abv_dynamic_patches_and_backward(patch_count):
     from src.middle_teacher.losses.adaptive_bridge_v2 import AdaptiveBridgeV2Bank,adaptive_bridge_v2_loss
     c=config('m2-hrd-sem')['distillation']['adaptive_bridge_v2'];c.update(teacher_dim=8,middle_dim=4,bridge_hidden_dim=16)
@@ -80,10 +80,11 @@ def test_abv_dynamic_patches_and_backward(patch_count):
     assert torch.isfinite(loss) and torch.isfinite(target.grad).all()
     assert audit['teacher_patch_shapes']==[[4,patch_count,8],[4,patch_count,8]]
 
-def test_p0_middle_states_match():
+@pytest.mark.parametrize('size',[256,384])
+def test_p0_middle_states_match(size):
     from src.middle_teacher.model import build_middle_teacher
     from src.middle_teacher.abv_runtime import build_stage3_model
-    c0=config(size=384);c2=config('m2-hrd-sem',384)
+    c0=config(size=size);c2=config('m2-hrd-sem',size)
     if not Path(c0['initialization']['path']).exists():pytest.skip('P0 asset unavailable')
     torch.manual_seed(0);a=build_middle_teacher(c0)
     torch.manual_seed(0);b=build_stage3_model(c2)
@@ -102,25 +103,26 @@ def test_r224_math_and_training_metadata_unchanged():
     assert "'img_size':224" not in s
 
 
-def test_real_middle_block10_geometry_and_selection_transform():
+@pytest.mark.parametrize('size',[256,384])
+def test_real_middle_block10_geometry_and_selection_transform(size):
     from src.middle_teacher.abv_runtime import build_stage3_model
     from src.dataset.teacher.val_dataloaders import build_1652_val_dataloaders
-    c=config('m2-hrd-sem',384)
+    c=config('m2-hrd-sem',size)
     if not Path(c['initialization']['path']).exists():pytest.skip('P0 asset unavailable')
     torch.manual_seed(0);model=build_stage3_model(c).eval();shapes=[]
     handle=model.backbone.model.blocks[10].register_forward_hook(lambda m,a,out:shapes.append(tuple(out.shape)))
-    with torch.no_grad():out=model(torch.zeros(1,3,384,384),return_layer_features=True)
+    with torch.no_grad():out=model(torch.zeros(1,3,size,size),return_layer_features=True)
     handle.remove()
     assert model.backbone.model.n_storage_tokens==4
-    assert shapes==[(1,581,768)]
+    assert shapes==[(1,5+(size//16)**2,768)]
     assert out['middle_features'][0].shape==(1,768)
     assert out['final_descriptor'].shape==(1,768)
-    loaders=build_1652_val_dataloaders(data_dir='data/U1652',img_size=[384,384],batch_size=32,num_workers=0,distributed=False)
+    loaders=build_1652_val_dataloaders(data_dir='data/U1652',img_size=[size,size],batch_size=32,num_workers=0,distributed=False)
     for pair in loaders.values():
-        for loader in pair:assert tuple(loader.dataset[0][0].shape)==(3,384,384)
+        for loader in pair:assert tuple(loader.dataset[0][0].shape)==(3,size,size)
 
 
-def _two_rank_shape_loss_worker(rank,init):
+def _two_rank_shape_loss_worker(rank,init,size):
     import torch.distributed as dist
     from src.utils.gather_features_and_labels_and_views import GatherLayer
     from src.middle_teacher.fchain_train import r0_pair_loss
@@ -137,10 +139,10 @@ def _two_rank_shape_loss_worker(rank,init):
             base,*_=r0_pair_loss(md,ms,torch.tensor(1.))
             loss=base
             if method=='m2-hrd-sem':
-                c=config(method,384)['distillation'];c['adaptive_bridge_v2'].update(teacher_dim=8,middle_dim=8,bridge_hidden_dim=16)
+                c=config(method,size)['distillation'];c['adaptive_bridge_v2'].update(teacher_dim=8,middle_dim=8,bridge_hidden_dim=16)
                 raw=hard_rank_losses(md,ms,md.detach(),ms.detach(),torch.arange(32),c)
                 bank=AdaptiveBridgeV2Bank(c['adaptive_bridge_v2'])
-                raw['adaptive_bridge_v2']=adaptive_bridge_v2_loss(tuple(torch.randn(32,8) for _ in range(2)),tuple(torch.randn(32,576,8) for _ in range(2)),local,bank,c['adaptive_bridge_v2'])
+                raw['adaptive_bridge_v2']=adaptive_bridge_v2_loss(tuple(torch.randn(32,8) for _ in range(2)),tuple(torch.randn(32,(size//16)**2,8) for _ in range(2)),local,bank,c['adaptive_bridge_v2'])
                 out=DistillationComposer(c).compose(base,{k:(lambda _,v=v:v) for k,v in raw.items()})
                 loss=out['total_loss']
                 torch.testing.assert_close(loss,base+.1*raw['margin'][0]+.05*raw['adaptive_bridge_v2'][0])
@@ -149,6 +151,7 @@ def _two_rank_shape_loss_worker(rank,init):
     finally:dist.destroy_process_group()
 
 
-def test_two_rank_synthetic_m0_m2(tmp_path):
+@pytest.mark.parametrize('size',[256,384])
+def test_two_rank_synthetic_m0_m2(tmp_path,size):
     import torch.multiprocessing as mp
-    mp.spawn(_two_rank_shape_loss_worker,args=('file://'+str(tmp_path/'init'),),nprocs=2,join=True)
+    mp.spawn(_two_rank_shape_loss_worker,args=('file://'+str(tmp_path/'init'),size),nprocs=2,join=True)
