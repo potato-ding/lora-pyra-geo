@@ -3,12 +3,6 @@
 UAV–satellite cross-view geo-localization with a three-stage research pipeline:
 **DINOv3 ViT-7B Teacher → DINOv3 ViT-B Middle Teacher → RepViT-M1.5 Student**.
 
-The repository contains the current implementations used to evaluate different
-components of the Teacher-to-Middle pipeline, including SRMD, as well as the
-Dual-STST Middle-to-Student interface. The R224 chain is undergoing renewed
-component-necessity validation: a historical SRMD combination is not claimed to
-be the final paper configuration.
-
 ## Method and objectives
 
 Teacher task adaptation → Middle knowledge transfer → residual-aware Middle
@@ -24,8 +18,8 @@ configurations define component equations and weights.
 ```text
 src/
   training/teacher/     Teacher training, selection wrapper and PairInfoNCE
-  middle_teacher/      Middle models, composer, bridges, residual methods, SAM
-  student/             RepViT baseline, Dual-STST and TRAIN-only subspace tools
+  middle_teacher/      Middle E3 model, HRD/ABV2 and KD-guided SAM
+  student/             RepViT S3 and TRAIN-only subspace tools
   evaluation/          Unified evaluator, strict loaders and metric certification
   models/              Backbone adapters and tuning policies
   data/                Middle paired-data pipeline
@@ -33,8 +27,8 @@ src/
   utils/               Shared metrics, distributed extraction and run utilities
 configs/
   teacher/             Teacher protocol reference JSONs
-  middle_teacher/      Seventeen retained component recipes
-  student/             Baseline and Dual-STST configurations
+  middle_teacher/      Formal E3 configurations
+  student/             Formal S3 configurations
 scripts/               Launch wrappers and result summarization
 tests/                 CPU-compatible unit and contract checks
 analysis/              Compact historical evidence, not model assets
@@ -71,8 +65,8 @@ dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth
 ```
 
 Student requires a separately obtained RepViT-M1.5 pretrained checkpoint.
-Dual-STST also requires a strict-compatible Middle checkpoint, config, and a
-SHA256-matched TRAIN-only 32D subspace bank. Missing assets fail closed. No weights,
+S3 also requires a validated E3 Middle checkpoint, config, and SHA256-matched
+TRAIN-only Top128 and calibration assets. Missing assets fail closed. No weights,
 bank, dataset or upstream source download is performed by these examples.
 
 ## Datasets
@@ -95,75 +89,20 @@ Datasets are not included in Git.
 
 Entry: `src.training.teacher.train`. Blocks are zero-based, with half-open tuning
 ranges: **0–19 frozen, 20–35 LoRA, 36–39 full fine-tuning**.
-Teacher protocol JSONs are references, not a `--config` interface; the trainer
-accepts CLI arguments and a separate user-prepared DeepSpeed JSON.
-
-```bash
-python -m src.training.teacher.train --help
-deepspeed --include localhost:0,1,2,3,4,5,6,7 --module src.training.teacher.train \
-  --experiment_id T0-CERTIFIED-R224-S0 \
-  --data_dir data/U1652 --img_size 224 --epochs 10 --seed 0 --batch_size 4 \
-  --training_stage paired_cross_view \
-  --lora_start_block 20 --lora_end_block 36 \
-  --full_finetune_start_block 36 --full_finetune_end_block 40 \
-  --infonce_weight 1 --triplet_weight 0 --same_domain_triplet_weight 0 \
-  --lr 0.0001 --scheduler cosine --warmup_ratio 0.05 \
-  --deepspeed_config assets/teacher_deepspeed.json \
-  --output_dir src/checkpoint/teacher/T0-CERTIFIED-R224-S0
-```
-
-Prepare `assets/teacher_deepspeed.json` for the intended protocol before launch:
-8 ranks × 4 local pairs = 32 global pairs, accumulation 1, BF16. This file is not
-shipped; verify optimizer/offload/runtime settings against the chosen run.
-The named R224 certified experiment uses the canonical training selection wrapper:
-shared final encoder/metric core and globally contiguous extraction groups of 8.
-Other Teacher experiment IDs retain their existing selection path; do not assume
-this wrapper is enabled for arbitrary renamed experiments.
+Formal training uses `configs/teacher/t0_certified_224.json` or
+`configs/teacher/t0_certified_256.json` through `--config`.
 
 ## Middle Teacher
 
-Entry: `src.middle_teacher.train`; recipes: `configs/middle_teacher/`.
-Retained implementations include R0 partial/full trainability, NRKD, Margin,
-AdaptiveBridge V1/V2, RDD, SAM, LC-RD, RE-Gated LC-RD, RMD and SRMD.
-
-```bash
-python -m src.middle_teacher.train --help
-deepspeed --include localhost:0,1 --no_local_rank --module src.middle_teacher.train \
-  --config configs/middle_teacher/srmd_s1.json \
-  --teacher-run assets/teacher_run \
-  --teacher-checkpoint assets/teacher_run/best_model.pth \
-  --val-data-dir data/U1652
-```
-
-Configure initialization, data and a new output path in a copy of the JSON before
-launching. Run from the repository root. `scripts/train_middle_teacher.sh` uses
-the active environment's DeepSpeed and accepts config followed by trainer arguments;
-the explicit command above controls GPU inclusion.
-
-**Current limitation:** non-SAM recipes are retained for component/configuration
-reproducibility, but the clean trainer explicitly rejects its non-SAM update loop.
-They are not advertised as launch-ready end-to-end training recipes. The SAM path
-exists, but this documentation audit does not certify a new full training run.
-`--build-only` constructs the model without loading foundation weights; it is not
-a complete runtime preflight.
+Final entry: `src.middle_teacher.fchain_train`; use
+`scripts/train_middle_teacher.sh` with the matching R224/R256 E3 config.
 
 ## Student
 
-Entry: `src.student.train`. Edit a copy of `configs/student/baseline.json` or
-`configs/student/dual_stst.json` to supply assets and a fresh output directory.
-
-```bash
-python -m src.student.train --config configs/student/baseline.json --validate-only
-CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 \
-  -m src.student.train --config configs/student/baseline.json
-# Dual-STST uses the same entry with configs/student/dual_stst.json.
-```
-
-The checked config is 2 GPUs, 16 pairs/GPU, 30 epochs, DeepSpeed ZeRO-1 BF16.
-Dual-STST accepts `middle_checkpoint`, `middle_config` and `stst_asset` in JSON;
-no historical Middle run is hard-coded. `src.student.subspace` provides the
-TRAIN-only centroid/SVD/seeded-QR construction; no bank is built implicitly.
-Interface/unit coverage is not a claim of completed Student benchmark results.
+Final entry: `src.student.launch`; use `scripts/train_student.sh` with the
+matching R224/R256 S3 config. Build Top128 and calibration with
+`scripts/build_student_assets.sh`. Detailed reproduction documentation is
+scheduled for Phase 5C.
 
 ## Unified formal evaluation
 

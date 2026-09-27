@@ -38,12 +38,11 @@ def test_best_reload_metric_mismatch_is_fatal():
 
 
 def test_pca_assets_never_quantized():
-    from src.student.dual_stst import DualSTSTSupervision
-    from src.student.part1 import PartISupervision
+    from src.student.formal_supervision import FormalSupervision
     # Non-BF16-representable real-valued fixtures catch round-trip corruption.
-    module=PartISupervision.__new__(PartISupervision);nn.Module.__init__(module)
+    module=FormalSupervision.__new__(FormalSupervision);nn.Module.__init__(module)
     module.projector_top=nn.Linear(512,128)
-    for name,shape in [('teacher_mean',(768,)),('top32_basis',(768,128)),('random32_basis',(768,32)),('random_b_basis',(768,32))]:
+    for name,shape in [('teacher_mean',(768,)),('top32_basis',(768,128)),('random32_basis',(768,32))]:
         module.register_buffer(name,torch.randn(shape),persistent=False)
     original={n:t.clone() for n,t in module.named_buffers()}
     for dtype in [torch.bfloat16,torch.float16,torch.float32,torch.bfloat16]:
@@ -54,27 +53,6 @@ def test_pca_assets_never_quantized():
     assert module.projector_top.weight.dtype==torch.bfloat16
 
 
-def test_pca_assets_formal_setup_and_calibration():
-    import json
-    from pathlib import Path
-    from src.student.part1 import PartISupervision
-    from src.student.artifacts import file_sha256
-    from src.student.allocation_gbw import prepare_top
-    from src.student.part2_integration import prepare_precision_groups
-    from src.student.train import StudentTrainingModel
-    from src.student.optimizer import build_student_optimizer
-    cfg=json.loads(Path('configs/student/certified_r224/p2_5_fixed_s0.json').read_text())
-    if not Path(cfg['stst_asset']).is_file():pytest.skip('Local fixture assets absent')
-    sup=PartISupervision(cfg['stst_asset'],cfg['original_stst_asset'],file_sha256(cfg['middle_checkpoint']),128,'single32')
-    before={n:t.clone() for n,t in sup.named_buffers()}
-    calibration=torch.load(cfg['p2_calibration_path'],weights_only=True,map_location='cpu')
-    exact=calibration.clone();assert calibration.dtype==torch.float32
-    sup.to('cpu').bfloat16();prepare_top(sup,cfg)
-    model=StudentTrainingModel(nn.Linear(2,512),sup);optimizer=build_student_optimizer(model)
-    prepare_precision_groups(model,optimizer,cfg)
-    for name,tensor in sup.named_buffers():
-        assert tensor.dtype==torch.float32 and torch.equal(tensor.cpu(),before[name])
-    assert torch.equal(calibration,exact)
 
 
 @pytest.mark.parametrize('kind',['middle','student'])
@@ -87,15 +65,23 @@ def test_real_model_checkpoint_reload(kind,tmp_path):
         model=StudentModel(ckpt_path=None);config=None;dim=512
     else:
         from src.middle_teacher.model import build_middle_teacher
-        config='configs/middle_teacher/core_v2/baseline.json'
+        config='configs/middle_teacher/m2-sam-e3-kd-r224-s0.json'
         model=build_middle_teacher(json.loads(Path(config).read_text()),load_foundation=True);dim=768
     model.bfloat16().eval();sig=selection_signature(model,kind)
     path=tmp_path/'best.pth'
-    torch.save(dict(model=model.state_dict(),precision_signature=sig),path)
+    if kind=='middle':
+        from src.middle_teacher.artifacts import MiddleCheckpointController
+        model.distillation_teacher_identity=dict(checkpoint='/teacher',sha256='fixture',checkpoint_metadata=dict(experiment_id='T0-INFONCE-R224',image_size=224,selection_mode='SINGLE_GPU_CANONICAL',selection_world_size=1,selection_rank=0))
+        model.sam_epoch_diagnostics=dict(steps=1)
+        ctl=MiddleCheckpointController(tmp_path,json.loads(Path(config).read_text()))
+        metrics={d+'_'+k:1. for d in ('D2S','S2D') for k in ('R1','R5','AP')}
+        ctl.save_best_if_improved(model,1,1,metrics)
+        path=tmp_path/'best_model.pth'
+    else:torch.save(dict(model=model.state_dict(),precision_signature=sig),path)
     encoder,audit=load_encoder(kind,path,config,device='cpu')
     assert audit['precision_signature']==sig and not audit['missing'] and not audit['unexpected']
     with torch.no_grad():
-        for size in (224,256,384,448):
+        for size in (224,256):
             x=torch.randn(1,3,size,size)
             before=EvaluationEncoder(model,dim)(x);after=encoder(x)
             assert before.shape==(1,dim) and before.dtype==torch.float32

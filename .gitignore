@@ -40,6 +40,8 @@ Miniconda3-latest-Linux-x86_64.sh
 *.log
 /results/
 /outputs/
+/logs/
+/cache/
 /runs/
 /wandb/
 # Archives / temporary features

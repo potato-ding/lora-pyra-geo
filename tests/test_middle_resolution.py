@@ -6,20 +6,21 @@ from src.middle_teacher.core_config import validate_core_config,validate_teacher
 from src.middle_teacher.artifacts import MiddleCheckpointController,checkpoint_metadata
 ROOT=Path(__file__).resolve().parents[1]
 
-def config(method='m0-infonce',size=224):
-    return json.loads((ROOT/f'configs/middle_teacher/{method}-r{size}.json').read_text())
+def config(method='e3',size=224):
+    return json.loads((ROOT/f'configs/middle_teacher/m2-sam-e3-kd-r{size}-s0.json').read_text())
 
-@pytest.mark.parametrize('size',[224,256,384])
-@pytest.mark.parametrize('method',['m0-infonce','m2-hrd-sem'])
+@pytest.mark.parametrize('size',[224,256])
+@pytest.mark.parametrize('method',['e3'])
 def test_config_and_only_resolution_differences(size,method):
     c=config(method,size);validate_core_config(c)
     base=config(method)
     c['experiment']['name']=base['experiment']['name'];c['checkpoint']['output_dir']=base['checkpoint']['output_dir'];c['data']['input_size']=224
-    assert c==base
+    from src.middle_teacher.config_identity import canonical_runtime_config
+    assert canonical_runtime_config(c)==canonical_runtime_config(base)
 
-@pytest.mark.parametrize('field,value',[('epochs',11),('batch',8),('weight',.2),('optimizer',.002),('selection','loss'),('gather',False),('size',448)])
+@pytest.mark.parametrize('field,value',[('epochs',11),('batch',8),('weight',.2),('optimizer',.002),('selection','loss'),('gather',False),('size',320)])
 def test_illegal_mutations(field,value):
-    c=config('m2-hrd-sem',384)
+    c=config('e3',256)
     if field=='epochs':c['experiment']['epochs']=value
     elif field=='batch':c['data']['local_pair_batch']=value
     elif field=='weight':c['distillation']['margin']['weight']=value
@@ -29,15 +30,15 @@ def test_illegal_mutations(field,value):
     else:c['data']['input_size']=value
     with pytest.raises(ValueError):validate_core_config(c)
 
-@pytest.mark.parametrize('size',[224,256,384])
+@pytest.mark.parametrize('size',[224,256])
 def test_teacher_identity(size):
     m=dict(experiment_id=f'T0-INFONCE-R{size}',image_size=size,selection_mode='SINGLE_GPU_CANONICAL',selection_world_size=1,selection_rank=0)
     assert validate_teacher_identity(m,size)==m
-    with pytest.raises(ValueError):validate_teacher_identity(m,384 if size==224 else 224)
+    with pytest.raises(ValueError):validate_teacher_identity(m,256 if size==224 else 224)
     m['experiment_id']='OTHER'
     with pytest.raises(ValueError):validate_teacher_identity(m,size)
 
-@pytest.mark.parametrize('size',[224,256,384])
+@pytest.mark.parametrize('size',[224,256])
 def test_evaluator_uses_requested_transform(size,monkeypatch):
     from src.evaluation import middle_canonical as mod
     from torch.utils.data import DataLoader,TensorDataset
@@ -50,12 +51,13 @@ def test_evaluator_uses_requested_transform(size,monkeypatch):
     assert seen['img_size']==[size,size] and seen['batch_size']==32 and seen['distributed'] is False
     assert x['D2S']['R@1']==100 and x['S2D']['AP']==100
 
-@pytest.mark.parametrize('size',[224,256,384])
+@pytest.mark.parametrize('size',[224,256])
 def test_artifact_and_cross_resolution_reload(size,tmp_path,monkeypatch):
     import src.middle_teacher.model as model_module
     from src.evaluation.model_loader import load_encoder
-    c=config('m2-hrd-sem',size);m=torch.nn.Linear(4,768,bias=False).bfloat16()
+    c=config('e3',size);m=torch.nn.Linear(4,768,bias=False).bfloat16()
     m.distillation_teacher_identity=dict(checkpoint=f'/teacher/R{size}/best_model.pth',sha256='fixture',checkpoint_metadata=dict(experiment_id=f'T0-INFONCE-R{size}',image_size=size,selection_mode='SINGLE_GPU_CANONICAL',selection_world_size=1,selection_rank=0))
+    m.sam_epoch_diagnostics=dict(steps=1)
     ctl=MiddleCheckpointController(tmp_path,c)
     metrics={d+'_'+k:v for d in ('D2S','S2D') for k,v in [('R1',80.),('R5',90.),('AP',75.)]};metrics['R1_sum']=160.
     assert ctl.save_best_if_improved(m,1,1,metrics)
@@ -66,48 +68,28 @@ def test_artifact_and_cross_resolution_reload(size,tmp_path,monkeypatch):
     monkeypatch.setattr(model_module,'build_middle_teacher',lambda *a,**kw:torch.nn.Linear(4,768,bias=False))
     enc,audit=load_encoder('middle',p,device='cpu',image_size=size)
     assert torch.equal(enc.model.weight,m.weight)
-    with pytest.raises(ValueError,match='cross-resolution'):load_encoder('middle',p,device='cpu',image_size=384 if size==224 else 224)
-    bad=copy.deepcopy(x);bad['config']['data']['input_size']=384 if size==224 else 224
+    with pytest.raises(ValueError,match='cross-resolution'):load_encoder('middle',p,device='cpu',image_size=256 if size==224 else 224)
+    bad=copy.deepcopy(x);bad['config']['data']['input_size']=256 if size==224 else 224
     with pytest.raises(ValueError):checkpoint_metadata(bad)
 
-@pytest.mark.parametrize('patch_count',[196,256,576])
+@pytest.mark.parametrize('patch_count',[196,256])
 def test_abv_dynamic_patches_and_backward(patch_count):
     from src.middle_teacher.losses.adaptive_bridge_v2 import AdaptiveBridgeV2Bank,adaptive_bridge_v2_loss
-    c=config('m2-hrd-sem')['distillation']['adaptive_bridge_v2'];c.update(teacher_dim=8,middle_dim=4,bridge_hidden_dim=16)
+    c=config('e3')['distillation']['adaptive_bridge_v2'];c.update(teacher_dim=8,middle_dim=4,bridge_hidden_dim=16)
     bank=AdaptiveBridgeV2Bank(c);target=torch.randn(4,4,requires_grad=True)
     cls=tuple(torch.randn(4,8) for _ in range(2));patch=tuple(torch.randn(4,patch_count,8) for _ in range(2))
     loss,audit=adaptive_bridge_v2_loss(cls,patch,target,bank,c);loss.backward()
     assert torch.isfinite(loss) and torch.isfinite(target.grad).all()
     assert audit['teacher_patch_shapes']==[[4,patch_count,8],[4,patch_count,8]]
 
-@pytest.mark.parametrize('size',[256,384])
-def test_p0_middle_states_match(size):
-    from src.middle_teacher.model import build_middle_teacher
-    from src.middle_teacher.abv_runtime import build_stage3_model
-    c0=config(size=size);c2=config('m2-hrd-sem',size)
-    if not Path(c0['initialization']['path']).exists():pytest.skip('P0 asset unavailable')
-    torch.manual_seed(0);a=build_middle_teacher(c0)
-    torch.manual_seed(0);b=build_stage3_model(c2)
-    assert a.backbone.state_dict().keys()==b.backbone.state_dict().keys()
-    assert all(torch.equal(p,b.backbone.state_dict()[n]) for n,p in a.backbone.state_dict().items())
-    assert torch.equal(a.logit_scale,b.logit_scale)
-
-def test_r224_math_and_training_metadata_unchanged():
-    import subprocess,ast
-    rev='d2c920b6d92df59bfaea6591e4338f03c42fa0b5'
-    for name in ['src/middle_teacher/losses/hard_rank_distillation.py','src/middle_teacher/losses/adaptive_bridge_v2.py','src/middle_teacher/optimizer.py','src/middle_teacher/runtime.py','src/middle_teacher/model.py']:
-        old=subprocess.check_output(['git','show',rev+':'+name],cwd=ROOT)
-        assert old==(ROOT/name).read_bytes()
-    s=(ROOT/'src/middle_teacher/fchain_train.py').read_text()
-    assert "'img_size':config['data']['input_size']" in s
-    assert "'img_size':224" not in s
 
 
-@pytest.mark.parametrize('size',[256,384])
+
+@pytest.mark.parametrize('size',[224,256])
 def test_real_middle_block10_geometry_and_selection_transform(size):
-    from src.middle_teacher.abv_runtime import build_stage3_model
+    from src.middle_teacher.e3_model import build_stage3_model
     from src.dataset.teacher.val_dataloaders import build_1652_val_dataloaders
-    c=config('m2-hrd-sem',size)
+    c=config('e3',size)
     if not Path(c['initialization']['path']).exists():pytest.skip('P0 asset unavailable')
     torch.manual_seed(0);model=build_stage3_model(c).eval();shapes=[]
     handle=model.backbone.model.blocks[10].register_forward_hook(lambda m,a,out:shapes.append(tuple(out.shape)))
@@ -131,14 +113,14 @@ def _two_rank_shape_loss_worker(rank,init,size):
     from src.middle_teacher.composer import DistillationComposer
     dist.init_process_group('gloo',init_method=init,rank=rank,world_size=2)
     try:
-        for method in ['m0-infonce','m2-hrd-sem']:
+        for method in ['e3']:
             torch.manual_seed(rank)
             local=torch.randn(32,8,requires_grad=True)
             desc=torch.nn.functional.normalize(local,dim=1)
             md=torch.cat(GatherLayer.apply(desc[:16]),0);ms=torch.cat(GatherLayer.apply(desc[16:]),0)
             base,*_=r0_pair_loss(md,ms,torch.tensor(1.))
             loss=base
-            if method=='m2-hrd-sem':
+            if method=='e3':
                 c=config(method,size)['distillation'];c['adaptive_bridge_v2'].update(teacher_dim=8,middle_dim=8,bridge_hidden_dim=16)
                 raw=hard_rank_losses(md,ms,md.detach(),ms.detach(),torch.arange(32),c)
                 bank=AdaptiveBridgeV2Bank(c['adaptive_bridge_v2'])
@@ -151,7 +133,7 @@ def _two_rank_shape_loss_worker(rank,init,size):
     finally:dist.destroy_process_group()
 
 
-@pytest.mark.parametrize('size',[256,384])
+@pytest.mark.parametrize('size',[224,256])
 def test_two_rank_synthetic_m0_m2(tmp_path,size):
     import torch.multiprocessing as mp
     mp.spawn(_two_rank_shape_loss_worker,args=('file://'+str(tmp_path/'init'),size),nprocs=2,join=True)

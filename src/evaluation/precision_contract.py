@@ -28,6 +28,8 @@ def forward_context(device):
     return torch.autocast("cuda", dtype=torch.bfloat16) if torch.device(device).type == "cuda" else nullcontext()
 
 def inspect_precision_signature(model, model_type, image_size=224):
+    if type(image_size) is not int or image_size not in (224,256):
+        raise ValueError('Formal resolution must be 224 or 256')
     model = unwrap(model)
     if model_type not in PROFILES:
         raise ValueError(model_type)

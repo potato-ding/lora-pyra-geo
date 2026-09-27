@@ -1,10 +1,9 @@
 """Canonical train-only Top RMLP with explicitly fixed hidden width 920."""
-import math
 import torch
 from torch import nn
 import torch.nn.functional as F
 
-from .part1 import BandProjector
+from .formal_supervision import BandProjector
 
 RMLP_HIDDEN_DIM = 920
 ALPHA_INIT = 1e-3
@@ -34,6 +33,8 @@ class FP32Module(nn.Module):
 class MLPResidual(FP32Module):
     def __init__(self, top_dim=128):
         super().__init__()
+        if top_dim != 128:
+            raise ValueError('Formal Top residual dimension is 128')
         self.hidden_dim = RMLP_HIDDEN_DIM
         self.fc1 = nn.Linear(512, self.hidden_dim, bias=True, dtype=torch.float32)
         self.fc2 = nn.Linear(self.hidden_dim, top_dim, bias=True, dtype=torch.float32)
@@ -61,8 +62,8 @@ class ResidualTopProjector(nn.Module):
     """
     def __init__(self, base, kind):
         super().__init__()
-        if type(base) is not BandProjector or base.linear.in_features != 512 or base.linear.out_features not in (128,256):
-            raise ValueError("An existing canonical Top128/256 BandProjector is required")
+        if type(base) is not BandProjector or base.linear.in_features != 512 or base.linear.out_features != 128:
+            raise ValueError("An existing canonical Top128 BandProjector is required")
         if kind != "rmlp":
             raise ValueError("Only the Top-RMLP interface is supported")
         self.linear = base.linear
@@ -117,8 +118,8 @@ class ResidualTopProjector(nn.Module):
 
 def install_residual_top(supervision, kind, calibration_inputs):
     """Explicit preparation helper; touches only Top, never Random/basis/loss."""
-    if supervision.top_dim not in (128,256) or supervision.random_layout not in ("single32", "single64", "single128", "disabled"):
-        raise ValueError("Top-RMLP requires Top128/256 and one optional Random branch")
+    if supervision.top_dim != 128 or supervision.random_layout != "single32":
+        raise ValueError("Top-RMLP requires Top128 and Random32")
     wrapper = ResidualTopProjector(supervision.projector_top, kind)
     wrapper.match_initial_amplitude(calibration_inputs)
     supervision.projector_top = wrapper

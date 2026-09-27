@@ -12,7 +12,7 @@ from src.middle_teacher.artifacts import MiddleCheckpointController,checkpoint_m
 from src.middle_teacher.selection import select_and_save
 
 def config():
-    return json.loads(Path('configs/middle_teacher/m0-infonce-r224.json').read_text())
+    return json.loads(Path('configs/middle_teacher/m2-sam-e3-kd-r224-s0.json').read_text())
 
 def loaders():
     ds=TensorDataset(torch.eye(4),torch.arange(4),torch.arange(4))
@@ -39,7 +39,7 @@ def test_builder_contract(monkeypatch):
     assert seen['distributed'] is False and seen['batch_size']==32 and seen['img_size']==[224,224]
 
 class Engine:
-    def __init__(self):self.module=torch.nn.Linear(4,768,bias=False).bfloat16();self.resumed=False
+    def __init__(self):self.module=torch.nn.Linear(4,768,bias=False).bfloat16();self.resumed=False;self.module.sam_epoch_diagnostics=dict(steps=1);self.module.distillation_teacher_identity=dict(checkpoint="/teacher",sha256="fixture",checkpoint_metadata=dict(experiment_id="T0-INFONCE-R224",image_size=224,selection_mode="SINGLE_GPU_CANONICAL",selection_world_size=1,selection_rank=0))
     def train(self):self.module.train();self.resumed=True
 
 def _worker(rank,init,out):
@@ -74,7 +74,7 @@ def test_two_rank_selection_save_tie_resume_and_failure(tmp_path):
     assert payload['metadata']['training_world_size']==2
     assert payload['metadata']['eval_batch_size']==32
     assert set(payload['model'])=={'weight'}
-    for field,value in [('best_score',0),('image_size',384),('selection_world_size',2)]:
+    for field,value in [('best_score',0),('image_size',320),('selection_world_size',2)]:
         bad=copy.deepcopy(payload);bad['metadata'][field]=value
         with pytest.raises(ValueError):checkpoint_metadata(bad)
 
@@ -82,10 +82,10 @@ def test_formal_configs_and_shared_reload():
     from src.middle_teacher.core_config import validate_core_config
     from src.evaluation import evaluate
     from src.middle_teacher import selection,fchain_train
-    c0=config();c2=json.loads(Path('configs/middle_teacher/m2-hrd-sem-r224.json').read_text())
+    c0=config();c2=json.loads(Path('configs/middle_teacher/m2-sam-e3-kd-r224-s0.json').read_text())
     for c in (c0,c2):
-        validate_core_config(c);assert not c['sam']['enabled'] and not c['checkpoint']['save_last']
-    assert c0['distillation']=={'base_loss':'pair_infonce'}
+        validate_core_config(c);assert c['sam']['enabled'] and not c['checkpoint']['save_last']
+    assert c0['distillation']['base_loss']=='pair_infonce'
     assert c2['distillation']['margin']['weight']==.1
     assert c2['distillation']['adaptive_bridge_v2']['weight']==.05
     for k in ('data','optimizer','scheduler','precision','trainability'):assert c0[k]==c2[k]
@@ -93,7 +93,7 @@ def test_formal_configs_and_shared_reload():
     assert 'evaluate_middle_u1652_canonical(model' in inspect.getsource(evaluate.main)
     source=inspect.getsource(fchain_train.main)
     assert 'controller.save_last' not in source and 'write_json(' not in source
-    assert "if len(config['distillation'])>1:" in source
+    assert 'sam_backward(' in source
 
 def test_self_contained_strict_reload_and_reference(tmp_path,monkeypatch):
     import src.middle_teacher.model as middle_model

@@ -1,0 +1,11 @@
+{
+  "src/models/teacher/model.py": "4cfda04c831383417b8f4703819947cb995e80079d09da240cfb344a463bb2df",
+  "src/models/teacher/dinov3_backbone.py": "d6e7f200b984a82cf5c44a9bbe528be6792e30cdf3e48578ea4bc596930a9d54",
+  "src/training/teacher/pair_infonce.py": "0048861e3a8ebecc8d38ca419dd236e84c1302f6a1c923a2bd063d2e6cb8fc61",
+  "src/student/model.py": "eb0a54c5028adde624300022c973ee170acfc9baf182cc2a07ab952fef221d28",
+  "src/student/objective.py": "7bb441c37f6dffa0200beee556a8be35ef58aac37e9747646f0da8178de5a0ee",
+  "src/student/part2.py": "8a1e80fa8bd493661bb6b507186fe564747bab500ed714b8626b2be715cf1e3b",
+  "src/middle_teacher/losses/hard_rank_distillation.py": "0f7fbf5c2b7a86fd592eb90026cf46d10bfc682750b887a01e53ef9ada079283",
+  "src/middle_teacher/losses/adaptive_bridge_v2.py": "b07a2b4dc09e09743e9afa1e7d236384f062293d558602ca00ae6b93260de808",
+  "src/middle_teacher/optimizer.py": "b35085cb8445f42ccb5fae784c270e829c4ba6671db29f578dc9df47479e7be9"
+}

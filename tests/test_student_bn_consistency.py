@@ -7,7 +7,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch import nn
-from src.student.train import sync_student_buffers_from_rank0, assert_student_validation_state_synced
+from src.student.formal_engine import sync_student_buffers_from_rank0, assert_student_validation_state_synced
 from src.student.artifacts import deployment_state_dict, require_u1652_eval_batch_size, best_record, resolved_config
 from src.student.evaluate_best import publish_result
 from src.evaluation.evaluate import parse_args

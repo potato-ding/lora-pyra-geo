@@ -26,11 +26,11 @@ def test_canonical_never_reads_training_world_or_collectives(monkeypatch,world):
     for name in ('all_gather','all_reduce'):
         monkeypatch.setattr(dist,name,forbidden)
     result=canonical.evaluate_u1652_single_gpu_canonical(torch.nn.Identity(),
-        image_size=384,device='cpu',loaders=toy_loaders())
+        image_size=256,device='cpu',loaders=toy_loaders())
     assert result['D2S']['R@1']==100.0
     assert result['S2D']['AP']==100.0
 
-@pytest.mark.parametrize('size',[224,256,384,448])
+@pytest.mark.parametrize('size',[224,256])
 def test_builder_resolution_batch_and_no_distributed_sampler(monkeypatch,size):
     seen={}
     def builder(**kw): seen.update(kw); return toy_loaders()
@@ -88,7 +88,7 @@ def test_global_batch_audit_supports_both_layouts(monkeypatch,world,local):
     monkeypatch.setattr(torch.cuda,'current_device',lambda:0)
     monkeypatch.setattr(torch.cuda,'get_device_name',lambda *_:'RTX 3090')
     args=SimpleNamespace(batch_size=local,grad_accum_steps=1,experiment_id=audit.T0_EXPERIMENT_ID,
-        seed=0,epochs=10,img_size=384,data_dir='data/U1652',output_dir='/tmp/test',
+        seed=0,epochs=10,img_size=256,data_dir='data/U1652',output_dir='/tmp/test',
         deepspeed_config='configs/deepspeed/teacher_zero2.json',training_stage='paired_cross_view')
     report=audit.print_experiment_configuration(args,{'bf16':{'enabled':True}},0,0,world,Path('.'))
     assert report['valid'] is True

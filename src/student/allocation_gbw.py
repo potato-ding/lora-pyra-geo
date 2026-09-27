@@ -1,61 +1,43 @@
-"""Four fixed S0 GBW/learnable-GBW controls; canonical P2 components reused."""
+"""Formal S3 bounded gate and isolated gradient balancing."""
 import hashlib
 import json
 from pathlib import Path
 import torch
 from torch import nn
-from .artifacts import ROOT,file_sha256
-from .train import load_config as historical_load_config
-from .part2_integration import prepare_top as historical_prepare_top
-from .dual_stst import stst_total_loss,stst_warmup_factor
-from .gbw import apply_branch_coefficients
 
-BASE=ROOT/'src/checkpoint/student/CERTIFIED_R224'
-AUDIT=BASE/'_PREFLIGHT/P2_5_LGBW_S0'
-VARIANTS={
-    'fixed':('P2.5-GBW-TOP-RMLP-S0',None,None,4),
-    'audit':('P2.5-LGBW-AUDIT-S0','bounded',1.0826756964052977,5),
-    'equal':('P2.5-LGBW-EQUAL-S0','bounded',0.,6),
-    'unbound':('P2.5-LGBW-UNBOUND-S0','unbounded',0.504430717880143,7)}
-TEACHER_SHA='1f5dd3a94e38d5e79bfff05b407959195eb59b9b9359f2380727f6a68fed3d78'
+GATE_OPTIMIZER_LR=1e-4
+GATE_OPTIMIZER_WEIGHT_DECAY=0.
+GATE_OPTIMIZER_BETAS=(.9,.999)
+GATE_OPTIMIZER_EPS=1e-8
 
-def reference_config():
-    return historical_load_config(ROOT/'configs/student/certified_r224/p2_top_rmlp_s0.json')
 
-def make_config(variant):
-    if variant not in VARIANTS:raise ValueError('Only the four approved S0 controls')
-    name,kind,initial,_=VARIANTS[variant]
-    cfg=reference_config()
-    cfg.update(experiment_name=name,output_dir=str(BASE/name),
-        sealed_provenance_file=str(AUDIT/'SOURCE_SEAL.json'),allocation_variant=variant,
-        gate_parameterization=kind,gate_initial_d=initial,lambda_top=1.247,lambda_random=.753)
-    return cfg
 
 def validate_config(cfg):
-    if cfg.get('source_contract')=='CORE_SOURCE_CONTRACT_V2':
-        from .core_config import validate_config as validate_new
-        validate_new(cfg)
-        if cfg['paper_mode'] not in ('fixed','learnable'):raise ValueError('Allocation entry requires GBW family')
-        return cfg
-    if cfg != make_config(cfg.get('allocation_variant')):
-        raise ValueError('Exact matched S0 P2 protocol and fixed allocation controls required')
-    return cfg
+    from .core_config import validate_config as validate_final
+    return validate_final(cfg)
 
 def load_config(path):return validate_config(json.loads(Path(path).read_text()))
 
-def prepare_top(supervision,cfg):
-    historical_prepare_top(supervision,cfg if cfg.get('source_contract')=='CORE_SOURCE_CONTRACT_V2' else reference_config())
 
 class AllocationGate(nn.Module):
     def __init__(self,kind,initial):
         super().__init__()
-        if kind not in ('bounded','unbounded'):raise ValueError(kind)
+        if kind != 'bounded':raise ValueError('S3 requires bounded gate')
         self.kind=kind
         self.d=nn.Parameter(torch.tensor(initial,dtype=torch.float32))
     def forward(self):
         assert self.d.dtype==torch.float32
         p=self.d.sigmoid()
-        return (.5+p,1.5-p) if self.kind=='bounded' else (2*p,2*(1-p))
+        return .5+p,1.5-p
+
+def stst_warmup_factor(epoch, warmup_epochs):
+    if warmup_epochs <= 0:
+        return 1.0
+    return min(1.0, max(0.0, float(epoch) / float(warmup_epochs)))
+
+def stst_total_loss(info_nce, stst_loss, weight, epoch, warmup_epochs):
+    effective_weight = float(weight) * stst_warmup_factor(epoch, warmup_epochs)
+    return info_nce + effective_weight * stst_loss, effective_weight
 
 def gradient_signal(audit,z,pairs):
     # The other-view Jacobian rows are zero. Slice grad(L_view,z) to obtain
@@ -75,12 +57,12 @@ def gradient_signal(audit,z,pairs):
     assert not top.requires_grad and not rand.requires_grad
     return top.detach(),rand.detach(),cosine.detach()
 
-def gate_objective(gate,g_top,g_rand,epoch):
+def gate_objective(gate,g_top,g_rand,epoch,warmup_epochs=5):
     wt,wr=gate()
     raw=(torch.log(wt*g_top.detach()+1e-8)-torch.log(wr*g_rand.detach()+1e-8)).square()
-    return stst_warmup_factor(epoch,5)*raw
+    return stst_warmup_factor(epoch,warmup_epochs)*raw
 
-def isolated_gradient_signal(supervision,z,y,original_audit):
+def isolated_gradient_signal(supervision,z,y,original_audit,pairs=32):
     # DeepSpeed installs backward hooks on the live engine output. A descriptor
     # leaf and detached head tensors compute the same partial derivative without
     # entering its optimizer hooks. This repeats only the tiny training heads,
@@ -88,53 +70,49 @@ def isolated_gradient_signal(supervision,z,y,original_audit):
     leaf=z.detach().requires_grad_(True)
     state={k:v.detach() for k,v in supervision.named_parameters()}
     state.update({k:v.detach() for k,v in supervision.named_buffers()})
-    _,probe=torch.func.functional_call(supervision,state,(leaf,y.detach(),32))
+    _,probe=torch.func.functional_call(supervision,state,(leaf,y.detach(),pairs))
     for branch in ('top','random'):
         for view in ('drone','satellite'):
             key=f'{branch}_{view}_loss'
             assert torch.equal(probe[key].detach(),original_audit[key].detach())
-    return gradient_signal(probe,leaf,32)
+    return gradient_signal(probe,leaf,pairs)
 
-def objective_from_descriptors(student,supervision,z,y,criterion,cfg,epoch,gate=None):
-    drone,satellite=z.split(32,dim=0)
+def objective_from_descriptors(student,supervision,z,y,criterion,cfg,epoch,gate):
+    if gate is None:raise ValueError('S3 requires AllocationGate')
+    pairs=cfg['batch_size'];weight=cfg['stst_weight'];warmup=cfg['stst_warmup_epochs']
+    drone,satellite=z.split(pairs,dim=0)
     info=criterion(drone,satellite,student.logit_scale.exp())
-    original,audit=supervision(z.float(),y.detach().float(),32)
+    original,audit=supervision(z.float(),y.detach().float(),pairs)
     for key in ('top','random'):
         assert torch.allclose(audit[key+'_loss'],.5*(audit[key+'_drone_loss']+audit[key+'_satellite_loss']),rtol=0,atol=1e-7)
-    gate_loss=None
-    diagnostics={}
-    if gate is None:
-        # Exact historical fixed reducer; audit 1:1 preserves original tensor.
-        coeff=dict(cfg,experiment_name='P1.5-T128-R32-GBW-S0')
-        kd,_=apply_branch_coefficients(coeff,original,audit)
-        wt,wr=cfg.get('lambda_top',1.),cfg.get('lambda_random',1.)
-    else:
-        wt_live,wr_live=gate();wt,wr=wt_live.detach(),wr_live.detach()
-        kd=wt*audit['top_loss']+wr*audit['random_loss']
-        gt,gr,cos=isolated_gradient_signal(supervision,z,y,audit)
-        gate_loss=gate_objective(gate,gt,gr,epoch)
-        diagnostics=dict(d=gate.d.detach().clone(),G_top=gt,G_rand=gr,
-            weighted_G_top=wt*gt,weighted_G_rand=wr*gr,gate_loss=gate_loss.detach(),
-            grad_ratio_raw=gt/(gr+1e-8),grad_ratio_weighted=(wt*gt)/(wr*gr+1e-8),
-            TOP_RANDOM_GRAD_COS=cos)
-    total,outer=stst_total_loss(info,kd,.2,epoch,5)
+    wt_live,wr_live=gate();wt,wr=wt_live.detach(),wr_live.detach()
+    kd=wt*audit['top_loss']+wr*audit['random_loss']
+    gt,gr,cos=isolated_gradient_signal(supervision,z,y,audit,pairs)
+    gate_loss=gate_objective(gate,gt,gr,epoch,warmup)
+    diagnostics=dict(d=gate.d.detach().clone(),G_top=gt,G_rand=gr,
+        weighted_G_top=wt*gt,weighted_G_rand=wr*gr,gate_loss=gate_loss.detach(),
+        grad_ratio_raw=gt/(gr+1e-8),grad_ratio_weighted=(wt*gt)/(wr*gr+1e-8),
+        TOP_RANDOM_GRAD_COS=cos)
+    total,outer=stst_total_loss(info,kd,weight,epoch,warmup)
     metrics=dict(loss_total=total.detach(),InfoNCE=info.detach(),L_top=audit['top_loss'].detach(),
         L_random=audit['random_loss'].detach(),L_top_D=audit['top_drone_loss'].detach(),
         L_top_S=audit['top_satellite_loss'].detach(),L_rand_D=audit['random_drone_loss'].detach(),
-        L_rand_S=audit['random_satellite_loss'].detach(),warmup_factor=stst_warmup_factor(epoch,5),
+        L_rand_S=audit['random_satellite_loss'].detach(),warmup_factor=stst_warmup_factor(epoch,warmup),
         effective_outer_weight=outer,effective_KD_loss=(outer*kd).detach(),gbw_loss=kd.detach(),
         w_top=wt,w_rand=wr,**diagnostics)
     assert total.dtype==torch.float32 and torch.isfinite(total)
     return total,gate_loss,metrics
 
-def batch_loss(engine,teacher,images,criterion,cfg,epoch,gate=None):
-    size=int(cfg.get('img_size',224))
-    assert images.shape==(64,3,size,size)
+def batch_loss(engine,teacher,images,criterion,cfg,epoch,gate):
+    size=cfg['img_size']
+    pairs=cfg['batch_size']
+    full_batch=2*pairs
+    assert images.shape==(full_batch,3,size,size)
     calls=[]
     h=engine.module.student.register_forward_pre_hook(lambda m,a:calls.append(tuple(a[0].shape)))
     try:z=engine(images.to(dtype=next(engine.module.student.parameters()).dtype))
     finally:h.remove()
-    assert calls==[(64,3,size,size)]
+    assert calls==[(full_batch,3,size,size)]
     with torch.no_grad():y=teacher(images.to(dtype=torch.bfloat16)).detach().float()
     assert not teacher.training and all(not p.requires_grad and p.grad is None for p in teacher.parameters())
     total,gate_loss,metrics=objective_from_descriptors(engine.module.student,engine.module.stst,z,y,criterion,cfg,epoch,gate)
@@ -144,24 +122,16 @@ def batch_loss(engine,teacher,images,criterion,cfg,epoch,gate=None):
 def metadata(cfg):
     return dict(part='Part-II.5',research_axis='fixed_and_learnable_gbw_s0',
         CANONICAL_N64_FORWARD=True,TOP_INTERFACE='residual_mlp',RANDOM_INTERFACE='linear',
-        GBW_ENABLED=True,LGBW_ENABLED=cfg['allocation_variant']!='fixed',
+        GBW_ENABLED=True,LGBW_ENABLED=True,
         STUDENT_LOSS_GATE_GRAD_ZERO=True,NO_SECOND_ORDER_GATE_GRAD=True,
         GATE_LOSS_ONLY_UPDATES_D=True,gate_optimizer='independent AdamW FP32 scalar',
-        gate_lr=1e-4,gate_weight_decay=0.,gate_eps=1e-8,
-        gate_lr_scheduler='same Student per-step cosine with 0.1 epoch warmup',
+        gate_lr=GATE_OPTIMIZER_LR,gate_weight_decay=GATE_OPTIMIZER_WEIGHT_DECAY,gate_eps=GATE_OPTIMIZER_EPS,
+        gate_lr_scheduler=f"same Student per-step cosine with {cfg['warmup_epochs']} epoch warmup",
         spatial_kd_enabled=False,launch_runtime='direct Python; canonical DeepSpeed stage1 world_size1')
 
 def assert_assets(cfg):
-    if cfg.get('source_contract')=='CORE_SOURCE_CONTRACT_V2':
-        from .core_config import assert_assets as assert_new_assets
-        return assert_new_assets(cfg)
-    checks={'middle_checkpoint':TEACHER_SHA,
-        'student_pretrained':'d645a2de5481c9aac1639d0e97b04cd4bdb0df9d7347920b132dd0ed45de8b39',
-        'stst_asset':'3fdcd8bc62f7204a36469ba05c0cd65d4792fcf7dafeda8d4ffb6780f769b50c',
-        'original_stst_asset':cfg['original_stst_asset_sha256'],
-        'p2_calibration_path':cfg['p2_calibration_sha256']}
-    for k,h in checks.items():assert file_sha256(cfg[k])==h,k
-    return checks
+    from .core_config import assert_assets as assert_final_assets
+    return assert_final_assets(cfg)
 
 def state_hash(state):
     h=hashlib.sha256()
@@ -179,7 +149,5 @@ class EpochLog:
             record[k+'_min']=min(r[k] for r in self.rows);record[k+'_max']=max(r[k] for r in self.rows)
         record.update(epoch=epoch,steps=len(self.rows),lr=lr,gate_lr=gate_lr,
             alpha=float(supervision.projector_top.alpha.detach()),FINAL_ALPHA=float(supervision.projector_top.alpha.detach()))
-        if gate is not None:
-            wt,wr=gate();record.update(d=float(gate.d.detach()),w_top=float(wt.detach()),w_rand=float(wr.detach()))
-        else:record.update(w_top=1.247,w_rand=.753)
+        wt,wr=gate();record.update(d=float(gate.d.detach()),w_top=float(wt.detach()),w_rand=float(wr.detach()))
         return record

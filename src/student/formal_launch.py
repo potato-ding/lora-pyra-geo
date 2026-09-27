@@ -27,7 +27,7 @@ def launch(cfg, config_path):
     with socket.socket() as sock:
         sock.bind(('127.0.0.1',0));port=sock.getsockname()[1]
     env.update(RANK='0',LOCAL_RANK='0',WORLD_SIZE='1',LOCAL_WORLD_SIZE='1',MASTER_ADDR='127.0.0.1',MASTER_PORT=str(port))
-    module='src.student.train_allocation' if cfg['paper_mode'] in ('fixed','learnable') else 'src.student.train'
+    module='src.student.train_allocation'
     run.mkdir(parents=True,exist_ok=True)
     with (run/'train.log').open('xb') as sink:
         child=subprocess.Popen([sys.executable,'-m',module,'--config',str(config)],cwd=ROOT,env=env,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)

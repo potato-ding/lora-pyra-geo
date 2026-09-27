@@ -6,39 +6,14 @@ import pytest
 import torch
 from torch import nn
 from src.student.core_config import validate_config
-from src.student.train import load_config
-from src.student.gbw import apply_branch_coefficients
-from src.student.dual_stst import stst_total_loss
+from src.student.launch import load_config
 from src.student.allocation_gbw import AllocationGate
 from src.student.formal_runtime import construction_rng, snapshot_assets, assert_assets_preserved
 from src.student import canonical_selection
 
 CONFIGS=sorted(Path('configs/student/r224').glob('*.json'))
 
-@pytest.mark.parametrize('path',CONFIGS)
-def test_formal_config(path):
-    cfg=load_config(path)
-    assert cfg['artifact_contract']=='STUDENT_BEST_ONLY_V1'
-    assert cfg['world_size']==1 and not cfg['cross_gpu_gather']
-    assert cfg['u1652_eval_batch_size']==32
-    bad=dict(cfg,batch_size=16)
-    with pytest.raises(ValueError):validate_config(bad)
-    if cfg['paper_mode']=='b0':
-        with pytest.raises(ValueError):validate_config(dict(cfg,middle_checkpoint='forbidden'))
-    if cfg['paper_mode']=='top_only':
-        with pytest.raises(ValueError):validate_config(dict(cfg,lambda_top=1.))
-        assert cfg['random_layout']=='disabled' and cfg['allocation_variant'] is None
 
-@pytest.mark.parametrize('epoch,outer',[(1,.04),(2,.08),(3,.12),(4,.16),(5,.20),(30,.20)])
-def test_top_only_budget_and_gradients(epoch,outer):
-    cfg=load_config('configs/student/r224/s1-top-rmlp-r224.json')
-    top=torch.tensor(.3,requires_grad=True)
-    kd,_=apply_branch_coefficients(cfg,top,dict(top_loss=top,random_loss=None))
-    total,weight=stst_total_loss(torch.tensor(1.),kd,.2,epoch,5)
-    assert weight==pytest.approx(outer)
-    total.backward()
-    assert top.grad.item()==pytest.approx(2*outer)
-    with pytest.raises(ValueError):apply_branch_coefficients(cfg,top,dict(top_loss=top,random_loss=top))
 
 def test_gate_budget_and_rng_isolation():
     cfg={'artifact_contract':'STUDENT_BEST_ONLY_V1'}

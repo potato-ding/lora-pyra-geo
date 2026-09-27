@@ -59,19 +59,32 @@ def test_result_identity_and_no_overwrite(tmp_path):
     with pytest.raises(FileExistsError):publish_result(run,"u1652",payload,"fixture")
 
 def test_launcher_tees_stderr_and_preserves_nonempty_run(tmp_path,monkeypatch,capfdbinary):
-    from src.student import launch
+    from src.student import launch,formal_launch
     run=tmp_path/"reserved"
-    monkeypatch.setattr(launch,"load_config",lambda _:dict(output_dir=str(run)))
+    config=tmp_path/'fixture.json';config.write_text('{}')
+    monkeypatch.setattr(launch,"load_config",lambda _:dict(output_dir=str(run),assigned_gpu=3))
+    monkeypatch.setattr(formal_launch,'validate_config',lambda *a,**k:None)
+    monkeypatch.setattr(formal_launch,'ROOT',tmp_path)
+    monkeypatch.setenv('CUDA_VISIBLE_DEVICES','3')
+    def check_output(command,**kwargs):
+        if command[:2]==['git','branch']:return 'dev\n'
+        if command[:2]==['git','status']:return ''
+        if command[:2]==['git','rev-parse']:return 'fixture-head\n'
+        if command[0]=='nvidia-smi':return '0\n'
+        raise AssertionError(command)
+    monkeypatch.setattr(formal_launch.subprocess,'check_output',check_output)
+    monkeypatch.setattr(formal_launch.subprocess,'run',lambda *a,**k:None)
     original=subprocess.Popen
     def fake_child(command,**kwargs):
+        assert command[2]=='src.student.train_allocation'
         return original([sys.executable,"-c",
             "import sys; print('stdout-line'); print('stderr-line',file=sys.stderr); sys.exit(7)"],**kwargs)
-    monkeypatch.setattr(launch.subprocess,"Popen",fake_child)
-    with pytest.raises(SystemExit) as e:launch.main(["--config","fixture.json"])
+    monkeypatch.setattr(formal_launch.subprocess,"Popen",fake_child)
+    with pytest.raises(SystemExit) as e:launch.main(["--config",str(config)])
     assert e.value.code==7
     data=(run/"train.log").read_bytes()
     assert b"stdout-line" in data and b"stderr-line" in data
-    with pytest.raises(FileExistsError):launch.main(["--config","fixture.json"])
+    with pytest.raises(FileExistsError):launch.main(["--config",str(config)])
     assert (run/"train.log").read_bytes()==data
 
 

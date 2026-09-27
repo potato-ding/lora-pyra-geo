@@ -59,20 +59,6 @@ def source_identity(gbw=False):
     return explicit_identity('m2s',gbw=gbw)
 
 
-def dual_stst_metadata(cfg):
-    # Bind D0 metadata to the actual validated train-only bank and Teacher.
-    from .dual_stst import load_stst_asset
-    teacher_sha = file_sha256(cfg["middle_checkpoint"])
-    bank = load_stst_asset(cfg["stst_asset"], teacher_sha)
-    if bank["metadata"].get("train_rows") != 1402:
-        raise ValueError("Original Dual-STST requires 1402 train rows")
-    return dict(middle_teacher_run=Path(cfg["middle_checkpoint"]).parent.name,
-                middle_teacher_checkpoint=str(Path(cfg["middle_checkpoint"]).resolve()),
-                middle_teacher_sha256=teacher_sha, middle_teacher_descriptor_dim=768,
-                stst_asset_path=str(Path(cfg["stst_asset"]).resolve()),
-                stst_asset_sha256=file_sha256(cfg["stst_asset"]),
-                top_dim=32, random_dim=32, random_seed=bank["metadata"]["random_seed"],
-                teacher_frozen=True, teacher_trainable_params=0)
 
 
 def resolved_config(cfg, steps_per_epoch=None):
@@ -82,19 +68,16 @@ def resolved_config(cfg, steps_per_epoch=None):
         raise RuntimeError("HEAD changed after sealed launch")
     metadata=dict(cfg)
     metadata.update(selection_metadata())
-    if cfg["mode"] == "dual_stst":
-        if cfg.get("part") == "Part-I":
-            from .part1 import part1_metadata
-            metadata.update(part1_metadata(cfg))
-            metadata['source_commit'] = commit
-        else:
-            metadata.update(dual_stst_metadata(cfg))
+    if cfg.get('paper_mode')=='learnable' and cfg.get('random_basis_mode')=='gaussian_qr_per_run':
+        from .formal_supervision import metadata as formal_metadata
+        metadata.update(formal_metadata(cfg))
+        metadata['source_commit']=commit
     require_u1652_eval_batch_size(cfg.get("u1652_eval_batch_size", U1652_EVAL_BATCH_SIZE))
     metadata.update(u1652_eval_batch_size=U1652_EVAL_BATCH_SIZE, validation_buffer_source="rank0")
-    if cfg.get("protocol_id") in ("STU-1G-B32-R224-v1", "STU-1G-B32-R256-v1", "STU-1G-B32-R384-v1"):
+    if cfg.get("protocol_id") in ("STU-1G-B32-R224-v1", "STU-1G-B32-R256-v1"):
         from .canonical_selection import evaluator_metadata
         metadata.update(evaluator_metadata(), bn_protocol="single_rank_native_bn", cross_rank_buffer_sync=False, bn_buffer_broadcast_required=False)
-    return dict(metadata, experiment_name=Path(cfg["output_dir"]).name,
+    return dict(metadata, formal_config=dict(cfg), experiment_name=Path(cfg["output_dir"]).name,
         method=cfg["mode"], git_commit=commit, sealed_commit=expected or commit,
         source_sha256=source_identity(gbw=cfg.get('allocation_variant') is not None),source_contract='CORE_SOURCE_CONTRACT_V2',
         student_architecture="RepViT-M1.5", student_pretrained_path=str(Path(cfg["student_pretrained"]).resolve()),
@@ -130,13 +113,25 @@ def best_record(epoch, metrics, canonical=False):
 def validate_training_complete(run):
     require_valid_run(run)
     run=Path(run)
+    checkpoint=run/'best_model.pth'
+    sidecar=run/'run_config.json'
+    formal_declared=sidecar.is_file() and json.loads(sidecar.read_text()).get('artifact_contract')=='STUDENT_BEST_ONLY_V1'
+    if checkpoint.is_file() and (not sidecar.is_file() or formal_declared):
+        import torch
+        from .checkpoint_contract import SCHEMA, verify_student_best
+        payload=torch.load(checkpoint,map_location='cpu',weights_only=True)
+        if isinstance(payload,dict) and payload.get('artifact_schema')==SCHEMA:
+            metadata=verify_student_best(payload)
+            return payload['config'],metadata
+        if formal_declared or (isinstance(payload,dict) and isinstance(payload.get('metadata'),dict) and payload['metadata'].get('artifact_contract')=='STUDENT_BEST_ONLY_V1'):
+            raise ValueError('Malformed formal Student best checkpoint')
     cfg=json.loads((run/"run_config.json").read_text())
     history=json.loads((run/"epoch_metrics.json").read_text())
     if cfg["epochs"]!=30 or [row["epoch"] for row in history]!=list(range(1,31)):
         raise ValueError("Complete thirty-epoch history required")
     best=json.loads((run/"best_metrics.json").read_text())
     expected=max(history,key=lambda row:row["metrics"]["D2S"]["R@1"]+row["metrics"]["S2D"]["R@1"])
-    expected_best=best_record(expected["epoch"],expected["metrics"],canonical=cfg.get("protocol_id") in ("STU-1G-B32-R224-v1", "STU-1G-B32-R256-v1", "STU-1G-B32-R384-v1"))
+    expected_best=best_record(expected["epoch"],expected["metrics"],canonical=cfg.get("protocol_id") in ("STU-1G-B32-R224-v1", "STU-1G-B32-R256-v1"))
     if 'precision_signature' in expected: expected_best['precision_signature']=expected['precision_signature']
     if best != expected_best:
         raise ValueError("Best metadata violates first strict maximum selection")
@@ -147,7 +142,9 @@ def validate_training_complete(run):
 def package_results(run):
     run=Path(run).resolve()
     cfg,best=validate_training_complete(run)
-    for name in SLIM_FILES:
+    formal=best.get('artifact_contract')=='STUDENT_BEST_ONLY_V1'
+    files=(('train.log',)+RESULT_FILES) if formal else SLIM_FILES
+    for name in files:
         if not (run/name).is_file():raise FileNotFoundError(run/name)
     best_sha=file_sha256(run/"best_model.pth")
     for name in RESULT_FILES:
@@ -157,25 +154,25 @@ def package_results(run):
     archive=run/(run.name+"_RESULTS.tar.gz")
     manifest_path=run/"RESULT_MANIFEST.txt"
     if archive.exists() or manifest_path.exists(): raise FileExistsError("Result package already exists")
-    manifest=dict(EXPERIMENT_NAME=run.name,METHOD=cfg["method"],SEED=cfg["seed"],GIT_COMMIT=cfg["git_commit"],
-        STUDENT_PRETRAINED_PATH=cfg["student_pretrained_path"],STUDENT_PRETRAINED_SHA256=cfg["student_pretrained_sha256"],
+    manifest=dict(EXPERIMENT_NAME=run.name,METHOD=cfg.get('method',cfg.get('mode')),SEED=cfg['seed'],GIT_COMMIT=best.get('git_commit',cfg.get('git_commit')),
+        STUDENT_PRETRAINED_PATH=cfg.get('student_pretrained',cfg.get('student_pretrained_path')),STUDENT_PRETRAINED_SHA256=cfg['student_pretrained_sha256'],
         BEST_MODEL=str(run/"best_model.pth"),BEST_MODEL_SHA256=best_sha,
         BEST_EPOCH=best["best_epoch"],BEST_SCORE=best["best_score"],
-        LAST_MODEL=str(run/"last_model.pth"),LAST_MODEL_SHA256=file_sha256(run/"last_model.pth"),
         TRAIN_LOG=str(run/"train.log"),U1652_RESULT=str(run/RESULT_FILES[0]),
         SUES_RESULT=str(run/RESULT_FILES[1]),GTA_RESULT=str(run/RESULT_FILES[2]),
         PACKAGE=str(archive),PACKAGE_SHA256="RECORDED_IN_EXTERNAL_FINAL_MANIFEST",
         PACKAGE_SIZE="RECORDED_IN_EXTERNAL_FINAL_MANIFEST",
         package_manifest_policy="Embedded pre-package manifest; external final manifest adds actual archive SHA256 and size. Avoids circular self-hash.",
-        files={name:dict(sha256=file_sha256(run/name),size=(run/name).stat().st_size) for name in SLIM_FILES})
+        files={name:dict(sha256=file_sha256(run/name),size=(run/name).stat().st_size) for name in files})
+    if not formal:manifest.update(LAST_MODEL=str(run/'last_model.pth'),LAST_MODEL_SHA256=file_sha256(run/'last_model.pth'))
     embedded=(json.dumps(manifest,indent=2)+"\n").encode()
     with archive.open("xb") as target:
         with tarfile.open(fileobj=target,mode="w:gz") as tar:
-            for name in SLIM_FILES:tar.add(run/name,arcname=name,recursive=False)
+            for name in files:tar.add(run/name,arcname=name,recursive=False)
             info=tarfile.TarInfo("RESULT_MANIFEST.txt");info.size=len(embedded)
             tar.addfile(info,io.BytesIO(embedded))
     with tarfile.open(archive) as tar:
-        if set(tar.getnames()) != set(SLIM_FILES+("RESULT_MANIFEST.txt",)):
+        if set(tar.getnames()) != set(files+("RESULT_MANIFEST.txt",)):
             raise RuntimeError("Slim archive allowlist violation")
     manifest.update(PACKAGE_SHA256=file_sha256(archive),PACKAGE_SIZE=archive.stat().st_size,
                     embedded_manifest_sha256=hashlib.sha256(embedded).hexdigest())

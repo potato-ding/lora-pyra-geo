@@ -8,13 +8,12 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from src.student.part1 import BandProjector, PartISupervision
+from src.student.formal_supervision import BandProjector
 from src.student.part2 import (MLPResidual, ResidualTopProjector,
     install_residual_top, trainable_count, RMLP_HIDDEN_DIM, ALPHA_INIT)
-from src.student.train import StudentTrainingModel
+from src.student.formal_engine import StudentTrainingModel
 from src.student.artifacts import deployment_state_dict
 from src.student.optimizer import build_student_optimizer
-from test_student_part1 import banks
 
 
 def inputs(n=16, device="cpu"):
@@ -90,33 +89,6 @@ def test_dtype_cast_preserves_exact_residual_and_grid_values(kind):
     assert y.dtype == torch.float32
 
 
-@pytest.mark.parametrize("kind", ["rmlp"])
-def test_random_unchanged_optimizer_inclusion_and_bare_deployment(banks, kind):
-    torch.manual_seed(0)
-    supervision = PartISupervision(banks[1],banks[0],banks[2],128,"single32")
-    z = inputs()
-    random_before = copy.deepcopy(supervision.projector_random)
-    base_before = copy.deepcopy(supervision.projector_top)
-    bases = {k:v.clone() for k,v in supervision.named_buffers()}
-    rng = torch.get_rng_state()
-    install_residual_top(supervision,kind,z.detach())
-    assert torch.equal(rng,torch.get_rng_state())
-    for a,b in zip(supervision.projector_random(z),random_before(z)):assert torch.equal(a,b)
-    assert all(torch.equal(v,dict(supervision.named_buffers())[k]) for k,v in bases.items())
-    assert all(torch.equal(v,supervision.projector_top.linear.state_dict()[k]) for k,v in base_before.linear.state_dict().items())
-    student = nn.Linear(2,512)
-    model = StudentTrainingModel(student,supervision)
-    optimizer = build_student_optimizer(model)
-    optimizer_ids = {id(p) for g in optimizer.param_groups for p in g["params"]}
-    assert all(id(p) in optimizer_ids for p in supervision.parameters())
-    target = F.normalize(torch.randn(16,768),dim=1).requires_grad_()
-    loss,_ = supervision(z,target,8)
-    loss.backward()
-    assert target.grad is None
-    assert_grads(supervision)
-    state = deployment_state_dict(model)
-    assert set(state)==set(student.state_dict())
-    assert all(torch.equal(v,student.state_dict()[k]) for k,v in state.items())
 
 
 

@@ -1,9 +1,9 @@
 """Formal full-FT paper matrix, independent of historical run directories."""
-import copy,json
+import json
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[2]
 
-SUPPORTED_IMAGE_SIZES = (224, 256, 384)
+SUPPORTED_IMAGE_SIZES = (224, 256)
 
 def validate_image_size(image_size):
     if type(image_size) is not int or image_size not in SUPPORTED_IMAGE_SIZES:
@@ -23,17 +23,18 @@ def validate_teacher_identity(metadata, image_size):
 def validate_core_config(config,allow_sam=False):
     from .config import validate_config
     validate_config(config)
-    ref=json.loads((ROOT/'configs/middle_teacher/fchain_margin_abv2_s0.json').read_text())
+    ref=json.loads((ROOT/'configs/middle_teacher/m2-sam-e3-kd-r224-s0.json').read_text())
     ref['data']['input_size']=validate_image_size(config['data']['input_size'])
     for key in ('best_metric','strict_load'):
         if config['checkpoint'][key]!=ref['checkpoint'][key]:raise ValueError('Canonical selection changed: '+key)
     permitted={'base_loss','margin','adaptive_bridge_v2'}
-    if set(config['distillation'])-permitted:raise ValueError('Only HRD/Semantic paper matrix allowed')
+    if set(config['distillation'])!=permitted:raise ValueError('Only HRD/Semantic paper matrix allowed')
     for key,value in config['distillation'].items():
         if value!=ref['distillation'][key]:raise ValueError('Method math changed: '+key)
-    if config['sam']['enabled'] and not allow_sam:raise ValueError('SAM is an explicit extension only')
+    from .distill_sam import validate_sharpness
+    validate_sharpness(config)
     # Seed/name/output are experiment identity, not mathematical switches.
     for key in ('model','initialization','trainability','precision','optimizer','scheduler','data'):
         if config[key]!=ref[key]:raise ValueError('Canonical Middle protocol changed: '+key)
-    if config['experiment']['epochs']!=10 or config['seed'] not in (0,1,2):raise ValueError('Epoch/seed')
+    if config['experiment']['epochs']!=10 or config['seed'] != 0:raise ValueError('Epoch/seed')
     return config

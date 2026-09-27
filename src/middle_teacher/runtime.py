@@ -1,4 +1,4 @@
-"""DeepSpeed construction matching the retained formal SRMD-S1 protocol."""
+"""DeepSpeed construction matching the formal E3 precision and optimizer protocol."""
 from __future__ import annotations
 
 import copy

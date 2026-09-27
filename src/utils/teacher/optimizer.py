@@ -1,6 +1,5 @@
 """Teacher optimizer construction."""
 
-import torch
 from torch.optim import AdamW
 
 try:
@@ -15,14 +14,13 @@ def build_optimizer_and_scale(model, args):
     Build the teacher optimizer for the current DINOv3 teacher setup.
 
     Trainable groups are LoRA params, fully fine-tuned backbone params,
-    the InfoNCE logit_scale, and a small fallback group for unexpected params.
+    the InfoNCE logit_scale. Unknown trainable parameters fail closed.
     """
     logit_scale = model.logit_scale
     lora_weight_decay = []
     lora_no_weight_decay = []
     backbone_full_decay = []
     backbone_full_no_decay = []
-    other_params = []
 
     for name, param in model.named_parameters():
         if not param.requires_grad:
@@ -51,14 +49,13 @@ def build_optimizer_and_scale(model, args):
             else:
                 backbone_full_decay.append(param)
         else:
-            print(f"[TeacherOptimizer] warning: unexpected trainable param: {name}")
-            other_params.append(param)
+            raise ValueError(f"Unexpected Teacher trainable parameter: {name}")
 
     print(
         f"[TeacherOptimizer] lora_decay={len(lora_weight_decay)} | "
         f"lora_no_decay={len(lora_no_weight_decay)} | "
         f"full_backbone_decay/no_decay={len(backbone_full_decay)}/{len(backbone_full_no_decay)} | "
-        f"other={len(other_params)} | logit_scale=1"
+        "logit_scale=1"
     )
 
     optimizer_grouped_parameters = []
@@ -89,13 +86,6 @@ def build_optimizer_and_scale(model, args):
             "params": backbone_full_no_decay,
             "lr": full_lr,
             "weight_decay": 0.0,
-        })
-
-    if other_params:
-        optimizer_grouped_parameters.append({
-            "params": other_params,
-            "lr": args.lr,
-            "weight_decay": 0.01,
         })
 
     logit_scale_lr_mult = getattr(args, "logit_scale_lr_mult", 1.0)

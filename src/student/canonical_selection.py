@@ -90,10 +90,15 @@ def select_epoch(engine, output, epoch, previous_best, data_dir, num_workers=8, 
                    precision_signature=signature,selection_metrics=metrics)
         formal=run_metadata is not None and run_metadata.get('artifact_contract')=='STUDENT_BEST_ONLY_V1'
         if formal:
+            from .checkpoint_contract import SCHEMA, config_fingerprint
+            formal_config=run_metadata.get('formal_config',run_metadata)
+            state.update(artifact_schema=SCHEMA,config=formal_config)
             flat={d+'_'+k:float(metrics[d][source]) for d in ('D2S','S2D')
                   for k,source in (('R1','R@1'),('R5','R@5'),('AP','AP'))}
             flat['R1_sum']=score
-            metadata=dict(run_metadata,experiment_id=run_metadata['experiment_name'],
+            metadata=dict(run_metadata,student_architecture='RepViT-M1.5',
+                config_sha256=config_fingerprint(formal_config),
+                experiment_id=run_metadata['experiment_name'],
                 image_size=image_size,best_epoch=epoch,best_score=score,
                 selection_mode='SINGLE_GPU_CANONICAL',training_world_size=1,
                 selection_world_size=1,selection_rank=0,eval_batch_size=32,
@@ -102,9 +107,11 @@ def select_epoch(engine, output, epoch, previous_best, data_dir, num_workers=8, 
                 allocation=allocation)
             if allocation is not None:
                 metadata.update(allocation_mode=allocation['mode'],lambda_top=allocation['lambda_top'],lambda_random=allocation['lambda_random'])
-            state.update(metadata=metadata,best_epoch=epoch,best_score=score)
-            if metadata.get('random_basis_mode')=='generated_fixed':
-                from .bandwidth_assets import tensor_sha256
+            from .artifacts import selection_metadata
+            state.update(metadata=metadata,best_epoch=epoch,best_score=score,
+                         selection_protocol=selection_metadata())
+            if metadata.get('random_basis_mode') in ('generated_fixed','gaussian_qr_per_run'):
+                from .subspace_utils import tensor_sha256
                 if training_auxiliary is None:raise ValueError('Generated basis checkpoint requires actual tensor')
                 if tensor_sha256(training_auxiliary['supervision']['random32_basis'])!=metadata['random_basis_sha256']:raise ValueError('Checkpoint Random identity mismatch')
                 state['training_auxiliary']=training_auxiliary

@@ -3,7 +3,6 @@ import argparse
 import json
 from pathlib import Path
 import torch
-import time
 from .model_loader import load_encoder
 from .metrics import getdist_1652_val_and_get_recall,run_sues_val_and_get_metrics,run_gta_val_and_get_metrics
 from src.dataset.teacher.val_dataloaders import build_1652_val_dataloaders,build_sues200_val_dataloaders,build_gta_val_dataloaders
@@ -36,6 +35,10 @@ def main(argv=None):
         from src.student.artifacts import require_valid_run
         require_valid_run(Path(args.checkpoint).resolve().parent)
     model,load_audit=load_encoder(args.model_type,args.checkpoint,args.config,device,image_size=args.image_size)
+    if args.model_type=='middle' and not args.certification_only and load_audit.get('artifact_classification') != 'FORMAL_MIDDLE_CHECKPOINT':
+        raise RuntimeError('LEGACY_CHECKPOINT: not certified for new formal Middle evaluation')
+    if args.model_type=='student' and not args.certification_only and load_audit.get('artifact_classification') != 'FORMAL_STUDENT_CHECKPOINT':
+        raise RuntimeError('LEGACY_CHECKPOINT: not certified for new formal Student evaluation')
     if args.model_type=='teacher' and not args.certification_only and load_audit.get('artifact_classification') != 'FORMAL_TEACHER_CHECKPOINT':
         raise RuntimeError('LEGACY_CHECKPOINT: not certified for new formal Teacher evaluation')
     signature=load_audit['precision_signature']

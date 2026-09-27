@@ -1,9 +1,6 @@
 import os
 import random
-import hashlib
-import json
 import numpy as np
-import torch
 import torch.distributed as dist
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
@@ -15,12 +12,11 @@ def read_rgb_image(path):
 
 class U1652PairDataset(Dataset):
 
-    def __init__(self, data_dir, sat_transforms=None, drone_transforms=None, prob_flip=0.5, shuffle_batch_size=128):
+    def __init__(self, data_dir, sat_transforms=None, drone_transforms=None, prob_flip=0.5):
         self.data_dir = data_dir
         self.sat_transforms = sat_transforms
         self.drone_transforms = drone_transforms
         self.prob_flip = prob_flip
-        self.shuffle_batch_size = shuffle_batch_size
         self.pairs = []
         self.pair_pids = []
         self.pids = []
@@ -79,41 +75,12 @@ class U1652PairDataset(Dataset):
         sat_tensor = self.sat_transforms(image=sat_img)['image']
         return (drone_tensor, sat_tensor, label, pid)
 
-    def shuffle(self):
-        pair_pool = self.pairs[:]
-        random.shuffle(pair_pool)
-        used_pairs = set()
-        ids_in_batch = set()
-        current_batch = []
-        shuffled = []
-        break_counter = 0
-        while pair_pool:
-            pair = pair_pool.pop(0)
-            pid = pair[0]
-            if pid not in ids_in_batch and pair not in used_pairs:
-                ids_in_batch.add(pid)
-                current_batch.append(pair)
-                used_pairs.add(pair)
-                break_counter = 0
-            else:
-                if pair not in used_pairs:
-                    pair_pool.append(pair)
-                break_counter += 1
-                if break_counter >= 512:
-                    break
-            if len(current_batch) == self.shuffle_batch_size:
-                shuffled.extend(current_batch)
-                ids_in_batch = set()
-                current_batch = []
-        self.samples = shuffled
-        print(f'[PairedCrossView Loader] pairs={len(self.pairs)} | shuffled_pairs={len(self.samples)} | batch_size={self.shuffle_batch_size} | steps_per_epoch={len(self) // self.shuffle_batch_size}')
-
 def create_student_train_dataset_and_loader(args):
     train_data_dir = getattr(args, 'train_data_dir', None)
     if train_data_dir is None:
         train_data_dir = os.path.join(getattr(args, 'data_dir', 'data/U1652'), 'train')
     (_, train_sat_tf, train_drone_tf) = get_train_transforms(img_size=[args.img_size, args.img_size], mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    train_dataset = U1652PairDataset(data_dir=train_data_dir, sat_transforms=train_sat_tf, drone_transforms=train_drone_tf, prob_flip=getattr(args, 'prob_flip', 0.5), shuffle_batch_size=args.batch_size)
+    train_dataset = U1652PairDataset(data_dir=train_data_dir, sat_transforms=train_sat_tf, drone_transforms=train_drone_tf, prob_flip=getattr(args, 'prob_flip', 0.5))
     if dist.is_available() and dist.is_initialized():
         train_sampler = CrossViewPairSampler(train_dataset, batch_size=args.batch_size, shuffle=True, seed=getattr(args, 'seed', 0))
         return DataLoader(dataset=train_dataset, batch_sampler=train_sampler, num_workers=getattr(args, 'num_workers', 8), pin_memory=getattr(args, 'pin_memory', True))

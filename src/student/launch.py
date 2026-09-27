@@ -1,55 +1,21 @@
-"""Reserve a fresh formal run and tee all torchrun output to train.log."""
+"""Validate and launch only the formal S3 R224/R256 training chain."""
 import argparse
 import json
-import os
 from pathlib import Path
-import subprocess
-import sys
-from .train import load_config
-from .artifacts import ROOT, source_identity, file_sha256
+from .core_config import validate_config
+
+def load_config(path):
+    return validate_config(json.loads(Path(path).read_text()))
 
 def main(argv=None):
-    p=argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--config",required=True)
-    p.add_argument('--validate-only',action='store_true')
-    args=p.parse_args(argv)
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--config',required=True)
+    parser.add_argument('--validate-only',action='store_true')
+    args=parser.parse_args(argv)
     cfg=load_config(args.config)
     if args.validate_only:
         print(json.dumps(cfg,indent=2));return
-    if cfg.get('artifact_contract')=='STUDENT_BEST_ONLY_V1':
-        from .formal_launch import launch
-        return launch(cfg,args.config)
-    visible=os.environ.get("CUDA_VISIBLE_DEVICES")
-    if visible is not None and len(visible.split(",")) != 1:
-        raise ValueError("STU-1G-B32-R224-v1 requires exactly one visible GPU")
-    seal=None
-    if cfg.get("sealed_provenance_file") and cfg.get("source_contract")!="CORE_SOURCE_CONTRACT_V2":
-        seal=json.loads(Path(cfg["sealed_provenance_file"]).read_text())
-        head=subprocess.check_output(["git","rev-parse","HEAD"],cwd=ROOT,text=True).strip()
-        dirty=subprocess.check_output(["git","status","--porcelain"],cwd=ROOT,text=True)
-        if not seal["B0_FINAL_SEAL"] or seal["SEALED_COMMIT"]!=head or dirty:
-            raise RuntimeError("Sealed commit/clean-worktree gate failed")
-        if seal["source_sha256"]!=source_identity():
-            raise RuntimeError("Sealed source SHA mismatch")
-        if file_sha256(args.config)!=seal["config_sha256"][str(Path(args.config).resolve())]:
-            raise RuntimeError("Sealed config SHA mismatch")
-    run=Path(cfg["output_dir"]).resolve()
-    if run.exists() and any(run.iterdir()):raise FileExistsError(run)
-    run.mkdir(parents=True,exist_ok=True)
-    log=run/"train.log"
-    env=dict(os.environ,STUDENT_RESERVED_OUTPUT=str(run),PYTHONUNBUFFERED="1")
-    if seal:env["STUDENT_SEALED_COMMIT"]=seal["SEALED_COMMIT"]
-    command=[sys.executable,"-m","torch.distributed.run","--standalone","--nproc_per_node=1",
-             "-m","src.student.train","--config",str(Path(args.config).resolve())]
-    with log.open("xb") as sink:
-        child=subprocess.Popen(command,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,env=env)
-        try:
-            for line in iter(child.stdout.readline,b""):
-                sink.write(line);sink.flush()
-                sys.stdout.buffer.write(line);sys.stdout.buffer.flush()
-            code=child.wait()
-        except BaseException:
-            child.terminate();child.wait();raise
-    raise SystemExit(code)
+    from .formal_launch import launch
+    return launch(cfg,args.config)
 
-if __name__=="__main__":main()
+if __name__=='__main__':main()

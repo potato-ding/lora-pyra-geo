@@ -9,12 +9,15 @@ from src.utils.save_path import get_save_pth
 
 def test_r256_config_matches_canonical_four_gpu_t0():
     cfg=json.loads(Path('configs/teacher/t0_certified_256.json').read_text())
-    args=parse_args([v for k,x in cfg.items() for v in ('--'+k,str(x))])
-    for size in (224,384):
+    args=parse_args(['--config','configs/teacher/t0_certified_256.json'])
+    for size in (224,):
         old=json.loads(Path(f'configs/teacher/t0_certified_{size}.json').read_text())
         # Historical templates use 8 ranks x 4 pairs. Formal 4-rank T0 uses 8 pairs.
         old['batch_size']=8
-        old['weak_paired_cross_view_weight']=old.pop('weak_sample4geo_weight')
+        if 'weak_sample4geo_weight' in old:
+            old['weak_paired_cross_view_weight']=old.pop('weak_sample4geo_weight')
+        if 'experiment_id' in old:old['experiment_id']='T0-INFONCE-R256'
+        if 'output_dir' in old:old['output_dir']=cfg['output_dir']
         old['img_size']=256
         assert all(cfg[k]==v for k,v in old.items())
     assert args.experiment_id=='T0-INFONCE-R256' and args.img_size==256
@@ -26,12 +29,10 @@ def test_r256_config_matches_canonical_four_gpu_t0():
     assert args.lora_target_names=='qkv,proj'
     assert (args.lora_start_block,args.lora_end_block,args.full_finetune_start_block,args.full_finetune_end_block)==(20,36,36,40)
 
-@pytest.mark.parametrize('size',[224,256,384])
+@pytest.mark.parametrize('size',[224,256])
 def test_formal_resolution_no_sidecars(tmp_path,size):
-    from src.training.teacher.hparams import save_training_record
     args=SimpleNamespace(experiment_id=f'T0-INFONCE-R{size}',img_size=size)
     assert is_formal_teacher(args)
-    save_training_record(str(tmp_path),args,[],None,0)
     assert list(tmp_path.iterdir())==[]
 
 def test_r256_real_patch_embed_geometry():

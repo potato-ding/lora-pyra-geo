@@ -5,29 +5,28 @@ ZeRO post-accumulation hooks are not populated. Each branch is explicitly
 SUM/world synchronized in FP32. Only the second backward enters DeepSpeed.
 """
 import hashlib
-import math
 import torch
 import torch.distributed as dist
-from .sam import capture_rng_state, restore_rng_state
+from .sam_rng import capture_rng_state, restore_rng_state
 
 FRAMEWORK = 'M2_DISTILL_SAM_V1'
 
 
 def validate_sharpness(config, allow_blocked=False):
-    s = config['sam']; mode = s.get('sharpness_mode', 'none')
-    if mode == 'none':
-        if s.get('enabled'): raise ValueError('Legacy SAM is not a final M2 SAM configuration')
-        return False
-    if s.get('framework') != FRAMEWORK or not s.get('enabled'): raise ValueError('Explicit M2 SAM framework required')
-    if mode not in ('sam', 'asam') or s.get('search_direction') not in ('full', 'task', 'kd', 'balanced'): raise ValueError('Unknown sharpness mode/direction')
-    if s.get('perturb_scope') not in ('all_trainable', 'recipient_only'): raise ValueError('Unknown perturbation scope')
-    for key, value in dict(second_pass_objective='full', same_batch=True, rng_replay=True, balanced_task_weight=0.5, balanced_kd_weight=0.5, norm_epsilon=1e-12).items():
-        if s.get(key) != value: raise ValueError('Sharpness contract changed: ' + key)
-    if mode == 'asam':
-        if s.get('perturb_scope') != 'all_trainable' or not s.get('adaptive'): raise ValueError('ASAM requires adaptive=true and all_trainable scope')
-        if s.get('rho') != 0.10 or s.get('asam_eta', s.get('eta')) != 0.01: raise ValueError('ASAM requires rho=0.10 and asam_eta=0.01')
-    elif s.get('rho') != 0.10 or s.get('adaptive') is not False: raise ValueError('Historical retained R224 SAM requires rho=0.10, adaptive=False')
-    if config['seed'] != 0 or config['checkpoint'].get('save_last') is not False: raise ValueError('Final SAM requires canonical seed0 and best-only artifacts')
+    """Accept only the paper E3 KD-guided Standard SAM contract."""
+    sam = config['sam']
+    expected = dict(enabled=True, framework=FRAMEWORK, sharpness_mode='sam',
+                    search_direction='kd', perturb_scope='all_trainable',
+                    adaptive=False, rho=0.10, second_pass_objective='full',
+                    same_batch=True, rng_replay=True, norm_epsilon=1e-12)
+    for key, value in expected.items():
+        if sam.get(key) != value:
+            raise ValueError('E3 SAM contract changed: ' + key)
+    for key in ('balanced_task_weight', 'balanced_kd_weight'):
+        if key in sam and sam[key] != .5:
+            raise ValueError('Legacy E3 metadata changed: ' + key)
+    if config['seed'] != 0 or config['checkpoint'].get('save_last') is not False:
+        raise ValueError('E3 requires seed0 and best-only artifacts')
     return True
 
 def parameter_spaces(model):
@@ -36,7 +35,7 @@ def parameter_spaces(model):
     Deployment calls backbone only, final CLS then FP32 L2. The unmasked
     forward multiplies mask_token by zero: it is retained state but has no
     retrieval function. logit_scale and the ABV2 bank are training-only.
-    Unknown trainable modules fail closed rather than entering E5 by name.
+    Unknown trainable modules fail closed; classification is audit-only.
     """
     all_params = sorted((n, p) for n, p in model.named_parameters() if p.requires_grad)
     recipient, excluded = [], []
@@ -68,42 +67,28 @@ def synchronized_gradients(loss, named, retain_graph=False):
     return values
 
 
-def _scale_for_parameter(name, parameter, eta):
-    weight_like = name.endswith('.weight') or name == 'weight'
-    if weight_like: return parameter.detach().float().abs().add(float(eta)), True
-    return torch.ones_like(parameter, dtype=torch.float32), False
-
-
 def make_direction(task, kd, options, named=None):
-    eps=options['norm_epsilon']; nt,nk=vector_norm(task),vector_norm(kd)
-    dot=torch.stack([(a*b).sum() for a,b in zip(task,kd)]).sum(); cosine=dot/(nt*nk+eps)
-    direction=options['search_direction']
-    if direction=='full': search=[a+b for a,b in zip(task,kd)]
-    elif direction=='task': search=task
-    elif direction=='kd': search=kd
-    elif direction=='balanced': search=[options['balanced_task_weight']*a/(nt+eps)+options['balanced_kd_weight']*b/(nk+eps) for a,b in zip(task,kd)]
-    else: raise ValueError(direction)
-    norm=vector_norm(search)
-    if not bool(torch.isfinite(norm)): raise FloatingPointError('Nonfinite search direction')
-    adaptive=bool(options.get('adaptive',False))
-    if not adaptive:
-        perturbations=[options['rho']*g/(norm+eps) for g in search]; pn=vector_norm(perturbations); expected=options['rho']*norm/(norm+eps)
-        if not torch.isclose(pn,expected,rtol=2e-5,atol=1e-7): raise RuntimeError('SAM radius normalization failed')
-        metric=pn; scaled_norm=norm; weightlike_count=identity_count=0
-    else:
-        if named is None or len(named)!=len(search): raise ValueError('ASAM requires named trainable parameters')
-        eta=float(options.get('asam_eta',options.get('eta',0.01))); scales=[]; weightlike_count=identity_count=0
-        for (name,parameter),g in zip(named,search):
-            scale,is_weight=_scale_for_parameter(name,parameter,eta); scales.append(scale)
-            if is_weight: weightlike_count+=1
-            else: identity_count+=1
-        scaled=[s*g.float() for s,g in zip(scales,search)]; scaled_norm=vector_norm(scaled)
-        if not bool(torch.isfinite(scaled_norm)) or float(scaled_norm)<=0: raise FloatingPointError('Nonfinite/zero ASAM scaled search norm')
-        perturbations=[options['rho']*(s*s)*g.float()/(scaled_norm+eps) for s,g in zip(scales,search)]
-        pn=vector_norm(perturbations); metric=vector_norm([e/s for e,s in zip(perturbations,scales)])
-        if not torch.isclose(metric,torch.as_tensor(options['rho'],dtype=torch.float32),rtol=2e-5,atol=1e-6): raise RuntimeError('ASAM metric radius normalization failed')
-    stats=dict(task_grad_norm=float(nt),kd_grad_norm=float(nk),task_kd_cosine=float(cosine),search_grad_norm_before_radius_normalization=float(norm),asam_scaled_search_norm=float(scaled_norm),perturb_norm=float(pn),euclidean_perturb_norm=float(pn),asam_metric_norm=float(metric),rho=options['rho'],search_mode=direction,perturb_scope=options['perturb_scope'],adaptive=adaptive,asam_eta=float(options.get('asam_eta',options.get('eta',0.01))) if adaptive else None,weightlike_parameter_count=weightlike_count,identity_scale_parameter_count=identity_count,balanced_task_coeff=options['balanced_task_weight'],balanced_kd_coeff=options['balanced_kd_weight'])
-    return search,perturbations,stats
+    """E3 search is the synchronized KD gradient, normalized in FP32."""
+    eps = options['norm_epsilon']
+    nt, nk = vector_norm(task), vector_norm(kd)
+    dot = torch.stack([(a*b).sum() for a, b in zip(task, kd)]).sum()
+    cosine = dot/(nt*nk+eps)
+    search = kd
+    norm = vector_norm(search)
+    if not bool(torch.isfinite(norm)):
+        raise FloatingPointError('Nonfinite KD search direction')
+    perturbations = [options['rho']*g/(norm+eps) for g in search]
+    pn = vector_norm(perturbations)
+    expected = options['rho']*norm/(norm+eps)
+    if not torch.isclose(pn, expected, rtol=2e-5, atol=1e-7):
+        raise RuntimeError('SAM radius normalization failed')
+    stats = dict(task_grad_norm=float(nt), kd_grad_norm=float(nk),
+                 task_kd_cosine=float(cosine),
+                 search_grad_norm_before_radius_normalization=float(norm),
+                 perturb_norm=float(pn), euclidean_perturb_norm=float(pn),
+                 rho=options['rho'], search_mode='kd',
+                 perturb_scope='all_trainable', adaptive=False)
+    return search, perturbations, stats
 
 def rank_vector_audit(named, values):
     """Full-vector hash AND parameterwise rank-0 maximum absolute difference."""
@@ -177,11 +162,13 @@ def canonical_objective(forward, model, kd, images, ids, step):
     from src.utils.gather_features_and_labels_and_views import GatherLayer, concat_all_gather
     hidden = forward(images, return_layer_features=True)
     descriptor = hidden['final_descriptor']
-    assert descriptor.dtype == torch.float32 and tuple(descriptor.shape) == (32, 768)
-    md = torch.cat(GatherLayer.apply(descriptor[:16]), 0)
-    ms = torch.cat(GatherLayer.apply(descriptor[16:]), 0)
+    pairs = kd.local_pair_batch
+    global_pairs = pairs * dist.get_world_size()
+    assert descriptor.dtype == torch.float32 and tuple(descriptor.shape) == (2 * pairs, 768)
+    md = torch.cat(GatherLayer.apply(descriptor[:pairs]), 0)
+    ms = torch.cat(GatherLayer.apply(descriptor[pairs:]), 0)
     global_ids = concat_all_gather(ids)
-    assert md.shape == ms.shape == (32, 768) and global_ids.unique().numel() == 32
+    assert md.shape == ms.shape == (global_pairs, 768) and global_ids.unique().numel() == global_pairs
     task, d2s, s2d = r0_pair_loss(md, ms, model.logit_scale)
     full, stats, kd_loss = kd.compose_all(task, md, ms, images, global_ids, model, step, hidden,
                                         return_kd_objective=True)
@@ -197,8 +184,8 @@ def sam_backward(engine, kd, images, ids, step, options, audit_ranks=False):
     Diagnostics use two autograd traversals of the same first-pass graph.
     """
     model = engine.module
-    all_named, recipient, _ = parameter_spaces(model)
-    named = recipient if options['perturb_scope'] == 'recipient_only' else all_named
+    all_named, _, _ = parameter_spaces(model)
+    named = all_named
     if any(p.grad is not None for _, p in all_named):
         raise RuntimeError('Unexpected gradients at start of SAM batch')
     if any(p.requires_grad or p.grad is not None for p in kd.teacher.parameters()):
@@ -212,19 +199,6 @@ def sam_backward(engine, kd, images, ids, step, options, audit_ranks=False):
     if any(p.grad is not None for _, p in all_named):
         raise RuntimeError('First-pass autograd unexpectedly accumulated parameter gradients')
     search, perturbations, stats = make_direction(task_grad, kd_grad, options, named=named)
-    if options.get('adaptive') and dist.is_initialized():
-        local = torch.tensor([stats['asam_scaled_search_norm']], device=perturbations[0].device, dtype=torch.float32)
-        gathered = [torch.zeros_like(local) for _ in range(dist.get_world_size())]
-        dist.all_gather(gathered, local)
-        stats['asam_scale_norm_match'] = max(float(x.item()) for x in gathered) - min(float(x.item()) for x in gathered) <= 1e-7
-        if not stats['asam_scale_norm_match']:
-            raise RuntimeError('ASAM scaled norm mismatch')
-    if options.get('adaptive') and options.get('search_direction') == 'balanced':
-        nt, nk = vector_norm(task_grad), vector_norm(kd_grad); eps = options['norm_epsilon']
-        reference = [options['balanced_task_weight']*a/(nt+eps) + options['balanced_kd_weight']*b/(nk+eps) for a,b in zip(task_grad,kd_grad)]
-        stats['balanced_direction_regression_vs_e4'] = all(torch.equal(a,b) for a,b in zip(search, reference))
-        if not stats['balanced_direction_regression_vs_e4']:
-            raise RuntimeError('Balanced direction regression mismatch')
     if audit_ranks:
         stats['task_rank_audit'] = rank_vector_audit(named, task_grad)
         stats['kd_rank_audit'] = rank_vector_audit(named, kd_grad)

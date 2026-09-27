@@ -12,6 +12,10 @@ def checkpoint_metadata(payload):
     if payload.get('artifact_schema') != SCHEMA:
         return None
     m=payload['metadata'];config=payload['config']
+    if 'canonical_runtime_config_sha256' in m:
+        from .config_identity import runtime_fingerprint
+        if m['canonical_runtime_config_sha256']!=runtime_fingerprint(config):
+            raise ValueError('Middle canonical runtime config SHA mismatch')
     from .core_config import validate_image_size, validate_teacher_identity
     size=validate_image_size(config['data']['input_size'])
     expected=selection_metadata(size)
@@ -26,10 +30,13 @@ def checkpoint_metadata(payload):
     if payload['selection_metrics']!=m['selection_metrics'] or payload['selection_protocol']!=expected:
         raise ValueError('Conflicting Middle selection reference')
     if payload['precision_signature']['image_size']!=size:raise ValueError('Middle resolution mismatch')
+    formal_e3=str(config['experiment']['name']).startswith('M2-SAM-E3-KD-R')
     if 'teacher' in m:
         validate_teacher_identity(m['teacher']['checkpoint_metadata'],size)
-    elif size!=224 and len(config['distillation'])>1:
+    elif formal_e3 or (size!=224 and len(config['distillation'])>1):
         raise ValueError('Missing Middle Teacher checkpoint identity')
+    if formal_e3 and (m.get('sam') is not True or m.get('sharpness')!=config['sam']):
+        raise ValueError('Missing or inconsistent E3 SAM metadata')
     return m
 
 class MiddleCheckpointController(CheckpointController):
@@ -47,9 +54,11 @@ class MiddleCheckpointController(CheckpointController):
         teacher_identity=getattr(raw_model(model_or_engine),'distillation_teacher_identity',None)
         if teacher_identity is not None:metadata['teacher']=teacher_identity
         if self.config['sam'].get('framework')=='M2_DISTILL_SAM_V1':
+            from .config_identity import runtime_fingerprint
+            metadata['canonical_runtime_config_sha256']=runtime_fingerprint(self.config)
             metadata.update({k:self.config['sam'][k] for k in (
-                'sharpness_mode','search_direction','perturb_scope','rho',
-                'balanced_task_weight','balanced_kd_weight')})
+                'sharpness_mode','search_direction','perturb_scope','rho')})
+            metadata.update({k:self.config['sam'][k] for k in ('balanced_task_weight','balanced_kd_weight') if k in self.config['sam']})
             if self.config['sam'].get('sharpness_mode') == 'asam':
                 metadata['asam_eta'] = self.config['sam']['asam_eta']
             metadata.update(sharpness=self.config['sam'],

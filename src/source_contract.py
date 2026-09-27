@@ -12,7 +12,6 @@ def source_identity(stage='m2s',config_path=None,gbw=False,sam=False):
     if gbw:groups.append('gbw_family')
     if sam:groups.append('sam_extension')
     paths=set(p for g in groups for p in manifest[g]);paths.add('configs/source_contract_v2.json')
-    paths.add('configs/middle_teacher/fchain_margin_abv2_s0.json')
     result={p:hashlib.sha256((ROOT/p).read_bytes()).hexdigest() for p in sorted(paths)}
     if config_path:result[str(config_path)]=hashlib.sha256(Path(config_path).read_bytes()).hexdigest()
     return result

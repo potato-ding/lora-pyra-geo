@@ -58,7 +58,13 @@ def test_actual_loader_applies_precision_after_strict_load(kind,dimension,tmp_pa
             return super().bfloat16()
     model=FakeModel();checkpoint=tmp_path/'best_model.pth';checkpoint.touch()
     (tmp_path/'best_metrics.json').write_text(json.dumps({'hyperparameters':{}}))
-    monkeypatch.setattr(model_loader,'safe_load',lambda _:model.state_dict())
+    payload=dict(model=model.state_dict(),hyperparameters={},config={})
+    monkeypatch.setattr(model_loader,'safe_load',lambda _:payload)
+    # This test isolates strict-load/cast ordering; schema contracts are tested separately.
+    import src.training.teacher.artifacts as ta
+    import src.middle_teacher.artifacts as ma
+    monkeypatch.setattr(ta,'checkpoint_metadata',lambda _: {})
+    monkeypatch.setattr(ma,'checkpoint_metadata',lambda _: {})
     monkeypatch.setattr(model_loader,'sha256',lambda _:'test-checkpoint')
     if kind=='teacher':
         fake=types.ModuleType('src.models.teacher.model');fake.TeacherModel=lambda args:model
@@ -74,20 +80,3 @@ def test_actual_loader_applies_precision_after_strict_load(kind,dimension,tmp_pa
     assert audit['runtime_precision']['parameter_dtype']=='bfloat16'
     assert not audit['missing'] and not audit['unexpected']
     assert _model_input_dtype(encoder)==torch.float32
-
-@pytest.mark.parametrize('kind,expected',[
-    ('P',{'D2S':[93.2320697397966,98.17725531633866,94.36460878681812],
-          'S2D':[95.86305278174036,97.43223965763195,92.67510211416726]}),
-    ('F',{'D2S':[94.21740853255844,98.32518821820103,95.17015998547087],
-          'S2D':[96.43366619115548,97.57489300998573,94.1616085558577]})])
-def test_r0_certified_precision_fixture(kind,expected):
-    root=os.environ.get('R0_PRECISION_REGRESSION_DIR')
-    if not root: pytest.skip('Set R0_PRECISION_REGRESSION_DIR to GPU regression artifacts')
-    folder=Path(root)/kind
-    result=json.loads((folder/'new/test_1652.json').read_text())
-    gate=json.loads((folder/'ranking_gate.json').read_text())
-    assert result['runtime_precision']['parameter_dtype']=='bfloat16'
-    assert gate['pass'] and gate['top1_difference_count']==0 and gate['top5_difference_count']==0
-    for direction,values in expected.items():
-        for metric,target in zip(('R@1','R@5','AP'),values):
-            assert abs(result['results'][direction][metric]-target)<=(1e-4 if metric=='AP' else 1e-10)

@@ -14,7 +14,9 @@
   "infonce_weight": 1.0,
   "triplet_weight": 0.0,
   "same_domain_triplet_weight": 0.0,
-  "weak_sample4geo_weight": 0.0,
   "num_workers": 4,
-  "prob_flip": 0.5
+  "prob_flip": 0.5,
+  "experiment_id": "T0-INFONCE-R224",
+  "output_dir": "/home/dingyi/lora-pyra-geo/src/checkpoint/teacher/R224/T0-INFONCE-R224",
+  "weak_paired_cross_view_weight": 0.0
 }

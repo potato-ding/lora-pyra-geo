@@ -12,12 +12,14 @@ from src.evaluation.precision_contract import apply_runtime_precision
 def main(argv=None):
     p=argparse.ArgumentParser(description=__doc__)
     for name in ('middle-checkpoint','middle-run-config','student-pretrained','asset-output','train-root'):p.add_argument('--'+name,required=True)
-    p.add_argument('--seed',type=int,default=0);p.add_argument('--image-size',type=int,default=224)
+    p.add_argument('--seed',type=int,default=0);p.add_argument('--image-size',type=int,choices=(224,256),default=224)
     p.add_argument('--device',default='cuda:0');p.add_argument('--num-workers',type=int,default=4)
     args=p.parse_args(argv);output=Path(args.asset_output).resolve()
     if output.exists() or Path(str(output)+'.json').exists():raise FileExistsError(output)
     middle=json.loads(Path(args.middle_run_config).read_text())
-    if middle.get('sam',{}).get('enabled') or middle['data']['input_size']!=args.image_size:raise ValueError('New-chain Middle protocol mismatch')
+    if middle['data']['input_size']!=args.image_size:raise ValueError('Middle/input resolution mismatch')
+    from .middle_source import validate_e3_middle
+    validate_e3_middle(args.middle_checkpoint,args.middle_run_config,args.image_size)
     torch.manual_seed(args.seed)
     student=StudentModel(ckpt_path=args.student_pretrained).to(args.device)
     apply_runtime_precision(student,'student');encoder=EvaluationEncoder(student,512).eval()

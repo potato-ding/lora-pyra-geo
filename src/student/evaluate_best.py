@@ -36,7 +36,7 @@ def main(argv=None):
     if args.dataset in ("u1652","all") and not args.package_only:
         require_u1652_eval_batch_size(args.batch_size)
     run=Path(args.run_dir).resolve()
-    validate_training_complete(run)
+    cfg,best=validate_training_complete(run)
     if args.package_only:
         print(json.dumps(package_results(run),indent=2));return
     from src.evaluation.evaluate import main as unified_main
@@ -45,17 +45,9 @@ def main(argv=None):
     for dataset in datasets:
         if (run/NAMES[dataset][1]).exists():raise FileExistsError(run/NAMES[dataset][1])
     for dataset in datasets:
-        if dataset == "u1652":
-            from .canonical_selection import evaluate_checkpoint
-            config=json.loads((run/"run_config.json").read_text())
-            payload=evaluate_checkpoint(checkpoint,config.get("val_data_dir",str(ROOT/"data/U1652")),
-                                        args.num_workers,device=args.device)
-            if file_sha256(checkpoint)!=initial:raise RuntimeError("Checkpoint changed during evaluation")
-            publish_result(run,dataset,payload,initial)
-            continue
         with tempfile.TemporaryDirectory(prefix="student_formal_eval_") as temporary:
             unified_main(["--model-type","student","--checkpoint",str(checkpoint),
-                "--dataset",dataset,"--data-root",str(ROOT/"data"),"--device",args.device,"--batch-size",str(args.batch_size),
+                "--dataset",dataset,"--data-root",str(ROOT/"data"),"--u1652-dir",cfg.get('val_data_dir',str(ROOT/'data/U1652')),"--device",args.device,"--batch-size",str(args.batch_size),
                 "--num-workers",str(args.num_workers),"--output-dir",temporary])
             if file_sha256(checkpoint)!=initial:raise RuntimeError("Checkpoint changed during evaluation")
             payload=json.loads((Path(temporary)/NAMES[dataset][0]).read_text())

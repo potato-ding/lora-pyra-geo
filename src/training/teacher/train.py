@@ -1,11 +1,10 @@
 def enforce_formal_task_policy(args):
-    if args.training_stage not in ('auto', 'paired_cross_view'):
-        raise ValueError('Formal T0 supports paired_cross_view only')
-    if args.enable_identity_stage or args.enable_hard_pool_stage or args.triplet_weight != 0 or (args.same_domain_triplet_weight != 0) or (args.identity_preflight_batches != 0):
-        raise ValueError('Historical experimental objectives are not supported in formal T0')
-    if args.infonce_weight != 1.0:
-        raise ValueError('Formal T0 PairInfoNCE weight must be 1.0')
-    args.training_stage = 'paired_cross_view'
+    if args.training_stage != 'paired_cross_view' or args.infonce_weight != 1.0:
+        raise ValueError('Formal Teacher requires paired PairInfoNCE')
+    if args.img_size not in (224,256) or args.epochs != 10:
+        raise ValueError('Formal Teacher resolution/epoch contract changed')
+    if args.experiment_id != f'T0-INFONCE-R{args.img_size}' or not args.config:
+        raise ValueError('Formal Teacher requires a bound T224/T256 config')
 import sys
 import os
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..'))
@@ -15,22 +14,18 @@ os.environ['NO_ALBUMENTATIONS_UPDATE'] = '1'
 import time
 import torch
 import math
-import torch.nn.functional as F
 import torch.distributed as dist
 import gc
 import inspect
 import json
 from datetime import datetime
-from torch.utils.data import Dataset, DataLoader
 from src.training.teacher.pair_infonce import TeacherPairInfoNCE as infonce
 from src.utils.initdist import try_init_dist
 from src.utils.gather_features_and_labels_and_views import gather_features_and_labels_and_views
-from src.utils.train_eval_utils import getdist_1652_val_and_get_recall, select_model_descriptor
+from src.utils.train_eval_utils import select_model_descriptor
 from src.dataset.teacher.datasets import create_1652_teacher_train_dataloaders
-from src.dataset.teacher.val_dataloaders import build_1652_val_dataloaders
 from src.models.teacher.model import TeacherModel
 from src.training.teacher.args import parse_args
-from src.training.teacher.hparams import save_training_record
 from src.training.teacher.artifacts import is_formal_teacher, save_best_checkpoint, validate_training_artifacts
 from src.utils.teacher.optimizer import build_optimizer_and_scale
 from src.utils.teacher.scheduler import get_scheduler
@@ -179,32 +174,14 @@ def get_current_lr(optimizer, scheduler=None):
     return 0.0
 
 def get_training_mode_desc(dataset, args):
-    mode = getattr(dataset, 'sampling_mode', 'unknown')
-    if mode == 'paired_cross_view':
-        return (mode, f"{len(getattr(dataset, 'pairs', []))} sat-drone pairs, unique PID per global batch")
-    if mode in {'identity', 'identity_hard'}:
-        hard_text = ''
-        if mode == 'identity_hard':
-            hard_text = f", hard_pool_ids={len(getattr(dataset, 'hard_pool_paths', {}))}"
-        return (mode, f"{len(getattr(dataset, 'pids', []))} identities, sat_per_id={getattr(dataset, 'sat_per_id', 'unknown')}, drone_per_id={getattr(dataset, 'drone_per_id', 'unknown')}{hard_text}")
-    return (mode, 'PairedCrossView dataloader expected')
+    return 'paired_cross_view', f"{len(dataset.pairs)} sat-drone pairs, unique PID per global batch"
 
 def get_training_mode(epoch, args):
-    if not args.enable_identity_stage:
-        return 'paired_cross_view'
-    if epoch <= args.stage1_end_epoch:
-        return 'paired_cross_view'
-    if getattr(args, 'enable_hard_pool_stage', False) and epoch > args.stage2_end_epoch:
-        return 'identity_hard'
-    return 'identity'
+    return 'paired_cross_view'
 
 def select_epoch_dataloader(train_loaders, epoch, args):
-    requested_mode = get_training_mode(epoch, args)
-    if not isinstance(train_loaders, dict):
-        return (train_loaders, requested_mode, 'paired_cross_view')
-    if requested_mode in train_loaders:
-        return (train_loaders[requested_mode], requested_mode, requested_mode)
-    return (train_loaders['paired_cross_view'], requested_mode, 'paired_cross_view')
+    loader=train_loaders['paired_cross_view'] if isinstance(train_loaders,dict) else train_loaders
+    return loader,'paired_cross_view','paired_cross_view'
 
 def set_epoch_on_dataloader(dataloader, epoch):
     if hasattr(dataloader, 'dataset') and hasattr(dataloader.dataset, 'set_epoch'):
@@ -315,108 +292,30 @@ def print_distributed_descriptor_audit_once(local_feats, local_views, gathered_s
     print('=' * 80)
 
 def get_loss_weight_desc(args):
-    return f'tri={args.triplet_weight:g}(drone+sat) | infonce={args.infonce_weight:g} | identity={args.identity_loss_weight:g} | same_triplet={args.same_domain_triplet_weight:g} | weak_s4g={args.weak_paired_cross_view_weight:g}'
+    return 'infonce=1'
 
 def validate_loss_weights(args):
-    weight_names = ['triplet_weight', 'infonce_weight', 'identity_loss_weight', 'same_domain_triplet_weight', 'weak_paired_cross_view_weight']
-    for name in weight_names:
-        if getattr(args, name) < 0:
-            raise ValueError(f'{name} must be non-negative')
-    if args.triplet_margin <= 0:
-        raise ValueError('triplet_margin must be greater than 0')
-    if args.identity_temperature <= 0:
-        raise ValueError('identity_temperature must be greater than 0')
-    paired_cross_view_loss_enabled = args.triplet_weight > 0 or args.infonce_weight > 0
-    identity_loss_enabled = args.identity_loss_weight > 0 or args.same_domain_triplet_weight > 0 or (args.infonce_weight > 0 and args.weak_paired_cross_view_weight > 0)
-    will_use_paired_cross_view = not args.enable_identity_stage or args.stage1_end_epoch >= 1
-    will_use_identity = args.enable_identity_stage and args.epochs > args.stage1_end_epoch
-    if will_use_paired_cross_view and (not paired_cross_view_loss_enabled):
-        raise ValueError('all PairedCrossView loss weights are 0; training would have no gradient')
-    if will_use_identity and (not identity_loss_enabled):
-        raise ValueError('all identity-stage loss weights are 0; training would have no gradient')
+    if args.infonce_weight != 1.0:
+        raise ValueError('Formal Teacher PairInfoNCE weight must be 1')
 
 def validate_scheduler_args(args):
     if args.warmup_ratio < 0 or args.warmup_ratio >= 1:
         raise ValueError('warmup_ratio must be in [0, 1)')
 
-def validate_identity_training_args(args):
-    positive_int_args = ['identity_ids_per_batch', 'identity_drone_per_id', 'identity_sat_per_id']
-    for name in positive_int_args:
-        if getattr(args, name) <= 0:
-            raise ValueError(f'{name} must be greater than 0')
 
-def normalize_hard_pool_args(args):
-    if not getattr(args, 'enable_hard_pool_stage', False):
-        return
-    args.enable_identity_stage = True
-    if getattr(args, 'build_hard_pool_epoch', None) is None:
-        args.build_hard_pool_epoch = int(getattr(args, 'stage2_end_epoch', 0))
-    if args.hard_pool_topk <= 0:
-        raise ValueError('hard_pool_topk must be greater than 0')
-    if args.hard_pool_topneg_k <= 0:
-        raise ValueError('hard_pool_topneg_k must be greater than 0')
-    if args.stage2_end_epoch < args.stage1_end_epoch:
-        raise ValueError('stage2_end_epoch must be >= stage1_end_epoch')
-    if args.stage2_end_epoch <= 0 and (not args.load_hard_pool_path) and (not args.build_hard_pool_before_train):
-        raise ValueError('identity_hard from epoch 1 requires --load_hard_pool_path or --build_hard_pool_before_train')
 
-def normalize_explicit_training_stage(args):
-    stage = getattr(args, 'training_stage', 'auto')
-    if stage in (None, 'auto'):
-        return
-    if stage == 'paired_cross_view':
-        args.enable_identity_stage = False
-        return
-    if not getattr(args, 'init_checkpoint', None):
-        raise ValueError(f'--training_stage {stage} requires --init_checkpoint from the previous best_model.pth')
-    if stage == 'identity':
-        args.enable_identity_stage = True
-        args.stage1_end_epoch = 0
-        return
-    if stage == 'identity_hard':
-        args.enable_identity_stage = True
-        args.enable_hard_pool_stage = True
-        args.stage1_end_epoch = 0
-        args.stage2_end_epoch = 0
-        return
-    raise ValueError(f'unsupported training_stage: {stage}')
 
 def should_run_validation(cur_epoch, args):
-    if cur_epoch == args.epochs:
-        return True
-    mode = get_training_mode(cur_epoch, args)
-    if mode == 'paired_cross_view':
-        return True
-    if mode in {'identity', 'identity_hard'}:
-        stage_start = int(getattr(args, 'stage1_end_epoch', 10)) + 1
-        stage_end = args.epochs
-    else:
-        return cur_epoch % 5 == 0
-    if cur_epoch < stage_start:
-        return False
-    last_ten_start = max(stage_start, stage_end - 9)
-    if cur_epoch >= last_ten_start:
-        return cur_epoch % 2 == 0
-    return cur_epoch % 5 == 0
+    return True
 
 def build_scheduler_plan(train_loader, train_sampler, args, grad_accum_steps):
-    if isinstance(train_loader, dict):
-        total_train_batches = 0
-        mode_epoch_counts = {}
-        mode_batch_counts = {}
-        for epoch in range(1, args.epochs + 1):
-            (epoch_loader, _, effective_mode) = select_epoch_dataloader(train_loader, epoch, args)
-            total_train_batches += len(epoch_loader)
-            mode_epoch_counts[effective_mode] = mode_epoch_counts.get(effective_mode, 0) + 1
-            mode_batch_counts[effective_mode] = len(epoch_loader)
-        mode_parts = [f'{mode}_epochs={mode_epoch_counts[mode]}, batches/epoch={mode_batch_counts[mode]}' for mode in sorted(mode_epoch_counts.keys())]
-        mode_desc = 'multi_stage(' + '; '.join(mode_parts) + ')'
-    else:
-        total_train_batches = len(train_loader) * args.epochs
-        mode_desc = f'paired_cross_view_epochs={args.epochs}, batches/epoch={len(train_loader)}'
-    total_train_steps = math.ceil(total_train_batches / grad_accum_steps)
-    warmup_steps = int(total_train_steps * args.warmup_ratio)
-    return {'total_train_batches': total_train_batches, 'total_train_steps': total_train_steps, 'warmup_steps': warmup_steps, 'mode_desc': mode_desc}
+    loader=train_loader['paired_cross_view'] if isinstance(train_loader,dict) else train_loader
+    total_train_batches=len(loader)*args.epochs
+    total_train_steps=math.ceil(total_train_batches/grad_accum_steps)
+    warmup_steps=int(total_train_steps*args.warmup_ratio)
+    return dict(total_train_batches=total_train_batches,total_train_steps=total_train_steps,
+                warmup_steps=warmup_steps,
+                mode_desc=f'paired_cross_view_epochs={args.epochs}, batches/epoch={len(loader)}')
 
 def print_scheduler_plan(plan, args, grad_accum_steps):
     if is_main_process():
@@ -427,275 +326,40 @@ def clear_memory_cache():
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-class HardPoolImageDataset(Dataset):
 
-    def __init__(self, samples, transform):
-        self.samples = samples
-        self.transform = transform
 
-    def __len__(self):
-        return len(self.samples)
 
-    @staticmethod
-    def _read_rgb(path):
-        import cv2
-        img = cv2.imread(path)
-        if img is None:
-            raise RuntimeError(f'Failed to read image: {path}')
-        return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
-    def __getitem__(self, idx):
-        sample = self.samples[idx]
-        img = self._read_rgb(sample['image_path'])
-        if self.transform is not None:
-            img = self.transform(image=img)['image']
-        return (img, sample['pid'], sample['image_path'])
 
-def resolve_hard_pool_path(path_template, epoch):
-    if path_template is None:
-        path_template = 'outputs/hard_pool_epoch{epoch}.json'
-    return path_template.format(epoch=epoch)
 
-def get_hard_pool_reference_dataset(train_loaders):
-    if isinstance(train_loaders, dict):
-        for mode in ('identity_hard', 'identity', 'paired_cross_view'):
-            loader = train_loaders.get(mode)
-            dataset = getattr(loader, 'dataset', None)
-            if dataset is not None and hasattr(dataset, 'pids') and hasattr(dataset, 'satellite_dict') and hasattr(dataset, 'drone_dict'):
-                return dataset
-        return None
-    dataset = getattr(train_loaders, 'dataset', None)
-    if dataset is not None and hasattr(dataset, 'pids') and hasattr(dataset, 'satellite_dict') and hasattr(dataset, 'drone_dict'):
-        return dataset
-    return None
 
-def build_hard_pool_image_samples(dataset, view_name):
-    view_dict = dataset.satellite_dict if view_name == 'satellite' else dataset.drone_dict
-    samples = []
-    for pid in dataset.pids:
-        for path in view_dict.get(pid, []):
-            samples.append({'pid': str(pid), 'image_path': path})
-    return samples
 
-@torch.no_grad()
-def extract_hard_pool_features(model_engine, samples, transform, args, device, view_name):
-    feature_dataset = HardPoolImageDataset(samples, transform)
-    loader = DataLoader(feature_dataset, batch_size=max(1, int(getattr(args, 'batch_size', 1))), shuffle=False, num_workers=getattr(args, 'num_workers', 0), pin_memory=True)
-    records = []
-    num_batches = len(loader)
-    for (batch_idx, (imgs, pids, paths)) in enumerate(loader, start=1):
-        imgs = imgs.to(device, non_blocking=True).to(torch.bfloat16)
-        feats = model_engine(imgs)
-        if isinstance(feats, tuple):
-            feats = feats[1] if len(feats) > 1 else feats[0]
-        feats = F.normalize(feats.float(), p=2, dim=-1, eps=1e-06).cpu()
-        for (feat, pid, path) in zip(feats, pids, paths):
-            records.append({'pid': str(pid), 'image_path': path, 'feature': feat})
-        if is_main_process() and (batch_idx == 1 or batch_idx == num_batches or batch_idx % 100 == 0):
-            print(f'[HardPool] Extract {view_name} features | batch {batch_idx}/{num_batches} | images={len(records)}/{len(samples)}')
-    return records
 
-def compute_hard_pool_from_features(satellite_records, drone_records, args, epoch, model_source):
-    sat_features_by_pid = {}
-    for record in satellite_records:
-        sat_features_by_pid.setdefault(record['pid'], []).append(record['feature'])
-    satellite_proto = {}
-    for (pid, features) in sat_features_by_pid.items():
-        proto = torch.stack(features, dim=0).mean(dim=0)
-        satellite_proto[pid] = F.normalize(proto.float(), p=2, dim=-1, eps=1e-06)
-    proto_pids = sorted(satellite_proto.keys())
-    if len(proto_pids) < 2:
-        raise RuntimeError('hard_pool needs at least 2 IDs with satellite prototypes to compute negative similarity')
-    proto_mat = torch.stack([satellite_proto[pid] for pid in proto_pids], dim=0)
-    pid_to_proto_idx = {pid: idx for (idx, pid) in enumerate(proto_pids)}
-    hard_pool = {}
-    for record in drone_records:
-        pid = record['pid']
-        pos_idx = pid_to_proto_idx.get(pid)
-        if pos_idx is None:
-            continue
-        sims = proto_mat @ record['feature'].float()
-        pos_sim = sims[pos_idx].item()
-        neg_sims = sims.clone()
-        neg_sims[pos_idx] = -float('inf')
-        neg_count = min(int(args.hard_pool_topneg_k), neg_sims.numel() - 1)
-        if neg_count <= 0:
-            continue
-        (top_neg_sims, top_neg_indices) = torch.topk(neg_sims, k=neg_count, largest=True)
-        topk_neg_mean = top_neg_sims.mean().item()
-        top1_neg_sim = top_neg_sims[0].item()
-        top1_neg_pid = proto_pids[int(top_neg_indices[0].item())]
-        boundary_risk = topk_neg_mean - pos_sim
-        hard_pool.setdefault(pid, []).append({'pid': pid, 'image_path': record['image_path'], 'boundary_risk': float(boundary_risk), 'pos_sim': float(pos_sim), 'topk_neg_mean': float(topk_neg_mean), 'top1_neg_pid': top1_neg_pid, 'top1_neg_sim': float(top1_neg_sim)})
-    topk = int(args.hard_pool_topk)
-    id_risk = {}
-    for (pid, samples) in list(hard_pool.items()):
-        samples.sort(key=lambda item: item['boundary_risk'], reverse=True)
-        kept_samples = samples[:topk]
-        hard_pool[pid] = kept_samples
-        top_risks = [item['boundary_risk'] for item in kept_samples[:3]]
-        if top_risks:
-            id_risk[pid] = float(sum(top_risks) / len(top_risks))
-    return {'meta': {'epoch': epoch, 'model_source': model_source, 'hard_pool_topk': int(args.hard_pool_topk), 'hard_pool_topneg_k': int(args.hard_pool_topneg_k)}, 'hard_pool': hard_pool, 'id_risk': id_risk}
 
-def save_hard_pool_payload(path, payload):
-    save_dir = os.path.dirname(path)
-    if save_dir:
-        os.makedirs(save_dir, exist_ok=True)
-    with open(path, 'w', encoding='utf-8') as f:
-        json.dump(_json_safe_value(payload), f, indent=2, ensure_ascii=False)
 
-def load_hard_pool_payload(path):
-    with open(path, 'r', encoding='utf-8') as f:
-        payload = json.load(f)
-    if isinstance(payload, dict) and 'hard_pool' in payload:
-        hard_pool = payload.get('hard_pool', {})
-        id_risk = payload.get('id_risk', {})
-        meta = payload.get('meta', {})
-    else:
-        hard_pool = payload
-        id_risk = {}
-        meta = {}
-    if not isinstance(hard_pool, dict):
-        raise ValueError(f'invalid hard_pool file format: {path}')
-    return {'meta': meta, 'hard_pool': hard_pool, 'id_risk': id_risk}
 
-def summarize_hard_pool_payload(payload):
-    hard_pool = payload.get('hard_pool', {})
-    id_risk = payload.get('id_risk', {})
-    covered_ids = sum((1 for samples in hard_pool.values() if samples))
-    sample_count = sum((len(samples) for samples in hard_pool.values()))
-    avg_samples = sample_count / covered_ids if covered_ids > 0 else 0.0
-    risk_values = [float(value) for value in id_risk.values()]
-    if risk_values:
-        risk_mean = sum(risk_values) / len(risk_values)
-        risk_max = max(risk_values)
-        risk_min = min(risk_values)
-    else:
-        risk_mean = risk_max = risk_min = 0.0
-    top_ids = sorted(id_risk.items(), key=lambda item: float(item[1]), reverse=True)[:10]
-    top_ids_text = ', '.join((f'{pid}:{float(risk):.4f}' for (pid, risk) in top_ids))
-    return {'covered_ids': covered_ids, 'avg_samples': avg_samples, 'risk_mean': risk_mean, 'risk_max': risk_max, 'risk_min': risk_min, 'top_ids_text': top_ids_text or 'none'}
 
-def print_hard_pool_summary(payload, path, prefix='[HardPool]'):
-    summary = summarize_hard_pool_payload(payload)
-    print(f"{prefix} covered_ids={summary['covered_ids']} | avg_hard_samples_per_id={summary['avg_samples']:.2f} | risk_mean={summary['risk_mean']:.4f} | risk_max={summary['risk_max']:.4f} | risk_min={summary['risk_min']:.4f}")
-    print(f"{prefix} top10_hardest_ids={summary['top_ids_text']}")
-    print(f'{prefix} path={path}')
 
-def apply_hard_pool_to_train_loaders(train_loaders, hard_pool):
-    updated = 0
-    loaders = train_loaders.values() if isinstance(train_loaders, dict) else [train_loaders]
-    for loader in loaders:
-        dataset = getattr(loader, 'dataset', None)
-        if dataset is not None and hasattr(dataset, 'set_hard_pool'):
-            dataset.set_hard_pool(hard_pool)
-            updated += 1
-    return updated
 
-def ensure_identity_hard_ready(epoch, stage_mode, effective_mode, dataloader, args, hard_pool_loaded):
-    pass
-HARD_SAMPLING_STAT_KEYS = ('hard_requested', 'hard_from_pool', 'hard_fallback', 'missing_hard_pool_ids', 'short_hard_pool_ids', 'random_requested')
 
-def load_initial_hard_pool_if_needed(args, train_loaders):
-    load_path = getattr(args, 'load_hard_pool_path', None)
-    if not load_path:
-        return False
-    if not getattr(args, 'enable_identity_stage', False):
-        if is_main_process():
-            print('[HardPool] load_hard_pool_path is set but identity stage is disabled; skip loading')
-        return False
-    payload = load_hard_pool_payload(load_path)
-    updated = apply_hard_pool_to_train_loaders(train_loaders, payload['hard_pool'])
-    if is_main_process():
-        print_hard_pool_summary(payload, load_path, prefix='[HardPoolLoad]')
-        print(f'[HardPoolLoad] applied_to_datasets={updated}')
-    return True
-
-def build_initial_hard_pool_if_needed(model_engine, train_loaders, args, device, hard_pool_loaded):
-    if not getattr(args, 'build_hard_pool_before_train', False):
-        return hard_pool_loaded
-    if not getattr(args, 'enable_identity_stage', False) or not getattr(args, 'enable_hard_pool_stage', False):
-        raise ValueError('--build_hard_pool_before_train requires identity and hard_pool stages')
-    if hard_pool_loaded:
-        if is_main_process():
-            print('[HardPool] build_hard_pool_before_train is set, but hard_pool is already loaded; skip building')
-        return True
-    pool_epoch = int(getattr(args, 'build_hard_pool_epoch', 0))
-    if pool_epoch < 0:
-        pool_epoch = 0
-    if is_main_process():
-        print(f'[HardPool] pre-train build requested | save_epoch_label={pool_epoch}')
-    return build_save_and_apply_hard_pool(model_engine, train_loaders, args, pool_epoch, device)
-
-def should_build_hard_pool(epoch, args, hard_pool_loaded):
-    return getattr(args, 'enable_identity_stage', False) and getattr(args, 'enable_hard_pool_stage', False) and (not hard_pool_loaded) and (epoch == int(getattr(args, 'build_hard_pool_epoch', -1)))
-
-def build_hard_pool_with_model(model_engine, train_loaders, args, epoch, device):
-    from src.dataset.teacher.transforms import get_paired_cross_view_val_transforms
-    reference_dataset = get_hard_pool_reference_dataset(train_loaders)
-    if reference_dataset is None:
-        raise RuntimeError('cannot build hard_pool without a dataset containing pids/satellite_dict/drone_dict')
-    val_transform = get_paired_cross_view_val_transforms(img_size=[args.img_size, args.img_size], mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    sat_samples = build_hard_pool_image_samples(reference_dataset, 'satellite')
-    drone_samples = build_hard_pool_image_samples(reference_dataset, 'drone')
-    model_source = 'current'
-    was_training = getattr(model_engine, 'training', True)
-    try:
-        model_engine.eval()
-        with torch.no_grad():
-            satellite_records = extract_hard_pool_features(model_engine, sat_samples, val_transform, args, device, view_name='satellite')
-            drone_records = extract_hard_pool_features(model_engine, drone_samples, val_transform, args, device, view_name='drone')
-            payload = compute_hard_pool_from_features(satellite_records, drone_records, args, epoch, model_source=model_source)
-    finally:
-        if was_training:
-            model_engine.train()
-        else:
-            model_engine.eval()
-        clear_memory_cache()
-    return payload
-
-def build_save_and_apply_hard_pool(model_engine, train_loaders, args, epoch, device):
-    save_path = resolve_hard_pool_path(args.save_hard_pool_path, epoch)
-    if is_main_process():
-        print(f'[HardPool] Build start | epoch={epoch} | topk={args.hard_pool_topk} | topneg_k={args.hard_pool_topneg_k}')
-        payload = build_hard_pool_with_model(model_engine, train_loaders, args, epoch, device)
-        save_hard_pool_payload(save_path, payload)
-        print_hard_pool_summary(payload, save_path)
-    if dist.is_available() and dist.is_initialized():
-        dist.barrier()
-    payload = load_hard_pool_payload(save_path)
-    updated = apply_hard_pool_to_train_loaders(train_loaders, payload['hard_pool'])
-    if is_main_process():
-        print(f'[HardPool] applied_to_datasets={updated}')
-    return True
 
 def unpack_training_batch(batch, training_mode, device):
-    if training_mode == 'paired_cross_view':
-        (sat_tensors, drone_tensors, labels, pids) = batch
-        if sat_tensors.ndim == 4:
-            sat_tensors = sat_tensors.unsqueeze(1)
-        if drone_tensors.ndim == 4:
-            drone_tensors = drone_tensors.unsqueeze(1)
-        sat_views_per_id = sat_tensors.size(1)
-        drone_views_per_id = drone_tensors.size(1)
-        sat_imgs = sat_tensors.reshape(-1, *sat_tensors.shape[2:])
-        drone_imgs = drone_tensors.reshape(-1, *drone_tensors.shape[2:])
-        imgs = torch.cat([sat_imgs, drone_imgs], dim=0).to(device).to(torch.bfloat16)
-        sat_labels = labels.repeat_interleave(sat_views_per_id)
-        drone_labels = labels.repeat_interleave(drone_views_per_id)
-        labels = torch.cat([sat_labels, drone_labels], dim=0).to(device)
-        num_sat = sat_imgs.size(0)
-        num_drone = drone_imgs.size(0)
-        views = torch.cat([torch.zeros(num_sat, dtype=torch.long), torch.ones(num_drone, dtype=torch.long)]).to(device)
-        meta = {'pids': pids, 'sat_views_per_id': sat_views_per_id, 'drone_views_per_id': drone_views_per_id, 'raw_satellite_tensor': sat_tensors, 'raw_drone_tensor': drone_tensors}
-        return (imgs, labels, views, meta)
-    if training_mode in {'identity', 'identity_hard'}:
-        imgs = batch['images'].to(device).to(torch.bfloat16)
-        labels = batch['labels'].to(device)
-        views = batch['view_type'].to(device)
-        return (imgs, labels, views, batch)
-    raise ValueError(f'unsupported training_mode: {training_mode}')
+    if training_mode != 'paired_cross_view':
+        raise ValueError('Teacher requires paired cross-view batches')
+    sat_tensors,drone_tensors,labels,pids=batch
+    if sat_tensors.ndim == 4:sat_tensors=sat_tensors.unsqueeze(1)
+    if drone_tensors.ndim == 4:drone_tensors=drone_tensors.unsqueeze(1)
+    sat_views_per_id=sat_tensors.size(1);drone_views_per_id=drone_tensors.size(1)
+    sat_imgs=sat_tensors.reshape(-1,*sat_tensors.shape[2:])
+    drone_imgs=drone_tensors.reshape(-1,*drone_tensors.shape[2:])
+    imgs=torch.cat([sat_imgs,drone_imgs],dim=0).to(device).to(torch.bfloat16)
+    labels=torch.cat([labels.repeat_interleave(sat_views_per_id),
+                      labels.repeat_interleave(drone_views_per_id)],dim=0).to(device)
+    views=torch.cat([torch.zeros(sat_imgs.size(0),dtype=torch.long),
+                     torch.ones(drone_imgs.size(0),dtype=torch.long)]).to(device)
+    meta=dict(pids=pids,sat_views_per_id=sat_views_per_id,drone_views_per_id=drone_views_per_id,
+              raw_satellite_tensor=sat_tensors,raw_drone_tensor=drone_tensors)
+    return imgs,labels,views,meta
 
 def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=None, ds_config=None, init_checkpoint_report=None):
     local_rank = int(os.environ.get('LOCAL_RANK', 0)) if 'LOCAL_RANK' in os.environ else 0
@@ -704,23 +368,16 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
     import deepspeed
     (model_engine, optimizer, _, scheduler) = deepspeed.initialize(model=model, optimizer=optimizer, lr_scheduler=scheduler, config=ds_config if ds_config is not None else args.deepspeed_config)
     runtime_dtype_audit_printed = False
-    identity_precision_audit_printed = False
-    identity_batch_contract_printed = False
     distributed_descriptor_audit_printed = False
     if is_main_process():
         print('[GradientAudit] exact global NaN/Inf gradient element counts are unavailable without gathering ZeRO-2 partitioned gradients; fields will be reported as unavailable rather than fabricated.')
     save_dir = get_save_pth(args)
-    if getattr(args, 'save_hard_pool_path', None) is None:
-        args.save_hard_pool_path = os.path.join(save_dir, 'hard_pool_epoch{epoch}.json')
     if is_main_process() and not args.smoke_test:
         os.makedirs(save_dir, exist_ok=True)
         if is_formal_teacher(args):
             validate_training_artifacts(save_dir, require_best=False)
-        save_training_record(save_dir=save_dir, args=args, validation_history=[], best_metrics=None, last_completed_epoch=0)
         print(f'[Checkpoint] Save directory: {save_dir}')
     distributed_barrier_with_log('[Checkpoint] initial training record saved', local_rank)
-    hard_pool_loaded = load_initial_hard_pool_if_needed(args, dataloader)
-    hard_pool_loaded = build_initial_hard_pool_if_needed(model_engine, dataloader, args, amp_device, hard_pool_loaded)
     best_r1_sum = -1.0
     best_epoch = 0
     best_metrics = None
@@ -729,7 +386,6 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
     for epoch in range(1, args.epochs + 1):
         stage_mode = get_training_mode(epoch, args)
         (epoch_dataloader, _, effective_mode) = select_epoch_dataloader(train_loaders, epoch, args)
-        ensure_identity_hard_ready(epoch, stage_mode, effective_mode, epoch_dataloader, args, hard_pool_loaded)
         set_epoch_on_dataloader(epoch_dataloader, epoch)
         model_engine.train()
         if torch.cuda.is_available():
@@ -737,20 +393,19 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
         (mode_name, mode_desc) = get_training_mode_desc(epoch_dataloader.dataset, args)
         num_batches = len(epoch_dataloader)
         world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
-        local_pid_batch = args.batch_size if effective_mode == 'paired_cross_view' else getattr(args, 'identity_ids_per_batch', args.batch_size)
+        local_pid_batch = args.batch_size
         epoch_start_time = time.time()
         epoch_validation_metrics = None
         nan_loss_count = 0
         inf_loss_count = 0
         last_grad_norm = None
         last_grad_norm_source = 'unavailable'
-        loss_log_keys = ('total', 'd2s_loss', 's2d_loss', 'tri_drone', 'tri_sat', 'infonce', 'cross_id', 'same_triplet', 'weak_s4g')
+        loss_log_keys = ('total', 'd2s_loss', 's2d_loss', 'infonce')
         loss_sums = {key: 0.0 for key in loss_log_keys}
         loss_counts = {key: 0 for key in loss_log_keys}
         epoch_precision_checked = False
         if is_main_process():
-            fallback_note = ' | fallback_to_paired_cross_view=True' if stage_mode != effective_mode else ''
-            print(f'[TrainMode] Epoch {epoch}/{args.epochs} | mode={stage_mode} | effective_mode={effective_mode}{fallback_note}')
+            print(f'[TrainMode] Epoch {epoch}/{args.epochs} | mode=paired_cross_view')
             print(f'[Sampler] Epoch {epoch}/{args.epochs} | mode={effective_mode} | {get_sampler_debug_desc(epoch_dataloader)}')
             print(f'[Train] Epoch {epoch}/{args.epochs} start | mode={mode_name} ({mode_desc}) | batches={num_batches} | local_pid_batch={local_pid_batch} | global_pid_batch={local_pid_batch * world_size} | loss_weights={get_loss_weight_desc(args)}')
         for (batch_idx, batch) in enumerate(epoch_dataloader):
@@ -768,25 +423,21 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
             if is_main_process() and (not distributed_descriptor_audit_printed):
                 print_distributed_descriptor_audit_once(final_feats, views, sat_feats, drone_feats)
                 distributed_descriptor_audit_printed = True
-            if effective_mode == 'paired_cross_view':
-                if args.infonce_weight > 0:
-                    logit_scale = get_logit_scale(model_engine)
-                    infonce_loss = infonce_criterion(sat_feats, drone_feats, logit_scale)
-                    total_infonce_loss = args.infonce_weight * infonce_loss
-                    loss_terms.append(total_infonce_loss)
-                    loss_values['infonce'] = total_infonce_loss.item()
-                    if infonce_criterion.last_loss_d2s is not None and infonce_criterion.last_loss_s2d is not None:
-                        directional_losses = torch.stack([infonce_criterion.last_loss_d2s, infonce_criterion.last_loss_s2d]).float().cpu().tolist()
-                        loss_values['d2s_loss'] = directional_losses[0]
-                        loss_values['s2d_loss'] = directional_losses[1]
-            else:
-                raise ValueError(f'unsupported effective_mode: {effective_mode}')
+            logit_scale = get_logit_scale(model_engine)
+            infonce_loss = infonce_criterion(sat_feats, drone_feats, logit_scale)
+            total_infonce_loss = args.infonce_weight * infonce_loss
+            loss_terms.append(total_infonce_loss)
+            loss_values['infonce'] = total_infonce_loss.item()
+            if infonce_criterion.last_loss_d2s is not None and infonce_criterion.last_loss_s2d is not None:
+                directional_losses = torch.stack([infonce_criterion.last_loss_d2s, infonce_criterion.last_loss_s2d]).float().cpu().tolist()
+                loss_values['d2s_loss'] = directional_losses[0]
+                loss_values['s2d_loss'] = directional_losses[1]
             loss = sum(loss_terms) if loss_terms else None
             if torch.is_tensor(loss):
-                if effective_mode == 'paired_cross_view' and (not runtime_dtype_audit_printed):
+                if not runtime_dtype_audit_printed:
                     print_runtime_dtype_audit_once(model_engine, infonce_criterion, batch_meta, final_feats, sat_feats, drone_feats, loss)
                     runtime_dtype_audit_printed = True
-                if effective_mode == 'paired_cross_view' and (not epoch_precision_checked):
+                if not epoch_precision_checked:
                     enforce_epoch_first_batch_precision(model_engine, infonce_criterion, final_feats, loss)
                     epoch_precision_checked = True
                 model_engine.backward(loss)
@@ -843,14 +494,13 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                 elapsed_min = (time.time() - epoch_start_time) / 60.0
                 lr = get_current_lr(optimizer, scheduler)
                 debug_values = get_model_debug_values(model_engine)
-                metric_keys = ('d2s_loss', 's2d_loss', 'tri_drone', 'tri_sat', 'infonce') if effective_mode == 'paired_cross_view' else ('cross_id', 'same_triplet', 'weak_s4g')
+                metric_keys = ('d2s_loss', 's2d_loss', 'infonce')
                 metric_parts = [format_optional_metric(key, loss_values.get(key)) for key in metric_keys]
                 metric_parts = [part for part in metric_parts if part is not None]
                 metric_text = ' | '.join(metric_parts) if metric_parts else 'loss_parts=none'
                 memory = gpu_memory_snapshot()
                 grad_norm_text = f'{last_grad_norm:.6g}' if last_grad_norm is not None else 'unavailable'
                 print(f"[Train] Epoch {epoch}/{args.epochs} | mode={mode_name} | batch {step}/{num_batches} ({progress:.1f}%) | loss={loss_item:.4f} avg={avg_total:.4f} | {metric_text} | lr={lr:.2e} | scale={debug_values.get('scale', 0.0):.3f} | grad_norm={grad_norm_text} | grad_norm_source={last_grad_norm_source} | gpu_allocated={memory['allocated_gib']:.3f}GiB | gpu_reserved={memory['reserved_gib']:.3f}GiB | gpu_peak_allocated={memory['peak_allocated_gib']:.3f}GiB | nan_loss_count={nan_loss_count} | inf_loss_count={inf_loss_count} | nan_gradient_count=unavailable | inf_gradient_count=unavailable | elapsed={elapsed_min:.1f}m")
-        hard_sampler_summary = None
         if is_main_process():
             elapsed_min = (time.time() - epoch_start_time) / 60.0
             memory = gpu_memory_snapshot()
@@ -860,20 +510,6 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                     avg_parts.append(f'{key}_avg={loss_sums[key] / loss_counts[key]:.4f}')
             avg_text = ' | '.join(avg_parts) if avg_parts else 'no_update'
             print(f"[Train] Epoch {epoch}/{args.epochs} done | mode={mode_name} | updates={loss_counts['total']} | {avg_text} | nan_loss_count={nan_loss_count} | inf_loss_count={inf_loss_count} | nan_gradient_count=unavailable | inf_gradient_count=unavailable | peak_gpu_allocated={memory['peak_allocated_gib']:.3f}GiB | time={elapsed_min:.1f}m")
-            if hard_sampler_summary is not None:
-                print(f'[HardPoolSampler] Epoch {epoch} | {hard_sampler_summary}')
-            if not is_formal_teacher(args):
-                last_state = collect_teacher_delta_state(model_engine)
-                if teacher_verbose_eval_log():
-                    rank_log(f'[Checkpoint] last_model.pth save start | epoch={epoch}')
-                torch.save(last_state, os.path.join(save_dir, 'last_model.pth'))
-                if teacher_verbose_eval_log():
-                    rank_log(f'[Checkpoint] last_model.pth save done | epoch={epoch}')
-                    rank_log(f'[Checkpoint] best_metrics.json save start | epoch={epoch}')
-                save_training_record(save_dir=save_dir, args=args, validation_history=validation_history, best_metrics=best_metrics, last_completed_epoch=epoch)
-                if teacher_verbose_eval_log():
-                    rank_log(f'[Checkpoint] best_metrics.json save done | epoch={epoch}')
-                    print(f'[Checkpoint] Saved last_model.pth | epoch={epoch}', flush=True)
         cur_epoch = epoch
         distributed_barrier_with_log(f'[Checkpoint] epoch={cur_epoch} after epoch artifact handling', local_rank)
         if val_loaders is not None and should_run_validation(cur_epoch, args):
@@ -910,26 +546,14 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                     best_metrics = current_metrics
                     if verbose_eval:
                         rank_log(f'[Checkpoint] best_model.pth save start | epoch={cur_epoch}')
-                    from src.evaluation.precision_contract import selection_signature, flat_selection_metrics
+                    from src.evaluation.precision_contract import selection_signature
                     teacher_model=get_base_model(model_engine)
                     signature=selection_signature(teacher_model,'teacher',args.img_size)
-                    if is_formal_teacher(args):
-                        save_best_checkpoint(teacher_model, args, current_metrics, save_dir,
-                            dist.get_world_size() if dist.is_initialized() else 1)
-                    else:
-                        torch.save(dict(model={n:t.detach().cpu() for n,t in teacher_model.state_dict().items()},
-                            precision_signature=signature,
-                            selection_metrics=dict(flat_selection_metrics(current_metrics), R1_sum=r1_sum),
-                            selection_protocol=selection_metadata(args.img_size)),
-                            os.path.join(save_dir,'best_model.pth'))
+                    save_best_checkpoint(teacher_model, args, current_metrics, save_dir,
+                        dist.get_world_size() if dist.is_initialized() else 1)
                     current_metrics['precision_signature']=signature
                     if verbose_eval:
                         rank_log(f'[Checkpoint] best_model.pth save done | epoch={cur_epoch}')
-                if verbose_eval and not is_formal_teacher(args):
-                    rank_log(f'[Checkpoint] best_metrics.json save start | epoch={cur_epoch} after eval')
-                save_training_record(save_dir=save_dir, args=args, validation_history=validation_history, best_metrics=best_metrics, last_completed_epoch=cur_epoch)
-                if verbose_eval and not is_formal_teacher(args):
-                    rank_log(f'[Checkpoint] best_metrics.json save done | epoch={cur_epoch} after eval')
                 print(f'[Eval] Epoch {cur_epoch}/{args.epochs} done | D2S R@1={d2s_r1:.2f} R@5={d2s_r5:.2f} R@10={d2s_r10:.2f} mAP={d2s_map:.2f} | S2D R@1={s2d_r1:.2f} R@5={s2d_r5:.2f} R@10={s2d_r10:.2f} mAP={s2d_map:.2f} | R@1_sum={r1_sum:.2f} | best_R@1_sum={best_r1_sum:.2f}@epoch{best_epoch}')
                 if is_best and verbose_eval:
                     print(f'[Checkpoint] Saved best_model.pth | epoch={cur_epoch} | D2S_R@1={d2s_r1:.2f} | S2D_R@1={s2d_r1:.2f} | R@1_sum={r1_sum:.2f}')
@@ -949,8 +573,6 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
             finally:
                 model_engine.train()
                 clear_memory_cache()
-        if should_build_hard_pool(epoch, args, hard_pool_loaded):
-            hard_pool_loaded = build_save_and_apply_hard_pool(model_engine, train_loaders, args, epoch, amp_device)
         if is_main_process():
             memory = gpu_memory_snapshot()
             avg_total = loss_sums['total'] / max(loss_counts['total'], 1)
@@ -969,7 +591,7 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
             print(f'validation metrics={validation_text}')
             print(f'current best metric (D2S_R@1+S2D_R@1)={best_metric_text}')
             print(f'current best epoch={best_epoch_text}')
-            print(f"current checkpoint path={os.path.join(save_dir, 'best_model.pth' if is_formal_teacher(args) else 'last_model.pth')}")
+            print(f"current checkpoint path={os.path.join(save_dir, 'best_model.pth')}")
             print(f"current best checkpoint path={os.path.join(save_dir, 'best_model.pth')}")
             print('=' * 80)
         distributed_barrier_with_log(f'[Train] epoch={epoch} end', local_rank)
@@ -1003,12 +625,8 @@ def print_deepspeed_batch_config(ds_config, args, world_size):
     grad_accum_steps = ds_config['gradient_accumulation_steps']
     global_pid_batch = ds_config['train_batch_size']
     active_stage = get_training_mode(1, args)
-    if active_stage in {'identity', 'identity_hard'}:
-        drone_views_per_pid = int(args.identity_drone_per_id)
-        satellite_views_per_pid = int(args.identity_sat_per_id)
-    else:
-        drone_views_per_pid = 1
-        satellite_views_per_pid = 1
+    drone_views_per_pid = 1
+    satellite_views_per_pid = 1
     total_views_per_pid = drone_views_per_pid + satellite_views_per_pid
     micro_image_batch = micro_pid_batch * total_views_per_pid
     global_image_batch = global_pid_batch * total_views_per_pid
@@ -1020,11 +638,8 @@ def main():
     args = parse_args()
     enforce_formal_task_policy(args)
     try:
-        normalize_explicit_training_stage(args)
-        normalize_hard_pool_args(args)
         validate_loss_weights(args)
         validate_scheduler_args(args)
-        validate_identity_training_args(args)
         (device, rank, local_rank, world_size) = try_init_dist()
         if not args.smoke_test:
             resolve_shared_output_dir(args, get_save_pth, is_main_process())
@@ -1036,7 +651,7 @@ def main():
         print_deepspeed_batch_config(ds_config, args, world_size)
         (train_dataset, train_sampler, train_loader) = create_1652_teacher_train_dataloaders(args)
         val_loaders = None
-        if args.identity_preflight_batches == 0 and not args.smoke_test:
+        if not args.smoke_test:
             val_loaders = True  # Full loaders are built only inside rank0 selection.
         model = TeacherModel(args)
         model = model.to(device)

@@ -19,13 +19,9 @@ class MiddleTeacherModel(nn.Module):
         checkpoint_bridge_name="_".join(("layer","semantic","projectors"))
         setattr(self,checkpoint_bridge_name,None)
         if bridge:
-            historical=dict(bridge)
-            if historical["mode"]=="adaptive_bridge_v1":
-                from .losses.adaptive_bridge_v1 import AdaptiveBridgeBank
-                layers=historical["teacher_layers"]; priors=historical["gate_init_values"]
-                setattr(self,checkpoint_bridge_name,AdaptiveBridgeBank(historical["teacher_dim"],historical["middle_dim"],layers,[priors[str(x)] for x in layers]))
-            elif historical["mode"]=="adaptive_bridge_v2": setattr(self,checkpoint_bridge_name,AdaptiveBridgeV2Bank(historical))
-            else: raise ValueError("unsupported bridge mode")
+            if bridge["mode"]!="adaptive_bridge_v2":
+                raise ValueError("E3 requires adaptive_bridge_v2")
+            setattr(self,checkpoint_bridge_name,AdaptiveBridgeV2Bank(bridge))
     def forward(self,images,return_layer_features=False,return_local_patches=False):
         if return_layer_features: return self.forward_with_layer_features(images,return_local_patches)
         descriptor=self.backbone(images); self._runtime_forward_audit=dict(self.backbone._runtime_forward_audit or {})
@@ -33,24 +29,15 @@ class MiddleTeacherModel(nn.Module):
     def forward_with_layer_features(self,images,return_local_patches=False):
         bridge_bank=getattr(self,"_".join(("layer","semantic","projectors")))
         if bridge_bank is None: raise RuntimeError("bridge projectors are not registered")
-        target=int(self.bridge_config["middle_target_layer"]); captured={}; handle=None
         if return_local_patches:
-            core=self.backbone.model; storage=int(core.n_storage_tokens)
-            def capture(_module,_inputs,output):
-                patch=output[:,storage+1:]
-                captured["patch"]=(core.patch_norm(patch) if getattr(core,"untie_cls_and_patch_norms",False) else core.norm(patch))
-            handle=core.blocks[9].register_forward_hook(capture)
-        try: descriptor,features,_=self.backbone.forward_with_middle_layers(images,middle_layers=[target])
-        finally:
-            if handle is not None: handle.remove()
-        result={"final_descriptor":descriptor,"middle_features":features}
-        if return_local_patches: result["middle_patches"]=captured["patch"]
-        return result
+            raise ValueError("Local patch representation is not part of E3")
+        target=int(self.bridge_config["middle_target_layer"])
+        descriptor,features,_=self.backbone.forward_with_middle_layers(images,middle_layers=[target])
+        return {"final_descriptor":descriptor,"middle_features":features}
 
 def build_middle_teacher(config,load_foundation=True):
-    bridge=None
-    for name in ("adaptive_bridge_v2","adaptive_bridge_v1"):
-        component=config["distillation"].get(name,{})
-        if component.get("enabled"): bridge=component; break
+    bridge=config["distillation"].get("adaptive_bridge_v2")
+    if config["distillation"].get("adaptive_bridge_v1",{}).get("enabled"):
+        raise ValueError("Historical adaptive_bridge_v1 is not a final Middle representation")
     return MiddleTeacherModel(config["initialization"]["path"] if load_foundation else None,
         0.07,config["trainability"],bridge)

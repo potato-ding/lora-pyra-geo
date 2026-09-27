@@ -1,11 +1,13 @@
 """Self-contained formal Teacher checkpoints; historical sidecars stay legacy."""
 from pathlib import Path
+import hashlib
+import json
 import torch
-from src.evaluation.precision_contract import selection_signature, flat_selection_metrics, VERSION
+from src.evaluation.precision_contract import selection_signature, flat_selection_metrics
 from src.training.teacher.certified_selection import selection_metadata
 
 SCHEMA = 'TEACHER_BEST_MODEL_V2'
-FORMAL_EXPERIMENTS = {'T0-INFONCE-R224', 'T0-INFONCE-R256', 'T0-INFONCE-R384', 'T0-INFONCE-R448'}
+FORMAL_EXPERIMENTS = {'T0-INFONCE-R224', 'T0-INFONCE-R256'}
 
 def is_formal_teacher(args):
     return getattr(args, 'experiment_id', None) in FORMAL_EXPERIMENTS
@@ -28,10 +30,15 @@ def save_best_checkpoint(model, args, metrics, directory, training_world_size):
     metadata = dict(protocol, experiment_id=args.experiment_id, best_epoch=metrics['epoch'],
                     best_score=score, training_world_size=int(training_world_size),
                     selection_metrics=refs)
+    formal_config = json.loads(Path(args.config).read_text()) if getattr(args, 'config', None) else None
+    if formal_config is not None:
+        encoded=json.dumps(formal_config,sort_keys=True,separators=(',',':'),ensure_ascii=False).encode()
+        metadata['config_sha256']=hashlib.sha256(encoded).hexdigest()
     payload = dict(artifact_schema=SCHEMA, model={n:t.detach().cpu() for n,t in model.state_dict().items()},
                    precision_signature=signature, selection_metrics=refs,
                    selection_protocol=protocol, metadata=metadata,
                    hyperparameters=dict(vars(args)))
+    if formal_config is not None:payload['config']=formal_config
     torch.save(payload, Path(directory)/'best_model.pth')
     return metadata
 
@@ -56,4 +63,10 @@ def checkpoint_metadata(payload):
         raise ValueError('Conflicting Teacher checkpoint metadata')
     if payload.get('precision_signature',{}).get('image_size') != metadata['image_size']:
         raise ValueError('Teacher checkpoint image size mismatch')
+    if 'config_sha256' in metadata:
+        config=payload.get('config')
+        if not isinstance(config,dict):raise ValueError('Teacher config identity missing')
+        encoded=json.dumps(config,sort_keys=True,separators=(',',':'),ensure_ascii=False).encode()
+        if hashlib.sha256(encoded).hexdigest()!=metadata['config_sha256']:
+            raise ValueError('Teacher config SHA mismatch')
     return metadata
