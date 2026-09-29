@@ -1,4 +1,4 @@
-"""Formal Top128/Random32 supervision and canonical E3 Top source."""
+"""TSD/ADSD Top128 source and ADSD Random32 supervision."""
 import json
 from pathlib import Path
 import torch
@@ -10,8 +10,8 @@ from .subspace_utils import tensor_sha256
 STUDENT_DIM=512
 SUBSPACE_DIM=32
 
-class STSTProjector(nn.Module):
-    """The sole trainable STST component; shared by drone and satellite."""
+class SubspaceProjector(nn.Module):
+    """Reference 32D projection used to initialize the training heads."""
 
     def __init__(self, student_dim=STUDENT_DIM):
         super().__init__()
@@ -21,7 +21,7 @@ class STSTProjector(nn.Module):
     def forward(self, descriptor):
         if descriptor.shape[-1] != self.student_dim:
             raise ValueError(f"student descriptor must end in {self.student_dim}")
-        # DeepSpeed BF16 casts module parameters, while the audited STST
+        # DeepSpeed BF16 casts module parameters, while the audited subspace
         # precision contract requires the projection and cosine loss in FP32.
         raw = F.linear(
             descriptor.float(),
@@ -43,14 +43,10 @@ def load_top_source(manifest_path,teacher_sha):
         raise ValueError('Canonical Top128 provenance mismatch')
     if meta.get('image_size') not in (224,256):
         raise ValueError('Formal Top source requires explicit R224/R256 identity')
-    expected={224:'historical tensor SHA256 exact',256:'canonical protocol resolution refit'}
-    compatibility=meta.get('compatibility')
-    if meta.get('image_size')==224 and compatibility=='E3 Part-I exact Top128 extraction':
-        if (meta.get('split'),meta.get('train_ids'),meta.get('bank_rows'))!=('train',701,1402):
-            raise ValueError('R224 E3 Top source requires canonical TRAIN representatives')
-    elif compatibility not in (expected.get(meta['image_size']), 'canonical protocol resolution refit'):
-        raise ValueError('Top source resolution/provenance mismatch')
-    if compatibility=='canonical protocol resolution refit' and (meta.get('split'),meta.get('train_ids'),meta.get('bank_rows'))!=('train',701,1402):raise ValueError('R256 Top source must use canonical TRAIN representatives')
+    if meta.get("compatibility") != "canonical protocol resolution refit":
+        raise ValueError("Top128 source must be fitted to the current M3 Middle")
+    if (meta.get("split"), meta.get("train_ids"), meta.get("bank_rows")) != ("train", 701, 1402):
+        raise ValueError("Top128 source must use canonical TRAIN representatives")
     result={}
     for key,shape in [('teacher_mean',(768,)),('top128_basis',(768,128))]:
         v=torch.load(path.parent/(key+'.pt'),map_location='cpu',weights_only=True)
@@ -61,7 +57,7 @@ def load_top_source(manifest_path,teacher_sha):
     result['metadata']=meta
     return result
 
-class FormalSupervision(nn.Module):
+class SubspaceSupervision(nn.Module):
     def __init__(self,manifest_path,teacher_sha):
         nn.Module.__init__(self)
         asset=load_top_source(manifest_path,teacher_sha)
@@ -69,25 +65,25 @@ class FormalSupervision(nn.Module):
         self.metadata=asset['metadata'];self.student_dim=512
         self.top_dim=128;self.random_layout='single32';self.random_total_dim=32
         self.register_buffer('teacher_mean',asset['teacher_mean'].clone())
-        self.register_buffer('top32_basis',asset['top128_basis'].clone())
+        self.register_buffer('top128_basis',asset['top128_basis'].clone())
         # Placeholder is never used as a target: configure_basis runs before training.
         self.register_buffer('random32_basis',torch.zeros(768,32,dtype=torch.float32))
-        # Consume the same two legacy head initializations; no legacy basis is loaded.
-        old_top=STSTProjector();old_random=STSTProjector()
-        old_random.load_state_dict(old_top.state_dict(),strict=True)
+        # Use the fixed head initialization sequence for reproducible TSD/ADSD comparisons.
+        reference_top=SubspaceProjector();reference_random=SubspaceProjector()
+        reference_random.load_state_dict(reference_top.state_dict(),strict=True)
         with torch.random.fork_rng(devices=[]):
             torch.random.default_generator.manual_seed(20260914)
             top=BandProjector(128);BandProjector(32);random=BandProjector(32)
             with torch.no_grad():
-                top.linear.weight[:32].copy_(old_top.linear.weight);top.linear.bias[:32].copy_(old_top.linear.bias)
-                random.linear.weight.copy_(old_random.linear.weight);random.linear.bias.copy_(old_random.linear.bias)
+                top.linear.weight[:32].copy_(reference_top.linear.weight);top.linear.bias[:32].copy_(reference_top.linear.bias)
+                random.linear.weight.copy_(reference_random.linear.weight);random.linear.bias.copy_(reference_random.linear.bias)
         self.projector_top=top;self.projector_random=random
 
     def _apply(self, fn, recurse=True):
         # Knowledge buffers must never visit a low-precision dtype. Probe only an
         # empty tensor to discover the requested device; move original FP32 bits.
         assets={id(value):value for name,value in self._buffers.items()
-                if name in ('teacher_mean','top32_basis','random32_basis')
+                if name in ('teacher_mean','top128_basis','random32_basis')
                 and value is not None}
         def preserve_asset(tensor):
             if id(tensor) in assets:
@@ -103,16 +99,16 @@ class FormalSupervision(nn.Module):
         if not hasattr(self,'random_structure_metadata'):
             raise RuntimeError('Random basis not initialized')
         if self.teacher_mean.dtype != torch.float32:
-            raise RuntimeError("Dual-STST teacher_mean storage must remain torch.float32")
-        if self.top32_basis.dtype != torch.float32:
-            raise RuntimeError("Dual-STST TOP32 basis storage must remain torch.float32")
+            raise RuntimeError("ADSD teacher_mean storage must remain torch.float32")
+        if self.top128_basis.dtype != torch.float32:
+            raise RuntimeError("ADSD Top128 basis storage must remain torch.float32")
         if self.random32_basis.dtype != torch.float32:
-            raise RuntimeError("Dual-STST RANDOM32 basis storage must remain torch.float32")
+            raise RuntimeError("ADSD RANDOM32 basis storage must remain torch.float32")
         centered = descriptor.detach().float() - self.teacher_mean
-        top_raw = centered @ self.top32_basis
+        top_raw = centered @ self.top128_basis
         random_raw = centered @ self.random32_basis
         if top_raw.dtype != torch.float32 or random_raw.dtype != torch.float32:
-            raise RuntimeError("Dual-STST teacher projections must run in torch.float32")
+            raise RuntimeError("ADSD teacher projections must run in torch.float32")
         top = F.normalize(top_raw, dim=-1).detach()
         random = F.normalize(random_raw, dim=-1).detach()
         return (top, top_raw.detach()), (random, random_raw.detach())
@@ -128,7 +124,7 @@ class FormalSupervision(nn.Module):
 
     def forward(self, student_descriptor, teacher_descriptor, pair_batch_size):
         if student_descriptor.shape[0] != 2 * pair_batch_size:
-            raise ValueError("Dual-STST expects concatenated drone then satellite pairs")
+            raise ValueError("ADSD expects concatenated drone then satellite pairs")
         if teacher_descriptor.shape[0] != student_descriptor.shape[0]:
             raise ValueError("student/teacher batch mismatch")
         student_top, student_top_raw = self.projector_top(student_descriptor.float())
@@ -140,7 +136,7 @@ class FormalSupervision(nn.Module):
         random_loss, random_drone_loss, random_sat_loss, srd, srs, trd, trs = random
         dual_loss = top_loss + random_loss
         if not torch.isfinite(dual_loss):
-            raise FloatingPointError("non-finite Dual-STST loss")
+            raise FloatingPointError("non-finite ADSD loss")
         audit = {
             "loss_total": dual_loss,
             "loss_drone": top_drone_loss + random_drone_loss,
@@ -186,28 +182,14 @@ class FormalSupervision(nn.Module):
             "teacher_targets_detached": not teacher_top.requires_grad and not teacher_random.requires_grad,
             "teacher_target_detached": not teacher_top.requires_grad and not teacher_random.requires_grad,
             "teacher_descriptor_dtype": teacher_descriptor.dtype,
-            "basis_dtype": self.top32_basis.dtype,
-            "top_basis_dtype": self.top32_basis.dtype,
+            "basis_dtype": self.top128_basis.dtype,
+            "top_basis_dtype": self.top128_basis.dtype,
             "random_basis_dtype": self.random32_basis.dtype,
             "mean_storage_dtype": self.teacher_mean.dtype,
             "projection_dtype": teacher_top_raw.dtype,
-            "student_stst_dtype": student_top.dtype,
+            "student_adsd_dtype": student_top.dtype,
             "loss_dtype": dual_loss.dtype,
         }
         audit.update(top_dim=128,random_layout='single32',random_total_dim=32,
                      random_loss_aggregation='single_branch')
         return dual_loss,audit
-
-def make_supervision(cfg, teacher_sha):
-    if cfg['random_basis_mode'] != 'gaussian_qr_per_run':
-        raise ValueError('Formal S3 requires run-local Gaussian QR Random32')
-    return FormalSupervision(cfg['stst_asset'],teacher_sha)
-
-def metadata(cfg):
-    from .random_structure import structure_metadata
-    asset=load_top_source(cfg['stst_asset'],cfg['middle_checkpoint_sha256'])
-    return dict(structure_metadata(cfg),part='Part-I',top_source='TOP128_CANONICAL_V1',
-        top_source_sha256=file_sha256(cfg['stst_asset']),top_tensor_sha256=asset['metadata']['tensor_sha256'],
-        middle_teacher_run=Path(cfg['middle_checkpoint']).parent.name,middle_teacher_sha256=cfg['middle_checkpoint_sha256'],
-        teacher_frozen=True,teacher_trainable_params=0,random_layout='single32',random_total_dim=32,
-        deployment_model='bare RepViT-M1.5',inference_overhead=False,DEPLOYMENT_PARAM_DELTA_VS_D0=0)

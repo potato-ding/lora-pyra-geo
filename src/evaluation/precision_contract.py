@@ -27,9 +27,13 @@ def descriptor_postprocess(descriptor, eps=1e-12):
 def forward_context(device):
     return torch.autocast("cuda", dtype=torch.bfloat16) if torch.device(device).type == "cuda" else nullcontext()
 
-def inspect_precision_signature(model, model_type, image_size=224):
+def inspect_precision_signature(model, model_type, image_size=224, selection_batch_size=None):
     if type(image_size) is not int or image_size not in (224,256):
         raise ValueError('Formal resolution must be 224 or 256')
+    if selection_batch_size is None:
+        selection_batch_size = 8 if model_type == "teacher" else 32
+    if type(selection_batch_size) is not int or selection_batch_size <= 0:
+        raise ValueError("selection_batch_size must be a positive integer")
     model = unwrap(model)
     if model_type not in PROFILES:
         raise ValueError(model_type)
@@ -46,7 +50,7 @@ def inspect_precision_signature(model, model_type, image_size=224):
                 descriptor_before_normalization="float32", descriptor_after_normalization="float32",
                 final_cls_dtype="bfloat16" if model_type in ("teacher", "middle") else "not_applicable",
                 evaluation_preprocessing="canonical_deterministic", horizontal_flip=False,
-                selection_batch_size=8 if model_type=="teacher" else 32,
+                selection_batch_size=selection_batch_size,
                 **PROFILES[model_type])
 
 def assert_precision_signature(actual, expected):
@@ -54,8 +58,8 @@ def assert_precision_signature(actual, expected):
         keys=sorted(k for k in set(actual)|set(expected) if actual.get(k)!=expected.get(k))
         raise RuntimeError("PRECISION_OR_RELOAD_CONTRACT_FAILURE: signature fields " + str(keys))
 
-def selection_signature(model, model_type, image_size=224):
-    signature=inspect_precision_signature(model, model_type, image_size)
+def selection_signature(model, model_type, image_size=224, selection_batch_size=None):
+    signature=inspect_precision_signature(model, model_type, image_size, selection_batch_size)
     # Canonical training paths use DeepSpeed BF16 for all inference parameters.
     bad={n:d for n,d in signature['parameter_dtypes'].items() if d != 'bfloat16'}
     if bad:
@@ -79,7 +83,8 @@ def apply_runtime_precision(model, model_type, expected=None, image_size=224):
                 target=getattr(torch,expected[field][name])
                 if tensor.dtype != target:
                     tensor.data=tensor.data.to(dtype=target)
-        assert_precision_signature(inspect_precision_signature(model,model_type,image_size),expected)
+        assert_precision_signature(inspect_precision_signature(
+            model,model_type,image_size,expected.get('selection_batch_size')),expected)
     return dict(PROFILES[model_type], precision_contract_version=VERSION,
                 train_selection_signature_verified=expected is not None)
 

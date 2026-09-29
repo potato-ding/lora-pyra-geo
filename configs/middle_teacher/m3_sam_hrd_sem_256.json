@@ -1,0 +1,66 @@
+{
+  "epochs": 10,
+  "seed": 0,
+  "model": "dinov3_vitb16",
+  "pretrained_checkpoint": "src/models/dinov3-pth/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth",
+  "data_dir": "data/U1652",
+  "world_size": 2,
+  "local_pair_batch": 16,
+  "global_pair_batch": 32,
+  "cross_gpu_gather": true,
+  "num_workers": 4,
+  "backbone_precision": "bfloat16",
+  "descriptor_precision": "float32",
+  "optimizer": "DeepSpeedCPUAdam",
+  "lr": 0.0001,
+  "weight_decay": 0.01,
+  "betas": [
+    0.9,
+    0.999
+  ],
+  "eps": 1e-08,
+  "scheduler": "cosine",
+  "warmup_ratio": 0.05,
+  "task_loss": "pair_infonce",
+  "output_dir": null,
+  "experiment_id": "M3-SAM-HRD-SEM-R256",
+  "img_size": 256,
+  "teacher_checkpoint": null,
+  "hrd": {
+    "weight": 0.1,
+    "operator": "ABS_MARGIN",
+    "negative_selection": "teacher_top5_wrong_identity"
+  },
+  "semantic": {
+    "weight": 0.05,
+    "mode": "adaptive_bridge_v2",
+    "teacher_layers": [
+      28,
+      36
+    ],
+    "teacher_dim": 4096,
+    "feature_mode": "CLS_PATCH",
+    "bridge_type": "SEPARATE_MLP",
+    "bridge_hidden_dim": 2048,
+    "spatial_pooling": "ATTENTION_POOL",
+    "gate_type": "GLOBAL_SOFTMAX",
+    "gate_init_values": {
+      "28": 0.3,
+      "36": 0.7
+    },
+    "fusion_mode": "GATED_FEATURE_FUSION",
+    "adaptive_operator": "WEIGHTED_LAYER_LOSS",
+    "middle_dim": 768,
+    "middle_target_layer": 10
+  },
+  "sam": {
+    "search_direction": "kd",
+    "perturb_scope": "all_trainable",
+    "rho": 0.1,
+    "adaptive": false,
+    "same_batch": true,
+    "rng_replay": true,
+    "second_pass_objective": "full",
+    "norm_epsilon": 1e-12
+  }
+}

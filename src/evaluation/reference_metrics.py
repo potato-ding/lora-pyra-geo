@@ -65,4 +65,4 @@ def gta_official_reference_metrics(qf,ql,qc,gf,gl,gc,device='cpu'):
         dis_sum+=float(distances[0])
         sdm_sum+=float(np.sum(weights*np.exp(-.001*distances))/weights.sum())
     return {'R@1':100*hits/len(qf),'AP':100*ap_sum/len(qf),
-            'DIS@1':dis_sum/len(qf),'SDM@3':100*sdm_sum/len(qf)}
+            'DIS@1':dis_sum/len(qf),'SDM@3':sdm_sum/len(qf)}

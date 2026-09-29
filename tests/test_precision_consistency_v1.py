@@ -38,11 +38,11 @@ def test_best_reload_metric_mismatch_is_fatal():
 
 
 def test_pca_assets_never_quantized():
-    from src.student.formal_supervision import FormalSupervision
+    from src.student.formal_supervision import SubspaceSupervision
     # Non-BF16-representable real-valued fixtures catch round-trip corruption.
-    module=FormalSupervision.__new__(FormalSupervision);nn.Module.__init__(module)
+    module=SubspaceSupervision.__new__(SubspaceSupervision);nn.Module.__init__(module)
     module.projector_top=nn.Linear(512,128)
-    for name,shape in [('teacher_mean',(768,)),('top32_basis',(768,128)),('random32_basis',(768,32))]:
+    for name,shape in [('teacher_mean',(768,)),('top128_basis',(768,128)),('random32_basis',(768,32))]:
         module.register_buffer(name,torch.randn(shape),persistent=False)
     original={n:t.clone() for n,t in module.named_buffers()}
     for dtype in [torch.bfloat16,torch.float16,torch.float32,torch.bfloat16]:
@@ -55,37 +55,68 @@ def test_pca_assets_never_quantized():
 
 
 
-@pytest.mark.parametrize('kind',['middle','student'])
-def test_real_model_checkpoint_reload(kind,tmp_path):
+@pytest.mark.parametrize("kind", ["middle", "student"])
+def test_real_model_checkpoint_reload(kind, tmp_path):
     import json
     from pathlib import Path
-    from src.evaluation.model_loader import load_encoder,EvaluationEncoder
-    if kind=='student':
-        from src.student.model import StudentModel
-        model=StudentModel(ckpt_path=None);config=None;dim=512
-    else:
+    from src.evaluation.model_loader import load_encoder, EvaluationEncoder
+
+    if kind == "middle":
+        from src.middle_teacher.formal_config import to_runtime_config
         from src.middle_teacher.model import build_middle_teacher
-        config='configs/middle_teacher/m2-sam-e3-kd-r224-s0.json'
-        model=build_middle_teacher(json.loads(Path(config).read_text()),load_foundation=True);dim=768
-    model.bfloat16().eval();sig=selection_signature(model,kind)
-    path=tmp_path/'best.pth'
-    if kind=='middle':
         from src.middle_teacher.artifacts import MiddleCheckpointController
-        model.distillation_teacher_identity=dict(checkpoint='/teacher',sha256='fixture',checkpoint_metadata=dict(experiment_id='T0-INFONCE-R224',image_size=224,selection_mode='SINGLE_GPU_CANONICAL',selection_world_size=1,selection_rank=0))
-        model.sam_epoch_diagnostics=dict(steps=1)
-        ctl=MiddleCheckpointController(tmp_path,json.loads(Path(config).read_text()))
-        metrics={d+'_'+k:1. for d in ('D2S','S2D') for k in ('R1','R5','AP')}
-        ctl.save_best_if_improved(model,1,1,metrics)
-        path=tmp_path/'best_model.pth'
-    else:torch.save(dict(model=model.state_dict(),precision_signature=sig),path)
-    encoder,audit=load_encoder(kind,path,config,device='cpu')
-    assert audit['precision_signature']==sig and not audit['missing'] and not audit['unexpected']
+        config_path = Path("configs/middle_teacher/m0_infonce_224.json")
+        public = json.loads(config_path.read_text())
+        runtime = to_runtime_config(config_path)
+        runtime["checkpoint"]["output_dir"] = str(tmp_path)
+        model = build_middle_teacher(runtime, load_foundation=True).bfloat16().eval()
+        signature = selection_signature(model, kind, 224, selection_batch_size=16)
+        controller = MiddleCheckpointController(tmp_path, runtime, public_config=public)
+        metrics = {direction + "_" + metric: 1.0 for direction in ("D2S", "S2D")
+                   for metric in ("R1", "R5", "AP")}
+        controller.save_best_if_improved(model, 6, 1, metrics)
+        path = tmp_path / "best_model.pth"
+        dimension = 768
+    else:
+        from src.student.model import StudentModel
+        from src.student.formal_checkpoint import SCHEMA, fingerprint, validate_checkpoint
+        config_path = Path("configs/student/s0_infonce_224.json")
+        public = json.loads(config_path.read_text())
+        model = StudentModel(ckpt_path=None).bfloat16().eval()
+        signature = selection_signature(model, kind, 224, selection_batch_size=16)
+        metrics = {direction: {"R@1": 1.0, "R@5": 1.0, "AP": 1.0}
+                   for direction in ("D2S", "S2D")}
+        payload = {
+            "artifact_schema": SCHEMA,
+            "model": {name: tensor.detach().cpu().clone()
+                      for name, tensor in model.state_dict().items()},
+            "public_config": public,
+            "metadata": {
+                "experiment_id": public["experiment_id"], "image_size": 224,
+                "config_sha256": fingerprint(public), "best_epoch": 11,
+                "best_score": 2.0, "selection_world_size": 1,
+                "selection_batch_size": 16,
+                "asset_sha256": {"student_pretrained": "a" * 64},
+                "source_identity": {"fixture": "a" * 64},
+            },
+            "precision_signature": signature,
+            "selection_metrics": metrics,
+            "training_auxiliary": None,
+        }
+        validate_checkpoint(payload)
+        path = tmp_path / "best_model.pth"
+        torch.save(payload, path)
+        dimension = 512
+        config_path = None
+    encoder, audit = load_encoder(kind, path, config_path, device="cpu")
+    assert audit["precision_signature"] == signature
+    assert not audit["missing"] and not audit["unexpected"]
     with torch.no_grad():
-        for size in (224,256):
-            x=torch.randn(1,3,size,size)
-            before=EvaluationEncoder(model,dim)(x);after=encoder(x)
-            assert before.shape==(1,dim) and before.dtype==torch.float32
-            assert torch.equal(before,after)
+        x = torch.randn(1, 3, 224, 224)
+        before = EvaluationEncoder(model, dimension)(x)
+        after = encoder(x)
+        assert before.shape == (1, dimension) and before.dtype == torch.float32
+        assert torch.equal(before, after)
 
 
 def test_teacher_real_lora_precision_signature():

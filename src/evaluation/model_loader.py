@@ -84,25 +84,28 @@ def load_encoder(model_type,checkpoint,config=None,device='cuda',image_size=None
         middle_info=middle_metadata(payload)
         if middle_info is None:raise ValueError('Canonical Middle checkpoint required')
         resolved_config=payload['config']
-        if config is not None and load_config(config)!=resolved_config:
-            raise ValueError('Middle config differs from checkpoint configuration')
+        if config is not None:
+            from src.middle_teacher.formal_config import CONFIG_DIR, load_formal_config
+            if Path(config).resolve().parent == CONFIG_DIR.resolve():
+                _, public_config = load_formal_config(config)
+                if payload.get('public_config') != public_config:
+                    raise ValueError('Middle public config differs from checkpoint')
+            elif load_config(config) != resolved_config:
+                raise ValueError('Middle config differs from checkpoint configuration')
         model=build_middle_teacher(resolved_config,load_foundation=False);dimension=768
         state=normalize_state(payload);result=model.load_state_dict(state,strict=True)
         schema='full Middle deployment state'
     elif model_type=='student':
-        from src.student.checkpoint_contract import SCHEMA, verify_student_best
-        student_metadata=None
-        if isinstance(payload,dict) and payload.get('artifact_schema')==SCHEMA:
-            student_metadata=verify_student_best(payload)
-            if config is not None and json.loads(Path(config).read_text())!=payload['config']:
-                raise ValueError('Student config differs from checkpoint configuration')
-        elif isinstance(payload,dict) and (payload.get('artifact_schema') is not None or
-                isinstance(payload.get('metadata'),dict) and payload['metadata'].get('artifact_contract')=='STUDENT_BEST_ONLY_V1'):
-            raise ValueError('Malformed formal Student checkpoint schema')
+        from src.student.formal_checkpoint import SCHEMA, validate_checkpoint
+        if not isinstance(payload,dict) or payload.get('artifact_schema')!=SCHEMA:
+            raise ValueError('Formal Student checkpoint schema mismatch')
+        student_metadata=validate_checkpoint(payload)
+        if config is not None and json.loads(Path(config).read_text())!=payload['public_config']:
+            raise ValueError('Student config differs from checkpoint')
         from src.student.model import StudentModel
         model=StudentModel(ckpt_path=None);dimension=512
         state=normalize_state(payload);result=model.load_state_dict(state,strict=True)
-        schema='full RepViT-M1.5 deployment state'
+        schema='formal RepViT-M1.5 deployment state'
     else:raise ValueError(model_type)
     runtime_precision = apply_contract(model,model_type,expected,image_size)
     model.to(device).eval()
@@ -110,7 +113,8 @@ def load_encoder(model_type,checkpoint,config=None,device='cuda',image_size=None
     audit={'checkpoint_type':schema,'checkpoint':str(checkpoint.resolve()),'sha256':sha256(checkpoint),
            'state_keys':len(state),'missing':list(result.missing_keys),'unexpected':list(result.unexpected_keys),
            'runtime_precision':runtime_precision,
-           'precision_signature':inspect_precision_signature(model,model_type,image_size),
+           'precision_signature':inspect_precision_signature(model,model_type,image_size,
+               expected.get('selection_batch_size') if expected is not None else None),
            'selection_metrics':payload.get('selection_metrics') if isinstance(payload,dict) else None,
            'selection_protocol':payload.get('selection_protocol', {'selection_mode':'LEGACY_MULTI_GPU_SELECTION'}) if model_type == 'teacher' and isinstance(payload,dict) else None}
     if model_type == 'middle':

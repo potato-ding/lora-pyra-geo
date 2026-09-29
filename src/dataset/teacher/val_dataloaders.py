@@ -3,6 +3,7 @@
 import json
 import os
 
+import cv2
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -276,14 +277,16 @@ class GTAUAVDataset(Dataset):
     def __getitem__(self, idx):
         img_path = self.img_paths[idx]
         label = torch.tensor(self.labels[idx], dtype=torch.long)
-        img = Image.open(img_path).convert('RGB')
-        
+        img = cv2.imread(img_path)
+        if img is None:
+            raise FileNotFoundError(f"GTA-UAV image could not be decoded: {img_path}")
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
         if self.transform is not None:
-            augmented = self.transform(image=np.array(img))
-            img = augmented['image']
+            img = self.transform(image=img)['image']
                 
         # 将 [X, Y] 转为 PyTorch Tensor
-        coord = torch.tensor(self.coords[idx], dtype=torch.float32) if self.coords is not None else torch.tensor([float('inf'), float('inf')])
+        coord = torch.tensor(self.coords[idx], dtype=torch.float64) if self.coords is not None else torch.tensor([float('inf'), float('inf')], dtype=torch.float64)
         
         return img, label, coord, idx
 

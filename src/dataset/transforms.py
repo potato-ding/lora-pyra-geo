@@ -37,7 +37,7 @@ def get_train_transforms(
     ]
 
     train_sat_transforms = A.Compose([
-        A.Resize(img_size[0], img_size[1], interpolation=cv2.INTER_CUBIC),
+        A.Resize(img_size[0], img_size[1], interpolation=cv2.INTER_LINEAR_EXACT),
         A.RandomRotate90(p=1.0),
         *common_transforms,
         A.Normalize(mean=mean, std=std),
@@ -45,7 +45,7 @@ def get_train_transforms(
     ])
 
     train_drone_transforms = A.Compose([
-        A.Resize(img_size[0], img_size[1], interpolation=cv2.INTER_CUBIC),
+        A.Resize(img_size[0], img_size[1], interpolation=cv2.INTER_LINEAR_EXACT),
         *common_transforms,
         A.Normalize(mean=mean, std=std),
         ToTensorV2(),
@@ -61,7 +61,7 @@ def get_test_transforms(
     std=[0.229, 0.224, 0.225],
 ):
     return A.Compose([
-        A.Resize(img_size[0], img_size[1], interpolation=cv2.INTER_CUBIC),
+        A.Resize(img_size[0], img_size[1], interpolation=cv2.INTER_LINEAR_EXACT),
         A.Normalize(mean=mean, std=std),
         ToTensorV2(),
     ])

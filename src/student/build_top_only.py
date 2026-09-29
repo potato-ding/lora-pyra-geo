@@ -1,4 +1,4 @@
-"""Fit canonical TRAIN mean/Top128 from a validated E3 Middle."""
+"""Fit canonical TRAIN mean/Top128 from a validated M3 Middle."""
 import argparse,json,hashlib
 from pathlib import Path
 import torch
@@ -23,7 +23,7 @@ def fit_top128(rows):
 
 def main(argv=None):
     from src.evaluation.model_loader import load_encoder
-    from .middle_source import validate_e3_middle
+    from .formal_assets import validate_m3_middle
     from .formal_supervision import load_top_source
     p=argparse.ArgumentParser(description=__doc__)
     for field in ('middle-checkpoint','middle-config','output'):p.add_argument('--'+field,required=True)
@@ -32,7 +32,7 @@ def main(argv=None):
     p.add_argument('--device',default='cuda:0');p.add_argument('--num-workers',type=int,default=4)
     a=p.parse_args(argv);out=Path(a.output)
     if out.exists():raise FileExistsError(out)
-    _,teacher_sha=validate_e3_middle(a.middle_checkpoint,a.middle_config,a.image_size)
+    _,teacher_sha=validate_m3_middle(a.middle_checkpoint,a.middle_config,a.image_size)
     config_sha=file_sha256(a.middle_config)
     torch.set_num_threads(8)
     model,audit=load_encoder('middle',a.middle_checkpoint,a.middle_config,a.device,image_size=a.image_size)

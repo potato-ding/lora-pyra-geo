@@ -3,31 +3,32 @@ from pathlib import Path
 from types import SimpleNamespace
 import pytest
 import torch
-from src.training.teacher.args import parse_args
+from src.training.teacher.formal_config import parse_args
 from src.training.teacher.artifacts import is_formal_teacher, checkpoint_metadata, save_best_checkpoint
 from src.utils.save_path import get_save_pth
 
 def test_r256_config_matches_canonical_four_gpu_t0():
-    cfg=json.loads(Path('configs/teacher/t0_certified_256.json').read_text())
-    args=parse_args(['--config','configs/teacher/t0_certified_256.json'])
-    for size in (224,):
-        old=json.loads(Path(f'configs/teacher/t0_certified_{size}.json').read_text())
-        # Historical templates use 8 ranks x 4 pairs. Formal 4-rank T0 uses 8 pairs.
-        old['batch_size']=8
-        if 'weak_sample4geo_weight' in old:
-            old['weak_paired_cross_view_weight']=old.pop('weak_sample4geo_weight')
-        if 'experiment_id' in old:old['experiment_id']='T0-INFONCE-R256'
-        if 'output_dir' in old:old['output_dir']=cfg['output_dir']
-        old['img_size']=256
-        assert all(cfg[k]==v for k,v in old.items())
-    assert args.experiment_id=='T0-INFONCE-R256' and args.img_size==256
-    assert args.batch_size*4*args.grad_accum_steps==32 and args.epochs==10
-    assert args.val_batch_size==8 and args.init_checkpoint is None
-    assert get_save_pth(args)=='/home/dingyi/lora-pyra-geo/src/checkpoint/teacher/R256/T0-INFONCE-R256'
-    assert is_formal_teacher(args)
-    assert (args.lora_rank,args.lora_alpha,args.lora_dropout)==(8,16,.1)
-    assert args.lora_target_names=='qkv,proj'
-    assert (args.lora_start_block,args.lora_end_block,args.full_finetune_start_block,args.full_finetune_end_block)==(20,36,36,40)
+    configs = {
+        size: json.loads(Path(f"configs/teacher/t0_{size}.json").read_text())
+        for size in (224, 256)
+    }
+    for size, config in configs.items():
+        args = parse_args(["--config", f"configs/teacher/t0_{size}.json"])
+        assert args.experiment_id == f"T0-INFONCE-R{size}"
+        assert args.img_size == size
+        assert args.batch_size * 4 * args.grad_accum_steps == 32
+        assert args.epochs == 10 and args.val_batch_size == 16
+        assert args.init_checkpoint is None
+        assert is_formal_teacher(args)
+        assert (args.lora_rank, args.lora_alpha, args.lora_dropout) == (8, 16, .1)
+        assert args.lora_target_names == "qkv,proj"
+        assert (args.lora_start_block, args.lora_end_block,
+                args.full_finetune_start_block, args.full_finetune_end_block) == (20, 36, 36, 40)
+    left = {key: value for key, value in configs[224].items()
+            if key not in ("img_size", "experiment_id", "output_dir")}
+    right = {key: value for key, value in configs[256].items()
+             if key not in ("img_size", "experiment_id", "output_dir")}
+    assert left == right
 
 @pytest.mark.parametrize('size',[224,256])
 def test_formal_resolution_no_sidecars(tmp_path,size):

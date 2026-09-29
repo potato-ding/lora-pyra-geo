@@ -1,0 +1,57 @@
+{
+  "epochs": 30,
+  "seed": 0,
+  "model": "repvit_m1_5",
+  "pretrained_checkpoint": "src/models/repvit/repvit_m1_5_distill_450e.pth",
+  "data_dir": "data/U1652",
+  "world_size": 1,
+  "local_pair_batch": 32,
+  "global_pair_batch": 32,
+  "cross_gpu_gather": false,
+  "num_workers": 8,
+  "backbone_precision": "bfloat16",
+  "descriptor_precision": "float32",
+  "lr": 0.0001,
+  "weight_decay": 0.0001,
+  "scheduler": "cosine",
+  "warmup_epochs": 0.1,
+  "min_lr_ratio": 0.01,
+  "grad_accum_steps": 1,
+  "task_loss": {
+    "name": "pair_infonce",
+    "temperature": 0.07,
+    "label_smoothing": 0.1
+  },
+  "selection_eval_batch_size": 16,
+  "output_dir": null,
+  "experiment_id": "S3-SAM-ADSD-R256",
+  "img_size": 256,
+  "middle_checkpoint": null,
+  "supervision_asset": null,
+  "distillation": {
+    "type": "ADSD",
+    "weight": 0.2,
+    "warmup_epochs": 5,
+    "top_dim": 128,
+    "top_head": "residual_mlp",
+    "random_dim": 32,
+    "random_head": "linear",
+    "random_basis": "gaussian_qr_per_run",
+    "allocation": {
+      "type": "bounded_learnable_gbw",
+      "initial_d": 0.0
+    }
+  },
+  "sam": {
+    "enabled": true,
+    "algorithm": "kd_guided_standard_sam",
+    "search_direction": "kd",
+    "rho": 0.1,
+    "adaptive": false,
+    "perturb_scope": "main_optimizer_all_trainable",
+    "second_pass_objective": "full"
+  },
+  "selection_start_epoch": 11,
+  "middle_config": null,
+  "top_calibration": null
+}

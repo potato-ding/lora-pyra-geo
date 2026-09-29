@@ -74,73 +74,10 @@ def structure_metadata(cfg,basis=None):
         random_rmlp_beta_init=cfg.get('random_rmlp_beta_init'))
     if cfg.get('random_seed_provenance') is not None:result['random_seed_provenance']=cfg['random_seed_provenance']
     for key in ('img_size','experiment_name','middle_checkpoint_sha256',
-                'middle_config_sha256','extended_stst_asset_sha256'):
+                'middle_config_sha256','supervision_asset_sha256'):
         if key in cfg:result[key]=cfg[key]
     if basis is not None:
         result.update(random_basis_sha256=tensor_sha256(basis),
                       random_basis_shape=list(basis.shape),random_basis_dtype=str(basis.dtype),
                       random_basis_generation_count=1)
     return result
-
-
-
-
-
-
-
-
-
-
-def capture_training_auxiliary(supervision,gate):
-    if gate is None:raise ValueError('Run-level checkpoint requires AllocationGate')
-    identity=dict(supervision.random_structure_metadata)
-    if tensor_sha256(supervision.random32_basis)!=identity['random_basis_sha256']:
-        raise RuntimeError('Frozen Random basis changed within run')
-    if supervision.random_basis_generation_count!=1:
-        raise RuntimeError('Fresh formal run must generate Random32 exactly once')
-    return dict(schema=CONTRACT,basis_identity=identity,
-        top_initialization=supervision.projector_top.initialization_audit,
-        supervision={k:v.detach().cpu().clone() for k,v in supervision.state_dict().items()},
-        allocation_gate={k:v.detach().cpu().clone() for k,v in gate.state_dict().items()})
-
-
-def restore_training_auxiliary(supervision,gate,state):
-    if set(state)!={'schema','basis_identity','top_initialization','supervision','allocation_gate'} or state['schema']!=CONTRACT:
-        raise ValueError('Invalid training auxiliary checkpoint')
-    identity=state['basis_identity']
-    if getattr(supervision,'random_basis_generation_count',None)!=0:
-        raise ValueError('Reload must install stored Random32 without generation')
-    expected=supervision.random_structure_metadata
-    if identity!=expected:
-        raise ValueError('Auxiliary basis/config identity mismatch')
-    basis=state['supervision']['random32_basis']
-    validate_basis(basis)
-    if tensor_sha256(basis)!=identity['random_basis_sha256']:raise ValueError('Stored Random basis SHA mismatch')
-    supervision.load_state_dict(state['supervision'],strict=True)
-    gate.load_state_dict(state['allocation_gate'],strict=True)
-    supervision.projector_top.initialization_audit=state['top_initialization']
-
-
-def restore_training_checkpoint(checkpoint,cfg,device='cpu'):
-    """Strict model/head/gate restore, not an optimizer/sampler resume API."""
-    from .model import StudentModel
-    from .formal_top import prepare_top
-    from .allocation_gbw import AllocationGate
-    from .formal_runtime import construction_rng
-    from src.evaluation.precision_contract import apply_runtime_precision
-    payload=torch.load(checkpoint,map_location='cpu',weights_only=True)
-    state=payload['training_auxiliary'];meta=payload['metadata']
-    if any(meta.get(key)!=value for key,value in state['basis_identity'].items()):
-        raise ValueError('Checkpoint metadata/basis/config mismatch')
-    with construction_rng(cfg,device):
-        student=StudentModel(ckpt_path=None).to(device)
-        student.load_state_dict(payload['model'],strict=True)
-        apply_runtime_precision(student,'student',payload['precision_signature'],cfg['img_size'])
-        from .formal_supervision import make_supervision
-        sup=make_supervision(cfg,cfg['middle_checkpoint_sha256']).to(device)
-        configure_basis(sup,cfg,stored=state)
-        prepare_top(sup,cfg)
-        sup.bfloat16()
-        gate=AllocationGate(cfg['gate_parameterization'],cfg['gate_initial_d']).to(device)
-        restore_training_auxiliary(sup,gate,state)
-    return student,sup,gate

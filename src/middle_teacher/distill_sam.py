@@ -158,7 +158,7 @@ class GradientSummary:
 
 
 def canonical_objective(forward, model, kd, images, ids, step):
-    from .fchain_train import r0_pair_loss
+    from .losses.pair_infonce import pair_infonce
     from src.utils.gather_features_and_labels_and_views import GatherLayer, concat_all_gather
     hidden = forward(images, return_layer_features=True)
     descriptor = hidden['final_descriptor']
@@ -169,7 +169,7 @@ def canonical_objective(forward, model, kd, images, ids, step):
     ms = torch.cat(GatherLayer.apply(descriptor[pairs:]), 0)
     global_ids = concat_all_gather(ids)
     assert md.shape == ms.shape == (global_pairs, 768) and global_ids.unique().numel() == global_pairs
-    task, d2s, s2d = r0_pair_loss(md, ms, model.logit_scale)
+    task, d2s, s2d = pair_infonce(md, ms, model.logit_scale)
     full, stats, kd_loss = kd.compose_all(task, md, ms, images, global_ids, model, step, hidden,
                                         return_kd_objective=True)
     if not bool(torch.isfinite(full)):

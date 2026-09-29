@@ -267,7 +267,7 @@ class ExtractFeaturesDistTest(unittest.TestCase):
             )
             self.assertEqual(metrics, (100.0, 100.0, 100.0, 100.0))
 
-    def test_gta_metrics_use_paper_subset_and_percentage_sdm(self):
+    def test_gta_metrics_match_official_units(self):
         query_features = torch.tensor([[1.0, 0.0], [0.0, 1.0]], dtype=torch.float32)
         query_labels = torch.tensor([[0], [2]], dtype=torch.long)
         query_coords = torch.tensor([[0.0, 0.0], [10.0, 0.0]], dtype=torch.float32)
@@ -300,13 +300,16 @@ class ExtractFeaturesDistTest(unittest.TestCase):
             torch.device("cpu"),
         )
 
-        self.assertEqual(set(metrics), {"R@1", "R@5", "AP", "SDM@3", "DIS@1"})
+        self.assertEqual(set(metrics), {"R@1", "R@5", "R@10", "R@top1", "AP",
+                                        "SDM@1", "SDM@3", "SDM@5",
+                                        "DIS@1", "DIS@3", "DIS@5"})
         self.assertEqual(metrics["R@1"], 100.0)
         self.assertEqual(metrics["R@5"], 100.0)
         self.assertEqual(metrics["AP"], 100.0)
         self.assertEqual(metrics["DIS@1"], 0.0)
-        self.assertGreater(metrics["SDM@3"], 1.0)
-        self.assertLessEqual(metrics["SDM@3"], 100.0)
+        self.assertGreater(metrics["SDM@3"], 0.0)
+        self.assertLessEqual(metrics["SDM@3"], 1.0)
+        self.assertEqual(metrics["SDM@1"], 1.0)
 
 
 if __name__ == "__main__":

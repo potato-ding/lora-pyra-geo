@@ -77,21 +77,28 @@ def feature_sha(path):
 def certify_pair(model,pair,dataset,direction,device,cache_dir):
     cache_dir=Path(cache_dir);cache_dir.mkdir(parents=True,exist_ok=True)
     key=f'{dataset}_{direction}';path=cache_dir/(key+'.npz')
+    horizontal_flip = dataset == 'sues200'
     if path.exists():
+        if horizontal_flip:
+            previous_path=cache_dir/(key+'.json')
+            if (not previous_path.is_file()
+                    or json.loads(previous_path.read_text()).get('horizontal_flip') is not True):
+                raise RuntimeError('SUES cached features lack official flip protocol; use a fresh cache directory')
         features=read_features(path)
         if dataset=='u1652':features=align_u1652_cache(path,features,pair,direction)
         if len(features[0])!=len(pair[0].dataset) or len(features[3])!=len(pair[1].dataset):
             raise RuntimeError('Resume cache dataset-count mismatch')
         print(f'REUSING_EXTRACTED_FEATURES={path}',flush=True)
     else:
-        features=(*extract_features_dist(model,pair[0],device,stage_name=key+':query',horizontal_flip=False),
-                  *extract_features_dist(model,pair[1],device,stage_name=key+':gallery',horizontal_flip=False))
+        features=(*extract_features_dist(model,pair[0],device,stage_name=key+':query',horizontal_flip=horizontal_flip),
+                  *extract_features_dist(model,pair[1],device,stage_name=key+':gallery',horizontal_flip=horizontal_flip))
         cache_features(path,features,pair)
     clean=measure_clean(model,pair,features,dataset,device)
     reference=measure_reference(features,dataset,device)
     rows=[{'metric':k,'clean':v,'reference':reference[k],'abs_diff':abs(v-reference[k]),
            'tolerance':METRIC_ATOL,'pass':bool(abs(v-reference[k])<=METRIC_ATOL)} for k,v in clean.items()]
-    record={'dataset':dataset,'direction':direction,'clean':clean,'reference':reference,'rows':rows,
+    record={'dataset':dataset,'direction':direction,'horizontal_flip':horizontal_flip,
+            'clean':clean,'reference':reference,'rows':rows,
             'certification_version':'OFFICIAL_NUMPY_ORDER_V2',
             'pass':all(r['pass'] for r in rows),'feature_cache':str(path),'feature_sha256':feature_sha(path),
             'query_count':len(pair[0].dataset),'gallery_count':len(pair[1].dataset),
@@ -107,6 +114,8 @@ def reuse_pair(model,pair,dataset,direction,device,cache_dir):
     cache_dir=Path(cache_dir);key=f'{dataset}_{direction}'
     record=json.loads((cache_dir/(key+'.json')).read_text())
     path=cache_dir/(key+'.npz')
+    if dataset == 'sues200' and record.get('horizontal_flip') is not True:
+        raise RuntimeError('SUES certified features lack official flip protocol')
     if not record['pass'] or feature_sha(path)!=record['feature_sha256']:
         raise RuntimeError('Uncertified or changed feature cache')
     if record['query_count']!=len(pair[0].dataset) or record['gallery_count']!=len(pair[1].dataset):

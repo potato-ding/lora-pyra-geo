@@ -1,8 +1,8 @@
 def enforce_formal_task_policy(args):
     if args.training_stage != 'paired_cross_view' or args.infonce_weight != 1.0:
         raise ValueError('Formal Teacher requires paired PairInfoNCE')
-    if args.img_size not in (224,256) or args.epochs != 10:
-        raise ValueError('Formal Teacher resolution/epoch contract changed')
+    if args.img_size not in (224,256) or args.epochs < 1:
+        raise ValueError('Formal Teacher resolution/epoch configuration invalid')
     if args.experiment_id != f'T0-INFONCE-R{args.img_size}' or not args.config:
         raise ValueError('Formal Teacher requires a bound T224/T256 config')
 import sys
@@ -25,8 +25,8 @@ from src.utils.gather_features_and_labels_and_views import gather_features_and_l
 from src.utils.train_eval_utils import select_model_descriptor
 from src.dataset.teacher.datasets import create_1652_teacher_train_dataloaders
 from src.models.teacher.model import TeacherModel
-from src.training.teacher.args import parse_args
-from src.training.teacher.artifacts import is_formal_teacher, save_best_checkpoint, validate_training_artifacts
+from src.training.teacher.formal_config import parse_args
+from src.training.teacher.formal_checkpoint import is_formal_teacher, save_best_checkpoint, validate_training_artifacts
 from src.utils.teacher.optimizer import build_optimizer_and_scale
 from src.utils.teacher.scheduler import get_scheduler
 from src.utils.teacher_experiment_audit import audit_teacher_runtime_structure, get_runtime_parameter_dtypes, gpu_memory_snapshot, print_experiment_configuration, read_deepspeed_grad_norm, tensor_nonfinite_counts
@@ -306,7 +306,7 @@ def validate_scheduler_args(args):
 
 
 def should_run_validation(cur_epoch, args):
-    return True
+    return 6 <= cur_epoch <= args.epochs
 
 def build_scheduler_plan(train_loader, train_sampler, args, grad_accum_steps):
     loader=train_loader['paired_cross_view'] if isinstance(train_loader,dict) else train_loader
@@ -513,24 +513,25 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
         cur_epoch = epoch
         distributed_barrier_with_log(f'[Checkpoint] epoch={cur_epoch} after epoch artifact handling', local_rank)
         if val_loaders is not None and should_run_validation(cur_epoch, args):
-            from src.training.teacher.certified_selection import (
+            from src.training.teacher.formal_selection import (
                 certified_teacher_selection, selection_metadata, best_selection_update)
             from src.training.teacher.selection_sync import run_rank0_selection
             verbose_eval = teacher_verbose_eval_log()
             def select_and_save():
                 nonlocal best_metrics, best_r1_sum, best_epoch, epoch_validation_metrics
-                print('[TeacherSelection] ' + json.dumps(dict(selection_metadata(args.img_size),
+                print('[TeacherSelection] ' + json.dumps(dict(selection_metadata(args.img_size,args.val_batch_size),
                     mode='SINGLE_GPU_CANONICAL', training_world_size=dist.get_world_size() if dist.is_initialized() else 1,
                     precision='BF16 model; FP32 descriptor/L2/similarity')), flush=True)
                 clear_memory_cache()
                 results = certified_teacher_selection(model_engine, image_size=args.img_size,
-                    device=amp_device, data_dir=args.data_dir, num_workers=args.num_workers)
+                    device=amp_device, data_dir=args.data_dir, num_workers=args.num_workers,
+                    batch_size=args.val_batch_size)
                 d2s_r1, d2s_r5, d2s_r10, d2s_map = (results['D2S'][k] for k in ('R@1','R@5','R@10','AP'))
                 s2d_r1, s2d_r5, s2d_r10, s2d_map = (results['S2D'][k] for k in ('R@1','R@5','R@10','AP'))
                 current_metrics = build_validation_metrics(cur_epoch, (d2s_r1, d2s_r5, d2s_r10, d2s_map), (s2d_r1, s2d_r5, s2d_r10, s2d_map))
-                from src.evaluation.precision_contract import selection_signature
+                from src.training.teacher.formal_precision import formal_selection_signature as selection_signature
                 current_metrics['precision_signature']=selection_signature(get_base_model(model_engine),'teacher',args.img_size)
-                current_metrics['selection_protocol'] = selection_metadata(args.img_size)
+                current_metrics['selection_protocol'] = selection_metadata(args.img_size,args.val_batch_size)
                 epoch_validation_metrics = current_metrics
                 r1_sum = current_metrics['R@1_sum']
                 decision = best_selection_update(results, best_r1_sum, best_epoch, cur_epoch)
@@ -546,7 +547,7 @@ def train(model, dataloader, args, optimizer=None, scheduler=None, val_loaders=N
                     best_metrics = current_metrics
                     if verbose_eval:
                         rank_log(f'[Checkpoint] best_model.pth save start | epoch={cur_epoch}')
-                    from src.evaluation.precision_contract import selection_signature
+                    from src.training.teacher.formal_precision import formal_selection_signature as selection_signature
                     teacher_model=get_base_model(model_engine)
                     signature=selection_signature(teacher_model,'teacher',args.img_size)
                     save_best_checkpoint(teacher_model, args, current_metrics, save_dir,

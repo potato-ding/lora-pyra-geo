@@ -16,10 +16,8 @@ def main(argv=None):
     p.add_argument('--device',default='cuda:0');p.add_argument('--num-workers',type=int,default=4)
     args=p.parse_args(argv);output=Path(args.asset_output).resolve()
     if output.exists() or Path(str(output)+'.json').exists():raise FileExistsError(output)
-    middle=json.loads(Path(args.middle_run_config).read_text())
-    if middle['data']['input_size']!=args.image_size:raise ValueError('Middle/input resolution mismatch')
-    from .middle_source import validate_e3_middle
-    validate_e3_middle(args.middle_checkpoint,args.middle_run_config,args.image_size)
+    from .formal_assets import validate_m3_middle
+    validate_m3_middle(args.middle_checkpoint,args.middle_run_config,args.image_size)
     torch.manual_seed(args.seed)
     student=StudentModel(ckpt_path=args.student_pretrained).to(args.device)
     apply_runtime_precision(student,'student');encoder=EvaluationEncoder(student,512).eval()
