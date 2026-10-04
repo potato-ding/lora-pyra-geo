@@ -22,10 +22,10 @@
   "scheduler": "cosine",
   "warmup_ratio": 0.05,
   "task_loss": "pair_infonce",
-  "output_dir": null,
+  "output_dir": "/home/dingyi/lora-pyra-geo/src/checkpoint/middle_teacher/R224/M3-224",
   "experiment_id": "M3-SAM-HRD-SEM-R224",
   "img_size": 224,
-  "teacher_checkpoint": null,
+  "teacher_checkpoint": "/home/dingyi/lora-pyra-geo/src/checkpoint/teacher/T0-224/best_model.pth",
   "hrd": {
     "weight": 0.1,
     "operator": "ABS_MARGIN",

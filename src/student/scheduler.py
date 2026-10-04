@@ -34,6 +34,10 @@ def build_student_scheduler(optimizer, args, steps_per_epoch=None):
         return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
 
     scheduler = LambdaLR(optimizer, lr_lambda=lr_lambda)
+    scheduler._student_group_names = tuple(
+        group.get("name") for group in optimizer.param_groups
+    )
+    assert_student_scheduler_groups(scheduler)
 
     rank0_print(f"[Scheduler] total_epochs   : {total_epochs}")
     rank0_print(f"[Scheduler] warmup_epochs  : {warmup_epochs:g}")
@@ -46,4 +50,22 @@ def build_student_scheduler(optimizer, args, steps_per_epoch=None):
     return scheduler
 
 
-__all__ = ["build_student_scheduler"]
+def assert_student_scheduler_groups(scheduler):
+    """Fail closed if regrouping leaves parameters outside the LR schedule."""
+    groups = scheduler.optimizer.param_groups
+    names = tuple(group.get("name") for group in groups)
+    if (len(groups) != len(scheduler.base_lrs)
+            or len(groups) != len(scheduler.lr_lambdas)
+            or names != scheduler._student_group_names):
+        raise RuntimeError("Student optimizer/scheduler parameter-group mismatch")
+    expected = [
+        base * schedule(scheduler.last_epoch)
+        for base, schedule in zip(scheduler.base_lrs, scheduler.lr_lambdas)
+    ]
+    if any(not math.isfinite(group["lr"]) or not math.isclose(
+        group["lr"], target, rel_tol=1e-12, abs_tol=1e-15
+    ) for group, target in zip(groups, expected)):
+        raise RuntimeError("Student parameter-group learning rate mismatch")
+
+
+__all__ = ["build_student_scheduler", "assert_student_scheduler_groups"]

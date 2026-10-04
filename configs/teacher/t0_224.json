@@ -33,5 +33,5 @@
   "deepspeed_config": "configs/deepspeed/teacher_zero2.json",
   "device": "cuda",
   "log_interval": 200,
-  "output_dir": "/home/dingyi/lora-pyra-geo/src/checkpoint/teacher/R224/T0-INFONCE-R224-4GPU"
+  "output_dir": "/home/dingyi/lora-pyra-geo/src/checkpoint/teacher/T0-224"
 }

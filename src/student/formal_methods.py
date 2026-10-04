@@ -93,7 +93,7 @@ def adsd_objective(student, supervision, descriptors, middle, criterion,
 
 def sam_adsd_backward(engine, middle, images, criterion, cfg, epoch, gate, named):
     """KD-only search, one full-objective second pass, exact parameter restore."""
-    from .distill_sam import student_sam_step
+    from .distill_sam import student_sam_step, isolated_search_state
     supervision = engine.module.supervision
     if middle.training or any(p.requires_grad for p in middle.parameters()):
         raise RuntimeError("Middle must be frozen")
@@ -109,11 +109,35 @@ def sam_adsd_backward(engine, middle, images, criterion, cfg, epoch, gate, named
             criterion, cfg, epoch, gate, search_only=search_only,
         )
 
-    def first():
-        loss, _, audit = objective(True)
-        return loss, {"first_pass_kd_weight": audit["effective_kd_weight"]}
+    class SearchObjective(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.student = engine.module.student
+            self.supervision = supervision
 
-    result = student_sam_step(engine, named, first, lambda: objective(False))
+        def forward(self, search_images):
+            descriptors = self.student(search_images)
+            loss, _, audit = adsd_objective(
+                self.student, self.supervision, descriptors, targets,
+                criterion, cfg, epoch, gate, search_only=True,
+            )
+            return loss, {"first_pass_kd_weight": audit["effective_kd_weight"]}
+
+    search_module = SearchObjective()
+    search_state, search_named = isolated_search_state(search_module, named)
+
+    def first():
+        return torch.func.functional_call(
+            search_module, search_state, (student_images,), strict=True,
+        )
+
+    result = student_sam_step(
+        engine, named, first, lambda: objective(False), search_named=search_named,
+    )
+    if not getattr(sam_adsd_backward, "_startup_audit_count", 0) >= 3:
+        import json
+        print("STUDENT_SAM_AUDIT=" + json.dumps(result[3]), flush=True)
+        sam_adsd_backward._startup_audit_count = getattr(sam_adsd_backward, "_startup_audit_count", 0) + 1
     if not torch.equal(images, snapshots[0]) or not torch.equal(targets, snapshots[1]):
         raise RuntimeError("SAM changed the augmented batch or Middle target")
     return result

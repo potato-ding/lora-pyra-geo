@@ -100,6 +100,16 @@ def test_teacher_v3_saves_exact_two_artifacts_in_config_output(tmp_path,monkeypa
         encoder,audit=load_teacher_v3(run/'best_model.pth',device='cpu',image_size=size)
         assert audit['checkpoint_metadata']['best_epoch']==6
         assert set(encoder.model.state_dict())==set(model.state_dict())
+        from src.evaluation.evaluate import load_encoder
+        evaluated, evaluation_audit = load_encoder('teacher', run/'best_model.pth',
+                                                    cfg_path, device='cpu', image_size=size)
+        assert evaluated.descriptor_dim == 4096
+        assert evaluation_audit['artifact_classification'] == 'FORMAL_TEACHER_CHECKPOINT'
+        assert evaluation_audit['runtime_precision']['train_selection_signature_verified']
+        assert evaluation_audit['precision_signature']['selection_batch_size'] == 16
+        with pytest.raises(ValueError, match='resolution mismatch'):
+            load_encoder('teacher', run/'best_model.pth', device='cpu',
+                         image_size=256 if size == 224 else 224)
         with pytest.raises(ValueError,match='destination mismatch'):
             save_best_checkpoint(model,args,refs,tmp_path,4)
 

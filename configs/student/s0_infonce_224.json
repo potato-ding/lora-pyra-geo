@@ -23,7 +23,7 @@
     "label_smoothing": 0.1
   },
   "selection_eval_batch_size": 16,
-  "output_dir": null,
+  "output_dir": "/home/dingyi/lora-pyra-geo/src/checkpoint/student/R224/S0-224",
   "experiment_id": "S0-INFONCE-R224",
   "img_size": 224,
   "selection_start_epoch": 11

@@ -22,7 +22,7 @@
   "scheduler": "cosine",
   "warmup_ratio": 0.05,
   "task_loss": "pair_infonce",
-  "output_dir": null,
+  "output_dir": "/home/dingyi/lora-pyra-geo/src/checkpoint/middle_teacher/R256/M0-256",
   "experiment_id": "M0-INFONCE-R256",
   "img_size": 256
 }

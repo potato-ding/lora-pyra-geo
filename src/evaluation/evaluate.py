@@ -9,6 +9,22 @@ from src.dataset.teacher.val_dataloaders import build_1652_val_dataloaders,build
 
 def load_encoder(model_type, checkpoint, config=None, device="cuda", image_size=None):
     """Load a deployment model under its strict checkpoint contract."""
+    if model_type == 'teacher':
+        from src.training.teacher.formal_checkpoint import SCHEMA as TEACHER_V3
+        payload = torch.load(checkpoint, map_location='cpu', weights_only=True, mmap=True)
+        if isinstance(payload, dict) and payload.get('artifact_schema') == TEACHER_V3:
+            from src.training.teacher.formal_reload import load_teacher_v3
+            from src.evaluation.precision_contract import apply_runtime_precision
+            from src.middle_teacher.checkpoint import sha256
+            if config is not None and json.loads(Path(config).read_text()) != payload['config']:
+                raise ValueError('Teacher config differs from checkpoint configuration')
+            encoder, audit = load_teacher_v3(checkpoint, device=device, image_size=image_size)
+            signature = payload['precision_signature']
+            audit.update(sha256=sha256(checkpoint), precision_signature=signature,
+                         runtime_precision=apply_runtime_precision(
+                             encoder.model, 'teacher', signature, signature['image_size']),
+                         artifact_classification='FORMAL_TEACHER_CHECKPOINT')
+            return encoder, audit
     return _load_checkpoint_encoder(model_type, checkpoint, config, device, image_size=image_size)
 
 

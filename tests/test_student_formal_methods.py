@@ -23,13 +23,12 @@ def test_eight_student_configs(size, method):
     assert cfg["img_size"] == size
     assert cfg["epochs"] == 30
     assert (cfg["world_size"], cfg["local_pair_batch"], cfg["global_pair_batch"]) == (1, 32, 32)
-    assert cfg["output_dir"] is None
+    assert cfg["output_dir"] is None or isinstance(cfg["output_dir"], str)
     assert cfg["selection_start_epoch"] == 11
     assert cfg["selection_eval_batch_size"] == 16
     if method != "s0_infonce":
-        assert cfg["middle_checkpoint"] is None
-        assert cfg["middle_config"] is None
-        assert cfg["supervision_asset"] is None
+        for field in ("middle_checkpoint", "middle_config", "supervision_asset", "top_calibration"):
+            assert cfg[field] is None or isinstance(cfg[field], str)
 
 
 def test_student_selection_starts_after_ten_training_epochs():
@@ -290,6 +289,53 @@ def test_resolution_variants_share_training_math(method):
     left = json.loads((ROOT / f"configs/student/{method}_224.json").read_text())
     right = json.loads((ROOT / f"configs/student/{method}_256.json").read_text())
     for config in (left, right):
-        config.pop("img_size")
-        config.pop("experiment_id")
+        for field in ("img_size", "experiment_id", "output_dir", "middle_checkpoint",
+                      "middle_config", "supervision_asset", "top_calibration"):
+            config.pop(field, None)
     assert left == right
+
+
+@pytest.mark.parametrize("size", [224, 256])
+def test_s4_changes_only_s2_identity_and_middle_provider(size):
+    from src.student.formal_config import METHODS
+    from src.middle_teacher.formal_config import load_formal_config as load_middle
+    _, cfg = load_formal_config(ROOT / f"configs/student/s4_adsd_sam_middle_{size}.json")
+    base = json.loads((ROOT / f"configs/student/s2_adsd_{size}.json").read_text())
+    assert METHODS["s4_adsd_sam_middle"] == ("S4-ADSD-SAM-MIDDLE", "ADSD", False)
+    assert "sam" not in cfg
+    assert {key for key in cfg if key not in ("output_dir", "supervision_asset", "top_calibration") and cfg[key] != base[key]} == {
+        "experiment_id", "middle_checkpoint", "middle_config",
+    }
+    _, provider = load_middle(cfg["middle_config"])
+    assert provider["experiment_id"] == f"M3-SAM-HRD-SEM-R{size}"
+    assert provider["sam"]["search_direction"] == "kd"
+    assert Path(cfg["middle_checkpoint"]).parent == Path(provider["output_dir"])
+    for field in ("output_dir", "supervision_asset", "top_calibration"):
+        assert cfg[field] is None or (isinstance(cfg[field], str) and bool(cfg[field]))
+
+
+@pytest.mark.parametrize("image_size", [224, 256])
+def test_isolated_sam_search_matches_gradients_without_engine_hooks(image_size):
+    from src.student.distill_sam import isolated_search_state, compute_kd_search_grads, direction
+    torch.manual_seed(13)
+    module = nn.Sequential(nn.Conv2d(3, 4, 1), nn.BatchNorm2d(4), nn.AdaptiveAvgPool2d(1))
+    images = torch.randn(2, 3, image_size, image_size)
+    named = list(module.named_parameters())
+    buffers = {name: value.clone() for name, value in module.named_buffers()}
+    loss = module(images).square().sum()
+    reference = compute_kd_search_grads(loss, named)
+    with torch.no_grad():
+        for name, value in module.named_buffers():
+            value.copy_(buffers[name])
+    fired = []
+    handles = [parameter.register_hook(lambda grad: fired.append(True)) for _, parameter in named]
+    state, search_named = isolated_search_state(module, named)
+    isolated = torch.func.functional_call(module, state, (images,), strict=True).square().sum()
+    gradients = compute_kd_search_grads(isolated, search_named)
+    assert torch.equal(loss.detach(), isolated.detach())
+    assert all(torch.equal(a, b) for a, b in zip(reference, gradients))
+    assert all(torch.equal(a, b) for a, b in zip(direction(reference)[0], direction(gradients)[0]))
+    assert not fired and all(parameter.grad is None for _, parameter in named)
+    assert all(torch.equal(value, buffers[name]) for name, value in module.named_buffers())
+    for handle in handles:
+        handle.remove()

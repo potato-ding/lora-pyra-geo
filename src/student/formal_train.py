@@ -28,7 +28,7 @@ from .formal_supervision import load_top_source
 from .model import StudentModel
 from .objective import PairInfoNCE
 from .optimizer import build_student_optimizer
-from .scheduler import build_student_scheduler
+from .scheduler import build_student_scheduler, assert_student_scheduler_groups
 
 
 def method_name(config):
@@ -52,8 +52,14 @@ def validate_assets(config):
             raise FileNotFoundError(path)
     if middle_path.name != "best_model.pth":
         raise ValueError("Student requires the selected Middle best_model.pth")
-    from .formal_assets import validate_m3_middle
-    _, middle_sha = validate_m3_middle(middle_path, middle_config_path, size)
+    from .formal_assets import validate_middle_provider
+    expected_provider = {
+        "S1-TSD": "M2", "S2-ADSD": "M2",
+        "S3-SAM-ADSD": "M3", "S4-ADSD-SAM-MIDDLE": "M3",
+    }[method_name(config)]
+    _, middle_sha = validate_middle_provider(
+        middle_path, middle_config_path, size, expected_method=expected_provider,
+    )
     top = load_top_source(asset_path, middle_sha)
     if top["metadata"]["image_size"] != size:
         raise ValueError("Top128 source resolution mismatch")
@@ -169,7 +175,7 @@ def train(config_path):
     from src.source_contract import source_identity as calculate_source_identity
     kind = method_name(cfg)
     source = calculate_source_identity(
-        "m2s", gbw=kind in ("S2-ADSD", "S3-SAM-ADSD"),
+        "m2s", gbw=kind in ("S2-ADSD", "S3-SAM-ADSD", "S4-ADSD-SAM-MIDDLE"),
         sam=kind == "S3-SAM-ADSD",
     )
     deepspeed.init_distributed(dist_backend="nccl")
@@ -216,11 +222,11 @@ def train(config_path):
             gate = ADSDGate(cfg["distillation"]["allocation"]["initial_d"]).to(device)
     model = StudentTrainingModel(student, supervision).to(device)
     optimizer = build_student_optimizer(model, cfg["lr"], cfg["weight_decay"])
-    scheduler = build_student_scheduler(optimizer, args, steps_per_epoch=len(loader))
-    model.bfloat16()
-    # The residual head keeps FP32 parameters; DeepSpeed groups must be homogeneous.
+    # Finalize dtype groups before LambdaLR snapshots the optimizer groups.
+    # The residual head stays FP32; every final group needs its own schedule.
     from .formal_top import prepare_student_precision_groups
     prepare_student_precision_groups(model, optimizer)
+    scheduler = build_student_scheduler(optimizer, args, steps_per_epoch=len(loader))
     named = None
     if kind == "S3-SAM-ADSD":
         from .distill_sam import collect_optimizer_trainable_params
@@ -233,6 +239,7 @@ def train(config_path):
     engine, _, _, _ = deepspeed.initialize(
         model=model, optimizer=optimizer, lr_scheduler=scheduler, config=ds,
     )
+    assert_student_scheduler_groups(scheduler)
     selection_signature(
         engine.module.student, "student", cfg["img_size"],
         selection_batch_size=cfg["selection_eval_batch_size"],
@@ -308,6 +315,7 @@ def train(config_path):
             before_steps = engine.global_steps
             before_schedule = scheduler.last_epoch
             engine.step()
+            assert_student_scheduler_groups(scheduler)
             if engine.global_steps != before_steps + 1 or scheduler.last_epoch != before_schedule + 1:
                 raise RuntimeError("Student optimizer/scheduler step mismatch")
             if gate_loss is not None:
@@ -319,6 +327,10 @@ def train(config_path):
             if step <= 3 or step % 200 == 0:
                 print("STUDENT_STEP=" + json.dumps({
                     "epoch": epoch, "step": step,
+                    "learning_rates": {
+                        group["name"]: float(group["lr"])
+                        for group in scheduler.optimizer.param_groups
+                    },
                     "loss": float(loss.detach()),
                     **{name: float(value) for name, value in parts.items()},
                 }), flush=True)

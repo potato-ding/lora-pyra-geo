@@ -107,11 +107,14 @@ def first_pass_replay(model,device):
             with torch.no_grad():
                 for b,old in buffers:b.copy_(old)
 
-def student_sam_step(engine,named,first_objective,second_objective):
+def student_sam_step(engine,named,first_objective,second_objective,*,search_named=None):
     """Backward only; caller restores then owns one main/scheduler/gate step."""
     with first_pass_replay(engine.module,next(engine.module.parameters()).device):
         search,first_audit=first_objective()
-        first_loss=float(search.detach());grads=compute_kd_search_grads(search,named)
+        first_loss=float(search.detach())
+        grads=compute_kd_search_grads(search,named if search_named is None else search_named)
+        if any(p.grad is not None for _,p in named):
+            raise RuntimeError('First-pass gradient leak into engine parameters')
     eps,norm,pn=direction(grads);del search,grads
     engine.zero_grad()
     with PerturbedParameters(named,eps) as perturb:
@@ -125,3 +128,16 @@ def student_sam_step(engine,named,first_objective,second_objective):
         SECOND_PASS_FULL_OBJECTIVE='PASS',SECOND_PASS_FULL_LOSS=float(loss.detach()),
         SECOND_PASS_TASK_LOSS=float(metrics['InfoNCE']),SECOND_PASS_KD_LOSS=float(metrics['effective_KD_loss']))
     return loss,gate_loss,metrics,audit
+
+
+def isolated_search_state(module, named):
+    """Clone first-pass leaves/buffers without inheriting engine parameter hooks."""
+    selected = {name for name, _ in named}
+    state = {
+        name: parameter.detach().clone().requires_grad_(name in selected)
+        for name, parameter in module.named_parameters()
+    }
+    if not selected <= set(state):
+        raise RuntimeError("Search parameter inventory mismatch")
+    state.update({name: buffer.detach().clone() for name, buffer in module.named_buffers()})
+    return state, [(name, state[name]) for name, _ in named]

@@ -1,4 +1,4 @@
-"""Strict deployment checkpoint for the four retrained Student methods."""
+"""Strict deployment checkpoint for the retrained Student methods."""
 from __future__ import annotations
 
 import hashlib
@@ -30,7 +30,7 @@ def validate_checkpoint(payload):
     experiment = config.get("experiment_id")
     if size not in (224, 256) or experiment not in {
         f"{name}-R{size}" for name in
-        ("S0-INFONCE", "S1-TSD", "S2-ADSD", "S3-SAM-ADSD")
+        ("S0-INFONCE", "S1-TSD", "S2-ADSD", "S3-SAM-ADSD", "S4-ADSD-SAM-MIDDLE")
     }:
         raise ValueError("Unknown Student experiment identity")
     if not isinstance(metadata.get("source_identity"), dict) or not metadata["source_identity"]:

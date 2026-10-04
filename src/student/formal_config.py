@@ -1,4 +1,4 @@
-"""Public contract for the four formal Student methods at 224 and 256."""
+"""Public contract for the formal Student methods at 224 and 256."""
 from __future__ import annotations
 
 import argparse
@@ -12,6 +12,7 @@ METHODS = {
     "s1_tsd": ("S1-TSD", "TSD", False),
     "s2_adsd": ("S2-ADSD", "ADSD", False),
     "s3_sam_adsd": ("S3-SAM-ADSD", "ADSD", True),
+    "s4_adsd_sam_middle": ("S4-ADSD-SAM-MIDDLE", "ADSD", False),
 }
 SELECTION_START_EPOCH = 11
 SELECTION_BATCH_SIZE = 16

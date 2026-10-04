@@ -1,4 +1,4 @@
-"""Strict M3 Middle provider binding for TSD and ADSD asset construction."""
+"""Strict M2/M3 Middle provider binding for TSD and ADSD asset construction."""
 from pathlib import Path
 
 import torch
@@ -8,13 +8,23 @@ from src.middle_teacher.checkpoint import sha256
 from src.middle_teacher.formal_config import load_formal_config
 
 
-def validate_m3_middle(checkpoint, config_path, image_size):
+def validate_middle_provider(checkpoint, config_path, image_size, *, expected_method=None):
     path = Path(checkpoint).resolve()
     public_path, public = load_formal_config(config_path)
-    if public["experiment_id"] != f"M3-SAM-HRD-SEM-R{image_size}":
-        raise ValueError("Student requires its resolution-matched M3 Middle")
-    if path.name != "best_model.pth" or public["output_dir"] != str(path.parent):
-        raise ValueError("Middle best checkpoint/output identity mismatch")
+    allowed = {f"M2-HRD-SEM-R{image_size}", f"M3-SAM-HRD-SEM-R{image_size}"}
+    if public["experiment_id"] not in allowed:
+        raise ValueError("Student assets require a resolution-matched M2 or M3 Middle")
+    is_sam = public["experiment_id"] == f"M3-SAM-HRD-SEM-R{image_size}"
+    if expected_method is not None and expected_method != ("M3" if is_sam else "M2"):
+        raise ValueError("Middle provider method mismatch")
+    if path.name != "best_model.pth":
+        raise ValueError("Middle requires best_model.pth")
+    if public["output_dir"] != str(path.parent):
+        # A relocated run keeps its immutable original config identity.
+        import json
+        snapshot = path.parent / "config.json"
+        if not snapshot.is_file() or json.loads(snapshot.read_text()) != public:
+            raise ValueError("Relocated Middle requires an identical run config snapshot")
     payload = torch.load(path, map_location="cpu", weights_only=True)
     if not isinstance(payload, dict) or payload.get("artifact_schema") != SCHEMA:
         raise ValueError("Middle checkpoint schema mismatch")
@@ -42,8 +52,20 @@ def validate_m3_middle(checkpoint, config_path, image_size):
            for mapping in (parameters, buffers)
            for name, dtype in mapping.items()):
         raise ValueError("Middle stored tensor dtype differs from signature")
-    if metadata.get("sam") is not True or metadata.get("sharpness") != payload["config"]["sam"]:
-        raise ValueError("Middle SAM metadata mismatch")
-    if metadata.get("search_direction") != "kd" or metadata.get("rho") != 0.1:
-        raise ValueError("Middle M3 method mismatch")
+    if payload["config"]["model"] != {"architecture": "dinov3_vitb16", "descriptor_dim": 768}:
+        raise ValueError("Middle architecture mismatch")
+    if is_sam:
+        if metadata.get("sam") is not True or metadata.get("sharpness") != payload["config"]["sam"]:
+            raise ValueError("Middle SAM metadata mismatch")
+        if metadata.get("search_direction") != "kd" or metadata.get("rho") != 0.1:
+            raise ValueError("Middle M3 method mismatch")
+    elif metadata.get("sam") is not False or payload["config"]["sam"] != {"enabled": False} or any(
+        metadata.get(key) is not None for key in ("sharpness", "search_direction", "rho")
+    ):
+        raise ValueError("Middle M2 must have no SAM metadata")
     return public, sha256(path)
+
+
+def validate_m3_middle(checkpoint, config_path, image_size):
+    """Keep existing M3-only callers strict."""
+    return validate_middle_provider(checkpoint, config_path, image_size, expected_method="M3")

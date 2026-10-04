@@ -22,7 +22,7 @@ def test_formal_middle_config_and_runtime_projection(monkeypatch, size, method):
     assert public["img_size"] == size
     assert (public["world_size"], public["local_pair_batch"],
             public["global_pair_batch"], public["cross_gpu_gather"]) == (2, 16, 32, True)
-    assert public["output_dir"] is None
+    assert public["output_dir"] is None or (isinstance(public["output_dir"], str) and bool(public["output_dir"]))
     assert "best_metric" not in public
     assert ("teacher_checkpoint" in public) == (method != "m0_infonce")
     internal = to_runtime_config(path)
@@ -178,9 +178,10 @@ def test_formal_middle_selection_starts_at_six_and_uses_batch_sixteen(monkeypatc
 def test_resolution_variants_have_identical_training_math(method):
     a = json.loads((CONFIG_DIR / f"{method}_224.json").read_text())
     b = json.loads((CONFIG_DIR / f"{method}_256.json").read_text())
-    for key in ("experiment_id", "img_size"):
-        a.pop(key)
-        b.pop(key)
+    # Run destinations and provider paths differ by resolution, not the method.
+    for key in ("experiment_id", "img_size", "output_dir", "teacher_checkpoint"):
+        a.pop(key, None)
+        b.pop(key, None)
     assert a == b
 
 
