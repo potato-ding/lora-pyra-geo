@@ -7,11 +7,10 @@ import cv2
 import numpy as np
 import torch
 import torch.distributed as dist
-from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
-from torchvision import transforms
-from torchvision.datasets import ImageFolder
+
+from src.evaluation.protocols import GTA_PROTOCOL
 
 GTA_SATE_LENGTH = 24576
 GTA_TILE_LENGTH = 256
@@ -52,7 +51,7 @@ def get_paired_cross_view_folder_data(path):
     return data
 
 
-class PairedCrossViewU1652DatasetEval(Dataset):
+class PairedCrossViewDatasetEval(Dataset):
     def __init__(self, data_folder, mode, transform=None, sample_ids=None, gallery_n=-1):
         self.data_dict = get_paired_cross_view_folder_data(data_folder)
         self.ids = list(self.data_dict.keys())
@@ -72,14 +71,18 @@ class PairedCrossViewU1652DatasetEval(Dataset):
         return len(self.images)
 
     def __getitem__(self, idx):
-        img = Image.open(self.images[idx]).convert("RGB")
+        img = cv2.imread(self.images[idx])
+        if img is None:
+            raise FileNotFoundError(f"Retrieval image could not be decoded: {self.images[idx]}")
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         if self.transform is not None:
-            img = self.transform(image=np.array(img))["image"]
+            img = self.transform(image=img)["image"]
 
         sample_id = self.sample_ids[idx]
         label = int(sample_id)
-        # Non-query identities are formal distractors, not junk. Keep their
-        # true folder label so they participate in the full gallery ranking.
+        # Only query identities are valid gallery labels.
+        if self.given_sample_ids is not None and sample_id not in self.given_sample_ids:
+            label = -1
 
         return img, label
 
@@ -93,12 +96,12 @@ def build_1652_val_dataloaders(data_dir="data/U1652", img_size=[224, 224], batch
     val_transform = get_paired_cross_view_val_transforms(img_size=img_size)
 
     # ==================== 任务 1: D2S (无人机找卫星) ====================
-    val_q_drone_ds = PairedCrossViewU1652DatasetEval(
+    val_q_drone_ds = PairedCrossViewDatasetEval(
         os.path.join(data_dir, "test/query_drone"),
         mode="query",
         transform=val_transform,
     )
-    val_g_sat_ds = PairedCrossViewU1652DatasetEval(
+    val_g_sat_ds = PairedCrossViewDatasetEval(
         os.path.join(data_dir, "test/gallery_satellite"),
         mode="gallery",
         transform=val_transform,
@@ -106,12 +109,12 @@ def build_1652_val_dataloaders(data_dir="data/U1652", img_size=[224, 224], batch
     )
 
     # ==================== 任务 2: S2D (卫星找无人机) ====================
-    val_q_sat_ds = PairedCrossViewU1652DatasetEval(
+    val_q_sat_ds = PairedCrossViewDatasetEval(
         os.path.join(data_dir, "test/query_satellite"),
         mode="query",
         transform=val_transform,
     )
-    val_g_drone_ds = PairedCrossViewU1652DatasetEval(
+    val_g_drone_ds = PairedCrossViewDatasetEval(
         os.path.join(data_dir, "test/gallery_drone"),
         mode="gallery",
         transform=val_transform,
@@ -162,70 +165,41 @@ def build_1652_val_dataloaders(data_dir="data/U1652", img_size=[224, 224], batch
     }
 
 
+
+
+
 def build_sues200_val_dataloaders(
-    img_size=[224, 224],
-    batch_size=32,
-    num_workers=8,
-    data_dir=None,
-    heights=None,
+    img_size=[224, 224], batch_size=32, num_workers=8, data_dir=None, heights=None,
 ):
-    val_transform = transforms.Compose([
-        transforms.Resize((img_size[0], img_size[1]), interpolation=transforms.InterpolationMode.BICUBIC),
-        transforms.ToTensor(),
-        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-    ])
-
+    from src.dataset.teacher.transforms import get_paired_cross_view_val_transforms
+    transform = get_paired_cross_view_val_transforms(img_size=img_size)
     testing_dir = os.path.join(data_dir, "Testing")
-    heights = heights or ["150", "200", "250", "300"]
-    loaders_by_height = {}
+    groups = {}
 
-    def make_loader(ds):
-        ds = IndexedDataset(ds)
-        sampler = DistributedSampler(ds, shuffle=False, drop_last=False) if dist.is_available() and dist.is_initialized() else None
-        return DataLoader(
-            ds,
-            batch_size=batch_size,
-            sampler=sampler,
-            shuffle=False,
-            num_workers=num_workers,
-            pin_memory=True,
-            drop_last=False,
-        )
+    def make_loader(dataset):
+        dataset = IndexedDataset(dataset)
+        sampler = DistributedSampler(dataset, shuffle=False, drop_last=False) if dist.is_available() and dist.is_initialized() else None
+        return DataLoader(dataset, batch_size=batch_size, sampler=sampler,
+                          shuffle=False, num_workers=num_workers,
+                          pin_memory=True, drop_last=False)
 
-    def ensure_query_classes_in_gallery(query_classes, gallery_class_to_idx, context):
-        missing = [cls for cls in query_classes if cls not in gallery_class_to_idx]
-        if missing:
-            examples = ", ".join(missing[:5])
-            raise ValueError(
-                f"SUES-200 {context} has query classes missing from gallery: "
-                f"{examples} (total={len(missing)})"
-            )
-
-    for h in heights:
-        current_height_dir = os.path.join(testing_dir, h)
-        if not os.path.isdir(current_height_dir):
-            raise FileNotFoundError(f"SUES-200 testing height folder not found: {current_height_dir}")
-
-        val_q_drone_ds = ImageFolder(os.path.join(current_height_dir, "query_drone"), transform=val_transform)
-        val_g_sat_ds = ImageFolder(os.path.join(current_height_dir, "gallery_satellite"), transform=val_transform)
-        q_drone_classes = val_q_drone_ds.classes
-        g_sat_class_to_idx = val_g_sat_ds.class_to_idx
-        ensure_query_classes_in_gallery(q_drone_classes, g_sat_class_to_idx, f"{h}m D2S")
-        val_q_drone_ds.target_transform = lambda old_label, classes=q_drone_classes, class_to_idx=g_sat_class_to_idx: class_to_idx[classes[old_label]]
-
-        val_q_sat_ds = ImageFolder(os.path.join(current_height_dir, "query_satellite"), transform=val_transform)
-        val_g_drone_ds = ImageFolder(os.path.join(current_height_dir, "gallery_drone"), transform=val_transform)
-        q_sat_classes = val_q_sat_ds.classes
-        g_drone_class_to_idx = val_g_drone_ds.class_to_idx
-        ensure_query_classes_in_gallery(q_sat_classes, g_drone_class_to_idx, f"{h}m S2D")
-        val_q_sat_ds.target_transform = lambda old_label, classes=q_sat_classes, class_to_idx=g_drone_class_to_idx: class_to_idx[classes[old_label]]
-
-        loaders_by_height[f"{h}m"] = {
-            "D2S": (make_loader(val_q_drone_ds), make_loader(val_g_sat_ds)),
-            "S2D": (make_loader(val_q_sat_ds), make_loader(val_g_drone_ds)),
-        }
-
-    return loaders_by_height
+    for height in heights or ["150", "200", "250", "300"]:
+        folder = os.path.join(testing_dir, height)
+        if not os.path.isdir(folder):
+            raise FileNotFoundError(f"SUES-200 testing height folder not found: {folder}")
+        groups[f"{height}m"] = {}
+        for direction, query_view, gallery_view in [
+            ("D2S", "query_drone", "gallery_satellite"),
+            ("S2D", "query_satellite", "gallery_drone"),
+        ]:
+            query = PairedCrossViewDatasetEval(os.path.join(folder, query_view), "query", transform)
+            gallery = PairedCrossViewDatasetEval(os.path.join(folder, gallery_view), "gallery", transform,
+                                                sample_ids=query.get_sample_ids())
+            missing = query.get_sample_ids() - gallery.get_sample_ids()
+            if missing:
+                raise ValueError(f"SUES-200 {height}m {direction} has query classes missing from gallery: {sorted(missing)}")
+            groups[f"{height}m"][direction] = (make_loader(query), make_loader(gallery))
+    return groups
 
 
 def gta_sate2loc(tile_zoom, offset, tile_x, tile_y):
@@ -300,6 +274,8 @@ def build_gta_val_dataloaders(
     query_mode="D2S",
     mode="pos",
 ):
+    if (split_type, query_mode, mode) != ("cross-area", "D2S", "pos"):
+        raise ValueError("Unified GTA protocol requires cross-area / D2S / pos")
     from src.dataset.teacher.transforms import get_paired_cross_view_val_transforms
 
     val_transforms = get_paired_cross_view_val_transforms(img_size=img_size)
@@ -359,6 +335,7 @@ def build_gta_val_dataloaders(
         query_dataset = GTAUAVDataset(query_paths, query_labels, coords=query_coords, transform=val_transforms)
         gallery_dataset = GTAUAVDataset(all_sate_paths, sate_labels, coords=sate_coords, transform=val_transforms)
         query_dataset.protocol_audit = {
+            "gta_protocol": GTA_PROTOCOL,
             "raw_json_queries": len(json_data),
             "queries_with_positive": sum(bool(item[pair_key]) for item in json_data),
             "formal_query_count": len(query_paths),
@@ -424,7 +401,7 @@ def build_gta_val_dataloaders(
 __all__ = [
     "GTAUAVDataset",
     "IndexedDataset",
-    "PairedCrossViewU1652DatasetEval",
+    "PairedCrossViewDatasetEval",
     "build_1652_val_dataloaders",
     "build_gta_val_dataloaders",
     "build_sues200_val_dataloaders",

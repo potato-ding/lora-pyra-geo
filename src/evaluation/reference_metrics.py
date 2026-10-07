@@ -1,7 +1,7 @@
 """Independent certification metrics. Never used to fit a model.
 
 Reference protocols: layumi/University1652-Baseline evaluate_gpu.py;
-Reza-Zhu/SUES-200-Benchmark evaluate.py/test_and_evaluate.py;
+DAC/MEAN sample4geo/evaluate/university.py;
 Yux1angJi/GTA-UAV Game4Loc/game4loc/evaluate/gta.py.
 Source revisions/hashes are saved with the certification report.
 """
@@ -48,7 +48,6 @@ def u1652_official_reference_metrics(qf,ql,gf,gl,device='cpu'):
 
 def sues_official_reference_metrics(qf,ql,gf,gl,device='cpu'):
     return _triangle(qf,ql,gf,gl,device)
-
 
 def gta_official_reference_metrics(qf,ql,qc,gf,gl,gc,device='cpu'):
     hits=0;ap_sum=dis_sum=sdm_sum=0.0

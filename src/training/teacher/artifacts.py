@@ -3,6 +3,7 @@ from pathlib import Path
 import hashlib
 import json
 import torch
+from src.evaluation.protocols import RETRIEVAL_PROTOCOL
 from src.evaluation.precision_contract import selection_signature, flat_selection_metrics
 from src.training.teacher.certified_selection import selection_metadata
 
@@ -34,7 +35,7 @@ def save_best_checkpoint(model, args, metrics, directory, training_world_size):
     if formal_config is not None:
         encoded=json.dumps(formal_config,sort_keys=True,separators=(',',':'),ensure_ascii=False).encode()
         metadata['config_sha256']=hashlib.sha256(encoded).hexdigest()
-    payload = dict(artifact_schema=SCHEMA, model={n:t.detach().cpu() for n,t in model.state_dict().items()},
+    payload = dict(selection_dataset_protocol=RETRIEVAL_PROTOCOL, artifact_schema=SCHEMA, model={n:t.detach().cpu() for n,t in model.state_dict().items()},
                    precision_signature=signature, selection_metrics=refs,
                    selection_protocol=protocol, metadata=metadata,
                    hyperparameters=dict(vars(args)))

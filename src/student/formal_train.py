@@ -13,6 +13,7 @@ import torch.distributed as dist
 
 from src.evaluation.model_loader import EvaluationEncoder, load_encoder
 from src.evaluation.precision_contract import selection_signature
+from src.evaluation.protocols import RETRIEVAL_PROTOCOL
 from src.evaluation.student_canonical import evaluate_student_u1652_canonical
 from src.middle_teacher.checkpoint import sha256
 from .adsd import ADSDGate
@@ -140,6 +141,7 @@ def select_student(engine, config, output, epoch, best_score, asset_hashes,
             }
             payload = {
                 "artifact_schema": SCHEMA, "model": state,
+                "selection_dataset_protocol": RETRIEVAL_PROTOCOL,
                 "public_config": dict(config), "metadata": metadata,
                 "precision_signature": signature,
                 "selection_metrics": metrics,
@@ -154,6 +156,7 @@ def select_student(engine, config, output, epoch, best_score, asset_hashes,
                 temporary.unlink(missing_ok=True)
         print("STUDENT_SELECTION=" + json.dumps({
             "epoch": epoch, "metrics": metrics, "R1_sum": score,
+            "u1652_protocol": RETRIEVAL_PROTOCOL,
             "best_update": improved, "best_score": max(score, best_score),
         }), flush=True)
         return max(score, best_score)

@@ -151,17 +151,19 @@ def _query_tensor(image_rgb, image_size, normalization):
     return normalization(image=np.asarray(resized))["image"]
 
 
-def _gallery_tensor(image_bgr, image_size, normalization):
+def _gallery_tensor(image_bgr, image_size, normalization, channel_mode='official_bgr'):
     # The official gallery path uses cv2.resize's default INTER_LINEAR.
-    # Convert BGR to RGB for this repository's RGB-trained encoders.
+    # Preserve the upstream BGR array order for every evaluated model.
     resized = cv2.resize(
         image_bgr, (image_size, image_size), interpolation=cv2.INTER_LINEAR
     )
-    return normalization(image=cv2.cvtColor(resized, cv2.COLOR_BGR2RGB))["image"]
+    if channel_mode != "official_bgr":
+        raise ValueError(f"Unknown gallery channel mode: {channel_mode}")
+    return normalization(image=resized)["image"]
 
 
 @torch.no_grad()
-def evaluate_anyvisloc(model, root, image_size, device, batch_size=16):
+def evaluate_anyvisloc(model, root, image_size, device, batch_size=16, query_callback=None, gallery_channel_mode='official_bgr'):
     """Evaluate all released queries from Scene_01/02 against aerial tiles."""
     scenes = validate_anyvisloc_root(root)
     normalization = A.Compose([
@@ -206,7 +208,7 @@ def evaluate_anyvisloc(model, root, image_size, device, batch_size=16):
                     crop_bgr = rotated[row0:row0 + patch_h, col0:col0 + patch_w]
                     if crop_bgr.shape[:2] != (patch_h, patch_w):
                         raise RuntimeError(f"AnyVisLoc invalid gallery crop: {sample_path}")
-                    images.append(_gallery_tensor(crop_bgr, image_size, normalization))
+                    images.append(_gallery_tensor(crop_bgr, image_size, normalization, gallery_channel_mode))
                 gallery = model.encode(torch.stack(images).to(device))
                 scores.extend((gallery @ q_feature).cpu().numpy().tolist())
             if device.type == "cuda":
@@ -221,6 +223,8 @@ def evaluate_anyvisloc(model, root, image_size, device, batch_size=16):
             rows.append({"sample_id": sample_path.stem, "scene": scene,
                          "gallery_blocks": len(mids), "patch_height": patch_h, "patch_width": patch_w,
                          "retrieval_time_per_feature_ms": 1000 * elapsed / (len(mids) + 1), **metrics})
+            if query_callback is not None:
+                query_callback(dict(rows[-1]))
             if index % 20 == 0 or index == len(samples):
                 print(f"AnyVisLoc {scene}: {index}/{len(samples)}", flush=True)
             del rotated

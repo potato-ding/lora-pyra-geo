@@ -259,7 +259,6 @@ def extract_features_dist(
     dataloader,
     device,
     stage_name=None,
-    horizontal_flip=False,
     feature_name=None,
 ):
     model.eval()
@@ -284,20 +283,7 @@ def extract_features_dist(
         imgs = batch_data[0].to(device=device, dtype=input_dtype)
         labels = batch_data[1].to(device)
 
-        if horizontal_flip:
-            feats = None
-            for flip_idx in range(2):
-                model_imgs = torch.flip(imgs, dims=[3]) if flip_idx == 1 else imgs
-                current_feats = select_model_descriptor(
-                    model(model_imgs),
-                    feature_name=feature_name,
-                )
-                feats = current_feats.float() if feats is None else feats + current_feats.float()
-        else:
-            feats = select_model_descriptor(
-                model(imgs),
-                feature_name=feature_name,
-            )
+        feats = select_model_descriptor(model(imgs), feature_name=feature_name)
 
         # 2. L2 归一化，方便后面直接点乘作为余弦相似度
         feats = torch.nn.functional.normalize(feats, p=2, dim=1)
@@ -404,7 +390,7 @@ def extract_features_dist(
     return res_feats, res_labels, res_coords
 
 @torch.no_grad()
-def getdist_1652_val_and_get_recall(
+def _identity_retrieval_metrics(
     model,
     val_query_loader,
     val_gallery_loader,
@@ -427,7 +413,8 @@ def getdist_1652_val_and_get_recall(
         recall_1, recall_5, recall_10, mAP
     """
 
-    model.eval()
+    if model is not None:
+        model.eval()
 
     # 1. 提取并 all_gather query / gallery 特征
     query_stage = f"{task_name}:query" if task_name else None
@@ -470,12 +457,11 @@ def getdist_1652_val_and_get_recall(
     g_l = g_l.view(-1)
 
     valid_gallery_mask = g_l != -1
-    if valid_gallery_mask.any():
-        g_f = g_f[valid_gallery_mask]
-        g_l = g_l[valid_gallery_mask]
-        real_num_gallery = g_l.numel()
-    else:
-        raise RuntimeError("University-1652 gallery has no valid samples after removing junk label -1")
+    valid_num_gallery = int(valid_gallery_mask.sum().item())
+    if valid_num_gallery == 0:
+        raise RuntimeError("Retrieval gallery has no valid samples after removing junk label -1")
+    # Keep junk through sorting, as upstream does. Removing columns before
+    # np.argsort can change the relative order of exactly tied valid scores.
 
     g_f_device = g_f.to(device)
     g_l_device = g_l.to(device)
@@ -501,6 +487,8 @@ def getdist_1652_val_and_get_recall(
     local_correct_5 = torch.tensor(0.0, device=device)
     local_correct_10 = torch.tensor(0.0, device=device)
     local_ap_sum = torch.tensor(0.0, device=device)
+    local_correct_top1 = torch.tensor(0.0, device=device)
+    top1_percent_k = min(round(real_num_gallery * 0.01) + 1, valid_num_gallery)
 
     # 6. 分块计算，避免一次性相似度矩阵过大
     if local_num_queries > 0:
@@ -516,6 +504,9 @@ def getdist_1652_val_and_get_recall(
             # 降序排序
             sorted_indices = _official_descending_indices(score_chunk)
             sorted_gallery_labels = g_l_device[sorted_indices]
+            sorted_gallery_labels = sorted_gallery_labels[
+                sorted_gallery_labels != -1
+            ].reshape(q_f_chunk.size(0), valid_num_gallery)
 
             # [chunk_size, real_num_gallery]
             matches = (sorted_gallery_labels == q_l_chunk.unsqueeze(1)).float()
@@ -524,12 +515,13 @@ def getdist_1652_val_and_get_recall(
             local_correct_1 += matches[:, :1].any(dim=1).float().sum()
             local_correct_5 += matches[:, :5].any(dim=1).float().sum()
             local_correct_10 += matches[:, :10].any(dim=1).float().sum()
+            local_correct_top1 += matches[:, :top1_percent_k].any(dim=1).float().sum()
 
             # mAP
             cum_matches = torch.cumsum(matches, dim=1)
             ranks = torch.arange(
                 1,
-                real_num_gallery + 1,
+                valid_num_gallery + 1,
                 device=device
             ).float().unsqueeze(0)
 
@@ -538,7 +530,7 @@ def getdist_1652_val_and_get_recall(
 
             rank_indices = torch.arange(
                 0,
-                real_num_gallery,
+                valid_num_gallery,
                 device=device,
             ).float().unsqueeze(0)
             old_precisions = torch.where(
@@ -558,6 +550,7 @@ def getdist_1652_val_and_get_recall(
         _all_reduce_sum(local_correct_5, log_prefix=metric_log_prefix, tensor_name="correct@5")
         _all_reduce_sum(local_correct_10, log_prefix=metric_log_prefix, tensor_name="correct@10")
         _all_reduce_sum(local_ap_sum, log_prefix=metric_log_prefix, tensor_name="ap_sum")
+        _all_reduce_sum(local_correct_top1, log_prefix=metric_log_prefix, tensor_name="correct@top1")
 
     # 8. 计算最终指标
     recall_1 = local_correct_1.item() / real_num_queries * 100
@@ -565,7 +558,15 @@ def getdist_1652_val_and_get_recall(
     recall_10 = local_correct_10.item() / real_num_queries * 100
     mAP = local_ap_sum.item() / real_num_queries * 100
 
-    return recall_1, recall_5, recall_10, mAP
+    return {"R@1": recall_1, "R@5": recall_5, "R@10": recall_10, "AP": mAP,
+            "R@top1": local_correct_top1.item() / real_num_queries * 100}
+
+def getdist_1652_val_and_get_recall(model, val_query_loader, val_gallery_loader, device,
+                                  task_name=None, feature_name=None, precomputed_features=None):
+    result = _identity_retrieval_metrics(model, val_query_loader, val_gallery_loader, device,
+                                        task_name, feature_name, precomputed_features)
+    return tuple(result[key] for key in ("R@1", "R@5", "R@10", "AP"))
+
 
 def run_val_and_get_recall(
     model,
@@ -853,104 +854,7 @@ def run_gta_val_and_get_metrics(
 
 
 @torch.no_grad()
-def run_sues_val_and_get_metrics(
-    model,
-    val_query_loader,
-    val_gallery_loader,
-    device,
-    horizontal_flip=False,
-    feature_name=None,
-    precomputed_features=None,
-):
-    q_f, q_l, _ = (
-        precomputed_features[:3]
-        if precomputed_features is not None
-        else extract_features_dist(
-            model,
-            val_query_loader,
-            device,
-            horizontal_flip=horizontal_flip,
-            feature_name=feature_name,
-        )
-    )
-    g_f, g_l, _ = (
-        precomputed_features[3:]
-        if precomputed_features is not None
-        else extract_features_dist(
-            model,
-            val_gallery_loader,
-            device,
-            horizontal_flip=horizontal_flip,
-            feature_name=feature_name,
-        )
-    )
-
-    real_num_queries = len(val_query_loader.dataset)
-    real_num_gallery = len(val_gallery_loader.dataset)
-
-    q_f, q_l = q_f[:real_num_queries], q_l[:real_num_queries].view(-1)
-    g_f, g_l = g_f[:real_num_gallery], g_l[:real_num_gallery].view(-1)
-
-    world_size = dist.get_world_size() if dist.is_initialized() else 1
-    rank = dist.get_rank() if dist.is_initialized() else 0
-
-    queries_per_rank = (real_num_queries + world_size - 1) // world_size
-    start_idx = rank * queries_per_rank
-    end_idx = min(start_idx + queries_per_rank, real_num_queries)
-
-    local_q_f = q_f[start_idx:end_idx]
-    local_q_l = q_l[start_idx:end_idx]
-    local_num_queries = local_q_f.size(0)
-
-    g_f_device = g_f.to(device)
-    g_l_device = g_l.to(device)
-    top1_percent_k = min(round(real_num_gallery * 0.01) + 1, real_num_gallery)
-
-    local_correct_1 = torch.tensor(0.0, device=device)
-    local_correct_5 = torch.tensor(0.0, device=device)
-    local_correct_10 = torch.tensor(0.0, device=device)
-    local_correct_top1 = torch.tensor(0.0, device=device)
-    local_ap_sum = torch.tensor(0.0, device=device)
-
-    if local_num_queries > 0:
-        chunk_size = 1000
-        for i in range(0, local_num_queries, chunk_size):
-            q_f_chunk = local_q_f[i:i + chunk_size].to(device)
-            q_l_chunk = local_q_l[i:i + chunk_size].to(device)
-
-            score_chunk = torch.matmul(q_f_chunk, g_f_device.t())
-            sorted_indices = _official_descending_indices(score_chunk)
-            sorted_gallery_labels = g_l_device[sorted_indices]
-            matches = (sorted_gallery_labels == q_l_chunk.unsqueeze(1)).float()
-
-            local_correct_1 += matches[:, :1].any(dim=1).float().sum()
-            local_correct_5 += matches[:, :5].any(dim=1).float().sum()
-            local_correct_10 += matches[:, :10].any(dim=1).float().sum()
-            local_correct_top1 += matches[:, :top1_percent_k].any(dim=1).float().sum()
-
-            cum_matches = torch.cumsum(matches, dim=1)
-            ranks = torch.arange(1, real_num_gallery + 1, device=device).float().unsqueeze(0)
-            precisions = cum_matches / ranks
-            total_true_matches = matches.sum(dim=1)
-            rank_indices = torch.arange(0, real_num_gallery, device=device).float().unsqueeze(0)
-            old_precisions = torch.where(
-                rank_indices > 0,
-                (cum_matches - matches) / torch.clamp(rank_indices, min=1.0),
-                torch.ones_like(precisions),
-            )
-            ap_per_query = (((old_precisions + precisions) / 2.0) * matches).sum(dim=1) / (
-                total_true_matches + 1e-12
-            )
-            local_ap_sum += ap_per_query.sum()
-
-    if dist.is_initialized():
-        for tensor in (local_correct_1, local_correct_5, local_correct_10, local_correct_top1, local_ap_sum):
-            dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-
-    return {
-        "R@1": local_correct_1.item() / real_num_queries * 100,
-        "R@5": local_correct_5.item() / real_num_queries * 100,
-        "R@10": local_correct_10.item() / real_num_queries * 100,
-        "R@top1": local_correct_top1.item() / real_num_queries * 100,
-        "AP": local_ap_sum.item() / real_num_queries * 100,
-    }
+def run_sues_val_and_get_metrics(model, val_query_loader, val_gallery_loader, device,
+                               feature_name=None, precomputed_features=None):
+    return _identity_retrieval_metrics(model, val_query_loader, val_gallery_loader, device,
+                                      feature_name=feature_name, precomputed_features=precomputed_features)

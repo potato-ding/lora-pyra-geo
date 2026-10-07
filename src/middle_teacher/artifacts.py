@@ -3,6 +3,7 @@ import math
 import hashlib
 import json
 import torch
+from src.evaluation.protocols import RETRIEVAL_PROTOCOL
 from .checkpoint import CheckpointController, portable_state, raw_model
 from .distributed import rank
 from .selection import selection_metadata
@@ -95,7 +96,7 @@ class MiddleCheckpointController(CheckpointController):
                 metadata['asam_eta'] = self.config['sam']['asam_eta']
             metadata.update(sharpness=self.config['sam'],
                 best_epoch_gradient_diagnostics=raw_model(model_or_engine).sam_epoch_diagnostics)
-        payload=dict(artifact_schema=SCHEMA,model=portable_state(model_or_engine),config=self.config,
+        payload=dict(selection_dataset_protocol=RETRIEVAL_PROTOCOL, artifact_schema=SCHEMA,model=portable_state(model_or_engine),config=self.config,
             metadata=metadata,selection_protocol=protocol,selection_metrics=refs,
             precision_signature=selection_signature(raw_model(model_or_engine),'middle',protocol['image_size'],
                 selection_batch_size=selection_batch))

@@ -2,6 +2,7 @@
 import argparse
 import json
 from pathlib import Path
+from .protocols import RETRIEVAL_PROTOCOL, require_selection_protocol
 import torch
 from .model_loader import load_encoder as _load_checkpoint_encoder
 from .metrics import getdist_1652_val_and_get_recall,run_sues_val_and_get_metrics,run_gta_val_and_get_metrics
@@ -35,6 +36,7 @@ def verify_previous_u1652(path, load_audit, model_type, image_size):
     if (previous.get('model_type') != model_type
             or previous.get('checkpoint_sha256') != load_audit['sha256']
             or previous.get('dataset') != 'u1652'
+            or previous.get('protocol', {}).get('retrieval_protocol') != RETRIEVAL_PROTOCOL
             or previous.get('protocol', {}).get('input_size') != image_size
             or previous.get('protocol', {}).get('BEST_MODEL_RELOAD_CONSISTENCY') != 'PASS'):
         raise RuntimeError("Existing U1652 result does not match this formal checkpoint")
@@ -48,12 +50,10 @@ def parse_args(argv=None):
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--model-type',required=True,help='teacher, middle, student; comparison adapters can be registered later')
     p.add_argument('--checkpoint',required=True);p.add_argument('--config')
-    p.add_argument('--dataset',required=True,choices=['u1652','sues200','gta','anyvisloc','all'],help='all: U1652, SUES-200, GTA-UAV, AnyVisLoc')
-    p.add_argument('--data-root',default='data');p.add_argument('--u1652-dir');p.add_argument('--sues200-dir');p.add_argument('--gta-dir');p.add_argument('--anyvisloc-dir')
+    p.add_argument('--dataset',required=True,choices=['u1652','sues200','gta','anyvisloc','all'],help='all: finalized U1652, SUES-200 and GTA-UAV protocols')
+    p.add_argument('--data-root',default='data');p.add_argument('--u1652-dir');p.add_argument('--sues200-dir');p.add_argument('--gta-dir')
     p.add_argument('--batch-size',type=int,default=16);p.add_argument('--num-workers',type=int,default=8)
     p.add_argument('--image-size',type=int,required=True,help='evaluation input size; must match our model checkpoint');p.add_argument('--device',default='cuda:0');p.add_argument('--output-dir',help='comparison-model output directory; formal models write beside their checkpoint')
-    p.add_argument('--gta-split',choices=['cross-area'],default='cross-area')
-    p.add_argument('--gta-query-mode',choices=['D2S'],default='D2S')
     p.add_argument('--certification-only',action='store_true',help='Extract once and compare independent metrics, without issuing formal results')
     p.add_argument('--feature-cache-dir',help='Explicit certification cache directory, not included in result packages')
     p.add_argument('--reuse-certified-cache',action='store_true',help='Formal metrics from hash-verified previously certified descriptors')
@@ -66,8 +66,6 @@ def parse_args(argv=None):
         p.error(f"No evaluation model adapter registered for {args.model_type!r}")
     if args.reuse_certified_cache and not args.certification_only and args.model_type in ("student", "middle"):
         raise ValueError("U1652 reload verification requires fresh batch=16 extraction; cached batch provenance is unavailable")
-    if args.dataset in ("anyvisloc", "all") and (args.certification_only or args.reuse_certified_cache):
-        p.error("AnyVisLoc requires direct retrieval; descriptor certification cache is not supported")
     checkpoint_dir = Path(args.checkpoint).resolve().parent
     if args.certification_only:
         if args.output_dir is None:
@@ -95,6 +93,9 @@ def main(argv=None):
         raise RuntimeError('LEGACY_CHECKPOINT: not certified for new formal Student evaluation')
     if args.model_type=='teacher' and not args.certification_only and load_audit.get('artifact_classification') != 'FORMAL_TEACHER_CHECKPOINT':
         raise RuntimeError('LEGACY_CHECKPOINT: not certified for new formal Teacher evaluation')
+    header=torch.load(args.checkpoint,map_location='cpu',weights_only=True,mmap=True)
+    require_selection_protocol(header.get('selection_dataset_protocol'))
+    del header
     signature=load_audit['precision_signature']
     image_size=signature['image_size']
     if args.image_size is not None and args.image_size!=image_size:
@@ -122,8 +123,8 @@ def main(argv=None):
             result_names.append("test_sues200.json")
         if args.dataset in ("gta", "all"):
             result_names.append("test_gta_cross_area_d2s.json")
-        if args.dataset in ("anyvisloc", "all"):
-            result_names.append("test_anyvisloc.json")
+        if args.dataset == 'anyvisloc':
+            result_names.append('test_anyvisloc.json')
         for name in result_names:
             if (output/name).exists():
                 raise FileExistsError("Evaluation result already exists: "+str(output/name))
@@ -151,7 +152,7 @@ def main(argv=None):
             r1,r5,_,ap=getdist_1652_val_and_get_recall(model,*pair,device)
             return {'R@1':r1,'R@5':r5,'AP':ap}
         if dataset=='sues200':
-            result=run_sues_val_and_get_metrics(model,*pair,device,horizontal_flip=True)
+            result=run_sues_val_and_get_metrics(model,*pair,device)
             return {k:result[k] for k in ('R@1','R@5','R@10','R@top1','AP')}
         result=run_gta_val_and_get_metrics(model,*pair,device)
         return {k:result[k] for k in ('R@1','R@5','R@10','R@top1','AP',
@@ -159,13 +160,13 @@ def main(argv=None):
     roots={'u1652':args.u1652_dir or str(Path(args.data_root)/'U1652'),
            'sues200':args.sues200_dir or str(Path(args.data_root)/'SUES-200/SUES-200-512x512'),
            'gta':args.gta_dir or str(Path(args.data_root)/'GTA-UAV-LR/GTA-UAV-LR-baidu'),
-           'anyvisloc':args.anyvisloc_dir or str(Path(args.data_root)/'test_anyvisloc_scenes01_02')}
-    datasets=['u1652','sues200','gta','anyvisloc'] if args.dataset=='all' else [args.dataset]
+           'anyvisloc':str(Path(args.data_root)/'test_anyvisloc_scenes01_02')}
+    datasets=['u1652','sues200','gta'] if args.dataset=='all' else [args.dataset]
     if not args.certification_only and 'u1652' not in datasets and not (output/'test_1652.json').exists():
         datasets.insert(0,'u1652')
     for dataset in datasets:
         common=dict(img_size=[image_size,image_size],data_dir=roots[dataset],batch_size=args.batch_size,num_workers=args.num_workers)
-        protocol={'input_size':image_size,'preprocessing':'canonical deterministic','augmentation':False}
+        protocol={'input_size':image_size,'preprocessing':'canonical deterministic','augmentation':False,'batch_size':args.batch_size}
         results={}
         if dataset=='u1652':
             if args.model_type=='teacher' and not args.certification_only and not args.reuse_certified_cache:
@@ -186,10 +187,11 @@ def main(argv=None):
                 loaders=build_1652_val_dataloaders(**common)
                 if args.model_type=='teacher':
                     from .u1652_canonical import canonical_loader
-                    loaders={d:tuple(canonical_loader(loader) for loader in pair) for d,pair in loaders.items()}
+                    loaders={d:tuple(canonical_loader(loader, args.batch_size) for loader in pair) for d,pair in loaders.items()}
                 for direction,pair in loaders.items():
                     results[direction]=evaluate_pair(dataset,direction,pair)
-            name='test_1652.json';protocol.update(split='test')
+            name='test_1652.json';protocol.update(split='test',retrieval_protocol=RETRIEVAL_PROTOCOL,
+                distractors='non-query identities labeled -1; removed after full-gallery ranking')
             if not args.certification_only:
                 from .precision_contract import assert_best_reload_metrics
                 if load_audit['selection_metrics'] is None:raise RuntimeError('Missing train selection metrics')
@@ -202,7 +204,9 @@ def main(argv=None):
                     results[height][direction]=evaluate_pair(dataset,height+'_'+direction,pair)
             name='test_sues200.json';protocol.update(split='Testing',zero_shot=True,
                 heights=['150m','200m','250m','300m'],directions=['D2S','S2D'],
-                horizontal_flip=True,feature_fusion='sum_then_l2',similarity='cosine')
+                horizontal_flip=False,feature_fusion='none',retrieval_protocol=RETRIEVAL_PROTOCOL,
+                resize='OpenCV INTER_LINEAR_EXACT',channels='RGB',normalization='ImageNet',
+                gallery_policy='non-query identities marked -1 and excluded after ranking',similarity='cosine')
         elif dataset=='gta':
             loaders=build_gta_val_dataloaders(**common,split_type='cross-area',query_mode='D2S',mode='pos')
             results['D2S']=evaluate_pair(dataset,'D2S',loaders['D2S'])
@@ -213,18 +217,26 @@ def main(argv=None):
                             postprocess_matching=False)
         elif dataset=='anyvisloc':
             from .anyvisloc import evaluate_anyvisloc, validate_anyvisloc_root
-            validate_anyvisloc_root(roots[dataset])
-            results=evaluate_anyvisloc(model,roots[dataset],image_size,device,batch_size=args.batch_size)
-            name='test_anyvisloc.json'
-            protocol.update(scene_subset=['Scene_01','Scene_02'],subset_identity='current_public_release_01_02',
-                paper_table2_subset_verified=False,reference_mode='aerial',pose_priori='yp',
-                patch_scale=1.0,retrieval_cover_percent=50,similarity='cosine',
+            root=Path(args.data_root)/'test_anyvisloc_scenes01_02'
+            scenes=validate_anyvisloc_root(root)
+            progress_path=output/'test_anyvisloc_progress.jsonl'
+            if progress_path.exists():raise FileExistsError(progress_path)
+            protocol.update(scene_subset=['Scene_01','Scene_02'],
+                subset_identity='current_public_release_01_02',reference_mode='aerial',
+                pose_priori='yp',patch_scale=1.0,retrieval_cover_percent=50,
+                zero_shot=True,postprocess_matching=False,paper_table2_subset_verified=False,
+                training_dataset='University-1652',query_channels='RGB',gallery_channels='official_bgr',
+                normalization='ImageNet mean/std applied in input array order',
+                query_resize='Pillow bicubic',gallery_resize='OpenCV INTER_LINEAR',
                 retrieval_ks=[1,3,5],pdm_lambda=6.0,pdm_alpha=0.9,
-                recall_unit="fraction [0,1] (paper R@K reports percent)",pdm_unit="fraction [0,1]",
-                gallery='per-query aerial map sliding-window tiles',
-                preprocessing='model-native input size, RGB, ImageNet normalization',
-                query_resize='Pillow BICUBIC',gallery_resize='OpenCV INTER_LINEAR',
-                postprocess_matching=False)
+                metric_unit='Recall/PDM fraction [0,1]',
+                query_counts={scene:len(values[-1]) for scene,values in scenes.items()})
+            def progress(row):
+                with progress_path.open('a',encoding='utf-8') as stream:
+                    stream.write(json.dumps(row)+'\n')
+            results=evaluate_anyvisloc(model,root,image_size,device,batch_size=args.batch_size,
+                query_callback=progress,gallery_channel_mode='official_bgr')
+            name='test_anyvisloc.json'
         else:
             raise ValueError(dataset)
         payload={'model_type':args.model_type,'checkpoint':str(Path(args.checkpoint).resolve()),

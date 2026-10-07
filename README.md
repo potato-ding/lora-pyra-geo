@@ -9,7 +9,7 @@ DINOv3 ViT-7B Teacher → DINOv3 ViT-B Middle Teacher → RepViT-M1.5 Student.
 | --- | --- | ---: | ---: |
 | Teacher | T0 PairInfoNCE | 4 | 8 |
 | Middle | M0 PairInfoNCE; M1 HRD; M2 HRD + semantic; M3 HRD + semantic + SAM | 2 | 16 |
-| Student | S0 PairInfoNCE; S1 TSD; S2 ADSD; S3 SAM + ADSD | 1 | 32 |
+| Student | S0 PairInfoNCE; S1 TSD; S2 ADSD; S3 SAM + ADSD; S4 ADSD with SAM Middle | 1 | 32 |
 
 The public training configs are `configs/teacher/t0_{224,256}.json`,
 `configs/middle_teacher/m{0,1,2,3}_*.json`, and
@@ -44,16 +44,16 @@ directory. Middle and Student runs also save `config.json` there.
 
 The single-GPU entry is `bash scripts/eval.sh`. It accepts
 `--model-type teacher|middle|student` and
-`--dataset u1652|sues200|gta|anyvisloc|all`. The checkpoint's training
+`--dataset u1652|sues200|gta|all`. The checkpoint's training
 resolution must match `--image-size`. Batch size is 16.
 
 ```bash
 bash scripts/eval.sh --gpu 0 --model-type student   --checkpoint /path/to/run/best_model.pth   --dataset all --image-size 224 --data-root data
 ```
 
-The four formal result files are written beside the checkpoint:
+The three finalized formal result files are written beside the checkpoint:
 `test_1652.json`, `test_sues200.json`,
-`test_gta_cross_area_d2s.json`, and `test_anyvisloc.json`.
+`test_gta_cross_area_d2s.json`.
 Existing result files are not overwritten. U1652 evaluates D2S/S2D
 R@1, R@5 and AP; SUES-200 evaluates D2S/S2D at 150/200/250/300 m;
 GTA-UAV evaluates cross-area D2S; AnyVisLoc evaluates the released
@@ -72,3 +72,37 @@ historical identity record and is not used by the new training entries.
 Install the environment from `environment.yml` or
 `requirements.txt`, and run `python -m pytest -q` for CPU-compatible
 tests. No training or full-model evaluation runs as part of the test suite.
+
+## Fixed protocols and clean retraining (2026-10-05)
+
+Protocol identifiers are defined in `src/evaluation/protocols.py`. Training selection
+and final evaluation share the U1652 loader/metric and use batch 16. New internal
+weights must carry selection_dataset_protocol; old-result migration is removed.
+AnyVisLoc uses the official retrieval preprocessing for every model: RGB query, BGR gallery without channel conversion, Pillow bicubic query resize, OpenCV linear gallery resize, and ImageNet normalization in array order. Use `--dataset anyvisloc`; `all` runs U1652, SUES-200 and GTA first. Input size follows each checkpoint.
+
+The one-shot pipeline `python scripts/retrain_fixed.py --launch` runs all 20
+experiments from foundation weights, rebuilds Middle-dependent Student assets,
+then evaluates the three finalized datasets. It waits for the requested GPUs to
+be idle and stops on the first failed command. Status and logs are in
+`runs/fixed_protocol_retrain_20261005/`. Do not start it twice.
+
+Comparison models use the same shared loaders and metrics:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m src.evaluation.comparison --model camp --dataset u1652
+```
+
+Supported verified adapters: sample4geo, dac, camp, mean. MCCG's uploaded
+checkpoint currently does not strictly match its published source and is not
+queued for formal evaluation. No unmatched keys are silently discarded.
+Upstream source package names are preserved as model implementation provenance.
+
+University-1652 and SUES-200 share the sole formal protocol
+`query_identity_retrieval`: OpenCV RGB decoding, INTER_LINEAR_EXACT resizing,
+ImageNet normalization, one original-image forward, and L2-normalized global
+descriptors. Input size follows the checkpoint training resolution. Gallery
+identities absent from the query set are marked -1 and removed after NumPy
+ranking. AP uses trapezoidal integration. Both datasets share their loader,
+feature extraction and metric implementation; only dataset paths differ.
+Current SUES effective galleries are 80 satellite / 4000 drone images per height.
+No alternative retrieval protocol or historical result migration is supported.

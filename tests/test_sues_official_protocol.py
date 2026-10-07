@@ -1,4 +1,4 @@
-"""SUES-200 official horizontal-flip fusion and rank-index contract."""
+"""SUES-200 single-forward extraction and rank-index contract."""
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
@@ -23,12 +23,12 @@ class _RawDescriptor(torch.nn.Module):
         return torch.stack((2 * image[:, 0, 0, 0], image[:, 0, 0, 1]), dim=1)
 
 
-def test_flip_fusion_sums_before_normalizing():
+def test_single_forward_normalizes_original_only():
     features, labels, _ = extract_features_dist(
         _RawDescriptor(), DataLoader(_OneImage(), batch_size=1),
-        torch.device('cpu'), horizontal_flip=True,
+        torch.device('cpu'),
     )
-    expected = F.normalize(torch.tensor([[8.0, 4.0]]), dim=1)
+    expected = F.normalize(torch.tensor([[2.0, 3.0]]), dim=1)
     assert torch.allclose(features, expected, atol=1e-7)
     assert labels.tolist() == [1]
 
@@ -36,8 +36,8 @@ def test_flip_fusion_sums_before_normalizing():
 def test_sues_top_one_percent_matches_official_zero_based_index():
     angles = torch.linspace(0.01, 2.0, 200)
     gallery = torch.stack((angles.cos(), angles.sin()), dim=1)
-    gallery_labels = torch.zeros(200, dtype=torch.long)
-    gallery_labels[2] = 1
+    gallery_labels = torch.ones(200, dtype=torch.long)
+    gallery_labels[:2] = -1
     query = torch.tensor([[1.0, 0.0]])
     query_labels = torch.tensor([1])
     query_loader = DataLoader(_OneImage(), batch_size=1)
@@ -47,6 +47,6 @@ def test_sues_top_one_percent_matches_official_zero_based_index():
         _RawDescriptor(), query_loader, gallery_loader, torch.device('cpu'),
         precomputed_features=precomputed,
     )
-    assert result['R@1'] == 0.0
+    assert result['R@1'] == 100.0
     assert result['R@top1'] == 100.0  # official index round(200 * .01) == 2
     assert result['R@5'] == 100.0

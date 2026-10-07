@@ -619,7 +619,8 @@
   ],
   "precision": [
     "src/evaluation/precision_contract.py",
-    "src/source_contract.py"
+    "src/source_contract.py",
+    "src/evaluation/protocols.py"
   ],
   "gbw_family": [
     "configs/student/s0_infonce_224.json",

@@ -2,6 +2,7 @@
 import hashlib
 import json
 from pathlib import Path
+from .protocols import RETRIEVAL_PROTOCOL, GTA_PROTOCOL
 import numpy as np
 import torch
 from .reference_metrics import u1652_official_reference_metrics,sues_official_reference_metrics,gta_official_reference_metrics
@@ -16,7 +17,7 @@ def measure_clean(model,pair,features,dataset,device):
         r1,r5,_,ap=getdist_1652_val_and_get_recall(model,*pair,device,precomputed_features=features)
         return {'R@1':r1,'R@5':r5,'AP':ap}
     if dataset=='sues200':
-        result=run_sues_val_and_get_metrics(model,*pair,device,horizontal_flip=False,precomputed_features=features)
+        result=run_sues_val_and_get_metrics(model,*pair,device,precomputed_features=features)
         return {k:result[k] for k in ('R@1','AP')}
     result=run_gta_val_and_get_metrics(model,*pair,device,precomputed_features=features)
     return {k:result[k] for k in ('R@1','AP','DIS@1','SDM@3')}
@@ -37,30 +38,6 @@ def cache_features(path,features,pair=None):
     np.savez(path,**data)
 
 
-def align_u1652_cache(path,features,pair,direction):
-    """Reindex already-extracted features; never rerun a model for a sort fix."""
-    with np.load(path,allow_pickle=False) as data:
-        if 'query_paths' in data:
-            old={'query':data['query_paths'].tolist(),'gallery':data['gallery_paths'].tolist()}
-        else:
-            old=json.loads((path.parent/'original_sample_order.json').read_text())[direction]
-    target={'query':pair[0].dataset.images,'gallery':pair[1].dataset.images}
-    if old==target:return features
-    changed=list(features)
-    for offset,view in ((0,'query'),(3,'gallery')):
-        index={str(p):i for i,p in enumerate(old[view])}
-        if len(index)!=len(old[view]) or set(index)!=set(target[view]):raise RuntimeError('Cache path set mismatch')
-        permutation=torch.tensor([index[p] for p in target[view]],dtype=torch.long)
-        for k in range(offset,offset+3):
-            if changed[k] is not None:changed[k]=changed[k][permutation]
-    backup=path.with_suffix('.presort.npz')
-    if backup.exists():raise FileExistsError('Pre-sort backup already exists')
-    path.rename(backup)
-    cache_features(path,changed,pair)
-    print(f'OFFICIAL_ORDER_REINDEX_ONLY={path}; original={backup}',flush=True)
-    return tuple(changed)
-
-
 def read_features(path):
     with np.load(path,allow_pickle=False) as data:
         return tuple(torch.from_numpy(data[k].copy()) if k in data else None for k in ('qf','ql','qc','gf','gl','gc'))
@@ -77,35 +54,52 @@ def feature_sha(path):
 def certify_pair(model,pair,dataset,direction,device,cache_dir):
     cache_dir=Path(cache_dir);cache_dir.mkdir(parents=True,exist_ok=True)
     key=f'{dataset}_{direction}';path=cache_dir/(key+'.npz')
-    horizontal_flip = dataset == 'sues200'
+    horizontal_flip = False
     if path.exists():
-        if horizontal_flip:
+        if dataset == 'gta':
+            previous_path=cache_dir/(key+'.json')
+            if not previous_path.is_file() or json.loads(previous_path.read_text()).get('gta_protocol') != GTA_PROTOCOL:
+                raise RuntimeError('GTA cache protocol missing or changed; use a fresh cache directory')
+        if dataset == 'u1652':
+            previous_path=cache_dir/(key+'.json')
+            if (not previous_path.is_file() or json.loads(previous_path.read_text()).get('retrieval_protocol') != RETRIEVAL_PROTOCOL):
+                raise RuntimeError('U1652 cache uses an incompatible gallery protocol; use a fresh cache directory')
+        if dataset == 'sues200':
             previous_path=cache_dir/(key+'.json')
             if (not previous_path.is_file()
-                    or json.loads(previous_path.read_text()).get('horizontal_flip') is not True):
-                raise RuntimeError('SUES cached features lack official flip protocol; use a fresh cache directory')
+                    or json.loads(previous_path.read_text()).get('retrieval_protocol') != RETRIEVAL_PROTOCOL):
+                raise RuntimeError('SUES cached features use an incompatible protocol; use a fresh cache directory')
+        provenance_path=cache_dir/(key+'.json')
+        provenance=json.loads(provenance_path.read_text()) if provenance_path.is_file() else {}
+        if provenance.get('extraction_batch_sizes') != [pair[0].batch_size,pair[1].batch_size]:
+            raise RuntimeError('Cached extraction batch sizes missing or changed; use a fresh cache directory')
         features=read_features(path)
-        if dataset=='u1652':features=align_u1652_cache(path,features,pair,direction)
         if len(features[0])!=len(pair[0].dataset) or len(features[3])!=len(pair[1].dataset):
             raise RuntimeError('Resume cache dataset-count mismatch')
         print(f'REUSING_EXTRACTED_FEATURES={path}',flush=True)
     else:
-        features=(*extract_features_dist(model,pair[0],device,stage_name=key+':query',horizontal_flip=horizontal_flip),
-                  *extract_features_dist(model,pair[1],device,stage_name=key+':gallery',horizontal_flip=horizontal_flip))
+        features=(*extract_features_dist(model,pair[0],device,stage_name=key+':query'),
+                  *extract_features_dist(model,pair[1],device,stage_name=key+':gallery'))
         cache_features(path,features,pair)
     clean=measure_clean(model,pair,features,dataset,device)
     reference=measure_reference(features,dataset,device)
     rows=[{'metric':k,'clean':v,'reference':reference[k],'abs_diff':abs(v-reference[k]),
            'tolerance':METRIC_ATOL,'pass':bool(abs(v-reference[k])<=METRIC_ATOL)} for k,v in clean.items()]
     record={'dataset':dataset,'direction':direction,'horizontal_flip':horizontal_flip,
+            'extraction_batch_sizes':[pair[0].batch_size,pair[1].batch_size],
             'clean':clean,'reference':reference,'rows':rows,
-            'certification_version':'OFFICIAL_NUMPY_ORDER_V2',
+            'ranking':'numpy_descending_sort_then_remove_junk',
             'pass':all(r['pass'] for r in rows),'feature_cache':str(path),'feature_sha256':feature_sha(path),
             'query_count':len(pair[0].dataset),'gallery_count':len(pair[1].dataset),
             'query_norm_max_error':float((features[0].norm(dim=1)-1).abs().max()),
             'gallery_norm_max_error':float((features[3].norm(dim=1)-1).abs().max())}
+    if dataset == 'gta': record['gta_protocol']=GTA_PROTOCOL
+    if dataset == 'u1652': record['retrieval_protocol']=RETRIEVAL_PROTOCOL
+    if dataset == 'sues200': record['retrieval_protocol']=RETRIEVAL_PROTOCOL
     (cache_dir/(key+'.json')).write_text(json.dumps(record,indent=2))
     print('METRIC_CERTIFICATION='+json.dumps(record),flush=True)
+    if dataset == 'gta' and record.get('gta_protocol') != GTA_PROTOCOL:
+        raise RuntimeError('GTA certified cache protocol missing or changed')
     if not record['pass']:raise RuntimeError(f'Clean/reference disagreement: {key}; cache retained for diagnosis')
     return record
 
@@ -114,8 +108,14 @@ def reuse_pair(model,pair,dataset,direction,device,cache_dir):
     cache_dir=Path(cache_dir);key=f'{dataset}_{direction}'
     record=json.loads((cache_dir/(key+'.json')).read_text())
     path=cache_dir/(key+'.npz')
-    if dataset == 'sues200' and record.get('horizontal_flip') is not True:
-        raise RuntimeError('SUES certified features lack official flip protocol')
+    if dataset == 'u1652' and record.get('retrieval_protocol') != RETRIEVAL_PROTOCOL:
+        raise RuntimeError('U1652 certified cache uses an incompatible gallery protocol')
+    if dataset == 'sues200' and record.get('retrieval_protocol') != RETRIEVAL_PROTOCOL:
+        raise RuntimeError('SUES certified features use an incompatible protocol')
+    if dataset == 'gta' and record.get('gta_protocol') != GTA_PROTOCOL:
+        raise RuntimeError('GTA certified cache protocol missing or changed')
+    if record.get('extraction_batch_sizes') != [pair[0].batch_size,pair[1].batch_size]:
+        raise RuntimeError('Certified extraction batch sizes missing or changed')
     if not record['pass'] or feature_sha(path)!=record['feature_sha256']:
         raise RuntimeError('Uncertified or changed feature cache')
     if record['query_count']!=len(pair[0].dataset) or record['gallery_count']!=len(pair[1].dataset):

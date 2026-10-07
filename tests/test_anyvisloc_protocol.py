@@ -56,17 +56,16 @@ def test_nonfinite_gallery_distances_fail_closed():
         retrieval_metrics([np.nan, np.inf])
 
 
-def test_unified_entry_accepts_anyvisloc_without_starting_evaluation(tmp_path):
+def test_own_model_formal_entry_accepts_explicit_anyvisloc(tmp_path):
     from src.evaluation.evaluate import parse_args
     checkpoint = tmp_path / "best_model.pth"
-    args = parse_args(["--model-type", "student", "--checkpoint", str(checkpoint),
-                       "--dataset", "anyvisloc", "--image-size", "224"])
+    args = parse_args(["--model-type", "teacher", "--checkpoint", str(checkpoint),
+                       "--dataset", "anyvisloc", "--image-size", "256"])
     assert args.dataset == "anyvisloc"
     assert args.output_dir == str(tmp_path)
-    assert args.batch_size == 16
 
 
-def test_query_and_gallery_use_official_resize_filters_with_model_rgb():
+def test_query_and_gallery_use_official_resize_and_channel_orders():
     image_rgb = np.arange(13 * 11 * 3, dtype=np.uint8).reshape(13, 11, 3)
     image_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
     normalization = A.Compose([
@@ -79,10 +78,7 @@ def test_query_and_gallery_use_official_resize_filters_with_model_rgb():
     expected_query_rgb = np.asarray(
         Image.fromarray(image_rgb).resize((7, 7), resample=Image.Resampling.BICUBIC)
     )
-    expected_gallery_rgb = cv2.cvtColor(
-        cv2.resize(image_bgr, (7, 7), interpolation=cv2.INTER_LINEAR),
-        cv2.COLOR_BGR2RGB,
-    )
+    expected_gallery_bgr = cv2.resize(image_bgr, (7, 7), interpolation=cv2.INTER_LINEAR)
     mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
     std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
     np.testing.assert_allclose(
@@ -93,7 +89,7 @@ def test_query_and_gallery_use_official_resize_filters_with_model_rgb():
     )
     np.testing.assert_allclose(
         gallery.permute(1, 2, 0).numpy(),
-        (expected_gallery_rgb.astype(np.float32) / 255.0 - mean) / std,
+        (expected_gallery_bgr.astype(np.float32) / 255.0 - mean) / std,
         rtol=0,
         atol=1e-5,
     )

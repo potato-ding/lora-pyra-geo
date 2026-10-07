@@ -28,6 +28,8 @@ def validate_middle_provider(checkpoint, config_path, image_size, *, expected_me
     payload = torch.load(path, map_location="cpu", weights_only=True)
     if not isinstance(payload, dict) or payload.get("artifact_schema") != SCHEMA:
         raise ValueError("Middle checkpoint schema mismatch")
+    from src.evaluation.protocols import require_selection_protocol
+    require_selection_protocol(payload.get('selection_dataset_protocol'))
     metadata = checkpoint_metadata(payload)
     if payload.get("public_config") != public or metadata["experiment_id"] != public["experiment_id"]:
         raise ValueError("Middle public config/checkpoint mismatch")

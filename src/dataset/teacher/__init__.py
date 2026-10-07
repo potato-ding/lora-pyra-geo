@@ -9,9 +9,9 @@ _EXPORTS = {
     "IndexedDataset": ("src.dataset.teacher.val_dataloaders", "IndexedDataset"),
     "CrossViewPairSampler": ("src.dataset.teacher.datasets", "CrossViewPairSampler"),
     "PairedCrossViewU1652Dataset": ("src.dataset.teacher.datasets", "PairedCrossViewU1652Dataset"),
-    "PairedCrossViewU1652DatasetEval": (
+    "PairedCrossViewDatasetEval": (
         "src.dataset.teacher.val_dataloaders",
-        "PairedCrossViewU1652DatasetEval",
+        "PairedCrossViewDatasetEval",
     ),
     "build_1652_val_dataloaders": (
         "src.dataset.teacher.val_dataloaders",

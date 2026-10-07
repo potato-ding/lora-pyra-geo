@@ -1,4 +1,4 @@
-"""Strict reload for Teacher V3; the V2 loader stays unchanged."""
+"""Strict reload for the current-protocol Teacher V3."""
 from pathlib import Path
 import torch
 from src.training.teacher.formal_checkpoint import SCHEMA,checkpoint_metadata
@@ -12,6 +12,8 @@ def load_teacher_v3(path,device='cpu',image_size=None):
     payload=torch.load(Path(path),map_location='cpu',weights_only=True)
     if not isinstance(payload,dict) or payload.get('artifact_schema')!=SCHEMA:
         raise ValueError('Teacher V3 checkpoint required')
+    from src.evaluation.protocols import require_selection_protocol
+    require_selection_protocol(payload.get('selection_dataset_protocol'))
     meta=checkpoint_metadata(payload)
     size=meta['image_size']
     if image_size is not None and image_size!=size:
