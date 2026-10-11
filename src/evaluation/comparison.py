@@ -17,8 +17,8 @@ def main():
     p.add_argument('--compatibility-trial',action='store_true',help='Write unconfirmed model adaptation results separately')
     p.add_argument('--device',choices=('cpu','cuda:0'),default='cuda:0')
     a=p.parse_args();device=torch.device(a.device);torch.set_num_threads(2)
-    if a.compatibility_trial and a.model not in ('mccg','infogeo_rd_trial'):raise ValueError('Compatibility trial is adapted models only')
-    if a.model in ('mccg','infogeo_rd_trial') and not a.smoke_only and not a.compatibility_trial:
+    if a.compatibility_trial and a.model not in ('mccg','infogeo_rd_trial','spikevimformer'):raise ValueError('Compatibility trial is adapted models only')
+    if a.model in ('mccg','infogeo_rd_trial','spikevimformer') and not a.smoke_only and not a.compatibility_trial:
         raise ValueError('Adapted checkpoint forward is unconfirmed; pass --compatibility-trial to keep results separate')
     if device.type=='cuda' and torch.cuda.device_count()!=1:raise RuntimeError('Exactly one visible GPU required')
     if device.type=='cpu' and not a.smoke_only:raise ValueError('CPU is for adapter smoke checks only')

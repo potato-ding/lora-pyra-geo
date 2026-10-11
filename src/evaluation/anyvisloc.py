@@ -54,13 +54,13 @@ class _OfficialRetrievalModel(nn.Module):
         raw = encoder.model
         # Preserve restored parameter/buffer dtypes. Native encode() retains
         # its original BF16 autocast, even inside the upstream FP16 context.
-        self.legacy_encoder = getattr(encoder, 'kind', None) in ('lpn', 'muse', 'infogeo_rd_trial')
+        self.legacy_encoder = getattr(encoder, 'kind', None) in ('lpn', 'muse', 'infogeo_rd_trial', 'ccr', 'spikevimformer', 'dmnil')
         self.model = (encoder if self.native_encoder or self.legacy_encoder else raw).to(device).eval()
         self.kind = getattr(encoder, "kind", None)
         self.fusion = "descriptor" if self.legacy_encoder else ("MCCG" if self.kind == "mccg" else ("CAMP" if self.kind is not None else "descriptor"))
         parameter = next(raw.parameters(), torch.empty(0))
         self.runtime = dict(parameters_dtype=str(parameter.dtype).removeprefix("torch."),
-            inference_autocast=("cuda_bfloat16" if self.native_encoder else ("disabled" if self.kind == "mccg" or (self.legacy_encoder and self.kind != "infogeo_rd_trial") else "cuda_float16")) if device.type == "cuda" else "disabled",
+            inference_autocast=("cuda_bfloat16" if self.native_encoder else ("disabled" if self.kind == "mccg" or (self.legacy_encoder and self.kind not in ('infogeo_rd_trial','spikevimformer','dmnil')) else "cuda_float16")) if device.type == "cuda" else "disabled",
             source="checkpoint evaluation precision; no parameter dtype conversion")
 
     def forward(self, images):

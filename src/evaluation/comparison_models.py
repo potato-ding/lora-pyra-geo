@@ -17,6 +17,9 @@ SPECS={
     'mccg':('MCCG','pretrained.pth',256),
     'lpn':('LPN','net_119.pth',256),
     'muse':('MuSe-Net','net_209.pth',256),
+    'ccr':('CCR','net_194.pth',384),
+    'dmnil':('DMNIL','weights_0.9017.pth',384),
+    'spikevimformer':('SpikeViMFormer','weights_0.8803.pth',384),
     'infogeo_rd_trial':('InfoGeo','weights_e20_0.9180.pth',448),
 }
 
@@ -44,6 +47,15 @@ class PaperEncoder(nn.Module):
 
 def load_comparison(kind,device):
     name,weight,size=SPECS[kind];base=ROOT/'src/checkpoint/others'/name
+    if kind=='spikevimformer':
+        from .spikevimformer_compatibility import load_spike
+        return load_spike(base,device)
+    if kind=='dmnil':
+        from .dmnil import load_dmnil
+        return load_dmnil(base,device)
+    if kind=='ccr':
+        from .ccr import load_ccr_comparison
+        return load_ccr_comparison(base,device)
     if kind=='infogeo_rd_trial':
         from .infogeo_compatibility import load_infogeo_trial
         return load_infogeo_trial(kind,base,device)
