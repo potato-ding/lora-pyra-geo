@@ -1,4 +1,4 @@
-"""Distillation-aware SAM over the canonical M2 objective (ZeRO-2).
+"""Distillation-aware SAM over HRD with optional semantic distillation (ZeRO-2).
 
 Search uses autograd.grad on the unwrapped, replicated model: leaf .grad and
 ZeRO post-accumulation hooks are not populated. Each branch is explicitly
@@ -160,8 +160,10 @@ class GradientSummary:
 def canonical_objective(forward, model, kd, images, ids, step):
     from .losses.pair_infonce import pair_infonce
     from src.utils.gather_features_and_labels_and_views import GatherLayer, concat_all_gather
-    hidden = forward(images, return_layer_features=True)
-    descriptor = hidden['final_descriptor']
+    semantic = 'adaptive_bridge_v2' in kd.config
+    output = forward(images, return_layer_features=semantic)
+    hidden = output if semantic else None
+    descriptor = output['final_descriptor'] if semantic else output
     pairs = kd.local_pair_batch
     global_pairs = pairs * dist.get_world_size()
     assert descriptor.dtype == torch.float32 and tuple(descriptor.shape) == (2 * pairs, 768)

@@ -14,8 +14,12 @@ def main():
     p.add_argument('--data-root',type=Path,default=ROOT/'data')
     p.add_argument('--num-workers',type=int,default=4)
     p.add_argument('--smoke-only',action='store_true')
+    p.add_argument('--compatibility-trial',action='store_true',help='Write unconfirmed model adaptation results separately')
     p.add_argument('--device',choices=('cpu','cuda:0'),default='cuda:0')
     a=p.parse_args();device=torch.device(a.device);torch.set_num_threads(2)
+    if a.compatibility_trial and a.model not in ('mccg','infogeo_rd_trial'):raise ValueError('Compatibility trial is adapted models only')
+    if a.model in ('mccg','infogeo_rd_trial') and not a.smoke_only and not a.compatibility_trial:
+        raise ValueError('Adapted checkpoint forward is unconfirmed; pass --compatibility-trial to keep results separate')
     if device.type=='cuda' and torch.cuda.device_count()!=1:raise RuntimeError('Exactly one visible GPU required')
     if device.type=='cpu' and not a.smoke_only:raise ValueError('CPU is for adapter smoke checks only')
     torch.backends.cuda.matmul.allow_tf32=False;torch.backends.cudnn.allow_tf32=False
@@ -24,7 +28,8 @@ def main():
         with torch.inference_mode():z=model.encode(torch.zeros(2,3,size,size,device=device))
         assert torch.allclose(z.norm(dim=1),torch.ones(2,device=device),atol=1e-5)
         print(json.dumps(dict(audit=audit,smoke_descriptor_shape=list(z.shape),finite=True)),flush=True);return
-    out=ROOT/'src/checkpoint/others'/SPECS[a.model][0]/'results/fixed_protocol'
+    result_folder='infogeo_rd_trial' if a.model=='infogeo_rd_trial' else ('compatibility_trial' if a.compatibility_trial else 'fixed_protocol')
+    out=ROOT/'src/checkpoint/others'/SPECS[a.model][0]/'results'/result_folder
     out.mkdir(parents=True,exist_ok=True);dest=out/(a.dataset+'.json')
     if dest.exists():raise FileExistsError(dest)
     common=dict(img_size=[size,size],batch_size=16,num_workers=a.num_workers)
@@ -48,7 +53,7 @@ def main():
         protocol.update(pair[0].dataset.protocol_audit)
         results['D2S']=run_gta_val_and_get_metrics(model,*pair,device)
     else:
-        from .anyvisloc import evaluate_anyvisloc, validate_anyvisloc_root
+        from .anyvisloc import evaluate_anyvisloc, validate_anyvisloc_root, official_protocol_metadata
         root=a.data_root/'test_anyvisloc_scenes01_02'
         scenes=validate_anyvisloc_root(root)
         progress_path=out/'anyvisloc_progress.jsonl'
@@ -57,17 +62,19 @@ def main():
         protocol.update(scene_subset=['Scene_01','Scene_02'],subset_identity='current_public_release_01_02',
             reference_mode='aerial',pose_priori='yp',patch_scale=1.0,retrieval_cover_percent=50,
             zero_shot=True,postprocess_matching=False,paper_table2_subset_verified=False,
-            training_dataset='University-1652',query_channels='RGB',gallery_channels='official_bgr',
+            training_dataset='University-1652',query_channels='RGB',gallery_channels='RGB',
             normalization='ImageNet mean/std applied in input array order',
             query_resize='Pillow bicubic',gallery_resize='OpenCV INTER_LINEAR',
             retrieval_ks=[1,3,5],pdm_lambda=6.0,pdm_alpha=0.9,metric_unit='Recall/PDM fraction [0,1]',
-            query_counts={scene:len(values[-1]) for scene,values in scenes.items()})
+            query_counts={scene:len(values) for scene,values in scenes.items()})
         def progress(row):
             with progress_path.open('a',encoding='utf-8') as stream:
                 stream.write(json.dumps(row)+'\n')
+        protocol.update(official_protocol_metadata())
         results=evaluate_anyvisloc(model,root,size,device,batch_size=16,
-                                  query_callback=progress,gallery_channel_mode='official_bgr')
+                                  query_callback=progress)
     payload=dict(model=a.model,dataset=a.dataset,protocol=protocol,checkpoint=audit,results=results,elapsed_seconds=time.monotonic()-start)
+    if a.dataset=='anyvisloc':payload['runtime_precision']=model.anyvisloc_runtime
     with dest.open('x') as f:json.dump(payload,f,indent=2)
     print(json.dumps(payload),flush=True)
 if __name__=='__main__':main()

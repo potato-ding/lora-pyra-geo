@@ -80,3 +80,46 @@ def test_actual_loader_applies_precision_after_strict_load(kind,dimension,tmp_pa
     assert audit['runtime_precision']['parameter_dtype']=='bfloat16'
     assert not audit['missing'] and not audit['unexpected']
     assert _model_input_dtype(encoder)==torch.float32
+
+
+@pytest.mark.parametrize("kind", ["camp", "dac", "mean", "mccg"])
+def test_paper_forward_respects_upstream_autocast(kind, monkeypatch):
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+    from src.evaluation.comparison_models import PaperEncoder
+    enabled = []
+    @contextmanager
+    def autocast(device_type, dtype=None, enabled=True):
+        states.append(enabled)
+        yield
+        states.pop()
+    states = []
+    monkeypatch.setattr(torch, "autocast", autocast)
+    class Model(nn.Module):
+        def forward(self, images, *args):
+            enabled.append(states[-1])
+            if kind == "mccg":
+                return torch.ones(2, 768, 2), None
+            dimension = 768 if kind == "mean" else 1024
+            return None, torch.ones(2, dimension), None
+    encoder = PaperEncoder(Model(), kind)
+    result = encoder.forward_unnormalized(SimpleNamespace(device=torch.device("cuda")))
+    assert enabled == [kind != "mccg"]
+    assert result.dtype == torch.float32
+
+
+def test_anyvisloc_mccg_disables_outer_autocast():
+    from src.evaluation.anyvisloc import _OfficialRetrievalModel
+    from src.evaluation.comparison_models import PaperEncoder
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layer = nn.Linear(4, 8)
+        def forward(self, images, *args):
+            return self.layer(images), None
+    model = Model()
+    adapter = _OfficialRetrievalModel(PaperEncoder(model, "mccg"), torch.device("cpu"))
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        result = adapter(torch.ones(2, 4))
+    assert result.dtype == torch.float32
+    assert model.layer.weight.dtype == torch.float32

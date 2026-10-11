@@ -1,4 +1,4 @@
-"""Validate the eight formal Middle Teacher training configurations."""
+"""Validate the formal Middle Teacher training configurations."""
 from __future__ import annotations
 
 import argparse
@@ -12,6 +12,7 @@ METHODS = {
     "m1_hrd": ("M1-HRD", True, False, False),
     "m2_hrd_sem": ("M2-HRD-SEM", True, True, False),
     "m3_sam_hrd_sem": ("M3-SAM-HRD-SEM", True, True, True),
+    "m4_sam_hrd": ("M4-SAM-HRD", True, False, True),
 }
 
 
@@ -26,6 +27,7 @@ def load_formal_config(path: str | Path) -> tuple[Path, dict]:
     method = path.stem.removesuffix(f"_{size}")
     if method not in METHODS or path.stem != f"{method}_{size}":
         raise ValueError("Unknown formal Middle method")
+    name, hrd, semantic, sam = METHODS[method]
     base_keys = {
         "experiment_id", "img_size", "epochs", "seed", "model",
         "pretrained_checkpoint", "data_dir", "world_size",
@@ -35,10 +37,10 @@ def load_formal_config(path: str | Path) -> tuple[Path, dict]:
         "scheduler", "warmup_ratio", "task_loss", "output_dir",
     }
     expected_keys = base_keys | (
-        {"teacher_checkpoint", "hrd"} if method != "m0_infonce" else set()
+        {"teacher_checkpoint", "hrd"} if hrd else set()
     ) | (
-        {"semantic"} if method in ("m2_hrd_sem", "m3_sam_hrd_sem") else set()
-    ) | ({"sam"} if method == "m3_sam_hrd_sem" else set())
+        {"semantic"} if semantic else set()
+    ) | ({"sam"} if sam else set())
     if set(config) != expected_keys:
         raise ValueError(
             f"Middle config keys mismatch: missing={sorted(expected_keys-set(config))} "
@@ -70,7 +72,6 @@ def load_formal_config(path: str | Path) -> tuple[Path, dict]:
     if "teacher_checkpoint" in config and config["teacher_checkpoint"] is not None and (
             not isinstance(config["teacher_checkpoint"], str) or not config["teacher_checkpoint"]):
         raise ValueError("teacher_checkpoint must be a path or null")
-    name, hrd, semantic, sam = METHODS[method]
     if config.get("experiment_id") != f"{name}-R{size}":
         raise ValueError("Config filename and experiment_id disagree")
     if (

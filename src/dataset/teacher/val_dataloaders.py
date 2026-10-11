@@ -213,11 +213,12 @@ def gta_sate2loc(tile_zoom, offset, tile_x, tile_y):
 
 def get_gta_sate_paths(satellite_dir):
     paths = []
+    # Match Game4Loc get_sate_data: preserve os.walk/file enumeration order.
+    # Reordering the gallery changes np.argsort tie-breaking for equal scores.
     for root, _, files in os.walk(satellite_dir):
         for file in files:
-            if file.lower().endswith((".png", ".jpg", ".jpeg")):
-                paths.append(os.path.join(root, file))
-    return sorted(paths)
+            paths.append(os.path.join(root, file))
+    return paths
 
 
 def gta_sate_center_from_path(path):

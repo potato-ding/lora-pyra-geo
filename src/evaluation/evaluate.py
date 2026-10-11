@@ -216,7 +216,7 @@ def main(argv=None):
                             similarity='cosine',positive_pairs='pair_pos_sate_img_list',
                             postprocess_matching=False)
         elif dataset=='anyvisloc':
-            from .anyvisloc import evaluate_anyvisloc, validate_anyvisloc_root
+            from .anyvisloc import evaluate_anyvisloc, validate_anyvisloc_root, official_protocol_metadata
             root=Path(args.data_root)/'test_anyvisloc_scenes01_02'
             scenes=validate_anyvisloc_root(root)
             progress_path=output/'test_anyvisloc_progress.jsonl'
@@ -225,24 +225,27 @@ def main(argv=None):
                 subset_identity='current_public_release_01_02',reference_mode='aerial',
                 pose_priori='yp',patch_scale=1.0,retrieval_cover_percent=50,
                 zero_shot=True,postprocess_matching=False,paper_table2_subset_verified=False,
-                training_dataset='University-1652',query_channels='RGB',gallery_channels='official_bgr',
+                training_dataset='University-1652',query_channels='RGB',gallery_channels='RGB',
                 normalization='ImageNet mean/std applied in input array order',
                 query_resize='Pillow bicubic',gallery_resize='OpenCV INTER_LINEAR',
                 retrieval_ks=[1,3,5],pdm_lambda=6.0,pdm_alpha=0.9,
                 metric_unit='Recall/PDM fraction [0,1]',
-                query_counts={scene:len(values[-1]) for scene,values in scenes.items()})
+                query_counts={scene:len(values) for scene,values in scenes.items()})
             def progress(row):
                 with progress_path.open('a',encoding='utf-8') as stream:
                     stream.write(json.dumps(row)+'\n')
-            results=evaluate_anyvisloc(model,root,image_size,device,batch_size=args.batch_size,
-                query_callback=progress,gallery_channel_mode='official_bgr')
+            protocol.update(official_protocol_metadata())
+            results=evaluate_anyvisloc(model,root,image_size,device,batch_size=16,
+                query_callback=progress)
             name='test_anyvisloc.json'
         else:
             raise ValueError(dataset)
         payload={'model_type':args.model_type,'checkpoint':str(Path(args.checkpoint).resolve()),
                  'checkpoint_sha256':load_audit['sha256'],'dataset':dataset,
                  'protocol':protocol,'descriptor':{'dim':model.descriptor_dim,'normalized':True,'dtype':'float32'},
-                 'runtime_precision':load_audit['runtime_precision'],'precision_signature':signature,'results':results}
+                 'runtime_precision':(model.anyvisloc_runtime if dataset=='anyvisloc' else load_audit['runtime_precision']),'precision_signature':signature,'results':results}
+        if dataset=='anyvisloc':
+            payload['checkpoint_load_precision_signature']=payload.pop('precision_signature')
         if args.model_type=="student" and dataset=="u1652":
             payload["u1652_eval_batch_size"]=args.batch_size
         if not args.certification_only:

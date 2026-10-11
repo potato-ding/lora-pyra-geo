@@ -106,8 +106,6 @@ def main(argv=None):
     p.add_argument('--data-root',type=Path,default=ROOT/'data')
     p.add_argument('--dataset',choices=['anyvisloc'],required=True)
     p.add_argument('--num-workers',type=int,default=4)
-    p.add_argument('--anyvisloc-gallery-channels', choices=['official_bgr'], default='official_bgr',
-                   help='AnyVisLoc gallery array order; query remains RGB. official_bgr matches upstream channel handling.')
     args=p.parse_args(argv)
     if torch.cuda.device_count()!=1:
         raise RuntimeError('Set CUDA_VISIBLE_DEVICES to exactly one GPU')
@@ -126,17 +124,18 @@ def main(argv=None):
     def progress(row):
         with (out/(prefix+'_progress.jsonl')).open('a',encoding='utf-8') as stream:
             stream.write(json.dumps(row)+'\n');stream.flush()
-    from src.evaluation.anyvisloc import evaluate_anyvisloc
+    from src.evaluation.anyvisloc import evaluate_anyvisloc, official_protocol_metadata
     protocol.update(scene_subset=['Scene_01','Scene_02'],subset_identity='current_public_release_01_02',
         zero_shot=True,reference_mode='aerial',pose_priori='yp',patch_scale=1.0,retrieval_cover_percent=50,
         paper_table2_subset_verified=False,postprocess_matching=False,recall_ap_unit='Recall/PDM fraction [0,1]',
-        query_channels='RGB',gallery_channels=args.anyvisloc_gallery_channels,
+        query_channels='RGB',gallery_channels='RGB',
         normalization='ImageNet mean/std applied in input array order',
         query_resize='Pillow bicubic',gallery_resize='OpenCV INTER_LINEAR',retrieval_ks=[1,3,5],pdm_lambda=6.0,pdm_alpha=0.9)
-    results=evaluate_anyvisloc(model,args.data_root/'test_anyvisloc_scenes01_02',384,device,batch_size=16,query_callback=progress,gallery_channel_mode=args.anyvisloc_gallery_channels)
+    protocol.update(official_protocol_metadata())
+    results=evaluate_anyvisloc(model,args.data_root/'test_anyvisloc_scenes01_02',384,device,batch_size=16,query_callback=progress)
     payload=dict(model_type='sample4geo',checkpoint_sha256=audit['checkpoint_sha256'],dataset=args.dataset,
         protocol=protocol,counts=counts,descriptor=dict(dim=1024,normalized=True,dtype='float32'),
-        results=results,elapsed_seconds=time.perf_counter()-start,completed_utc=datetime.now(timezone.utc).isoformat())
+        runtime_precision=model.anyvisloc_runtime,results=results,elapsed_seconds=time.perf_counter()-start,completed_utc=datetime.now(timezone.utc).isoformat())
     write_json(out/(args.dataset+'.json'),payload)
     print('COMPLETE '+str(out/(args.dataset+'.json')),flush=True)
 

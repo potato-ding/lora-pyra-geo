@@ -781,20 +781,30 @@ def run_gta_val_and_get_metrics(
     local_correct_5 = torch.tensor(0.0, device=device)
     local_correct_10 = torch.tensor(0.0, device=device)
     local_correct_top1 = torch.tensor(0.0, device=device)
-    local_ap_sum = torch.tensor(0.0, device=device)
+    local_ap_sum = torch.tensor(0.0, device=device, dtype=torch.float64)
     local_sdm_sums = {k: torch.tensor(0.0, device=device, dtype=torch.float64) for k in (1, 3, 5)}
     local_dis_sums = {k: torch.tensor(0.0, device=device, dtype=torch.float64) for k in (1, 3, 5)}
     top1_percent_k = min(round(real_num_gallery * 0.01) + 1, real_num_gallery)
 
     if local_num_queries > 0:
+        # Game4Loc scores all queries against each gallery loader batch. Keep
+        # the same GEMM shapes and gallery order; store scores on CPU as upstream
+        # does, without retaining a second full copy during concatenation.
+        gallery_batch_size = getattr(val_gallery_loader, "batch_size", None) or 16
+        local_q_f_device = local_q_f.to(device=device, dtype=torch.float32)
+        all_scores = np.empty((local_num_queries, real_num_gallery), dtype=np.float32)
+        for gallery_start in range(0, real_num_gallery, gallery_batch_size):
+            gallery_end = min(gallery_start + gallery_batch_size, real_num_gallery)
+            scores = local_q_f_device @ g_f_device[gallery_start:gallery_end].float().t()
+            all_scores[:, gallery_start:gallery_end] = scores.cpu().numpy()
+        del local_q_f_device, scores
         chunk_size = 1000
         for i in range(0, local_num_queries, chunk_size):
-            q_f_chunk = local_q_f[i : i + chunk_size].to(device)
             q_l_chunk = local_q_l[i : i + chunk_size].to(device)
             q_c_chunk = local_q_c[i : i + chunk_size].to(device)
 
-            score_chunk = torch.matmul(q_f_chunk, g_f_device.t())
-            sorted_indices = _official_descending_indices(score_chunk)
+            score_chunk = torch.from_numpy(all_scores[i : i + chunk_size])
+            sorted_indices = _official_descending_indices(score_chunk).to(device)
             sorted_gallery_labels = g_l_device[sorted_indices]
 
             if q_l_chunk.dim() == 1:
@@ -807,11 +817,15 @@ def run_gta_val_and_get_metrics(
             local_correct_10 += matches[:, :10].any(dim=1).float().sum()
             local_correct_top1 += matches[:, :top1_percent_k].any(dim=1).float().sum()
 
-            cum_matches = torch.cumsum(matches, dim=1)
-            ranks = torch.arange(1, real_num_gallery + 1, device=device).float().unsqueeze(0)
+            # Official sklearn AP uses strictly descending *rank* scores, not
+            # raw similarities. This FP64 precision-at-positive formula is
+            # equivalent, including when raw similarities are tied.
+            ap_matches = matches.to(torch.float64)
+            cum_matches = torch.cumsum(ap_matches, dim=1)
+            ranks = torch.arange(1, real_num_gallery + 1, device=device, dtype=torch.float64).unsqueeze(0)
             precisions = cum_matches / ranks
-            total_true_matches = matches.sum(dim=1)
-            ap_per_query = (precisions * matches).sum(dim=1) / (total_true_matches + 1e-12)
+            total_true_matches = ap_matches.sum(dim=1)
+            ap_per_query = (precisions * ap_matches).sum(dim=1) / total_true_matches.clamp_min(1)
             local_ap_sum += ap_per_query.sum()
 
             top_indices = sorted_indices[:, :min(5, real_num_gallery)]

@@ -1,4 +1,4 @@
-"""Unified two-GPU training for M0, M1, M2 and M3 Middle Teachers."""
+"""Unified two-GPU training for M0 through M4 Middle Teachers."""
 from __future__ import annotations
 
 import argparse
@@ -133,6 +133,8 @@ def run(config_path, expected_gpus, teacher_chunk_size):
             "training_world_size": world_size(), "local_pair_batch": public["local_pair_batch"],
             "global_pair_batch": public["global_pair_batch"],
             "teacher_checkpoint": public.get("teacher_checkpoint"),
+            "sam": config["sam"],
+            "distillation_components": sorted(config["distillation"]),
             "optimizer": audit, "scheduler": config["scheduler"],
             "selection": "U1652_D2S_R1+U1652_S2D_R1",
             "selection_start_epoch": FIRST_MIDDLE_SELECTION_EPOCH,
@@ -182,6 +184,7 @@ def run(config_path, expected_gpus, teacher_chunk_size):
                     "loss": float(loss.detach()), "task": float(task.detach()),
                     "d2s": float(d2s.detach()), "s2d": float(s2d.detach()),
                     "kd": stats,
+                    **({"sam": sam_stats} if sam_summary is not None else {}),
                 }), flush=True)
         if sam_summary is not None:
             engine.module.sam_epoch_diagnostics = sam_summary.result()

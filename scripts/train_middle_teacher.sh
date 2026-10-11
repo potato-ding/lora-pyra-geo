@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Train a formal Middle Teacher experiment from one of the eight method configs.
+# Train a formal Middle Teacher experiment from a method config.
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -26,7 +26,7 @@ export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
 command -v "$PYTHON_BIN" >/dev/null || { echo "Activate the pyra_geo environment first." >&2; exit 2; }
 
 # The config selects the method, resolution, batch protocol and Teacher asset.
-# --check validates the eight templates before their asset paths are filled.
+# --check validates the templates before their asset paths are filled.
 mapfile -t RUN_FIELDS < <("$PYTHON_BIN" -m src.middle_teacher.formal_config "$CONFIG")
 
 if (( ${#RUN_FIELDS[@]} != 4 )); then

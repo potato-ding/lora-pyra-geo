@@ -51,7 +51,7 @@ def checkpoint_metadata(payload):
             or payload['precision_signature'].get('selection_batch_size')!=expected['eval_batch_size']):
         raise ValueError('Middle resolution or selection batch mismatch')
     formal_e3=str(config['experiment']['name']).startswith(
-        ('M2-SAM-E3-KD-R', 'M3-SAM-HRD-SEM-R'))
+        ('M2-SAM-E3-KD-R', 'M3-SAM-HRD-SEM-R', 'M4-SAM-HRD-R'))
     if 'teacher' in m:
         validate_teacher_identity(m['teacher']['checkpoint_metadata'],size)
     elif formal_e3 or (size!=224 and len(config['distillation'])>1):

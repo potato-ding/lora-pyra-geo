@@ -1,4 +1,4 @@
-"""Static contracts for the eight formal Middle Teacher training configs."""
+"""Static contracts for the formal Middle Teacher training configs."""
 from pathlib import Path
 import json
 from unittest.mock import patch
@@ -12,8 +12,7 @@ CONFIG_DIR = ROOT / "configs/middle_teacher"
 METHODS = ("m0_infonce", "m1_hrd", "m2_hrd_sem", "m3_sam_hrd_sem")
 
 
-@pytest.mark.parametrize("size", (224, 256))
-@pytest.mark.parametrize("method", METHODS)
+@pytest.mark.parametrize("size,method", [(s,m) for s in (224,256) for m in METHODS] + [(256,"m4_sam_hrd")])
 def test_formal_middle_config_and_runtime_projection(monkeypatch, size, method):
     monkeypatch.setattr("src.middle_teacher.checkpoint.sha256", lambda _path: "foundation-sha")
     path = CONFIG_DIR / f"{method}_{size}.json"
@@ -34,14 +33,15 @@ def test_formal_middle_config_and_runtime_projection(monkeypatch, size, method):
         "m1_hrd": {"base_loss", "margin"},
         "m2_hrd_sem": {"base_loss", "margin", "adaptive_bridge_v2"},
         "m3_sam_hrd_sem": {"base_loss", "margin", "adaptive_bridge_v2"},
+        "m4_sam_hrd": {"base_loss", "margin"},
     }[method]
-    assert internal["sam"]["enabled"] == (method == "m3_sam_hrd_sem")
+    assert internal["sam"]["enabled"] == (method in ("m3_sam_hrd_sem", "m4_sam_hrd"))
 
 
 def test_middle_formal_configs_are_the_only_public_set():
     assert {p.name for p in CONFIG_DIR.glob("*.json")} == {
         f"{method}_{size}.json" for method in METHODS for size in (224, 256)
-    }
+    } | {f"m4_sam_hrd_{size}.json" for size in (224, 256)}
 
 
 def test_method_components_fail_closed():

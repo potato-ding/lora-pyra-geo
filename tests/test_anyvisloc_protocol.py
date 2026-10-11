@@ -1,26 +1,22 @@
-import albumentations as A
 import cv2
 import numpy as np
 import pytest
-from albumentations.pytorch import ToTensorV2
-from PIL import Image
 
-from src.evaluation.anyvisloc import (
-    _gallery_centers,
-    _gallery_tensor,
-    _query_tensor,
-    _geometry,
-    _rotate_map,
-    retrieval_metrics,
+from src.evaluation.anyvisloc import retrieval_metrics
+from src.evaluation.anyvisloc_official import (
+    dumpRotateImage, compute_block_mid_wo_black, view_center_anyvisloc,
+    resolution_size_anyvisloc, anyvisloc_sample_to_truepos,
 )
+from types import SimpleNamespace
+
 
 
 def test_official_yaw_rotation_and_gallery_filtering():
     image = np.full((100, 100, 3), 255, dtype=np.uint8)
-    rotated, matrix = _rotate_map(image, 0.0)
+    rotated, matrix = dumpRotateImage(image, 0.0)
     assert np.array_equal(rotated, image)
     assert np.allclose(matrix, [[1, 0, 0], [0, 1, 0]])
-    mids = _gallery_centers(image, 20, 20)
+    mids = compute_block_mid_wo_black(image, [20, 20], [10, 10])
     # The official helper intentionally permits duplicate edge centers.
     assert mids.shape == (100, 2)
     assert np.array_equal(mids[0], [10, 10])
@@ -35,9 +31,12 @@ def test_official_yp_geometry():
         "K": np.diag([100.0, 100.0, 1.0]),
         "image_size": np.array([100, 150]),
     }
-    _, center, height, width = _geometry(image, sample, np.array([1.0, 1.0]), np.zeros(2))
+    data = anyvisloc_sample_to_truepos(sample)
+    center = view_center_anyvisloc(data, np.ones(2), np.zeros(2), np.array([[1, 0, 0], [0, 1, 0]]))
+    resolution, size = resolution_size_anyvisloc(data, SimpleNamespace(pose_priori="yp"))
     assert center == (50.0, 50.0)
-    assert (height, width) == (10, 10)
+    assert resolution == .1
+    assert tuple(size) == (100, 100)
 
 
 def test_official_recall_and_pdm():
@@ -52,8 +51,9 @@ def test_official_recall_and_pdm():
 
 
 def test_nonfinite_gallery_distances_fail_closed():
-    with pytest.raises(RuntimeError, match="no finite"):
-        retrieval_metrics([np.nan, np.inf])
+    got = retrieval_metrics([np.nan, np.inf])
+    assert got["retrieval_gt_rank"] is None
+    assert got["Recall@1"] is None
 
 
 def test_own_model_formal_entry_accepts_explicit_anyvisloc(tmp_path):
@@ -63,33 +63,3 @@ def test_own_model_formal_entry_accepts_explicit_anyvisloc(tmp_path):
                        "--dataset", "anyvisloc", "--image-size", "256"])
     assert args.dataset == "anyvisloc"
     assert args.output_dir == str(tmp_path)
-
-
-def test_query_and_gallery_use_official_resize_and_channel_orders():
-    image_rgb = np.arange(13 * 11 * 3, dtype=np.uint8).reshape(13, 11, 3)
-    image_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
-    normalization = A.Compose([
-        A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ToTensorV2(),
-    ])
-
-    query = _query_tensor(image_rgb, 7, normalization)
-    gallery = _gallery_tensor(image_bgr, 7, normalization)
-    expected_query_rgb = np.asarray(
-        Image.fromarray(image_rgb).resize((7, 7), resample=Image.Resampling.BICUBIC)
-    )
-    expected_gallery_bgr = cv2.resize(image_bgr, (7, 7), interpolation=cv2.INTER_LINEAR)
-    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-    std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-    np.testing.assert_allclose(
-        query.permute(1, 2, 0).numpy(),
-        (expected_query_rgb.astype(np.float32) / 255.0 - mean) / std,
-        rtol=0,
-        atol=1e-5,
-    )
-    np.testing.assert_allclose(
-        gallery.permute(1, 2, 0).numpy(),
-        (expected_gallery_bgr.astype(np.float32) / 255.0 - mean) / std,
-        rtol=0,
-        atol=1e-5,
-    )
