@@ -1,4 +1,4 @@
-"""Strict M2/M3 Middle provider binding for TSD and ADSD asset construction."""
+"""Strict M2/M3/M4 Middle provider binding for TSD and ADSD asset construction."""
 from pathlib import Path
 
 import torch
@@ -11,11 +11,16 @@ from src.middle_teacher.formal_config import load_formal_config
 def validate_middle_provider(checkpoint, config_path, image_size, *, expected_method=None):
     path = Path(checkpoint).resolve()
     public_path, public = load_formal_config(config_path)
-    allowed = {f"M2-HRD-SEM-R{image_size}", f"M3-SAM-HRD-SEM-R{image_size}"}
-    if public["experiment_id"] not in allowed:
-        raise ValueError("Student assets require a resolution-matched M2 or M3 Middle")
-    is_sam = public["experiment_id"] == f"M3-SAM-HRD-SEM-R{image_size}"
-    if expected_method is not None and expected_method != ("M3" if is_sam else "M2"):
+    allowed = {
+        f"M2-HRD-SEM-R{image_size}": "M2",
+        f"M3-SAM-HRD-SEM-R{image_size}": "M3",
+        f"M4-SAM-HRD-R{image_size}": "M4",
+    }
+    method = allowed.get(public["experiment_id"])
+    if method is None:
+        raise ValueError("Student assets require a resolution-matched M2, M3 or M4 Middle")
+    is_sam = method in ("M3", "M4")
+    if expected_method is not None and expected_method != method:
         raise ValueError("Middle provider method mismatch")
     if path.name != "best_model.pth":
         raise ValueError("Middle requires best_model.pth")
@@ -60,7 +65,7 @@ def validate_middle_provider(checkpoint, config_path, image_size, *, expected_me
         if metadata.get("sam") is not True or metadata.get("sharpness") != payload["config"]["sam"]:
             raise ValueError("Middle SAM metadata mismatch")
         if metadata.get("search_direction") != "kd" or metadata.get("rho") != 0.1:
-            raise ValueError("Middle M3 method mismatch")
+            raise ValueError(f"Middle {method} method mismatch")
     elif metadata.get("sam") is not False or payload["config"]["sam"] != {"enabled": False} or any(
         metadata.get(key) is not None for key in ("sharpness", "search_direction", "rho")
     ):

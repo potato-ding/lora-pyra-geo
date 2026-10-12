@@ -23,7 +23,7 @@
     "label_smoothing": 0.1
   },
   "selection_eval_batch_size": 16,
-  "output_dir": "/home/dingyi/lora-pyra-geo/src/checkpoint/student/R256/S3-256",
+  "output_dir": "/home/dingyi/lora-pyra-geo/src/checkpoint/student/R256/S3-256-M3",
   "experiment_id": "S3-SAM-ADSD-R256",
   "img_size": 256,
   "middle_checkpoint": "/home/dingyi/lora-pyra-geo/src/checkpoint/middle_teacher/R256/M3-256/best_model.pth",

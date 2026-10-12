@@ -54,7 +54,7 @@ def validate_assets(config):
     if middle_path.name != "best_model.pth":
         raise ValueError("Student requires the selected Middle best_model.pth")
     from .formal_assets import validate_middle_provider
-    expected_provider = {
+    expected_provider = config.get("middle_provider") or {
         "S1-TSD": "M2", "S2-ADSD": "M2",
         "S3-SAM-ADSD": "M3", "S4-ADSD-SAM-MIDDLE": "M3",
     }[method_name(config)]
