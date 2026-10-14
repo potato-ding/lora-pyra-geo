@@ -1,17 +1,13 @@
-"""Sample4Geo model adapter and official AnyVisLoc evaluation.
+"""Sample4Geo model adapter for shared retrieval evaluation.
 
 External checkpoints have their own provenance, never a fabricated internal
 train-selection/precision certification. Run one dataset per visible GPU.
 """
-import argparse
 from contextlib import nullcontext
-from datetime import datetime, timezone
 import hashlib
 import importlib.util
-import json
 from pathlib import Path
 import subprocess
-import time
 
 import torch
 import torch.nn.functional as F
@@ -53,7 +49,7 @@ class Sample4GeoEncoder(nn.Module):
 
     @torch.no_grad()
     def encode(self, images):
-        # AnyVisLoc consumes already-normalized descriptors.
+        # Adapter smoke checks use normalized FP32 descriptors.
         return F.normalize(self(images), dim=-1)
 
 
@@ -87,58 +83,6 @@ def load_encoder(checkpoint, source, device):
                  normalization='single-forward L2 FP32', batch_size=16,
                  train_selection_certification='not_applicable_external_checkpoint',
                  shared_sources={str(p.relative_to(ROOT)): sha256(p) for p in [
-                     ROOT/'src/utils/train_eval_utils.py', ROOT/'src/evaluation/anyvisloc.py',
+                     ROOT/'src/utils/train_eval_utils.py',
                      ROOT/'src/dataset/teacher/val_dataloaders.py']})
     return encoder, audit
-
-
-def write_json(path, value):
-    with path.open('x', encoding='utf-8') as stream:
-        json.dump(value, stream, indent=2, ensure_ascii=False)
-        stream.write('\n')
-
-
-def main(argv=None):
-    p=argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--checkpoint',type=Path,default=BASE/'weights/weights_e1_0.9515.pth')
-    p.add_argument('--source',type=Path,default=BASE/'source')
-    p.add_argument('--output-dir',type=Path,required=True)
-    p.add_argument('--data-root',type=Path,default=ROOT/'data')
-    p.add_argument('--dataset',choices=['anyvisloc'],required=True)
-    p.add_argument('--num-workers',type=int,default=4)
-    args=p.parse_args(argv)
-    if torch.cuda.device_count()!=1:
-        raise RuntimeError('Set CUDA_VISIBLE_DEVICES to exactly one GPU')
-    device=torch.device('cuda:0');torch.set_num_threads(2)
-    torch.backends.cuda.matmul.allow_tf32=False
-    torch.backends.cudnn.allow_tf32=False
-    out=args.output_dir.resolve();out.mkdir(parents=True,exist_ok=True)
-    prefix=args.dataset
-    for suffix in ['.json','_load.json','_started.json','_progress.jsonl']:
-        if (out/(prefix+suffix)).exists():raise FileExistsError(out/(prefix+suffix))
-    model,audit=load_encoder(args.checkpoint.resolve(),args.source.resolve(),device)
-    write_json(out/(prefix+'_load.json'),audit)
-    write_json(out/(prefix+'_started.json'),dict(started_utc=datetime.now(timezone.utc).isoformat(),dataset=args.dataset))
-    protocol=dict(input_size=384,training_dataset='University-1652',target_finetuning=False,batch_size=16)
-    results={};counts={};start=time.perf_counter()
-    def progress(row):
-        with (out/(prefix+'_progress.jsonl')).open('a',encoding='utf-8') as stream:
-            stream.write(json.dumps(row)+'\n');stream.flush()
-    from src.evaluation.anyvisloc import evaluate_anyvisloc, official_protocol_metadata
-    protocol.update(scene_subset=['Scene_01','Scene_02'],subset_identity='current_public_release_01_02',
-        zero_shot=True,reference_mode='aerial',pose_priori='yp',patch_scale=1.0,retrieval_cover_percent=50,
-        paper_table2_subset_verified=False,postprocess_matching=False,recall_ap_unit='Recall/PDM fraction [0,1]',
-        query_channels='RGB',gallery_channels='RGB',
-        normalization='ImageNet mean/std applied in input array order',
-        query_resize='Pillow bicubic',gallery_resize='OpenCV INTER_LINEAR',retrieval_ks=[1,3,5],pdm_lambda=6.0,pdm_alpha=0.9)
-    protocol.update(official_protocol_metadata())
-    results=evaluate_anyvisloc(model,args.data_root/'test_anyvisloc_scenes01_02',384,device,batch_size=16,query_callback=progress)
-    payload=dict(model_type='sample4geo',checkpoint_sha256=audit['checkpoint_sha256'],dataset=args.dataset,
-        protocol=protocol,counts=counts,descriptor=dict(dim=1024,normalized=True,dtype='float32'),
-        runtime_precision=model.anyvisloc_runtime,results=results,elapsed_seconds=time.perf_counter()-start,completed_utc=datetime.now(timezone.utc).isoformat())
-    write_json(out/(args.dataset+'.json'),payload)
-    print('COMPLETE '+str(out/(args.dataset+'.json')),flush=True)
-
-
-if __name__=='__main__':
-    main()

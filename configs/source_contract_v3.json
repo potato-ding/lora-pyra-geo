@@ -303,7 +303,6 @@
     "src/dataset/teacher/val_dataloaders.py",
     "src/dataset/transforms.py",
     "src/evaluation/__init__.py",
-    "src/evaluation/anyvisloc.py",
     "src/evaluation/certification.py",
     "src/evaluation/evaluate.py",
     "src/evaluation/metrics.py",

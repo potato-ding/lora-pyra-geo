@@ -106,20 +106,3 @@ def test_paper_forward_respects_upstream_autocast(kind, monkeypatch):
     result = encoder.forward_unnormalized(SimpleNamespace(device=torch.device("cuda")))
     assert enabled == [kind != "mccg"]
     assert result.dtype == torch.float32
-
-
-def test_anyvisloc_mccg_disables_outer_autocast():
-    from src.evaluation.anyvisloc import _OfficialRetrievalModel
-    from src.evaluation.comparison_models import PaperEncoder
-    class Model(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.layer = nn.Linear(4, 8)
-        def forward(self, images, *args):
-            return self.layer(images), None
-    model = Model()
-    adapter = _OfficialRetrievalModel(PaperEncoder(model, "mccg"), torch.device("cpu"))
-    with torch.autocast("cpu", dtype=torch.bfloat16):
-        result = adapter(torch.ones(2, 4))
-    assert result.dtype == torch.float32
-    assert model.layer.weight.dtype == torch.float32

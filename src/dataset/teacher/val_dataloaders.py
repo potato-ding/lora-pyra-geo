@@ -10,7 +10,7 @@ import torch.distributed as dist
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 
-from src.evaluation.protocols import GTA_PROTOCOL
+from src.evaluation.protocols import gta_protocol
 
 GTA_SATE_LENGTH = 24576
 GTA_TILE_LENGTH = 256
@@ -275,8 +275,8 @@ def build_gta_val_dataloaders(
     query_mode="D2S",
     mode="pos",
 ):
-    if (split_type, query_mode, mode) != ("cross-area", "D2S", "pos"):
-        raise ValueError("Unified GTA protocol requires cross-area / D2S / pos")
+    if split_type not in ("cross-area", "same-area") or (query_mode, mode) != ("D2S", "pos"):
+        raise ValueError("Unified GTA protocol requires cross-area or same-area / D2S / pos")
     from src.dataset.teacher.transforms import get_paired_cross_view_val_transforms
 
     val_transforms = get_paired_cross_view_val_transforms(img_size=img_size)
@@ -336,7 +336,7 @@ def build_gta_val_dataloaders(
         query_dataset = GTAUAVDataset(query_paths, query_labels, coords=query_coords, transform=val_transforms)
         gallery_dataset = GTAUAVDataset(all_sate_paths, sate_labels, coords=sate_coords, transform=val_transforms)
         query_dataset.protocol_audit = {
-            "gta_protocol": GTA_PROTOCOL,
+            "gta_protocol": gta_protocol(split_type),
             "raw_json_queries": len(json_data),
             "queries_with_positive": sum(bool(item[pair_key]) for item in json_data),
             "formal_query_count": len(query_paths),

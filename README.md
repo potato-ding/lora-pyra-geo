@@ -51,13 +51,12 @@ resolution must match `--image-size`. Batch size is 16.
 bash scripts/eval.sh --gpu 0 --model-type student   --checkpoint /path/to/run/best_model.pth   --dataset all --image-size 224 --data-root data
 ```
 
-The three finalized formal result files are written beside the checkpoint:
+The four finalized formal result files are written beside the checkpoint:
 `test_1652.json`, `test_sues200.json`,
-`test_gta_cross_area_d2s.json`.
+`test_gta_cross_area_d2s.json`, `test_gta_same_area_d2s.json`.
 Existing result files are not overwritten. U1652 evaluates D2S/S2D
 R@1, R@5 and AP; SUES-200 evaluates D2S/S2D at 150/200/250/300 m;
-GTA-UAV evaluates cross-area D2S; AnyVisLoc evaluates the released
-Scene_01/02 aerial-map retrieval subset. See `src/evaluation/evaluate.py`
+GTA-UAV evaluates cross-area and same-area D2S. See `src/evaluation/evaluate.py`
 for the exact runtime checks and dataset-specific protocol metadata.
 
 ## Runtime assets
@@ -78,7 +77,6 @@ tests. No training or full-model evaluation runs as part of the test suite.
 Protocol identifiers are defined in `src/evaluation/protocols.py`. Training selection
 and final evaluation share the U1652 loader/metric and use batch 16. New internal
 weights must carry selection_dataset_protocol; old-result migration is removed.
-AnyVisLoc uses the official retrieval preprocessing for every model: RGB query, BGR gallery without channel conversion, Pillow bicubic query resize, OpenCV linear gallery resize, and ImageNet normalization in array order. Use `--dataset anyvisloc`; `all` runs U1652, SUES-200 and GTA first. Input size follows each checkpoint.
 
 The one-shot pipeline `python scripts/retrain_fixed.py --launch` runs all 20
 experiments from foundation weights, rebuilds Middle-dependent Student assets,
@@ -106,3 +104,29 @@ ranking. AP uses trapezoidal integration. Both datasets share their loader,
 feature extraction and metric implementation; only dataset paths differ.
 Current SUES effective galleries are 80 satellite / 4000 drone images per height.
 No alternative retrieval protocol or historical result migration is supported.
+
+### GTA-UAV evaluation splits
+
+GTA evaluation now runs `cross-area` and `same-area` sequentially by default,
+using D2S positive-only queries and the complete satellite gallery for each split.
+The input size and single-GPU batch size (16) retain the checkpoint evaluation contract.
+Formal results are written beside the checkpoint as `test_gta_cross_area_d2s.json`
+and `test_gta_same_area_d2s.json`. Existing results are never overwritten.
+
+```bash
+# Evaluate both GTA splits for a new result directory.
+bash scripts/eval.sh --gpu 0 --model-type student \
+  --checkpoint src/checkpoint/student/R256/S3-256-M3/best_model.pth \
+  --image-size 256 --dataset gta
+
+# Supplement an existing cross-area result with same-area only.
+bash scripts/eval.sh --gpu 0 --model-type student \
+  --checkpoint src/checkpoint/student/R256/S3-256-M3/best_model.pth \
+  --image-size 256 --dataset gta --gta-split same-area
+```
+
+`--gta-split cross-area|same-area|both` also applies to `--dataset all` and
+`python -m src.evaluation.comparison --dataset gta`. Comparison checkpoints
+retain `gta.json` for cross-area and add `gta_same_area.json` for same-area.
+For models trained on University-1652, these are two GTA benchmark test splits
+under zero-shot transfer, not experiments trained on the GTA same-area training split.

@@ -67,17 +67,17 @@ def load_formal_config(path: str | Path) -> tuple[Path, dict]:
     if type(size) is not int or size not in (224, 256):
         raise ValueError("Student img_size must be 224 or 256")
     variant = path.stem.removesuffix(f"_{size}")
-    m4_provider = variant.endswith("_m4")
-    method = variant.removesuffix("_m4") if m4_provider else variant
+    provider_variant = next((p for p in ("M3", "M4") if variant.endswith("_" + p.lower())), None)
+    method = variant.removesuffix("_" + provider_variant.lower()) if provider_variant else variant
     if (method not in METHODS or path.stem != f"{variant}_{size}"
-            or (m4_provider and method not in ("s1_tsd", "s2_adsd", "s3_sam_adsd"))):
+            or (provider_variant and method not in ("s1_tsd", "s2_adsd", "s3_sam_adsd"))):
         raise ValueError("Unknown formal Student method")
     identity, distillation, sam = METHODS[method]
     expected = BASE_KEYS | (KD_KEYS if distillation else set()) | (SAM_KEYS if sam else set())
-    if m4_provider:
+    if provider_variant:
         expected |= {"middle_provider"}
-        if cfg.get("middle_provider") != "M4":
-            raise ValueError("M4 config must explicitly bind middle_provider=M4")
+        if cfg.get("middle_provider") != provider_variant:
+            raise ValueError(f"{provider_variant} config must explicitly bind middle_provider={provider_variant}")
     if set(cfg) != expected:
         raise ValueError(
             f"Student config keys mismatch: missing={sorted(expected-set(cfg))} "

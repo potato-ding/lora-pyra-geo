@@ -2,7 +2,7 @@
 import argparse
 import json
 from pathlib import Path
-from .protocols import RETRIEVAL_PROTOCOL, require_selection_protocol
+from .protocols import RETRIEVAL_PROTOCOL, require_selection_protocol, gta_eval_splits, gta_result_name
 import torch
 from .model_loader import load_encoder as _load_checkpoint_encoder
 from .metrics import getdist_1652_val_and_get_recall,run_sues_val_and_get_metrics,run_gta_val_and_get_metrics
@@ -50,7 +50,9 @@ def parse_args(argv=None):
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--model-type',required=True,help='teacher, middle, student; comparison adapters can be registered later')
     p.add_argument('--checkpoint',required=True);p.add_argument('--config')
-    p.add_argument('--dataset',required=True,choices=['u1652','sues200','gta','anyvisloc','all'],help='all: finalized U1652, SUES-200 and GTA-UAV protocols')
+    p.add_argument('--dataset',required=True,choices=['u1652','sues200','gta','all'],help='all: finalized U1652, SUES-200 and GTA-UAV protocols')
+    p.add_argument('--gta-split', choices=('cross-area','same-area','both'), default='both',
+                   help='GTA D2S test split; both evaluates cross-area then same-area')
     p.add_argument('--data-root',default='data');p.add_argument('--u1652-dir');p.add_argument('--sues200-dir');p.add_argument('--gta-dir')
     p.add_argument('--batch-size',type=int,default=16);p.add_argument('--num-workers',type=int,default=8)
     p.add_argument('--image-size',type=int,required=True,help='evaluation input size; must match our model checkpoint');p.add_argument('--device',default='cuda:0');p.add_argument('--output-dir',help='comparison-model output directory; formal models write beside their checkpoint')
@@ -122,9 +124,7 @@ def main(argv=None):
         if args.dataset in ("sues200", "all"):
             result_names.append("test_sues200.json")
         if args.dataset in ("gta", "all"):
-            result_names.append("test_gta_cross_area_d2s.json")
-        if args.dataset == 'anyvisloc':
-            result_names.append('test_anyvisloc.json')
+            result_names.extend(gta_result_name(split) for split in gta_eval_splits(args.gta_split))
         for name in result_names:
             if (output/name).exists():
                 raise FileExistsError("Evaluation result already exists: "+str(output/name))
@@ -159,13 +159,15 @@ def main(argv=None):
                                       'SDM@1','SDM@3','SDM@5','DIS@1','DIS@3','DIS@5')}
     roots={'u1652':args.u1652_dir or str(Path(args.data_root)/'U1652'),
            'sues200':args.sues200_dir or str(Path(args.data_root)/'SUES-200/SUES-200-512x512'),
-           'gta':args.gta_dir or str(Path(args.data_root)/'GTA-UAV-LR/GTA-UAV-LR-baidu'),
-           'anyvisloc':str(Path(args.data_root)/'test_anyvisloc_scenes01_02')}
+           'gta':args.gta_dir or str(Path(args.data_root)/'GTA-UAV-LR/GTA-UAV-LR-baidu')}
     datasets=['u1652','sues200','gta'] if args.dataset=='all' else [args.dataset]
+    datasets=[name for dataset in datasets for name in
+              ([('gta' if split=='cross-area' else 'gta_same_area') for split in gta_eval_splits(args.gta_split)]
+               if dataset=='gta' else [dataset])]
     if not args.certification_only and 'u1652' not in datasets and not (output/'test_1652.json').exists():
         datasets.insert(0,'u1652')
     for dataset in datasets:
-        common=dict(img_size=[image_size,image_size],data_dir=roots[dataset],batch_size=args.batch_size,num_workers=args.num_workers)
+        common=dict(img_size=[image_size,image_size],data_dir=roots["gta" if dataset=="gta_same_area" else dataset],batch_size=args.batch_size,num_workers=args.num_workers)
         protocol={'input_size':image_size,'preprocessing':'canonical deterministic','augmentation':False,'batch_size':args.batch_size}
         results={}
         if dataset=='u1652':
@@ -207,45 +209,21 @@ def main(argv=None):
                 horizontal_flip=False,feature_fusion='none',retrieval_protocol=RETRIEVAL_PROTOCOL,
                 resize='OpenCV INTER_LINEAR_EXACT',channels='RGB',normalization='ImageNet',
                 gallery_policy='non-query identities marked -1 and excluded after ranking',similarity='cosine')
-        elif dataset=='gta':
-            loaders=build_gta_val_dataloaders(**common,split_type='cross-area',query_mode='D2S',mode='pos')
+        elif dataset in ('gta','gta_same_area'):
+            split='same-area' if dataset=='gta_same_area' else 'cross-area'
+            loaders=build_gta_val_dataloaders(**common,split_type=split,query_mode='D2S',mode='pos')
             results['D2S']=evaluate_pair(dataset,'D2S',loaders['D2S'])
-            name='test_gta_cross_area_d2s.json';protocol.update(split='cross-area',query_mode='D2S')
+            name=gta_result_name(split);protocol.update(split=split,query_mode='D2S')
             protocol.update(loaders['D2S'][0].dataset.protocol_audit)
             protocol.update(DIS_unit='meter (m)',SDM_scale='unitless [0,1]',
                             similarity='cosine',positive_pairs='pair_pos_sate_img_list',
                             postprocess_matching=False)
-        elif dataset=='anyvisloc':
-            from .anyvisloc import evaluate_anyvisloc, validate_anyvisloc_root, official_protocol_metadata
-            root=Path(args.data_root)/'test_anyvisloc_scenes01_02'
-            scenes=validate_anyvisloc_root(root)
-            progress_path=output/'test_anyvisloc_progress.jsonl'
-            if progress_path.exists():raise FileExistsError(progress_path)
-            protocol.update(scene_subset=['Scene_01','Scene_02'],
-                subset_identity='current_public_release_01_02',reference_mode='aerial',
-                pose_priori='yp',patch_scale=1.0,retrieval_cover_percent=50,
-                zero_shot=True,postprocess_matching=False,paper_table2_subset_verified=False,
-                training_dataset='University-1652',query_channels='RGB',gallery_channels='RGB',
-                normalization='ImageNet mean/std applied in input array order',
-                query_resize='Pillow bicubic',gallery_resize='OpenCV INTER_LINEAR',
-                retrieval_ks=[1,3,5],pdm_lambda=6.0,pdm_alpha=0.9,
-                metric_unit='Recall/PDM fraction [0,1]',
-                query_counts={scene:len(values) for scene,values in scenes.items()})
-            def progress(row):
-                with progress_path.open('a',encoding='utf-8') as stream:
-                    stream.write(json.dumps(row)+'\n')
-            protocol.update(official_protocol_metadata())
-            results=evaluate_anyvisloc(model,root,image_size,device,batch_size=16,
-                query_callback=progress)
-            name='test_anyvisloc.json'
         else:
             raise ValueError(dataset)
         payload={'model_type':args.model_type,'checkpoint':str(Path(args.checkpoint).resolve()),
-                 'checkpoint_sha256':load_audit['sha256'],'dataset':dataset,
+                 'checkpoint_sha256':load_audit['sha256'],'dataset':('gta' if dataset=='gta_same_area' else dataset),
                  'protocol':protocol,'descriptor':{'dim':model.descriptor_dim,'normalized':True,'dtype':'float32'},
-                 'runtime_precision':(model.anyvisloc_runtime if dataset=='anyvisloc' else load_audit['runtime_precision']),'precision_signature':signature,'results':results}
-        if dataset=='anyvisloc':
-            payload['checkpoint_load_precision_signature']=payload.pop('precision_signature')
+                 'runtime_precision':load_audit['runtime_precision'],'precision_signature':signature,'results':results}
         if args.model_type=="student" and dataset=="u1652":
             payload["u1652_eval_batch_size"]=args.batch_size
         if not args.certification_only:
