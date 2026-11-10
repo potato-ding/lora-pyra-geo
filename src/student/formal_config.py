@@ -9,6 +9,7 @@ ROOT = Path(__file__).resolve().parents[2]
 CONFIG_DIR = ROOT / "configs/student"
 METHODS = {
     "s0_infonce": ("S0-INFONCE", None, False),
+    "s_hrd_sam": ("S-HRD-SAM", "HRD", True),
     "s1_tsd": ("S1-TSD", "TSD", False),
     "s2_adsd": ("S2-ADSD", "ADSD", False),
     "s3_sam_adsd": ("S3-SAM-ADSD", "ADSD", True),
@@ -43,19 +44,18 @@ def validate_tsd(component: dict) -> None:
         raise ValueError("TSD Top128 protocol changed")
 
 
-def validate_adsd(component: dict) -> None:
-    if component != {
+def validate_adsd(component: dict, *, shared=False) -> None:
+    expected = {
         "type": "ADSD", "weight": 0.2, "warmup_epochs": 5,
         "top_dim": 128, "top_head": "residual_mlp",
         "random_dim": 32, "random_head": "linear",
         "random_basis": "gaussian_qr_per_run",
         "allocation": {"type": "bounded_learnable_gbw", "initial_d": 0.0},
-    }:
+    }
+    if shared:
+        expected["random_basis"] = "checkpoint_exact_tensors"
+    if component != expected:
         raise ValueError("ADSD Top128/Random32 protocol changed")
-
-
-def validate_sam_adsd(component: dict) -> None:
-    validate_adsd(component)
 
 
 def load_formal_config(path: str | Path) -> tuple[Path, dict]:
@@ -63,21 +63,92 @@ def load_formal_config(path: str | Path) -> tuple[Path, dict]:
     if path.parent != CONFIG_DIR.resolve() or path.suffix != ".json":
         raise ValueError("Select a config directly from configs/student/")
     cfg = json.loads(path.read_text())
+    if cfg.get("distillation", {}).get("type") == "VkD":
+        from .vkd_config import load_config
+        return load_config(path)
+    if "ablation" in cfg:
+        from .ablation_config import load_config
+        return load_config(path)
     size = cfg.get("img_size")
     if type(size) is not int or size not in (224, 256):
         raise ValueError("Student img_size must be 224 or 256")
-    variant = path.stem.removesuffix(f"_{size}")
+    repeat = next((i for i in (1, 2) if path.stem == f"s3_sam_adsd_shared_m3_256_seed{i}"), None)
+    stem = path.stem
+    if repeat is not None:
+        base = json.loads((CONFIG_DIR / "s3_sam_adsd_shared_m3_256.json").read_text())
+        base.update(seed=repeat, output_dir=cfg.get("output_dir"))
+        if cfg != base:
+            raise ValueError("ADSD repeat may change only seed and output_dir")
+        stem = stem.removesuffix(f"_seed{repeat}")
+    variant = stem.removesuffix(f"_{size}")
+    from .s0_backbones import S0_BACKBONES
+
+    backbone = next((name for name in S0_BACKBONES if variant == f"s0_infonce_{name}"), None)
+    if backbone and size != 256:
+        raise ValueError("DINOv3 S0 comparisons require R256")
     provider_variant = next((p for p in ("M3", "M4") if variant.endswith("_" + p.lower())), None)
     method = variant.removesuffix("_" + provider_variant.lower()) if provider_variant else variant
-    if (method not in METHODS or path.stem != f"{variant}_{size}"
-            or (provider_variant and method not in ("s1_tsd", "s2_adsd", "s3_sam_adsd"))):
+    if backbone:
+        method = "s0_infonce"
+    hrd_replicate = next((i for i in (1, 2, 3, 4)
+                          if method == f"s3_sam_adsd_hrd_random{i}_shared"), None)
+    middle_hrd_variant = method == "s3_sam_adsd_hrd_shared" or hrd_replicate is not None
+    if hrd_replicate is not None:
+        expected_run = f"S3-256-M3-RMLP-LINEAR-RANDOM{hrd_replicate}-GBW"
+        reference = cfg.get("subspace_reference", {}).get("checkpoint", "")
+        if Path(reference).parent.name != expected_run:
+            raise ValueError("HRD replicate must reference the matching RANDOM checkpoint")
+    if middle_hrd_variant:
+        method = "s3_sam_adsd_shared"
+    hrd_variant = method == "s3_sam_adsd_t0_hrd_rmlp_linear"
+    direct_variant = method == "s3_sam_adsd_t0_rmlp_linear" or hrd_variant
+    if direct_variant:
+        method = "s3_sam_adsd"
+    independent_variant = next((("s3_sam_adsd", i) for i in (1, 2, 3, 4)
+                                if method == f"s3_sam_adsd_independent{i}"), None)
+    independent_replicate = independent_variant[1] if independent_variant else None
+    if independent_variant:
+        method = independent_variant[0]
+    shared_variant = method.endswith("_shared")
+    if shared_variant:
+        method = method.removesuffix("_shared")
+    if (method not in METHODS or stem != f"{variant}_{size}"
+            or (provider_variant and method not in ("s1_tsd", "s2_adsd", "s3_sam_adsd", "s_hrd_sam"))):
         raise ValueError("Unknown formal Student method")
     identity, distillation, sam = METHODS[method]
+    if backbone:
+        identity = S0_BACKBONES[backbone]
     expected = BASE_KEYS | (KD_KEYS if distillation else set()) | (SAM_KEYS if sam else set())
+    if distillation == "HRD":
+        from .hrd_only import validate_config
+        validate_config(cfg)
+        expected = BASE_KEYS | SAM_KEYS | {"hrd", "middle_provider", "middle_checkpoint", "middle_config"}
+    if direct_variant:
+        from .direct_teacher_distillation import CONFIG_KEYS
+        expected = BASE_KEYS | CONFIG_KEYS | SAM_KEYS
+        if hrd_variant:
+            expected |= {"hrd"}
+    if middle_hrd_variant:
+        from .middle_teacher_hrd import validate_config as validate_middle_hrd
+        validate_middle_hrd(cfg)
+        expected |= {"hrd"}
     if provider_variant:
         expected |= {"middle_provider"}
         if cfg.get("middle_provider") != provider_variant:
             raise ValueError(f"{provider_variant} config must explicitly bind middle_provider={provider_variant}")
+    shared = "subspace_reference" in cfg
+    if shared != shared_variant:
+        raise ValueError("Shared subspace filename/config mismatch")
+    if shared:
+        if method not in ("s2_adsd", "s3_sam_adsd") or size != 256 or provider_variant != "M3":
+            raise ValueError("Shared subspace controls require S2/S3 R256 M3")
+        from .shared_subspaces import validate_reference_config
+        validate_reference_config(cfg["subspace_reference"])
+        expected |= {"subspace_reference"}
+    if independent_replicate:
+        if size != 256 or provider_variant != "M3" or cfg.get("random_basis_replicate") != independent_replicate:
+            raise ValueError("Independent Random32 controls require matching R256 M3 replicate")
+        expected |= {"random_basis_replicate"}
     if set(cfg) != expected:
         raise ValueError(
             f"Student config keys mismatch: missing={sorted(expected-set(cfg))} "
@@ -85,8 +156,8 @@ def load_formal_config(path: str | Path) -> tuple[Path, dict]:
         )
     if cfg["experiment_id"] != f"{identity}-R{size}":
         raise ValueError("Student experiment_id/filename mismatch")
-    fixed = {
-        "epochs": 30, "model": "repvit_m1_5", "world_size": 1,
+    protocol = {
+        "epochs": 30, "model": backbone or "repvit_m1_5", "world_size": 1,
         "local_pair_batch": 32, "global_pair_batch": 32,
         "cross_gpu_gather": False, "backbone_precision": "bfloat16",
         "descriptor_precision": "float32", "lr": 1e-4,
@@ -99,7 +170,7 @@ def load_formal_config(path: str | Path) -> tuple[Path, dict]:
             "label_smoothing": 0.1,
         },
     }
-    for key, value in fixed.items():
+    for key, value in protocol.items():
         if cfg[key] != value:
             raise ValueError("Student protocol changed: " + key)
     if type(cfg["seed"]) is not int or type(cfg["num_workers"]) is not int or cfg["num_workers"] < 0:
@@ -107,16 +178,20 @@ def load_formal_config(path: str | Path) -> tuple[Path, dict]:
     for key in ("pretrained_checkpoint", "data_dir"):
         if not isinstance(cfg[key], str) or not cfg[key]:
             raise ValueError(f"{key} must be a nonempty path")
-    for key in ("output_dir",) + (tuple(KD_KEYS - {"distillation"}) if distillation else ()):
+    provider_paths = ("teacher_checkpoint", "teacher_asset_identity", "supervision_asset", "top_calibration", "random_basis_asset", "head_initialization_rng_asset") if direct_variant else (tuple(KD_KEYS - {"distillation"}) if distillation else ())
+    if distillation == "HRD":
+        provider_paths = ("middle_checkpoint", "middle_config")
+    for key in ("output_dir",) + provider_paths:
         value = cfg[key]
         if value is not None and (not isinstance(value, str) or not value):
             raise ValueError(f"{key} must be a path or null")
     if distillation == "TSD":
         validate_tsd(cfg["distillation"])
-    elif sam:
-        validate_sam_adsd(cfg["distillation"])
+    elif direct_variant:
+        from .direct_teacher_distillation import validate_config
+        validate_config(cfg)
     elif distillation == "ADSD":
-        validate_adsd(cfg["distillation"])
+        validate_adsd(cfg["distillation"], shared=shared)
     if sam and cfg["sam"] != {
         "enabled": True, "algorithm": "kd_guided_standard_sam",
         "search_direction": "kd", "rho": 0.1, "adaptive": False,
@@ -137,7 +212,8 @@ def main() -> None:
     print(path)
     for field in ("output_dir", "middle_checkpoint", "middle_config",
                   "supervision_asset", "top_calibration"):
-        print(cfg.get(field) or "")
+        aliases = {"middle_checkpoint": "teacher_checkpoint", "middle_config": "teacher_asset_identity"}
+        print(cfg.get(field) or cfg.get(aliases.get(field, "")) or "")
 
 
 if __name__ == "__main__":

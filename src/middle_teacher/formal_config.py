@@ -9,7 +9,9 @@ ROOT = Path(__file__).resolve().parents[2]
 CONFIG_DIR = ROOT / "configs/middle_teacher"
 METHODS = {
     "m0_infonce": ("M0-INFONCE", False, False, False),
+    "m1_kl": ("M1-KL", False, False, False),
     "m1_hrd": ("M1-HRD", True, False, False),
+    "m1_hrd_middle_hnd": ("M1-HRD-MIDDLE-HND", True, False, False),
     "m2_hrd_sem": ("M2-HRD-SEM", True, True, False),
     "m3_sam_hrd_sem": ("M3-SAM-HRD-SEM", True, True, True),
     "m4_sam_hrd": ("M4-SAM-HRD", True, False, True),
@@ -36,7 +38,10 @@ def load_formal_config(path: str | Path) -> tuple[Path, dict]:
         "optimizer", "lr", "weight_decay", "betas", "eps",
         "scheduler", "warmup_ratio", "task_loss", "output_dir",
     }
-    expected_keys = base_keys | (
+    kl = method == "m1_kl"
+    if kl and (size != 256 or config.get("similarity_kl") != {"temperature": 0.07, "weight": 2.0}):
+        raise ValueError("Unexpected R256 similarity KL protocol")
+    expected_keys = ({"teacher_checkpoint", "similarity_kl"} if kl else set()) | base_keys | (
         {"teacher_checkpoint", "hrd"} if hrd else set()
     ) | (
         {"semantic"} if semantic else set()
@@ -85,14 +90,16 @@ def load_formal_config(path: str | Path) -> tuple[Path, dict]:
         raise ValueError("Unexpected Middle epoch or task-loss protocol")
     if ("hrd" in config, "semantic" in config, "sam" in config) != (hrd, semantic, sam):
         raise ValueError("Config components do not match the selected method")
-    if ("teacher_checkpoint" in config) != hrd:
+    if ("teacher_checkpoint" in config) != (hrd or kl):
         raise ValueError("Teacher checkpoint belongs exactly to KD methods")
     if hrd and config["hrd"] != {
         "weight": 0.1,
         "operator": "ABS_MARGIN",
-        "negative_selection": "teacher_top5_wrong_identity",
+        "negative_selection": ("middle_top5_wrong_identity" if method == "m1_hrd_middle_hnd" else "teacher_top5_wrong_identity"),
     }:
         raise ValueError("HRD protocol changed")
+    if method == "m1_hrd_middle_hnd" and size != 256:
+        raise ValueError("Middle HND ablation is R256 only")
     if semantic:
         component = config["semantic"]
         if component.get("weight") != 0.05 or component.get("teacher_layers") != [28, 36] or component.get("middle_target_layer") != 10:
@@ -122,6 +129,8 @@ def to_runtime_config(path: str | Path) -> dict:
         raise FileNotFoundError(f"Middle pretrained checkpoint: {foundation}")
     size = cfg["img_size"]
     distillation = {"base_loss": "pair_infonce"}
+    if "similarity_kl" in cfg:
+        distillation["similarity_kl"] = dict(cfg["similarity_kl"])
     if "hrd" in cfg:
         distillation["margin"] = dict(cfg["hrd"], enabled=True)
     if "semantic" in cfg:

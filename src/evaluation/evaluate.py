@@ -59,6 +59,9 @@ def parse_args(argv=None):
     p.add_argument('--certification-only',action='store_true',help='Extract once and compare independent metrics, without issuing formal results')
     p.add_argument('--feature-cache-dir',help='Explicit certification cache directory, not included in result packages')
     p.add_argument('--reuse-certified-cache',action='store_true',help='Formal metrics from hash-verified previously certified descriptors')
+    p.add_argument("--independent-s0-reload", action="store_true",
+                   help="Evaluate a DINOv3 S0 checkpoint separately from historical selection metrics")
+    p.add_argument("--repvit-reparam", action="store_true", help="Evaluate the fused R256 D2 basis-0 student")
     args=p.parse_args(argv)
     if args.batch_size != 16:
         raise ValueError("Unified single-GPU evaluation requires batch_size=16")
@@ -69,7 +72,19 @@ def parse_args(argv=None):
     if args.reuse_certified_cache and not args.certification_only and args.model_type in ("student", "middle"):
         raise ValueError("U1652 reload verification requires fresh batch=16 extraction; cached batch provenance is unavailable")
     checkpoint_dir = Path(args.checkpoint).resolve().parent
-    if args.certification_only:
+    if args.repvit_reparam:
+        if (args.model_type != "student" or args.dataset != "all" or args.gta_split != "both"
+                or args.certification_only or args.reuse_certified_cache or args.feature_cache_dir
+                or args.independent_s0_reload or args.output_dir):
+            p.error("--repvit-reparam requires Student, all datasets and both GTA splits")
+        args.output_dir = str(checkpoint_dir / "reparameterized_eval")
+    elif args.independent_s0_reload:
+        if (args.model_type != "student" or args.dataset != "all" or args.certification_only
+                or args.reuse_certified_cache or args.feature_cache_dir or args.output_dir
+                or args.gta_split != "both"):
+            p.error("--independent-s0-reload requires Student, all datasets and both GTA splits")
+        args.output_dir = str(checkpoint_dir / "independent_reload")
+    elif args.certification_only:
         if args.output_dir is None:
             p.error("--certification-only requires a separate --output-dir")
     elif args.output_dir is None:
@@ -97,6 +112,26 @@ def main(argv=None):
         raise RuntimeError('LEGACY_CHECKPOINT: not certified for new formal Teacher evaluation')
     header=torch.load(args.checkpoint,map_location='cpu',weights_only=True,mmap=True)
     require_selection_protocol(header.get('selection_dataset_protocol'))
+    if args.independent_s0_reload:
+        from src.student.s0_backbones import S0_BACKBONES
+
+        public = header["public_config"]
+        backbone = public.get("model")
+        if backbone not in S0_BACKBONES or public.get("experiment_id") != f"{S0_BACKBONES[backbone]}-R256":
+            raise ValueError("Independent reload is limited to R256 DINOv3 S0 checkpoints")
+    if args.repvit_reparam:
+        public = header["public_config"]
+        if (public.get("experiment_id") != "D2-TOP256-RANDOM64-SAM-R256"
+                or public.get("model") != "repvit_m1_5" or public.get("seed") != 0
+                or "random_basis_control" in public):
+            raise ValueError("Reparameterization evaluation requires original D2 basis 0")
+        from .efficiency import prepare_deployment
+
+        with torch.no_grad():
+            fusion = prepare_deployment(model.model.float().eval())
+            model.model.bfloat16().eval()
+        if not fusion["changes"]:
+            raise RuntimeError("RepViT structural fusion produced no changes")
     del header
     signature=load_audit['precision_signature']
     image_size=signature['image_size']
@@ -110,6 +145,8 @@ def main(argv=None):
             raise FileExistsError("Certification output must be a fresh directory: "+str(output))
         output.mkdir(parents=True,exist_ok=True)
         (output/'checkpoint_load.json').write_text(json.dumps(load_audit,indent=2))
+    elif args.independent_s0_reload or args.repvit_reparam:
+        output.mkdir(exist_ok=False)
     else:
         if output.resolve() != Path(args.checkpoint).resolve().parent:
             raise RuntimeError("Formal results must share the checkpoint directory")
@@ -197,7 +234,23 @@ def main(argv=None):
             if not args.certification_only:
                 from .precision_contract import assert_best_reload_metrics
                 if load_audit['selection_metrics'] is None:raise RuntimeError('Missing train selection metrics')
-                protocol['BEST_MODEL_RELOAD_CONSISTENCY']=assert_best_reload_metrics(results,load_audit['selection_metrics'])
+                if args.independent_s0_reload or args.repvit_reparam:
+                    from .precision_contract import flat_selection_metrics
+
+                    expected = flat_selection_metrics(load_audit["selection_metrics"])
+                    delta = {
+                        direction: {metric: results[direction][metric] - value
+                                    for metric, value in metrics.items()}
+                        for direction, metrics in expected.items()
+                    }
+                    protocol["BEST_MODEL_RELOAD_CONSISTENCY"] = (
+                        "PASS" if all(value == 0 for metrics in delta.values() for value in metrics.values())
+                        else "MISMATCH"
+                    )
+                    protocol["training_selection_metrics"] = expected
+                    protocol["reload_minus_selection_percentage_points"] = delta
+                else:
+                    protocol['BEST_MODEL_RELOAD_CONSISTENCY']=assert_best_reload_metrics(results,load_audit['selection_metrics'])
         elif dataset=='sues200':
             loaders=build_sues200_val_dataloaders(**common,heights=['150','200','250','300'])
             for height,directions in loaders.items():
@@ -220,10 +273,19 @@ def main(argv=None):
                             postprocess_matching=False)
         else:
             raise ValueError(dataset)
+        if args.repvit_reparam:
+            from .precision_contract import inspect_precision_signature
+
+            protocol["evaluation_mode"] = "repvit_reparameterized"
+            protocol["fusion"] = fusion
+            protocol["source_precision_signature"] = signature
+        if args.independent_s0_reload:
+            protocol["evaluation_mode"] = "independent_dinov3_s0_checkpoint_reload"
         payload={'model_type':args.model_type,'checkpoint':str(Path(args.checkpoint).resolve()),
                  'checkpoint_sha256':load_audit['sha256'],'dataset':('gta' if dataset=='gta_same_area' else dataset),
                  'protocol':protocol,'descriptor':{'dim':model.descriptor_dim,'normalized':True,'dtype':'float32'},
-                 'runtime_precision':load_audit['runtime_precision'],'precision_signature':signature,'results':results}
+                 'runtime_precision':load_audit['runtime_precision'],'precision_signature':(inspect_precision_signature(model.model, 'student', image_size, args.batch_size)
+                     if args.repvit_reparam else signature),'results':results}
         if args.model_type=="student" and dataset=="u1652":
             payload["u1652_eval_batch_size"]=args.batch_size
         if not args.certification_only:

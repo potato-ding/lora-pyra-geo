@@ -1,0 +1,68 @@
+{
+  "epochs": 30,
+  "seed": 0,
+  "model": "repvit_m1_5",
+  "pretrained_checkpoint": "src/models/repvit/repvit_m1_5_distill_450e.pth",
+  "data_dir": "data/U1652",
+  "world_size": 1,
+  "local_pair_batch": 32,
+  "global_pair_batch": 32,
+  "cross_gpu_gather": false,
+  "num_workers": 8,
+  "backbone_precision": "bfloat16",
+  "descriptor_precision": "float32",
+  "lr": 0.0001,
+  "weight_decay": 0.0001,
+  "scheduler": "cosine",
+  "warmup_epochs": 0.1,
+  "min_lr_ratio": 0.01,
+  "grad_accum_steps": 1,
+  "task_loss": {
+    "name": "pair_infonce",
+    "temperature": 0.07,
+    "label_smoothing": 0.1
+  },
+  "selection_eval_batch_size": 16,
+  "output_dir": "/home/dingyi/lora-pyra-geo/src/checkpoint/student/R256/D4-TOP512",
+  "experiment_id": "D4-TOP512-SAM-R256",
+  "img_size": 256,
+  "middle_checkpoint": "/home/dingyi/lora-pyra-geo/src/checkpoint/middle_teacher/R256/M3-256/best_model.pth",
+  "supervision_asset": "/home/dingyi/lora-pyra-geo/src/checkpoint/student/R256/middle_assets/M3-256/top128/manifest.json",
+  "distillation": {
+    "type": "component_ablation",
+    "weight": 0.2,
+    "warmup_epochs": 5
+  },
+  "sam": {
+    "enabled": true,
+    "algorithm": "kd_guided_standard_sam",
+    "search_direction": "kd",
+    "rho": 0.1,
+    "adaptive": false,
+    "perturb_scope": "main_optimizer_all_trainable",
+    "second_pass_objective": "full"
+  },
+  "selection_start_epoch": 11,
+  "middle_config": "/home/dingyi/lora-pyra-geo/configs/middle_teacher/m3_sam_hrd_sem_256.json",
+  "top_calibration": "/home/dingyi/lora-pyra-geo/src/checkpoint/student/R256/middle_assets/M3-256/top_calibration.pt",
+  "middle_provider": "M3",
+  "subspace_reference": {
+    "checkpoint": "/home/dingyi/lora-pyra-geo/src/checkpoint/student/R256/S3-256-M3/best_model.pth",
+    "checkpoint_sha256": "c81054a83d64110db2bc0f3a3635baaabd03abe9d7459a9d055db1c0003ac47e",
+    "tensor_sha256": {
+      "teacher_mean": "d973992d17105000cf8b9630debfe6dc4379d63bd453ee7526d817c8a77c49a8",
+      "top128_basis": "115e304b81e01dbb4682522e59292c3926e2e5c3fc033d5579d93b5e92caf076",
+      "random32_basis": "d258f341aeff358efd01b804e9e4fcb373e3658b614a9c116c7e72ee62f43324"
+    },
+    "random_basis_seed": 3581722385785991807
+  },
+  "ablation": {
+    "variant": "d4_top512",
+    "target": "top",
+    "top_dim": 512,
+    "random_dim": 0,
+    "top_head": "residual_mlp",
+    "branch_weight": 1.0
+  },
+  "dimension_asset": "/home/dingyi/lora-pyra-geo/src/checkpoint/student/R256/middle_assets/M3-256/dimension_extension/manifest.json"
+}

@@ -17,8 +17,9 @@ ROOT = Path(__file__).resolve().parents[1]
 
 @pytest.mark.parametrize("size", [224, 256])
 @pytest.mark.parametrize("method", ["s0_infonce", "s1_tsd", "s2_adsd", "s3_sam_adsd"])
-def test_eight_student_configs(size, method):
-    path = ROOT / f"configs/student/{method}_{size}.json"
+def test_formal_student_configs(size, method):
+    provider = "_m3" if method in {"s1_tsd", "s2_adsd"} else ""
+    path = ROOT / f"configs/student/{method}{provider}_{size}.json"
     _, cfg = load_formal_config(path)
     assert cfg["img_size"] == size
     assert cfg["epochs"] == 30
@@ -286,8 +287,9 @@ def test_adsd_random32_is_run_seeded_and_orthonormal():
 
 @pytest.mark.parametrize("method", ["s0_infonce", "s1_tsd", "s2_adsd", "s3_sam_adsd"])
 def test_resolution_variants_share_training_math(method):
-    left = json.loads((ROOT / f"configs/student/{method}_224.json").read_text())
-    right = json.loads((ROOT / f"configs/student/{method}_256.json").read_text())
+    provider = "_m3" if method in {"s1_tsd", "s2_adsd"} else ""
+    left = json.loads((ROOT / f"configs/student/{method}{provider}_224.json").read_text())
+    right = json.loads((ROOT / f"configs/student/{method}{provider}_256.json").read_text())
     for config in (left, right):
         for field in ("img_size", "experiment_id", "output_dir", "middle_checkpoint",
                       "middle_config", "supervision_asset", "top_calibration"):
@@ -296,16 +298,19 @@ def test_resolution_variants_share_training_math(method):
 
 
 @pytest.mark.parametrize("size", [224, 256])
-def test_s4_changes_only_s2_identity_and_middle_provider(size):
+def test_s4_shares_s2_training_math_with_m3_provider(size):
     from src.student.formal_config import METHODS
     from src.middle_teacher.formal_config import load_formal_config as load_middle
     _, cfg = load_formal_config(ROOT / f"configs/student/s4_adsd_sam_middle_{size}.json")
-    base = json.loads((ROOT / f"configs/student/s2_adsd_{size}.json").read_text())
+    base = json.loads((ROOT / f"configs/student/s2_adsd_m3_{size}.json").read_text())
     assert METHODS["s4_adsd_sam_middle"] == ("S4-ADSD-SAM-MIDDLE", "ADSD", False)
     assert "sam" not in cfg
-    assert {key for key in cfg if key not in ("output_dir", "supervision_asset", "top_calibration") and cfg[key] != base[key]} == {
-        "experiment_id", "middle_checkpoint", "middle_config",
-    }
+    bindings = {"experiment_id", "output_dir", "middle_provider", "middle_checkpoint",
+                "middle_config", "supervision_asset", "top_calibration"}
+    assert {key: value for key, value in cfg.items() if key not in bindings} == {
+        key: value for key, value in base.items() if key not in bindings}
+    assert cfg["middle_checkpoint"] == base["middle_checkpoint"]
+    assert cfg["middle_config"] == base["middle_config"]
     _, provider = load_middle(cfg["middle_config"])
     assert provider["experiment_id"] == f"M3-SAM-HRD-SEM-R{size}"
     assert provider["sam"]["search_direction"] == "kd"

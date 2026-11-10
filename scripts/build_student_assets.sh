@@ -4,7 +4,7 @@ set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-python}"
-USAGE="Usage: scripts/build_student_assets.sh top|calibration [options]"
+USAGE="Usage: scripts/build_student_assets.sh top|calibration|teacher-top [options]"
 
 if (( $# < 1 )); then
   echo "$USAGE" >&2
@@ -19,6 +19,9 @@ export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
 case "$ACTION" in
   top)
     exec "$PYTHON_BIN" -m src.student.build_top_only "$@"
+    ;;
+  teacher-top)
+    exec "$PYTHON_BIN" -m src.student.direct_teacher_assets "$@"
     ;;
   calibration)
     exec "$PYTHON_BIN" -m src.student.build_calibration "$@"

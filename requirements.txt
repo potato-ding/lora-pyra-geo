@@ -13,3 +13,6 @@ Pillow==12.2.0
 # Unit-test runner and DeepSpeed extension build tool.
 pytest==9.1.1
 ninja==1.13.0
+# Independent metric verification and efficiency measurements.
+scikit-learn==1.7.2
+fvcore==0.1.5.post20221221

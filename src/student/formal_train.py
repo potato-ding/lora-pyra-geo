@@ -27,16 +27,49 @@ from .formal_methods import (
 )
 from .formal_supervision import load_top_source
 from .model import StudentModel
+from .dimension_config import is_dimension_config
 from .objective import PairInfoNCE
 from .optimizer import build_student_optimizer
 from .scheduler import build_student_scheduler, assert_student_scheduler_groups
 
 
 def method_name(config):
-    return config["experiment_id"].split("-R")[0]
+    from .s0_backbones import S0_BACKBONES
+
+    method = config["experiment_id"].rsplit("-R", 1)[0]
+    return "S0-INFONCE" if method in S0_BACKBONES.values() else method
+
+
+def sam_enabled(config):
+    """Use the validated config to select the SAM or ordinary backward path."""
+    return config.get("sam", {}).get("enabled", False) is True
 
 
 def validate_assets(config):
+    if "provider_control" in config:
+        from .provider_dimensions import validate_assets as validate_provider
+        return validate_provider(config)
+    if is_dimension_config(config):
+        from .dimension_supervision import validate_assets as validate_dimension_assets
+        return validate_dimension_assets(config)
+    if config.get("distillation", {}).get("type") == "VkD":
+        from .vkd_config import validate_config
+        from .formal_assets import validate_middle_provider
+        validate_config(config)
+        _, provider_sha = validate_middle_provider(config["middle_checkpoint"],config["middle_config"],256,expected_method="M3")
+        pretrained = (ROOT / config["pretrained_checkpoint"]).resolve()
+        if not pretrained.is_file(): raise FileNotFoundError(pretrained)
+        return {"student_pretrained":sha256(pretrained),"middle_checkpoint":provider_sha,
+                "middle_config":sha256(config["middle_config"])}
+    if "ablation" in config:
+        if config["ablation"]["variant"] == "b1_m0_provider":
+            from .m0_student_ablation import validate_assets as validate_m0_assets
+            return validate_m0_assets(config)
+        from .ablation_config import reference_config
+        return validate_assets(reference_config(config))
+    if config.get("teacher_provider") == "T0":
+        from .direct_teacher_distillation import validate_assets as validate_direct_assets
+        return validate_direct_assets(config, ROOT)
     size = config["img_size"]
     pretrained = (ROOT / config["pretrained_checkpoint"]).resolve()
     if not pretrained.is_file():
@@ -46,6 +79,12 @@ def validate_assets(config):
         return hashes
     middle_path = Path(config["middle_checkpoint"]).resolve()
     middle_config_path = Path(config["middle_config"]).resolve()
+    if method_name(config) == "S-HRD-SAM":
+        from .formal_assets import validate_middle_provider
+        _, middle_sha = validate_middle_provider(
+            middle_path, middle_config_path, size, expected_method="M3")
+        hashes.update(middle_checkpoint=middle_sha, middle_config=sha256(middle_config_path))
+        return hashes
     asset_path = Path(config["supervision_asset"]).resolve()
     calibration_path = Path(config["top_calibration"]).resolve()
     for path in (middle_path, middle_config_path, asset_path, calibration_path):
@@ -87,6 +126,12 @@ def validate_assets(config):
         supervision_asset=sha256(asset_path), top_calibration=sha256(calibration_path),
         top_calibration_metadata=sha256(calibration_meta_path),
     )
+    if "subspace_reference" in config:
+        from .shared_subspaces import load_reference
+        tensors = load_reference(config["subspace_reference"], config, hashes)
+        if not torch.equal(tensors["teacher_mean"],top["teacher_mean"]) or not torch.equal(tensors["top128_basis"],top["top128_basis"]):
+            raise ValueError("Shared source Top128 differs from canonical asset")
+        hashes["subspace_reference_checkpoint"] = config["subspace_reference"]["checkpoint_sha256"]
     return hashes
 
 
@@ -101,7 +146,7 @@ def select_student(engine, config, output, epoch, best_score, asset_hashes,
             selection_batch_size=config["selection_eval_batch_size"],
         )
         metrics = evaluate_student_u1652_canonical(
-            EvaluationEncoder(student, 512).eval(),
+            EvaluationEncoder(student, getattr(student, "embedding_dim", 512)).eval(),
             image_size=config["img_size"], device=next(student.parameters()).device,
             data_dir=str(ROOT / config["data_dir"]),
             num_workers=config["num_workers"],
@@ -164,6 +209,55 @@ def select_student(engine, config, output, epoch, best_score, asset_hashes,
         student.train()
 
 
+def collect_student_source_identity(config):
+    """Record method-specific source files without changing frozen stage manifests."""
+    from src.source_contract import source_identity as calculate_source_identity
+    kind = method_name(config)
+    if kind == "VKD-SAM":
+        source = calculate_source_identity("m2s",gbw=False,sam=True)
+        for name in ("vkd.py","vkd_config.py","vkd_checkpoint.py","distill_sam.py","formal_train.py","formal_config.py","formal_checkpoint.py"):
+            source["src/student/"+name] = sha256(ROOT / "src/student" / name)
+        return source
+    if "ablation" in config:
+        from .ablation_config import reference_config
+        source = collect_student_source_identity(reference_config(config))
+        for name in ("src/student/ablation_config.py", "src/student/component_ablation.py", "src/student/ablation_checkpoint.py"):
+            source[name] = sha256(ROOT / name)
+        if "provider_control" in config:
+            source["src/student/provider_dimensions.py"] = sha256(ROOT/"src/student/provider_dimensions.py")
+        if is_dimension_config(config):
+            for name in ("dimension_config.py","dimension_supervision.py","dimension_checkpoint.py","dimension_random.py"):
+                source["src/student/"+name] = sha256(ROOT/"src/student"/name)
+        if config["ablation"]["variant"].startswith(("c1_","c2_")):
+            source["src/student/full_feature_residual.py"] = sha256(ROOT / "src/student/full_feature_residual.py")
+        if config["ablation"]["variant"] == "b1_m0_provider":
+            for name in ("src/student/m0_student_ablation.py", "src/student/formal_assets.py"):
+                source[name] = sha256(ROOT / name)
+        return source
+    source = calculate_source_identity(
+        "m2s", gbw=kind in ("S2-ADSD", "S3-SAM-ADSD", "S4-ADSD-SAM-MIDDLE"),
+        sam=kind in ("S3-SAM-ADSD", "S-HRD-SAM"),
+    )
+    if kind == "S-HRD-SAM" or "subspace_reference" in config or "random_basis_replicate" in config:
+        source["src/student/shared_subspaces.py"] = sha256(ROOT / "src/student/shared_subspaces.py")
+    if config.get("teacher_provider") == "T0":
+        source.update(calculate_source_identity("teacher"))
+        for name in ("src/student/direct_teacher_assets.py", "src/student/direct_teacher_distillation.py", "src/student/shared_subspaces.py"):
+            source[name] = sha256(ROOT / name)
+    if kind in ("S3-SAM-ADSD", "S-HRD-SAM"):
+        sam_source = "src/student/distill_sam.py"
+        source[sam_source] = sha256(ROOT / sam_source)
+    if "hrd" in config and config.get("teacher_provider") != "T0":
+        name = "src/student/middle_teacher_hrd.py"
+        source[name] = sha256(ROOT / name)
+    if "hrd" in config:
+        for name in ("src/student/direct_teacher_hrd.py", "src/middle_teacher/losses/hard_rank_distillation.py"):
+            source[name] = sha256(ROOT / name)
+    if kind == "S-HRD-SAM":
+        source["src/student/hrd_only.py"] = sha256(ROOT / "src/student/hrd_only.py")
+    return source
+
+
 def train(config_path):
     import deepspeed
     path, cfg = load_formal_config(config_path)
@@ -175,12 +269,8 @@ def train(config_path):
     if not output.is_dir() or Path(os.environ.get("STUDENT_TRAIN_LOG", "")).resolve() != (output / "train.log").resolve():
         raise RuntimeError("Use scripts/train_student.sh to capture train.log")
     assets = validate_assets(cfg)
-    from src.source_contract import source_identity as calculate_source_identity
     kind = method_name(cfg)
-    source = calculate_source_identity(
-        "m2s", gbw=kind in ("S2-ADSD", "S3-SAM-ADSD", "S4-ADSD-SAM-MIDDLE"),
-        sam=kind == "S3-SAM-ADSD",
-    )
+    source = collect_student_source_identity(cfg)
     deepspeed.init_distributed(dist_backend="nccl")
     if dist.get_world_size() != 1 or torch.cuda.device_count() != 1:
         raise RuntimeError("Formal Student requires one GPU")
@@ -196,42 +286,81 @@ def train(config_path):
         min_lr_ratio=cfg["min_lr_ratio"],
     )
     loader = create_student_train_dataset_and_loader(args)
+    if "ablation" in cfg or kind in ("S-HRD-SAM", "VKD-SAM") or "subspace_reference" in cfg or "random_basis_replicate" in cfg or cfg.get("teacher_provider") == "T0":
+        from .shared_subspaces import configure_shared_data
+        configure_shared_data(loader, cfg["seed"])
     student = StudentModel(
         ckpt_path=str((ROOT / cfg["pretrained_checkpoint"]).resolve()),
         temperature=cfg["task_loss"]["temperature"],
+        model_name=cfg["model"],
     ).to(device)
     middle = supervision = gate = None
     random_seed = None
     if kind != "S0-INFONCE":
-        middle, _ = load_encoder(
-            "middle", cfg["middle_checkpoint"], cfg["middle_config"],
-            device, image_size=cfg["img_size"],
-        )
+        if "provider_control" in cfg:
+            from .provider_dimensions import load_provider
+            middle = load_provider(cfg,device)
+        elif cfg.get("teacher_provider") == "T0":
+            from .direct_teacher_distillation import load_provider
+            middle = load_provider(cfg, device)
+        else:
+            middle, _ = load_encoder(
+                "middle", cfg["middle_checkpoint"], cfg["middle_config"],
+                device, image_size=cfg["img_size"],
+            )
         if middle.training or any(p.requires_grad for p in middle.parameters()):
             raise RuntimeError("Middle must be frozen and in eval mode")
-        calibration = torch.load(
-            cfg["top_calibration"], map_location="cpu", weights_only=True,
-        )
-        if kind == "S1-TSD":
-            supervision = prepare_tsd(
-                cfg["supervision_asset"], assets["middle_checkpoint"], calibration,
-            ).to(device)
-        else:
-            random_seed = secrets.randbits(63)
-            supervision = prepare_adsd(
-                cfg["supervision_asset"], assets["middle_checkpoint"],
-                calibration, random_seed, cfg["seed"],
-            ).to(device)
-            gate = ADSDGate(cfg["distillation"]["allocation"]["initial_d"]).to(device)
-    model = StudentTrainingModel(student, supervision).to(device)
+        if kind == "VKD-SAM":
+            from .vkd import VkDHead
+            supervision = VkDHead().to(device)
+        elif "ablation" in cfg:
+            from .component_ablation import prepare
+            calibration = torch.load(cfg["top_calibration"],map_location="cpu",weights_only=True)
+            supervision, gate, random_seed = prepare(cfg, assets, calibration)
+            supervision = supervision.to(device)
+            if gate is not None:
+                gate = gate.to(device)
+        elif kind != "S-HRD-SAM":
+            calibration = torch.load(
+                cfg["top_calibration"], map_location="cpu", weights_only=True,
+            )
+            if cfg.get("teacher_provider") == "T0":
+                from .direct_teacher_distillation import TeacherSubspaceSupervision
+                random_seed = cfg["random_reference"]["random_basis_seed"]
+                supervision = TeacherSubspaceSupervision(cfg, assets["teacher_checkpoint"], calibration).to(device)
+                gate = ADSDGate(cfg["distillation"]["allocation"]["initial_d"]).to(device)
+            elif kind == "S1-TSD":
+                supervision = prepare_tsd(
+                    cfg["supervision_asset"], assets["middle_checkpoint"], calibration,
+                ).to(device)
+            else:
+                shared_tensors = None
+                if "subspace_reference" in cfg:
+                    from .shared_subspaces import load_reference
+                    shared_tensors = load_reference(cfg["subspace_reference"], cfg, assets)
+                random_seed = cfg["subspace_reference"]["random_basis_seed"] if shared_tensors is not None else secrets.randbits(63)
+                supervision = prepare_adsd(
+                    cfg["supervision_asset"], assets["middle_checkpoint"],
+                    calibration, random_seed, cfg["seed"],
+                    shared_tensors=shared_tensors,
+                ).to(device)
+                gate = ADSDGate(cfg["distillation"]["allocation"]["initial_d"]).to(device)
+    if kind == "VKD-SAM":
+        from .vkd import VkDTrainingModel
+        model = VkDTrainingModel(student,supervision).to(device)
+    else:
+        model = StudentTrainingModel(student, supervision).to(device)
     optimizer = build_student_optimizer(model, cfg["lr"], cfg["weight_decay"])
+    if kind == "VKD-SAM":
+        from .vkd import protect_householder_optimizer
+        protect_householder_optimizer(model,optimizer)
     # Finalize dtype groups before LambdaLR snapshots the optimizer groups.
     # The residual head stays FP32; every final group needs its own schedule.
     from .formal_top import prepare_student_precision_groups
     prepare_student_precision_groups(model, optimizer)
     scheduler = build_student_scheduler(optimizer, args, steps_per_epoch=len(loader))
     named = None
-    if kind == "S3-SAM-ADSD":
+    if sam_enabled(cfg):
         from .distill_sam import collect_optimizer_trainable_params
         named = collect_optimizer_trainable_params(model, optimizer, middle.parameters())
     ds = dict(deepspeed_config({
@@ -247,7 +376,7 @@ def train(config_path):
         engine.module.student, "student", cfg["img_size"],
         selection_batch_size=cfg["selection_eval_batch_size"],
     )
-    if kind == "S3-SAM-ADSD":
+    if sam_enabled(cfg):
         from .distill_sam import assert_engine_ownership
         assert_engine_ownership(engine, named)
     gate_optimizer = gate_scheduler = None
@@ -270,6 +399,56 @@ def train(config_path):
         "random_basis_seed": random_seed,
         "assets": assets,
     }), flush=True)
+    if "subspace_reference" in cfg and not is_dimension_config(cfg):
+        from .subspace_utils import tensor_sha256
+        from .shared_subspaces import validate_tensors, NAMES
+        validate_tensors(supervision.state_dict(), cfg["subspace_reference"])
+        identity = {"source":cfg["subspace_reference"], "tensor_sha256":{name:tensor_sha256(getattr(supervision,name)) for name in NAMES}, "random_generation_count":supervision.random_basis_generation_count}
+        (output / "subspace_identity.json").write_text(json.dumps(identity,indent=2)+"\n")
+        print("SHARED_SUBSPACE_IDENTITY="+json.dumps(identity),flush=True)
+        from .shared_subspaces import initialization_hashes
+        initial = {"student":initialization_hashes(student),
+                   "base_heads":initialization_hashes(supervision,base_heads_only=True),
+                   "all_heads":initialization_hashes(supervision),
+                   "training_seed":cfg["seed"],
+                   "initialization_policy":"canonical head RNG rules retained; training/data seed from config",
+                   "reference_use":"mean/Top/Random buffers only, never trained Student weights"}
+        (output / "initialization_identity.json").write_text(json.dumps(initial,indent=2)+"\n")
+    if "random_basis_replicate" in cfg:
+        from .subspace_utils import tensor_sha256
+        from .shared_subspaces import initialization_hashes
+        identity = {"replicate": cfg["random_basis_replicate"], "random_basis_seed": random_seed,
+                    "tensor_sha256": {name: tensor_sha256(getattr(supervision, name)) for name in ("teacher_mean", "top128_basis", "random32_basis")},
+                    "random_generation_count": supervision.random_basis_generation_count}
+        (output / "subspace_identity.json").write_text(json.dumps(identity, indent=2)+"\n")
+        (output / "initialization_identity.json").write_text(json.dumps({"student": initialization_hashes(student), "base_heads": initialization_hashes(supervision, base_heads_only=True)}, indent=2)+"\n")
+        print("INDEPENDENT_RANDOM32_IDENTITY="+json.dumps(identity), flush=True)
+    if cfg.get("teacher_provider") == "T0":
+        from .subspace_utils import tensor_sha256
+        from .shared_subspaces import initialization_hashes
+        identity = {"reference": cfg["random_reference"], "same_subspace_as_middle": False,
+                    "tensor_sha256": {name: tensor_sha256(getattr(supervision, name)) for name in ("teacher_mean", "top128_basis", "random32_basis")},
+                    "random_generation_count": supervision.random_basis_generation_count}
+        (output / "subspace_identity.json").write_text(json.dumps(identity, indent=2)+"\n")
+        (output / "initialization_identity.json").write_text(json.dumps({"student": initialization_hashes(student), "base_heads": initialization_hashes(supervision, base_heads_only=True)}, indent=2)+"\n")
+        print("DIRECT_T0_SUPERVISION="+json.dumps(identity), flush=True)
+    if kind == "S-HRD-SAM":
+        from .shared_subspaces import initialization_hashes
+        (output / "initialization_identity.json").write_text(json.dumps(
+            {"student": initialization_hashes(student), "subspace_heads": None, "gate": None}, indent=2)+"\n")
+    if cfg.get("ablation", {}).get("variant") == "b1_m0_provider":
+        from .m0_student_ablation import write_identity
+        write_identity(output,cfg,supervision,student)
+    if kind == "VKD-SAM":
+        from .shared_subspaces import initialization_hashes
+        identity={"training_seed":cfg["seed"],"student":initialization_hashes(student),
+            "all_heads":initialization_hashes(supervision),"feature":"shared BN before L2",
+            "orthogonality_error":supervision.orthogonality_error(),"teacher_sha256":assets["middle_checkpoint"],
+            "projector_weight_decay":0.,"warmup_epochs":cfg["distillation"]["warmup_epochs"]}
+        (output / "initialization_identity.json").write_text(json.dumps(identity,indent=2)+"\n")
+    if is_dimension_config(cfg):
+        from .dimension_supervision import write_identity
+        write_identity(output,cfg,supervision,student)
     best = float("-inf")
     for epoch in range(1, cfg["epochs"] + 1):
         engine.train()
@@ -281,10 +460,30 @@ def train(config_path):
                 raise ValueError("Student batch shape/resolution mismatch")
             if gate_optimizer is not None:
                 gate_optimizer.zero_grad(set_to_none=True)
-            if kind == "S3-SAM-ADSD":
-                loss, gate_loss, parts, audit = sam_adsd_backward(
-                    engine, middle, images, criterion, cfg, epoch, gate, named,
-                )
+            if sam_enabled(cfg):
+                if kind == "VKD-SAM":
+                    from .vkd import sam_backward
+                    loss,gate_loss,parts,audit = sam_backward(engine,middle,images,criterion,cfg,epoch,named)
+                elif "ablation" in cfg:
+                    from .component_ablation import sam_backward
+                    loss, gate_loss, parts, audit = sam_backward(
+                        engine,middle,images,criterion,cfg,epoch,gate,named,
+                        identities=batch[2].to(device,non_blocking=True))
+                elif kind == "S-HRD-SAM":
+                    from .hrd_only import sam_hrd_backward
+                    loss, gate_loss, parts, audit = sam_hrd_backward(
+                        engine, middle, images, criterion, cfg, epoch, gate, named,
+                        batch[2].to(device, non_blocking=True))
+                elif "hrd" in cfg:
+                    from .direct_teacher_hrd import sam_hrd_adsd_backward
+                    loss, gate_loss, parts, audit = sam_hrd_adsd_backward(
+                        engine, middle, images, criterion, cfg, epoch, gate, named,
+                        batch[2].to(device, non_blocking=True),
+                    )
+                else:
+                    loss, gate_loss, parts, audit = sam_adsd_backward(
+                        engine, middle, images, criterion, cfg, epoch, gate, named,
+                    )
                 if not audit["PERTURB_RESTORE_EXACT"]:
                     raise RuntimeError("SAM restore failed")
             else:
@@ -307,6 +506,11 @@ def train(config_path):
                             criterion, cfg, epoch,
                         )
                         gate_loss = None
+                    elif "ablation" in cfg:
+                        from .component_ablation import objective
+                        loss, gate_loss, parts = objective(
+                            engine.module.student, supervision, descriptors, targets,
+                            criterion, cfg, epoch, gate)
                     else:
                         loss, gate_loss, parts = adsd_objective(
                             engine.module.student, supervision, descriptors, targets,

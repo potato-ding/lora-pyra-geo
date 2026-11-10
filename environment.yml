@@ -17,3 +17,5 @@ dependencies:
       - Pillow==12.2.0
       - pytest==9.1.1
       - ninja==1.13.0
+      - scikit-learn==1.7.2
+      - fvcore==0.1.5.post20221221

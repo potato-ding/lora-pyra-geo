@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Train S0, TSD, ADSD or SAM-ADSD at 224/256 from a public config.
+# Train the configured Student method; VkD is an explicit R256 comparison.
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -57,7 +57,11 @@ if [[ -z "$OUTPUT_DIR" ]]; then
   echo "Set output_dir in $CONFIG before training." >&2
   exit 2
 fi
-if [[ "$EXPERIMENT" != S0-INFONCE-* &&
+if [[ ( "$EXPERIMENT" == S-HRD-SAM-* || "$EXPERIMENT" == VKD-SAM-* ) && ( -z "$MIDDLE_CHECKPOINT" || -z "$MIDDLE_CONFIG" ) ]]; then
+  echo "Set Middle provider paths before provider-guided training." >&2
+  exit 2
+fi
+if [[ "$EXPERIMENT" != S0-INFONCE-* && "$EXPERIMENT" != S-HRD-SAM-* && "$EXPERIMENT" != VKD-SAM-* &&
       ( -z "$MIDDLE_CHECKPOINT" || -z "$MIDDLE_CONFIG" ||
         -z "$SUPERVISION_ASSET" || -z "$TOP_CALIBRATION" ) ]]; then
   echo "Set Middle and supervision paths in $CONFIG before distillation." >&2

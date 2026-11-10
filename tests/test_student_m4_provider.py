@@ -9,7 +9,8 @@ METHODS = ("s1_tsd", "s2_adsd", "s3_sam_adsd")
 
 @pytest.mark.parametrize("method", METHODS)
 def test_m4_variant_changes_only_provider_and_output(method):
-    _, base = load_formal_config(ROOT / f"configs/student/{method}_256.json")
+    provider = "_m3" if method in {"s1_tsd", "s2_adsd"} else ""
+    _, base = load_formal_config(ROOT / f"configs/student/{method}{provider}_256.json")
     _, cfg = load_formal_config(ROOT / f"configs/student/{method}_m4_256.json")
     bindings = {"middle_provider", "middle_checkpoint", "middle_config",
                 "supervision_asset", "top_calibration", "output_dir"}
@@ -27,8 +28,8 @@ def test_m4_variant_rejects_wrong_provider(monkeypatch, provider):
     with pytest.raises(ValueError, match="middle_provider=M4"):
         load_formal_config(path)
 
-def test_legacy_config_cannot_silently_override_provider(monkeypatch):
-    path = ROOT / "configs/student/s2_adsd_256.json"
+def test_generic_sam_config_cannot_silently_override_provider(monkeypatch):
+    path = ROOT / "configs/student/s3_sam_adsd_256.json"
     cfg = json.loads(path.read_text())
     cfg["middle_provider"] = "M4"
     monkeypatch.setattr(Path, "read_text", lambda *a, **kw: json.dumps(cfg))

@@ -36,8 +36,8 @@ class Attention(nn.Module):
 result = flops(Attention(), torch.ones(1,2,4,3))
 assert result['status'] == 'operator_coverage_complete', result
 assert math.isclose(result['gflops']*1e9, 576), result
-for test_model, inputs, expected in [(model,x,15),(Attention(),torch.ones(1,2,4,3),576)]:
-    result = executed_flops(test_model, inputs)
+for candidate_model, inputs, expected in [(model,x,15),(Attention(),torch.ones(1,2,4,3),576)]:
+    result = executed_flops(candidate_model, inputs)
     assert result['status']=='operator_coverage_complete', result
     assert math.isclose(result['gflops']*1e9,expected), result
 with torch.inference_mode():

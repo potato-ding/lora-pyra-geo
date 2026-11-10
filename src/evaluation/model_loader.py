@@ -103,9 +103,10 @@ def load_encoder(model_type,checkpoint,config=None,device='cuda',image_size=None
         if config is not None and json.loads(Path(config).read_text())!=payload['public_config']:
             raise ValueError('Student config differs from checkpoint')
         from src.student.model import StudentModel
-        model=StudentModel(ckpt_path=None);dimension=512
+        model = StudentModel(ckpt_path=None, model_name=payload["public_config"].get("model", "repvit_m1_5"))
+        dimension = model.embedding_dim
         state=normalize_state(payload);result=model.load_state_dict(state,strict=True)
-        schema='formal RepViT-M1.5 deployment state'
+        schema='formal Student deployment state'
     else:raise ValueError(model_type)
     runtime_precision = apply_contract(model,model_type,expected,image_size)
     model.to(device).eval()

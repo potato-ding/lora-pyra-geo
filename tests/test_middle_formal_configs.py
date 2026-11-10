@@ -41,7 +41,7 @@ def test_formal_middle_config_and_runtime_projection(monkeypatch, size, method):
 def test_middle_formal_configs_are_the_only_public_set():
     assert {p.name for p in CONFIG_DIR.glob("*.json")} == {
         f"{method}_{size}.json" for method in METHODS for size in (224, 256)
-    } | {f"m4_sam_hrd_{size}.json" for size in (224, 256)}
+    } | {f"m4_sam_hrd_{size}.json" for size in (224, 256)} | {"m1_hrd_middle_hnd_256.json", "m3_sam_hrd_sem_adsd_256.json", "m_sam_adsd_256.json", "m1_kl_256.json"}
 
 
 def test_method_components_fail_closed():

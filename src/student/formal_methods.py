@@ -17,14 +17,24 @@ def prepare_tsd(manifest, middle_sha, calibration):
     return supervision
 
 
-def prepare_adsd(manifest, middle_sha, calibration, seed, training_seed):
-    supervision = SubspaceSupervision(manifest, middle_sha)
-    configure_basis(supervision, {
+def prepare_adsd(manifest, middle_sha, calibration, seed, training_seed, *, shared_tensors=None, supervision_class=SubspaceSupervision):
+    supervision = supervision_class(manifest, middle_sha)
+    basis_config = {
         "random_basis_mode": "gaussian_qr_per_run",
         "random_basis_seed": seed,
         "seed": training_seed,
         "random_projector_type": "linear",
-    })
+    }
+    stored = None
+    if shared_tensors is not None:
+        from .random_structure import structure_metadata
+        for name in ("teacher_mean", "top128_basis"):
+            if not torch.equal(getattr(supervision,name),shared_tensors[name]):
+                raise ValueError("Shared Top asset differs from current canonical asset")
+            setattr(supervision,name,shared_tensors[name].clone())
+        stored = {"basis_identity":structure_metadata(basis_config,shared_tensors["random32_basis"]),
+                  "supervision":{"random32_basis":shared_tensors["random32_basis"]}}
+    configure_basis(supervision,basis_config,stored=stored)
     install_residual_top(supervision, "rmlp", calibration)
     return supervision
 
@@ -98,7 +108,7 @@ def sam_adsd_backward(engine, middle, images, criterion, cfg, epoch, gate, named
     if middle.training or any(p.requires_grad for p in middle.parameters()):
         raise RuntimeError("Middle must be frozen")
     with torch.no_grad():
-        targets = middle(images.to(torch.bfloat16)).detach().float()
+        targets = middle(images.to(getattr(middle, "input_dtype", torch.bfloat16))).detach().float()
     student_images = images.to(next(engine.module.student.parameters()).dtype)
     snapshots = [images.detach().clone(), targets.detach().clone()]
 

@@ -1,0 +1,70 @@
+{
+  "epochs": 30,
+  "seed": 0,
+  "model": "repvit_m1_5",
+  "pretrained_checkpoint": "src/models/repvit/repvit_m1_5_distill_450e.pth",
+  "data_dir": "data/U1652",
+  "world_size": 1,
+  "local_pair_batch": 32,
+  "global_pair_batch": 32,
+  "cross_gpu_gather": false,
+  "num_workers": 8,
+  "backbone_precision": "bfloat16",
+  "descriptor_precision": "float32",
+  "lr": 0.0001,
+  "weight_decay": 0.0001,
+  "scheduler": "cosine",
+  "warmup_epochs": 0.1,
+  "min_lr_ratio": 0.01,
+  "grad_accum_steps": 1,
+  "task_loss": {
+    "name": "pair_infonce",
+    "temperature": 0.07,
+    "label_smoothing": 0.1
+  },
+  "selection_eval_batch_size": 16,
+  "output_dir": "/home/dingyi/lora-pyra-geo/src/checkpoint/student/R256/S3-256-T0-SAME-SEED-RMLP-LINEAR-GBW",
+  "experiment_id": "S3-SAM-ADSD-R256",
+  "img_size": 256,
+  "supervision_asset": "/home/dingyi/lora-pyra-geo/src/checkpoint/student/R256/teacher_assets/T0-256/top128/manifest.json",
+  "distillation": {
+    "type": "ADSD",
+    "weight": 0.2,
+    "warmup_epochs": 5,
+    "top_dim": 128,
+    "top_head": "residual_mlp",
+    "random_dim": 32,
+    "random_head": "linear",
+    "random_basis": "teacher_gaussian_qr_same_seed",
+    "allocation": {
+      "type": "bounded_learnable_gbw",
+      "initial_d": 0.0
+    }
+  },
+  "sam": {
+    "enabled": true,
+    "algorithm": "kd_guided_standard_sam",
+    "search_direction": "kd",
+    "rho": 0.1,
+    "adaptive": false,
+    "perturb_scope": "main_optimizer_all_trainable",
+    "second_pass_objective": "full"
+  },
+  "selection_start_epoch": 11,
+  "top_calibration": "/home/dingyi/lora-pyra-geo/src/checkpoint/student/R256/teacher_assets/T0-256/top_calibration.pt",
+  "teacher_provider": "T0",
+  "teacher_checkpoint": "/home/dingyi/lora-pyra-geo/src/checkpoint/teacher/T0-256/best_model.pth",
+  "teacher_asset_identity": "/home/dingyi/lora-pyra-geo/src/checkpoint/student/R256/teacher_assets/T0-256/teacher_identity.json",
+  "random_basis_asset": "/home/dingyi/lora-pyra-geo/src/checkpoint/student/R256/teacher_assets/T0-256-S3-RANDOM32/random32_basis.pt",
+  "random_reference": {
+    "checkpoint": "/home/dingyi/lora-pyra-geo/src/checkpoint/student/R256/S3-256-M3/best_model.pth",
+    "checkpoint_sha256": "c81054a83d64110db2bc0f3a3635baaabd03abe9d7459a9d055db1c0003ac47e",
+    "random_basis_seed": 3581722385785991807,
+    "source_basis_sha256": "d258f341aeff358efd01b804e9e4fcb373e3658b614a9c116c7e72ee62f43324",
+    "t0_basis_sha256": "61605143407f50044ad37bb77817199ada2373d52843b46c5aa7279bca3677f8",
+    "generation_algorithm": "CPU_GAUSSIAN_FLOAT64_QR_MAXABS_SIGN_FP32_V1"
+  },
+  "teacher_forward_batch_size": 4,
+  "head_initialization_rng_asset": "/home/dingyi/lora-pyra-geo/src/checkpoint/student/R256/teacher_assets/T0-256-S3-RANDOM32/head_initialization_rng.pt",
+  "head_initialization_rng_sha256": "d6f0b2903be0121baf44ca79e16f9160393c810677458b991acc9dc3c8eba565"
+}

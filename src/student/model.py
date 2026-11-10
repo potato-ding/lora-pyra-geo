@@ -18,11 +18,18 @@ class StudentModel(nn.Module):
     BACKBONE_NAME = "RepViT-M1.5"
     DEFAULT_CKPT_PATH = "src/models/repvit/repvit_m1_5_distill_450e.pth"
 
-    def __init__(self, ckpt_path=DEFAULT_CKPT_PATH, temperature=0.07):
+    def __init__(self, ckpt_path=DEFAULT_CKPT_PATH, temperature=0.07, model_name="repvit_m1_5"):
         super().__init__()
-        self.feat_channels = 512
-        self.embedding_dim = 512
-        self.backbone = RepViTBackbone(ckpt_path=ckpt_path)
+        self.model_name = model_name
+        if model_name == "repvit_m1_5":
+            self.backbone = RepViTBackbone(ckpt_path=ckpt_path)
+            self.feat_channels = 512
+        else:
+            from .s0_backbones import build_backbone
+
+            self.backbone = build_backbone(model_name, ckpt_path)
+            self.feat_channels = self.backbone.embed_dim
+        self.embedding_dim = self.feat_channels
         self.neck = nn.BatchNorm1d(self.feat_channels)
         self.logit_scale = nn.Parameter(torch.tensor(math.log(1 / temperature)))
         self._f4_shape_logged = False
@@ -32,8 +39,9 @@ class StudentModel(nn.Module):
 
     def _print_config(self):
         rank0_print("StudentModel config:")
-        rank0_print(f"  student_backbone: {self.BACKBONE_NAME}")
-        rank0_print("  descriptor: f4 -> GAP -> BatchNorm1d(512) -> L2")
+        rank0_print(f"  student_backbone: {self.model_name}")
+        source = "f4 -> GAP" if self.model_name == "repvit_m1_5" else "DINOv3 pooled descriptor"
+        rank0_print(f"  descriptor: {source} -> BatchNorm1d({self.embedding_dim}) -> L2")
         total_params = sum(param.numel() for param in self.parameters())
         rank0_print(
             "  total_params: "
@@ -47,6 +55,12 @@ class StudentModel(nn.Module):
         self._f4_shape_logged = True
 
     def forward(self, x, return_audit_features=False):
+        if self.model_name != "repvit_m1_5":
+            if return_audit_features:
+                raise ValueError("Stage feature audit is only available for RepViT")
+            # The ConvNeXt hub model applies GAP and final LayerNorm here.
+            pooled = self.backbone.forward_features(x)["x_norm_clstoken"]
+            return F.normalize(self.neck(pooled).float(), dim=1)
         features = self.backbone(x)
         f4 = features[-1]
         self._log_f4_shape_once(f4)

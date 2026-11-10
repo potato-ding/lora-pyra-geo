@@ -90,10 +90,10 @@ class PerturbedParameters:
             if not torch.isfinite(actual) or actual<=1e-12:raise FloatingPointError('Effective perturbation nonfinite/zero')
             dot=torch.stack([(a*b).sum() for a,b in zip(delta,self.epsilon)]).sum()
             self.audit=dict(FP32_TARGET_PERTURB_NORM=float(target),EFFECTIVE_PERTURB_NORM=float(actual),
-                EFFECTIVE_DIRECTION_COSINE=float(dot/(actual*target)),EFFECTIVE_NORM_RELATIVE_ERROR=float((actual-target).abs()/target),
-                BF16_TOLERANCE_STATUS='PENDING_GPU_CALIBRATION')
+                EFFECTIVE_DIRECTION_COSINE=float(dot/(actual*target)),EFFECTIVE_NORM_RELATIVE_ERROR=float((actual-target).abs()/target))
             if not all(math.isfinite(v) for v in self.audit.values() if isinstance(v,float)):raise FloatingPointError('Nonfinite perturbation audit')
             validate_effective_perturbation(float(target),float(actual),self.audit['EFFECTIVE_DIRECTION_COSINE'])
+            self.audit['BF16_TOLERANCE_STATUS']='PASS'
             return self
         except BaseException:self.restore_exact();raise
     def __exit__(self,*exc):self.restore_exact()

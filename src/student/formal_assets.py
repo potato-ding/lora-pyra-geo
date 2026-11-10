@@ -8,7 +8,7 @@ from src.middle_teacher.checkpoint import sha256
 from src.middle_teacher.formal_config import load_formal_config
 
 
-def validate_middle_provider(checkpoint, config_path, image_size, *, expected_method=None):
+def validate_middle_provider(checkpoint, config_path, image_size, *, expected_method=None, allow_m0_ablation=False):
     path = Path(checkpoint).resolve()
     public_path, public = load_formal_config(config_path)
     allowed = {
@@ -16,6 +16,8 @@ def validate_middle_provider(checkpoint, config_path, image_size, *, expected_me
         f"M3-SAM-HRD-SEM-R{image_size}": "M3",
         f"M4-SAM-HRD-R{image_size}": "M4",
     }
+    if allow_m0_ablation:
+        allowed[f"M0-INFONCE-R{image_size}"] = "M0"
     method = allowed.get(public["experiment_id"])
     if method is None:
         raise ValueError("Student assets require a resolution-matched M2, M3 or M4 Middle")

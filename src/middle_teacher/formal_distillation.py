@@ -2,6 +2,19 @@
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
+
+
+def bidirectional_similarity_kl(md, ms, td, ts, temperature):
+    with torch.autocast(device_type=md.device.type, enabled=False):
+        student = F.normalize(md.float()) @ F.normalize(ms.float()).T
+        teacher = F.normalize(td.detach().float()) @ F.normalize(ts.detach().float()).T
+        return temperature**2 * 0.5 * sum(
+            F.kl_div(F.log_softmax(s / temperature, dim=1),
+                     F.log_softmax(t / temperature, dim=1),
+                     reduction="batchmean", log_target=True)
+            for s, t in ((student, teacher), (student.T, teacher.T))
+        )
 
 from src.middle_teacher.checkpoint import sha256
 from src.middle_teacher.core_config import validate_teacher_identity
@@ -43,6 +56,17 @@ class FormalDistillationRuntime:
             final = features["final_cls"]
             td = concat_all_gather(final[: self.local_pair_batch])
             ts = concat_all_gather(final[self.local_pair_batch :])
+        if "similarity_kl" in self.config:
+            component = self.config["similarity_kl"]
+            raw_kl = bidirectional_similarity_kl(md, ms, td, ts, component["temperature"])
+            kd = component["weight"] * raw_kl
+            stats = {"similarity_kl_loss": float(raw_kl.detach()),
+                     "similarity_kl_weighted_loss": float(kd.detach()),
+                     "similarity_kl_to_infonce_ratio": float(kd.detach()) / max(float(base.detach()), 1e-12),
+                     "global_pool": int(md.shape[0])}
+            if return_kd_objective:
+                return base + kd, stats, kd
+            return base + kd, stats
         raw = hard_rank_losses(md, ms, td, ts, ids, self.config)
         if semantic:
             if hidden is None:
@@ -65,6 +89,7 @@ class FormalDistillationRuntime:
             "teacher_requires_grad_count": 0,
             "teacher_optimizer_param_count": 0,
             "teacher_descriptor_source": "FINAL_CLS",
+            "negative_selection": self.config["margin"].get("negative_selection", "teacher_top5_wrong_identity"),
             "global_pool": int(md.shape[0]),
         }
         for name, (value, audit) in raw.items():

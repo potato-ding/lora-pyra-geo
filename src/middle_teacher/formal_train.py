@@ -67,9 +67,9 @@ def run(config_path, expected_gpus, teacher_chunk_size):
     path, public = load_formal_config(config_path)
     if not public.get("output_dir"):
         raise ValueError("Set output_dir in the public config")
-    if "hrd" in public and not public.get("teacher_checkpoint"):
+    if ("hrd" in public or "similarity_kl" in public) and not public.get("teacher_checkpoint"):
         raise ValueError("Set teacher_checkpoint in the KD config")
-    if "hrd" in public and not Path(public["teacher_checkpoint"]).is_file():
+    if ("hrd" in public or "similarity_kl" in public) and not Path(public["teacher_checkpoint"]).is_file():
         raise FileNotFoundError(public["teacher_checkpoint"])
     data_root = Path(public["data_dir"])
     if not (data_root / "train" / "satellite").is_dir() or not (data_root / "train" / "drone").is_dir():
@@ -112,7 +112,7 @@ def run(config_path, expected_gpus, teacher_chunk_size):
     )
     device = torch.device("cuda", local_rank)
     kd = None
-    if "hrd" in public:
+    if ("hrd" in public or "similarity_kl" in public):
         with torch.random.fork_rng(devices=[local_rank]):
             kd = FormalDistillationRuntime(
                 config, public["teacher_checkpoint"], device, teacher_chunk_size,

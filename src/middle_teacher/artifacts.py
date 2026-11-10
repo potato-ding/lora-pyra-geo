@@ -66,6 +66,7 @@ class MiddleCheckpointController(CheckpointController):
         objective={
             frozenset({'base_loss'}): 'PairInfoNCE',
             frozenset({'base_loss','margin'}): 'PairInfoNCE_HRD',
+            frozenset({'base_loss','similarity_kl'}): 'PairInfoNCE_SIMILARITY_KL',
             frozenset({'base_loss','margin','adaptive_bridge_v2'}): 'PairInfoNCE_HRD_SEMANTIC',
         }.get(frozenset(components))
         if objective is None:raise ValueError('Unsupported Middle objective components')

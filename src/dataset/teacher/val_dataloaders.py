@@ -347,56 +347,7 @@ def build_gta_val_dataloaders(
         print(f"GTA_PROTOCOL_COUNTS={query_dataset.protocol_audit}", flush=True)
         return make_loader(query_dataset), make_loader(gallery_dataset)
 
-    def build_s2d():
-        pairs_sate2drone = {}
-        drone_paths, drone_names, drone_coords = [], [], []
-
-        for item in json_data:
-            pos_list = item.get(pair_key, [])
-            if not pos_list:
-                continue
-
-            drone_name = item["drone_img_name"]
-            drone_names.append(drone_name)
-            drone_paths.append(os.path.join(data_dir, item["drone_img_dir"], drone_name))
-            drone_coords.append(item["drone_loc_x_y"])
-
-            for sate_name in pos_list:
-                if sate_name in sate_name_to_id:
-                    pairs_sate2drone.setdefault(sate_name, []).append(drone_name)
-
-        drone_name_to_id = {name: idx for idx, name in enumerate(drone_names)}
-        max_pos = max([len(names) for names in pairs_sate2drone.values()] + [1])
-        query_paths, query_labels, query_coords = [], [], []
-
-        for sate_path, sate_coord in zip(all_sate_paths, sate_coords):
-            sate_name = os.path.basename(sate_path)
-            if sate_name not in pairs_sate2drone:
-                continue
-
-            valid_ids = [drone_name_to_id[name] for name in pairs_sate2drone[sate_name] if name in drone_name_to_id]
-            if not valid_ids:
-                continue
-
-            query_paths.append(sate_path)
-            query_labels.append(valid_ids + [-1] * (max_pos - len(valid_ids)))
-            query_coords.append(sate_coord)
-
-        query_dataset = GTAUAVDataset(query_paths, query_labels, coords=query_coords, transform=val_transforms)
-        gallery_dataset = GTAUAVDataset(drone_paths, list(range(len(drone_paths))), coords=drone_coords, transform=val_transforms)
-        return make_loader(query_dataset), make_loader(gallery_dataset)
-
-    modes = ["D2S", "S2D"] if query_mode == "both" else [query_mode]
-    loaders = {}
-    for mode_name in modes:
-        if mode_name == "D2S":
-            loaders["D2S"] = build_d2s()
-        elif mode_name == "S2D":
-            loaders["S2D"] = build_s2d()
-        else:
-            raise ValueError(f"unsupported GTA-UAV query mode: {mode_name}")
-
-    return loaders
+    return {"D2S": build_d2s()}
 
 
 __all__ = [

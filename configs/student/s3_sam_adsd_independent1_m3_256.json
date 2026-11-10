@@ -23,11 +23,11 @@
     "label_smoothing": 0.1
   },
   "selection_eval_batch_size": 16,
-  "output_dir": "/home/dingyi/lora-pyra-geo/src/checkpoint/student/R224/S2-224",
-  "experiment_id": "S2-ADSD-R224",
-  "img_size": 224,
-  "middle_checkpoint": "/home/dingyi/lora-pyra-geo/src/checkpoint/middle_teacher/R224/M2-224/best_model.pth",
-  "supervision_asset": "/home/dingyi/lora-pyra-geo/src/checkpoint/student/R224/middle_assets/M2-224/top128/manifest.json",
+  "output_dir": "/home/dingyi/lora-pyra-geo/src/checkpoint/student/R256/S3-256-M3-RMLP-LINEAR-RANDOM1-GBW",
+  "experiment_id": "S3-SAM-ADSD-R256",
+  "img_size": 256,
+  "middle_checkpoint": "/home/dingyi/lora-pyra-geo/src/checkpoint/middle_teacher/R256/M3-256/best_model.pth",
+  "supervision_asset": "/home/dingyi/lora-pyra-geo/src/checkpoint/student/R256/middle_assets/M3-256/top128/manifest.json",
   "distillation": {
     "type": "ADSD",
     "weight": 0.2,
@@ -42,7 +42,18 @@
       "initial_d": 0.0
     }
   },
+  "sam": {
+    "enabled": true,
+    "algorithm": "kd_guided_standard_sam",
+    "search_direction": "kd",
+    "rho": 0.1,
+    "adaptive": false,
+    "perturb_scope": "main_optimizer_all_trainable",
+    "second_pass_objective": "full"
+  },
   "selection_start_epoch": 11,
-  "middle_config": "/home/dingyi/lora-pyra-geo/configs/middle_teacher/m2_hrd_sem_224.json",
-  "top_calibration": "/home/dingyi/lora-pyra-geo/src/checkpoint/student/R224/middle_assets/M2-224/top_calibration.pt"
+  "middle_config": "/home/dingyi/lora-pyra-geo/configs/middle_teacher/m3_sam_hrd_sem_256.json",
+  "top_calibration": "/home/dingyi/lora-pyra-geo/src/checkpoint/student/R256/middle_assets/M3-256/top_calibration.pt",
+  "middle_provider": "M3",
+  "random_basis_replicate": 1
 }
