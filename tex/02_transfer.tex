@@ -1,0 +1,80 @@
+\begin{table*}[t]
+\centering
+\caption{Zero-shot transfer from University-1652 to SUES-200. Each cell reports R@1/AP (\%) at the indicated height.}
+\label{tab:transfer}
+\scriptsize
+\setlength{\tabcolsep}{1.5pt}
+\begin{tabular*}{\textwidth}{@{\extracolsep{\fill}}lc*{8}{c}@{}}
+\toprule
+& & \multicolumn{4}{c}{D$\rightarrow$S} & \multicolumn{4}{c}{S$\rightarrow$D} \\
+\cmidrule(lr){3-6}\cmidrule(lr){7-10}
+Method & Params (M)$\downarrow$ & 150 m & 200 m & 250 m & 300 m & 150 m & 200 m & 250 m & 300 m \\
+\midrule
+LPN~\cite{wang2022lpn}$^{r}$ & 27.71 & 41.28/49.24 & 53.00/59.83 & 59.58/65.59 & 63.98/69.61 & 36.25/34.20 & 46.25/45.69 & 57.50/53.17 & 65.00/59.02 \\
+MuSe-Net~\cite{wang2024musenet}$^{r}$ & 26.60 & 65.63/70.04 & 77.13/80.02 & 81.38/83.98 & 83.65/85.98 & 75.00/63.78 & 80.00/73.78 & 85.00/79.45 & 86.25/81.06 \\
+Sample4Geo~\cite{deuser2023sample4geo}$^{r}$ & 87.57 & 74.18/78.05 & 83.93/86.75 & 88.38/90.51 & 91.90/93.43 & 85.00/78.90 & 90.00/87.81 & 95.00/92.62 & 92.50/92.88 \\
+MEAN~\cite{chen2025mean} & 27.82 & 81.73/87.72 & 89.05/91.00 & 92.13/93.60 & 94.63/95.76 & 91.25/81.50 & 96.25/89.55 & 95.00/92.36 & 96.25/94.32 \\
+CAMP~\cite{wu2024camp}$^{r}$ & 87.71 & 78.90/82.37 & 86.83/89.27 & 91.95/93.63 & 95.68/96.65 & 87.50/78.98 & 95.00/87.04 & 95.00/91.05 & 96.25/93.44 \\
+DAC~\cite{xia2024dac}$^{r}$ & 87.57 & 76.65/80.57 & 86.48/89.01 & 92.98/94.20 & 94.53/95.45 & 87.50/79.87 & 96.25/88.98 & 95.00/92.81 & 96.25/93.99 \\
+CCR~\cite{du2024ccr}$^{r}$ & 121.68 & 73.33/77.72 & 86.73/89.05 & 93.23/94.43 & 95.53/96.32 & 86.25/75.31 & 92.50/88.36 & 95.00/93.93 & \textbf{97.50}/95.80 \\
+MCCG~\cite{shen2024mccg}$^{r}$ & 29.00 & 78.53/82.29 & 87.63/89.97 & 92.65/94.13 & 94.95/96.06 & 82.50/75.22 & 88.75/84.87 & 93.75/90.23 & 95.00/92.36 \\
+SpikeViMFormer-S~\cite{chen2026spikevimformer}$^{r}$ & 18.63 & 76.05/79.95 & 83.88/86.67 & 87.80/89.90 & 89.25/91.13 & 85.00/74.63 & 88.75/82.90 & 90.00/86.16 & 88.75/87.97 \\
+InfoGeo-RD~\cite{zhang2026infogeo}$^{r}$ & 91.57 & \textbf{91.88}/\textbf{93.15} & \textbf{95.40}/\textbf{96.11} & \textbf{96.83}/\textbf{97.26} & 96.68/97.18 & \textbf{97.50}/\textbf{89.17} & 96.25/\textbf{92.99} & \textbf{98.75}/\textbf{95.41} & 96.25/\textbf{96.04} \\
+MobileGeo~\cite{sun2025mobilegeo} & 28.57 & -- & -- & -- & -- & 92.50/83.81 & \textbf{97.50}/91.75 & \textbf{98.75}/94.59 & \textbf{97.50}/\textbf{96.04} \\
+\midrule\textbf{EfficientGeo} & 13.62 & 86.13/88.73 & 94.10/95.22 & 96.53/97.19 & 97.58/98.05 & 92.50/83.88 & \textbf{97.50}/91.56 & \textbf{98.75}/94.16 & 96.25/95.00 \\
+\textbf{EfficientGeo + Rep.} & \textbf{13.54} & 86.15/88.73 & 94.03/95.16 & 96.55/97.20 & \textbf{97.60}/\textbf{98.07} & 92.50/83.65 & \textbf{97.50}/91.58 & \textbf{98.75}/94.17 & \textbf{97.50}/95.04 \\
+\bottomrule
+\end{tabular*}
+\par\smallskip{\footnotesize\raggedright $^{r}$: reproduced results. Other results are paper-reported. --: unavailable.\par}
+\end{table*}
+
+\begin{table}[!b]
+\centering
+\caption{Zero-shot drone-to-satellite retrieval on GTA-UAV. R@1 and AP are in \%. Dis@1 is in meters.}
+\label{tab:gta_transfer}
+\scriptsize
+\setlength{\tabcolsep}{1.5pt}
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{lccccc}
+\toprule
+\multicolumn{6}{c}{Same-area} \\
+Method & Params (M) & R@1$\uparrow$ & AP$\uparrow$ & SDM@3$\uparrow$ & Dis@1$\downarrow$ \\
+\midrule
+LPN~\cite{wang2022lpn}$^{r}$ & 27.71 & 12.78 & 18.96 & 0.2968 & 2258.60 \\
+MuSe-Net~\cite{wang2024musenet}$^{r}$ & 26.60 & 25.88 & 33.28 & 0.4147 & 1634.71 \\
+Sample4Geo~\cite{deuser2023sample4geo}$^{r}$ & 87.57 & 29.28 & 38.18 & 0.4770 & 1363.48 \\
+MEAN~\cite{chen2025mean}$^{r}$ & 27.82 & 30.87 & 38.83 & 0.4730 & 1486.16 \\
+CAMP~\cite{wu2024camp}$^{r}$ & 87.71 & 34.71 & 43.62 & 0.5071 & 1326.12 \\
+DAC~\cite{xia2024dac}$^{r}$ & 87.57 & 34.24 & 43.45 & 0.5005 & 1374.89 \\
+CCR~\cite{du2024ccr}$^{r}$ & 121.68 & 32.36 & 40.78 & 0.4813 & 1308.37 \\
+MCCG~\cite{shen2024mccg}$^{r}$ & 29.00 & 35.49 & 43.85 & 0.4742 & 1414.49 \\
+SpikeViMFormer-S~\cite{chen2026spikevimformer}$^{r}$ & 18.63 & 23.06 & 30.54 & 0.4089 & 1704.76 \\
+InfoGeo-RD~\cite{zhang2026infogeo}$^{r}$ & 91.57 & 32.21 & 40.53 & 0.5112 & \textbf{1224.02} \\
+\midrule
+\textbf{EfficientGeo} & 13.62 & \textbf{40.37} & \textbf{48.16} & \textbf{0.5139} & 1282.56 \\
+\textbf{EfficientGeo + Rep.} & \textbf{13.54} & 40.17 & 47.99 & 0.5123 & 1288.51 \\
+\bottomrule
+\end{tabular}}\par\smallskip
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{lccccc}
+\toprule
+\multicolumn{6}{c}{Cross-area} \\
+Method & Params (M) & R@1$\uparrow$ & AP$\uparrow$ & SDM@3$\uparrow$ & Dis@1$\downarrow$ \\
+\midrule
+LPN~\cite{wang2022lpn}$^{r}$ & 27.71 & 12.83 & 20.04 & 0.3230 & 2050.10 \\
+MuSe-Net~\cite{wang2024musenet}$^{r}$ & 26.60 & 25.82 & 34.10 & 0.4382 & 1389.22 \\
+Sample4Geo~\cite{deuser2023sample4geo}$^{r}$ & 87.57 & 31.11 & 40.33 & 0.5115 & 1051.62 \\
+MEAN~\cite{chen2025mean}$^{r}$ & 27.82 & 29.99 & 38.65 & 0.5005 & 1185.61 \\
+CAMP~\cite{wu2024camp}$^{r}$ & 87.71 & 36.09 & 45.43 & 0.5483 & 928.02 \\
+DAC~\cite{xia2024dac}$^{r}$ & 87.57 & 36.23 & 45.73 & 0.5335 & 1052.64 \\
+CCR~\cite{du2024ccr}$^{r}$ & 121.68 & 32.46 & 41.47 & 0.5100 & 1101.47 \\
+MCCG~\cite{shen2024mccg}$^{r}$ & 29.00 & 36.89 & 46.21 & 0.5068 & 1109.27 \\
+SpikeViMFormer-S~\cite{chen2026spikevimformer}$^{r}$ & 18.63 & 20.99 & 29.24 & 0.4381 & 1364.73 \\
+InfoGeo-RD~\cite{zhang2026infogeo}$^{r}$ & 91.57 & 33.23 & 42.05 & 0.5345 & 962.25 \\
+\midrule
+\textbf{EfficientGeo} & 13.62 & 43.48 & 51.99 & \textbf{0.5681} & \textbf{892.75} \\
+\textbf{EfficientGeo + Rep.} & \textbf{13.54} & \textbf{43.60} & \textbf{52.03} & 0.5673 & 894.28 \\
+\bottomrule
+\end{tabular}}
+\par\smallskip{\footnotesize\raggedright $^{r}$: our reproduced retrieval results.\par}
+\end{table}

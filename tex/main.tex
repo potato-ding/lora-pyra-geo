@@ -1,0 +1,32 @@
+% CVPR 2027 official author kit, tag CVPR2027-v1.
+% Main document: pdfLaTeX + BibTeX. This project contains the confirmed Chapters 1--4.
+\documentclass[10pt,twocolumn,letterpaper]{article}
+\usepackage[review]{cvpr}
+\input{preamble}
+\definecolor{cvprblue}{rgb}{0.21,0.49,0.74}
+\usepackage[pagebackref,breaklinks,colorlinks,allcolors=cvprblue]{hyperref}
+\def\confName{CVPR}
+\def\confYear{2027}
+\title{EfficientGeo: Distilling Foundation Models for Lightweight and Generalizable UAV-Based Cross-View Geo-Localization}
+\author{Anonymous Authors}
+\begin{document}
+\maketitle
+\begin{abstract}
+UAV-based cross-view geo-localization requires accurate retrieval in unseen geographic regions under strict onboard computational constraints. Transferring visual foundation representations to a lightweight convolutional network involves both a substantial capacity gap and an architectural discrepancy. We present EfficientGeo, which uses a Transformer-based intermediate teacher and stage-specific supervision to transfer task-adapted foundation knowledge. To preserve discrimination among visually confusable locations across capacities, Teacher-Guided Hard Negative Distillation (TG-HND) matches positive-negative similarity margins on hard negatives selected by the foundation teacher in both retrieval directions. For cross-architecture transfer, Asymmetric Dual-Subspace Distillation (ADSD) constructs compact descriptor targets in a fixed PCA-based teacher subspace and an independently sampled random subspace. Student-side mappings learn these targets without full-dimensional feature alignment or intermediate-layer correspondence. Extensive experiments demonstrate that EfficientGeo achieves strong generalization performance in unseen geographic regions with fewer parameters and lower computational cost. Deployment on an NVIDIA Jetson Orin NX further confirms its practical efficiency for onboard inference.
+\end{abstract}
+\input{01_introduction}
+\input{02_related_work}
+\input{03_method}
+\input{04_experiments}
+\input{05_conclusion}
+\clearpage
+\input{llm_usage}
+{\small
+\bibliographystyle{ieeenat_fullname}
+\bibliography{references}
+}
+\input{supplement}
+\end{document}
+
+
+

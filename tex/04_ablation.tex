@@ -1,0 +1,29 @@
+\centering
+\caption{Stage-I ablations of intermediate-teacher training. Cells report D$\rightarrow$S R@1/AP (\%). SUES-200 averages four heights. Cal.: feature calibration. U1652: University-1652. GTA-S/C: GTA-UAV same-/cross-area.}
+\label{tab:ablation_middle}
+\setlength{\tabcolsep}{1.5pt}
+\fontsize{7.5}{9}\selectfont
+\begin{tabular*}{\linewidth}{@{\extracolsep{\fill}}lcccc@{}}
+\toprule
+Variant & U1652 & SUES-200 & GTA-S & GTA-C \\
+\midrule
+W/o distillation & 94.68/95.61 & 92.91/94.26 & 41.97/51.15 & 45.85/55.12 \\
+\midrule
+\multicolumn{5}{@{}l}{\textit{Distillation targets}} \\
+Similarity KL & 94.81/95.70 & 92.80/94.13 & 41.50/50.78 & 45.22/54.68 \\
+\addlinespace[2pt]
+HND ($M$-selected) & 95.26/96.08 & 93.18/94.42 & 40.87/49.78 & 44.52/53.84 \\
+\addlinespace[2pt]
+TG-HND & 95.62/96.42 & 94.63/95.63 & 43.16/52.32 & 47.27/56.55 \\
+\midrule
+\multicolumn{5}{@{}l}{\textit{Alternative objective (with DG-SAM)}} \\
+ADSD & 95.26/96.08 & 93.11/94.36 & 40.08/48.90 & 43.07/52.33 \\
+\midrule
+\multicolumn{5}{@{}l}{\textit{TG-HND extensions}} \\
++ Cal. & 95.80/96.55 & 94.39/95.40 & 42.70/51.78 & 46.48/56.12 \\
+\addlinespace[2pt]
++ DG-SAM & 95.93/96.65 & \textbf{95.53}/\textbf{96.32} & 44.58/53.38 & 47.60/57.18 \\
+\addlinespace[2pt]
++ Cal. + DG-SAM & \textbf{96.15}/\textbf{96.84} & 95.49/96.26 & \textbf{46.04}/\textbf{54.70} & \textbf{49.65}/\textbf{58.71} \\
+\bottomrule
+\end{tabular*}

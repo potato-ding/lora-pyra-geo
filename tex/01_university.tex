@@ -1,0 +1,30 @@
+\begin{table*}[t]
+\centering
+\caption{University-1652 retrieval performance (\%) and model efficiency. FPS is measured on Jetson Orin NX.}
+\label{tab:university}
+\footnotesize
+\setlength{\tabcolsep}{3pt}
+\begin{tabular*}{\textwidth}{@{\extracolsep{\fill}}lcrrrrrrrr@{}}
+\toprule
+\raisebox{-4.5pt}[0pt][0pt]{Method} & \raisebox{-4.5pt}[0pt][0pt]{Venue / Year} & \raisebox{-4.5pt}[0pt][0pt]{Input} & \raisebox{-4.5pt}[0pt][0pt]{Params (M)$\downarrow$} & \raisebox{-4.5pt}[0pt][0pt]{FLOPs (G)$\downarrow$} & \raisebox{-4.5pt}[0pt][0pt]{FPS$\uparrow$} & \multicolumn{2}{c}{D$\rightarrow$S} & \multicolumn{2}{c}{S$\rightarrow$D} \\
+ & & & & & & R@1$\uparrow$ & AP$\uparrow$ & R@1$\uparrow$ & AP$\uparrow$ \\
+\midrule
+LPN~\cite{wang2022lpn}$^{r}$ & TCSVT 2022 & 256 & 27.71 & 16.28 & 33.28 & 75.77 & 79.09 & 88.02 & 76.01 \\
+MuSe-Net~\cite{wang2024musenet}$^{r}$ & PR 2024 & 256 & 26.60 & 25.88 & 19.98 & 74.73 & 78.09 & 87.87 & 75.52 \\
+Sample4Geo~\cite{deuser2023sample4geo}$^{r}$ & ICCV 2023 & 384 & 87.57 & 90.83 & 24.06 & 92.66 & 93.81 & 95.15 & 91.39 \\
+MEAN~\cite{chen2025mean} & TGRS 2025 & 384 & 27.82 & 26.46 & 40.74 & 93.55 & 94.53 & 96.01 & 92.08 \\
+CAMP~\cite{wu2024camp}$^{r}$ & TGRS 2024 & 384 & 87.71 & 90.83 & 18.73 & 94.42 & 95.35 & 96.15 & 92.72 \\
+DAC~\cite{xia2024dac}$^{r}$ & TCSVT 2024 & 384 & 87.57 & 90.83 & 18.76 & \textbf{94.68} & \textbf{95.51} & \textbf{96.43} & \textbf{93.80} \\
+CCR~\cite{du2024ccr}$^{r}$ & TCSVT 2024 & 384 & 121.68 & 90.96 & 10.13 & 92.95 & 94.16 & 95.72 & 92.55 \\
+MCCG~\cite{shen2024mccg}$^{r}$ & TCSVT 2024 & 256 & 29.00 & 11.77 & 60.05 & 89.59 & 91.33 & 94.44 & 89.62 \\
+SpikeViMFormer-S~\cite{chen2026spikevimformer}$^{r}$ & TCSVT 2026 & 384 & 18.63 & 50.12 & 32.49 & 88.00 & 89.96 & 92.30 & 87.11 \\
+InfoGeo-RD~\cite{zhang2026infogeo}$^{r}$ & ICML 2026 & 448 & 91.57 & 223.50 & 18.24 & 89.82 & 91.43 & 95.29 & 90.32 \\
+DepthGeoLoc~\cite{sun2026depthgeoloc} & TGRS 2026 & 252 & 28.57 & 11.63 & -- & 92.75 & 93.82 & 94.58 & 91.56 \\
+MobileGeo~\cite{sun2025mobilegeo} & arXiv 2025 & 224 & 28.57 & \textbf{4.45} & -- & 93.87 & 94.83 & 95.72 & 92.57 \\
+\midrule
+\textbf{EfficientGeo} & Ours & 256 & 13.62 & 6.07 & 137.67 & 93.20 & 94.28 & 95.15 & 92.34 \\
+\textbf{EfficientGeo + Rep.} & Ours & 256 & \textbf{13.54} & 6.01 & \textbf{214.34} & 93.14 & 94.23 & 95.29 & 92.32 \\
+\bottomrule
+\end{tabular*}
+\par\smallskip{\footnotesize\raggedright $^{r}$: reproduced results. Other results are paper-reported. DepthGeoLoc: student. MobileGeo: without MSRM. Rep.: reparameterized. --: unavailable.\par}
+\end{table*}

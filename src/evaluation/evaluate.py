@@ -61,7 +61,7 @@ def parse_args(argv=None):
     p.add_argument('--reuse-certified-cache',action='store_true',help='Formal metrics from hash-verified previously certified descriptors')
     p.add_argument("--independent-s0-reload", action="store_true",
                    help="Evaluate a DINOv3 S0 checkpoint separately from historical selection metrics")
-    p.add_argument("--repvit-reparam", action="store_true", help="Evaluate the fused R256 D2 basis-0 student")
+    p.add_argument("--repvit-reparam", action="store_true", help="Evaluate the fused original R256 S3 or D2 student")
     args=p.parse_args(argv)
     if args.batch_size != 16:
         raise ValueError("Unified single-GPU evaluation requires batch_size=16")
@@ -121,10 +121,12 @@ def main(argv=None):
             raise ValueError("Independent reload is limited to R256 DINOv3 S0 checkpoints")
     if args.repvit_reparam:
         public = header["public_config"]
-        if (public.get("experiment_id") != "D2-TOP256-RANDOM64-SAM-R256"
+        supported = {"D2-TOP256-RANDOM64-SAM-R256", "S3-SAM-ADSD-R256"}
+        if (public.get("experiment_id") not in supported
                 or public.get("model") != "repvit_m1_5" or public.get("seed") != 0
-                or "random_basis_control" in public):
-            raise ValueError("Reparameterization evaluation requires original D2 basis 0")
+                or "random_basis_control" in public or "random_basis_replicate" in public
+                or "teacher_provider" in public or "provider_control" in public or "hrd" in public):
+            raise ValueError("Reparameterization evaluation requires an original R256 S3/D2 student")
         from .efficiency import prepare_deployment
 
         with torch.no_grad():

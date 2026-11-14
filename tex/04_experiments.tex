@@ -1,0 +1,94 @@
+\section{Experiments}
+\label{sec:experiments}
+\input{01_university}
+
+
+\subsection{Experimental Setup}
+\label{sec:experimental_setup}
+
+\paragraph{Datasets.}
+To assess the cross-dataset generalization of EfficientGeo,
+we train the model on University-1652~\cite{zheng2020university}
+and evaluate it on SUES-200~\cite{zhu2023sues} and
+GTA-UAV~\cite{ji2025game4loc} in a zero-shot setting. On
+SUES-200, we report results separately at four flight
+heights of 150, 200, 250, and 300\,m. On GTA-UAV, we
+report results on both the same-area and cross-area test
+splits. Further details of the three datasets are provided
+in Section B of the supplementary material.
+
+\input{02_transfer}
+\input{03_jetson}
+\paragraph{Implementation details.}
+University-1652 provides training and test splits but no
+separate validation split~\cite{zheng2020university}.
+As in the released implementations of
+Sample4Geo~\cite{deuser2023sample4geo},
+DAC~\cite{xia2024dac}, and
+MEAN~\cite{chen2025mean}, we evaluate on its test split
+during training and save checkpoints according to test
+performance. The selected student is evaluated on SUES-200
+and GTA-UAV in a zero-shot setting. The main retrieval tables
+report results for both the unreparameterized and reparameterized student.Further training and optimization details are provided in Section A.2 of the supplementary material.
+
+On University-1652 and SUES-200, we report Recall@1
+(R@1) and average precision (AP) for both
+drone-to-satellite (D$\rightarrow$S) and
+satellite-to-drone (S$\rightarrow$D) retrieval.
+Following the evaluation implementations of
+Sample4Geo~\cite{deuser2023sample4geo},
+DAC~\cite{xia2024dac}, and
+MEAN~\cite{chen2025mean}, we exclude gallery images
+whose identities are absent from the query set when
+computing these metrics.
+
+For GTA-UAV, we follow the official evaluation
+protocol~\cite{ji2025game4loc} and report R@1, AP,
+SDM@3, and Dis@1 for D$\rightarrow$S retrieval.
+\subsection{Cross-View Retrieval Performance}
+\label{sec:retrieval_performance}
+
+
+
+\paragraph{University-1652.}
+EfficientGeo achieves 93.20\% D$\rightarrow$S and 95.15\% S$\rightarrow$D R@1 with 13.62\,M parameters (Table~\ref{tab:university}). The lightweight SpikeViMFormer-S achieves 88.00\% and 92.30\% in the two directions with 18.63\,M parameters. DAC achieves 94.68\% and 96.43\% with 87.57\,M parameters. These results show that the compact student retains strong source-domain discrimination with substantially fewer parameters.
+
+\paragraph{Zero-shot transfer to SUES-200.}
+EfficientGeo achieves an average D$\rightarrow$S R@1 of 93.58\% across the four flight heights, outperforming all compared methods except InfoGeo-RD (Table~\ref{tab:transfer}). InfoGeo-RD achieves approximately 95.20\% with 91.57\,M parameters, compared with 13.62\,M for EfficientGeo. At 300\,m, EfficientGeo reaches 97.58\% R@1, compared with 96.68\% for InfoGeo-RD. The lightweight SpikeViMFormer-S achieves approximately 84.25\% average R@1. These results indicate that the compact student retains transferable representations across changes in flight height.
+
+\paragraph{Zero-shot transfer to GTA-UAV.}
+EfficientGeo achieves 40.37\%/48.16\% and 43.48\%/51.99\% R@1/AP on the same-area and cross-area splits, respectively (Table~\ref{tab:gta_transfer}). In comparison, MCCG achieves 35.49\%/36.89\% R@1 on the two splits, and the lightweight SpikeViMFormer-S achieves 23.06\%/20.99\% with 18.63\,M parameters. EfficientGeo also exceeds InfoGeo-RD in R@1 while using substantially fewer parameters (13.62\,M vs.\ 91.57\,M). These results suggest that the distilled student retains strong cross-region generalization under a compact model budget. On GTA cross-area, EfficientGeo achieves an SDM@3 of 0.5681 and a Dis@1 of 892.75\,m, compared with 0.5068 and 1109.27\,m for MCCG. On the cross-area split, InfoGeo-RD and Sample4Geo obtain Dis@1 values of 962.25\,m and 1051.62\,m, respectively, both higher than EfficientGeo's. On same-area retrieval, InfoGeo-RD achieves a lower Dis@1 of 1224.02\,m, compared with 1282.56\,m for EfficientGeo.
+
+
+\subsection{Deployment Efficiency on Jetson Orin NX}
+\label{sec:deployment_efficiency}
+\paragraph{Measurement setup.}
+We measure query encoding on Jetson Orin NX 16\,GB in MAXN\_SUPER mode with fixed clocks, batch size one, CUDA Graph, and each model's native resolution and precision. After warm-up, each of three rounds measures 1,024 queries. Timing includes copying the GPU-resident input into the CUDA Graph buffer, encoding, normalization, and synchronization. We report the average over three rounds. Further details of the deployment measurements are provided in Section C of the supplementary material.
+
+\paragraph{Deployment performance.}On Jetson Orin NX, reparameterized EfficientGeo encodes a query in 4.665\,ms, with a peak GPU allocation of 27.35\,MiB and an energy cost of 0.0932\,J per query (Table~\ref{tab:jetson}). Under the same input resolution and BF16 precision, these values are 29.8\%, 60.4\%, and 30.7\% lower, respectively, than those of the fine-tuned DINOv3 ViT-S/16. RepViT's native structural reparameterization~\cite{wang2024repvit} reduces latency by 35.8\% and energy per query by 25.0\% relative to the unreparameterized student, while power increases from 17.29\,W to 20.34\,W. The lightweight SpikeViMFormer-S has a query latency of 30.78\,ms and a peak GPU allocation of 100.55\,MiB on the same device. Reparameterized EfficientGeo also surpasses it in zero-shot R@1 on SUES-200 and both GTA-UAV splits. Together, these results show that EfficientGeo combines strong cross-region generalization with efficient onboard inference. Per-model inference settings and structural reparameterization results are provided in Sections C and D of the supplementary material, respectively.
+
+\subsection{Ablation Studies}
+\label{sec:ablations}
+\begin{table}[!b]
+\input{04_ablation}
+\end{table}
+\paragraph{Stage I: teacher-to-intermediate distillation.}
+Table~\ref{tab:ablation_middle} starts from an intermediate teacher trained without distillation. On GTA cross-area, similarity KL reduces D$\rightarrow$S R@1 from 45.85\% to 45.22\%, whereas TG-HND raises it to 47.27\%. On SUES-200 and GTA same-area, TG-HND reaches 94.63\% and 43.16\% R@1, compared with 92.80\% and 41.50\% for KL. When the foundation teacher still supplies the margin targets but the intermediate teacher selects hard negatives, GTA same-area and cross-area R@1 fall from 43.16\%/47.27\% to 40.87\%/44.52\%. This controlled comparison highlights the value of foundation-guided negative selection for transferring discriminative rankings across the capacity gap. With DG-SAM fixed, TG-HND reaches 44.58\%/47.60\% R@1 on the two GTA splits, compared with 40.08\%/43.07\% for ADSD. This supports teacher-guided ranking transfer for the tested same-architecture teacher pair.
+
+Feature calibration and DG-SAM further strengthen the intermediate teacher when used together. Relative to TG-HND alone, their combination raises GTA same-area and cross-area R@1 from 43.16\%/47.27\% to 46.04\%/49.65\%. With DG-SAM fixed, calibration raises GTA cross-area R@1 from 47.60\% to 49.65\%, while adding DG-SAM to the calibrated model increases it from 46.48\% to 49.65\%. Calibration alone lowers this score from 47.27\% to 46.48\%, indicating that its benefit depends on the optimization setting. Detailed ablation results are provided in Section E of the supplementary material.
+
+\paragraph{Stage II: cross-architecture distillation.}
+Table~\ref{tab:ablation_student} examines how subspace supervision and DG-SAM affect transfer to the RepViT student. Compared with training without distillation, teacher-subspace supervision improves zero-shot retrieval on GTA-UAV, indicating that the intermediate teacher provides transferable guidance. The benefit of the full ADSD objective depends on optimization. Without DG-SAM, ADSD does not outperform TS-only on GTA cross-area, whereas with DG-SAM it raises R@1 from 40.21\% to 43.48\%. This comparison reflects the combined effect of the random subspace and gradient-balanced weighting.
+
+Under DG-SAM, ADSD achieves the best R@1 and AP on SUES-200 and both GTA-UAV splits among the tested distillation objectives, including TG-HND, full-dimensional alignment, and VkD. On GTA cross-area, ADSD reaches 43.48\% R@1 compared with 39.58\% for VkD. Although VkD performs better on the source University-1652 dataset, ADSD consistently leads on the zero-shot settings. These results support dual-subspace supervision as an effective way to transfer the intermediate Transformer's knowledge to a compact CNN while improving generalization to unseen datasets. Detailed results and analyses of TS/RS dimensions, multiple seeds, and VkD distillation weights are provided in Section F of the supplementary material.
+
+
+\par\medskip\noindent\begin{minipage}{\columnwidth}
+\captionsetup{type=table}
+\input{05_ablation}
+\end{minipage}\par\medskip
+\par\medskip\noindent\begin{minipage}{\columnwidth}
+\captionsetup{type=table}
+\input{06_path_comparison}
+\end{minipage}\par\medskip
+\paragraph{Two-stage transfer path.}Table~\ref{tab:transfer-path} compares our two-stage path with one-stage alternatives. Across University-1652, SUES-200, and both GTA-UAV splits, the two-stage path achieves the best R@1 and AP. On GTA cross-area, it raises R@1 from 40.55\% for direct $T\rightarrow S$ transfer with ADSD to 43.48\%, while adding TG-HND to direct transfer does not close the gap. The foundation-guided intermediate teacher also improves upon its retrieval-only counterpart, which reaches 39.52\% on the same split. These results highlight the value of transferring foundation knowledge to a task-adapted intermediate model before supervising the compact student. By addressing the capacity gap first and the architectural discrepancy subsequently, the two-stage path offers a more effective route for preserving generalizable knowledge under the tested settings.

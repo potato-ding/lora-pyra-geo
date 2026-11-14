@@ -1,0 +1,18 @@
+\centering
+\caption{Comparison of one-stage and two-stage transfer paths. $T$, $M$, and $S$ denote the foundation teacher, intermediate teacher, and student, respectively. All paths use ADSD and DG-SAM for student training. In the one-stage $M\rightarrow S$ path, $M$ is trained with retrieval supervision only. Cells report D$\rightarrow$S R@1/AP (\%) as in Table~\ref{tab:ablation_middle}.}
+\label{tab:transfer-path}
+\setlength{\tabcolsep}{1.5pt}
+\fontsize{7.5}{9}\selectfont
+\begin{tabular*}{\linewidth}{@{\extracolsep{\fill}}lcccc@{}}
+\toprule
+Transfer path & U1652 & SUES-200 & GTA-S & GTA-C \\
+\midrule
+\multicolumn{5}{@{}l}{\textit{(a) One-stage distillation}} \\
+$T\rightarrow S$ (ADSD) & 92.53/93.68 & 91.74/93.22 & 38.66/46.68 & 40.55/49.79 \\
+$T\rightarrow S$ (+TG-HND) & 91.90/93.26 & 91.30/92.95 & 36.28/44.51 & 37.11/46.51 \\
+$M\rightarrow S$ (ADSD) & 92.65/93.80 & 92.08/93.55 & 38.11/46.20 & 39.52/48.57 \\
+\midrule
+\multicolumn{5}{@{}l}{\textit{(b) Two-stage distillation}} \\
+$T\rightarrow M\rightarrow S$ (ours) & \textbf{93.20/94.28} & \textbf{93.58/94.80} & \textbf{40.37/48.16} & \textbf{43.48/51.99} \\
+\bottomrule
+\end{tabular*}

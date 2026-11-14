@@ -1,0 +1,31 @@
+\begin{table}[t]
+\centering
+\caption{Query-encoding efficiency on Jetson Orin NX. Rep.: RepViT structural reparameterization.}
+\label{tab:jetson}
+\footnotesize
+\setlength{\tabcolsep}{2pt}
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{lcccc}
+\toprule
+Method & \shortstack{Latency\\(ms)$\downarrow$} & \shortstack{Peak alloc.\\(MiB)$\downarrow$} & \shortstack{Power\\(W)$\downarrow$} & \shortstack{Energy\\(J/image)$\downarrow$} \\
+\midrule
+LPN~\cite{wang2022lpn} & 30.04$\pm$0.01 & 241.32 & 24.72 & 0.7454 \\
+MuSe-Net~\cite{wang2024musenet} & 50.05$\pm$0.07 & 331.36 & 25.10 & 1.2648 \\
+Sample4Geo~\cite{deuser2023sample4geo} & 41.57$\pm$0.16 & 362.11 & 23.63 & 0.9789 \\
+MEAN~\cite{chen2025mean} & 24.55$\pm$0.02 & 169.86 & 21.88 & 0.5346 \\
+CAMP~\cite{wu2024camp} & 53.39$\pm$0.18 & 376.43 & 23.33 & 1.2412 \\
+DAC~\cite{xia2024dac} & 53.29$\pm$0.06 & 396.55 & 22.97 & 1.2205 \\
+CCR~\cite{du2024ccr} & 98.69$\pm$0.06 & 632.56 & 27.11 & 2.6693 \\
+MCCG~\cite{shen2024mccg} & 16.65$\pm$0.01 & 148.11 & 25.65 & 0.4241 \\
+SpikeViMFormer-S~\cite{chen2026spikevimformer} & 30.78$\pm$0.04 & 100.55 & 21.11 & 0.6507 \\
+InfoGeo-RD~\cite{zhang2026infogeo} & 54.82$\pm$0.03 & 607.77 & 24.78 & 1.3557 \\
+\midrule
+DINOv3 ViT-S/16 & 6.65$\pm$0.02 & 69.02 & 20.46 & 0.1345 \\
+DINOv3 ConvNeXt-T & 9.85$\pm$0.01 & 79.85 & 20.04 & 0.1960 \\
+\midrule
+\textbf{EfficientGeo} & 7.264$\pm$0.021 & 27.82 & \textbf{17.29} & 0.1242 \\
+\textbf{EfficientGeo + Rep.} & \textbf{4.665}$\pm$0.014 & \textbf{27.35} & 20.34 & \textbf{0.0932} \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}

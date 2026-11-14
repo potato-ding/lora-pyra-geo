@@ -1,0 +1,12 @@
+\section{Conclusion}
+\label{sec:conclusion}
+EfficientGeo distills a task-adapted foundation model into a lightweight convolutional encoder for UAV--satellite retrieval in unseen regions.
+In Stage~I, the foundation teacher selects hard negatives, and TG-HND trains the intermediate Transformer teacher to match the corresponding positive--negative similarity margins.
+In Stage~II, ADSD trains the student to predict two projections of the intermediate teacher's retrieval descriptor, one onto its principal directions and one onto an independently sampled random subspace.
+The trained intermediate teacher benefits the student most clearly on SUES-200, particularly at 150\,m; direct supervision from the foundation teacher remains competitive on GTA-UAV.
+After training on University-1652 and reparameterization, the encoder achieves 94.35\% mean D$\rightarrow$S R@1 across the four SUES-200 heights and 41.56\% on GTA-UAV cross-area.
+The same 13.54\,M-parameter encoder encodes a query image in 4.65\,ms on Jetson Orin NX.
+
+\paragraph{Limitations.}
+Low-altitude UAV views dominated by facades can share little visible structure with satellite imagery, and repeated building layouts can make distinct locations look alike.
+Future work will target these ambiguous matches while preserving onboard inference efficiency.

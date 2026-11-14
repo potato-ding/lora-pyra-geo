@@ -1,0 +1,23 @@
+\centering
+\caption{Stage-II ablations of student training. Cells report D$\rightarrow$S R@1/AP (\%). Abbreviations follow Table~\ref{tab:ablation_middle}. Full-dimensional alignment uses a residual MLP.}
+\label{tab:ablation_student}
+\setlength{\tabcolsep}{1.5pt}
+\fontsize{7.5}{9}\selectfont
+\begin{tabular*}{\linewidth}{@{\extracolsep{\fill}}lcccc@{}}
+\toprule
+Variant & U1652 & SUES-200 & GTA-S & GTA-C \\
+\midrule
+\multicolumn{5}{@{}l}{\textit{(a) Subspaces and optimization}} \\
+W/o distillation & 88.52/90.32 & 88.69/90.66 & 34.80/43.02 & 36.00/45.06 \\
+TS only & 92.24/93.51 & 92.09/93.50 & 39.24/47.67 & 41.98/50.93 \\
+ADSD & 92.94/94.06 & 92.98/94.27 & 38.48/46.66 & 41.00/50.11 \\
+TS only + DG-SAM & 92.31/93.54 & 92.90/94.21 & 37.82/45.91 & 40.21/49.30 \\
+ADSD + DG-SAM & \textbf{93.20}/\textbf{94.28} & \textbf{93.58}/\textbf{94.80} & \textbf{40.37}/\textbf{48.16} & \textbf{43.48}/\textbf{51.99} \\
+\midrule
+\multicolumn{5}{@{}l}{\textit{(b) Distillation objectives (all with DG-SAM)}} \\
+TG-HND & 89.96/91.62 & 89.44/91.45 & 36.51/44.63 & 38.94/48.02 \\
+Full-dim. alignment & 92.88/94.02 & 92.43/93.88 & 36.19/44.57 & 38.81/48.00 \\
+VkD~\cite{miles2024vkd} & \textbf{93.90}/\textbf{94.91} & 91.44/92.92 & 37.23/45.57 & 39.58/48.39 \\
+ADSD & 93.20/94.28 & \textbf{93.58}/\textbf{94.80} & \textbf{40.37}/\textbf{48.16} & \textbf{43.48}/\textbf{51.99} \\
+\bottomrule
+\end{tabular*}
